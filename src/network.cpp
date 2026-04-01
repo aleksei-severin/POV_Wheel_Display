@@ -169,6 +169,7 @@ void setupNetwork() {
     });
 
     server.on("/get_settings", HTTP_GET, [](AsyncWebServerRequest *request){
+        last_web_activity_time = millis();
         String json = "{";
         json += "\"bmin\":" + String(min_brightness) + ",";
         json += "\"bmax\":" + String(max_brightness) + ",";
@@ -263,6 +264,7 @@ void setupNetwork() {
     });
 
     server.on("/info", HTTP_GET, [](AsyncWebServerRequest *request){
+        last_web_activity_time = millis();
         uint32_t period  = rotation_period;
         uint32_t hall_t  = last_hall_time;
         uint32_t now_us  = micros();

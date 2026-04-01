@@ -549,6 +549,7 @@ void setup() {
 
     // Эндпоинт для телеметрии батареи с добавленным полным дебагом конфигурации ЗУ
     server.on("/battery", HTTP_GET, [](AsyncWebServerRequest *request){
+        last_web_activity_time = millis();
         // Включаем ADC (на случай если он был отключен)
         Wire.beginTransmission(BQ25792_ADDR);
         Wire.write(0x2E);
@@ -649,6 +650,7 @@ void setup() {
 
 void loop() {
     static uint32_t last_network_us = 0;
+    static uint32_t last_play_ms    = 0; // Время последнего запроса /play (для Section 2)
     uint32_t now_us_net = micros();
     if (now_us_net - last_network_us >= 5000) {
         loopNetwork();
@@ -672,7 +674,8 @@ void loop() {
         // Не сбрасываем last_hall_time — это портит rotation_period в ISR:
         // если Холл сработает вскоре после сброса, rotation_period = несколько мс
         // вместо ~333мс, и renderingTask выйдет из цикла после 1 сектора.
-        // Вместо этого секция 2 проверяет last_web_activity_time (обновляется в /play).
+        // Запоминаем момент запроса — секция 2 даст 2с на загрузку файла.
+        last_play_ms = millis();
     }
 
     // --- БЕЗОПАСНОЕ ЧТЕНИЕ ПРЕРЫВАНИЙ ---
@@ -733,11 +736,12 @@ void loop() {
     }
 
     // --- 2. Логика остановки (Таймаут 1 секунда) ---
-    // Не выключаем питание если недавно был запрос /play: файл может ещё грузиться
-    // (loadFrameFromFile читает PSRAM ~100–500 мс). last_web_activity_time обновляется
-    // в HTTP-обработчике /play до передачи семафора fileLoaderTask.
+    // 2-секундная защита после запроса /play: loadFrameFromFile читает до 500 мс,
+    // и без защиты peripherals сразу отключатся — колесо не успеет начать крутиться.
+    // Используем last_play_ms (не last_web_activity_time, иначе страница пингует
+    // каждые 500 мс и peripherals никогда не выключатся).
     if (peripherals_active && time_since_magnet_us > 1000000 && !force_stop_display &&
-        (now_ms - (uint32_t)last_web_activity_time) > 3000) {
+        (now_ms - last_play_ms) > 2000) {
         Serial.println("Остановка рендеринга (Таймаут 1с). Отключение питания LED");
         FastLED.clear(); sendLEDs_DMA();
         digitalWrite(PIN_EN_LEVEL_SHIFT, LOW);
@@ -821,23 +825,9 @@ void loop() {
     }
 
     // --- 5. Авто-яркость ---
-    // Формула: actual = constrain(lux/1000 * max_brightness, min_brightness, max_brightness)
-    // Пример: lux=800, max=40, min=20 → constrain(0.8*40, 20, 40) = 32%
-    // REF_LUX = 1000: при 1000 lux яркость = max; ниже min никогда не опускается
-    {
-        static uint32_t last_lux_time = 0;
-        if (now_ms - last_lux_time >= 50) {
-            last_lux_time = now_ms;
-            float lux = lightMeter.readLightLevel();
-            if (lux >= 0) last_lux_value = lux; // Сохраняем только валидные показания
-            float ratio = constrain(last_lux_value / 1000.0f, 0.0f, 1.0f);
-            global_brightness = (uint8_t)constrain(
-                (int)(ratio * (float)max_brightness),
-                (int)min_brightness,
-                (int)max_brightness
-            );
-        }
-    }
+    // Чтение BH1750 и обновление global_brightness выполняется в renderingTask (Core 1)
+    // каждые 100 мс — дублировать здесь нельзя, так как Wire не потокобезопасен
+    // при одновременном вызове с двух ядер.
 
     // --- 6. Мониторинг BMS (Непрерывный мониторинг, даже при остановленном рендере) ---
     static uint32_t last_bms_check_time = 0;
@@ -906,16 +896,28 @@ void loop() {
     // --- 9. LED-индикация успешной загрузки файла ---
     if (blink_ok_flag) {
         blink_ok_flag = false;
-        if (!peripherals_active) {
-            // Плавное моргание зелёным при остановленном дисплее
+        // Моргаем ТОЛЬКО когда колесо не вращается (нет прохода магнита > 500 мс).
+        // Причина: sendLEDs_DMA использует spi_device_transmit, который при блокировке
+        // отдаёт CPU. renderingTask тут же просыпается и вызывает spi_device_polling_start
+        // на том же SPI-устройстве — конфликт шины → зелёные артефакты на секторах.
+        if (time_since_magnet_us > 500000) {
+            bool _was_active = peripherals_active;
+            if (!_was_active) {
+                digitalWrite(PIN_EN_DCDC, HIGH);
+                digitalWrite(PIN_EN_LEVEL_SHIFT, HIGH);
+                delay(15); // стабилизация уровней
+            }
             for (int b = 0; b <= 25; b++) { fill_solid(leds, NUM_LEDS, CRGB(0, b, 0)); sendLEDs_DMA(); delay(8); }
             for (int b = 25; b >= 0; b--) { fill_solid(leds, NUM_LEDS, CRGB(0, b, 0)); sendLEDs_DMA(); delay(8); }
             fill_solid(leds, NUM_LEDS, CRGB::Black); sendLEDs_DMA();
-        } else {
-            // Короткая вспышка зелёным при активном рендеринге (конкурирует с renderingTask через mutex)
-            fill_solid(leds, NUM_LEDS, CRGB(0, 25, 0)); sendLEDs_DMA();
-            delay(80);
+            if (!_was_active) {
+                digitalWrite(PIN_EN_DCDC, LOW);
+                digitalWrite(PIN_EN_LEVEL_SHIFT, LOW);
+                last_dcdc_off_time = millis();
+            }
         }
+        // Если колесо вращается — renderingTask управляет SPI, не вмешиваемся.
+        // Новая анимация сразу появится на экране — это само по себе подтверждение.
     }
 
     // --- 10. LED-индикация статуса WiFi ---
