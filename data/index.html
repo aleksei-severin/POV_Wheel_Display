@@ -489,6 +489,32 @@ function drawCenteredSquare(img, ctx, size) {
 }
 
 // ===================== UPLOAD =====================
+
+// LittleFS на Arduino-ESP32: name_max = 31 байт (без ведущего '/').
+// Итоговое имя файла — prefix (4 символа) + base + '.bin' (4 символа) — должно
+// укладываться в 31 байт. Допускаем только ASCII [a-zA-Z0-9_-]: 1 символ = 1 байт,
+// что исключает кириллицу и прочий multi-byte UTF-8.
+const LFS_NAME_MAX  = 31;
+const SAFE_PATTERN  = /^[a-zA-Z0-9_-]+$/;
+
+function buildFileName(prefix, rawBase) {
+    const candidate = prefix + rawBase + '.bin';
+    if (SAFE_PATTERN.test(rawBase) && candidate.length <= LFS_NAME_MAX) {
+        return { name: candidate, warning: null };
+    }
+    // Диагностика причины
+    let reason;
+    if (!SAFE_PATTERN.test(rawBase)) {
+        reason = 'contains non-latin or special characters';
+    } else {
+        reason = `too long (${candidate.length} > ${LFS_NAME_MAX} chars)`;
+    }
+    // Уникальный 4-значный номер на основе времени
+    const num = (1000 + (Date.now() % 9000)).toString().slice(-4).padStart(4, '0');
+    const safe = prefix + 'invalid-' + num + '.bin';
+    return { name: safe, warning: `"${rawBase}" — ${reason}. Saving as: ${safe}` };
+}
+
 async function processAndUpload() {
     const fileEl = document.getElementById('fileInput');
     if (!fileEl.files[0]) { setStatus('uploadStatus', 'Select a file first.', 'err'); return; }
@@ -497,7 +523,9 @@ async function processAndUpload() {
     const prefix = isGif ? 'gif_' : 'img_';
     const baseName = file.name.replace(/\.[^/.]+$/, '');
     const nameInput = document.getElementById('fileNameInput').value.trim();
-    const fileName = prefix + (nameInput || baseName) + '.bin';
+    const rawBase = nameInput || baseName;
+
+    const { name: fileName, warning: nameWarning } = buildFileName(prefix, rawBase);
 
     setStatus('uploadStatus', `Converting → ${fileName}...`, '');
 
@@ -507,6 +535,24 @@ async function processAndUpload() {
     } else {
         // Static image: use previewCanvas (200×200 buffer with centered crop)
         outputBuffer = toPolarBuffer(previewCanvas);
+    }
+
+    // --- Проверка свободного места ДО загрузки ---
+    try {
+        const fsData = await fetch('/fs_info').then(r => r.json());
+        if (outputBuffer.length > fsData.free) {
+            setStatus('uploadStatus',
+                `Not enough space: need ${(outputBuffer.length/1024).toFixed(1)} kB, ` +
+                `only ${(fsData.free/1024).toFixed(1)} kB free — delete files first.`,
+                'err');
+            return;
+        }
+    } catch(e) { /* продолжаем если /fs_info недоступен */ }
+
+    // --- Предупреждение о переименовании ---
+    if (nameWarning) {
+        setStatus('uploadStatus', nameWarning, '');
+        await new Promise(r => setTimeout(r, 1800));
     }
 
     const progBar  = document.getElementById('uploadProgressBar');
