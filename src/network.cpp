@@ -239,13 +239,6 @@ void setupNetwork() {
         }
     });
 
-    server.on("/album", HTTP_GET, [](AsyncWebServerRequest *request){
-        last_web_activity_time = millis();
-        if (request->hasParam("state")) slideshowActive = (request->getParam("state")->value() == "1");
-        if (request->hasParam("interval")) slideInterval = request->getParam("interval")->value().toInt() * 1000;
-        request->send(200, "text/plain", "OK");
-    });
-
     server.on("/upload", HTTP_POST, [](AsyncWebServerRequest *request){
         last_web_activity_time = millis();
         //blink_ok_flag = true; // Trigger green blink on upload complete

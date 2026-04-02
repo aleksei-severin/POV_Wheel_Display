@@ -36,10 +36,6 @@ uint32_t lastFrameSwitchTime = 0;
 volatile bool newFrameReady = false;
 CRGB leds[NUM_LEDS];
 
-bool slideshowActive = false;
-uint16_t slideInterval = 5000;
-uint32_t lastSlideTime = 0;
-int currentSlideIndex = 0;
 std::vector<String> savedFiles;
 
 volatile uint32_t last_magnet_time = 0;   
@@ -904,86 +900,4 @@ void loop() {
             }
         }
     }
-
-    // --- 7. Слайд-шоу ---
-    if (slideshowActive && savedFiles.size() > 0 && now_ms - lastSlideTime > slideInterval) {
-        lastSlideTime = now_ms;
-        String currentFile = savedFiles[currentSlideIndex];
-        loadFrameFromFile("/" + currentFile);
-        currentSlideIndex++;
-        if (currentSlideIndex >= savedFiles.size()) currentSlideIndex = 0;
-    }
-/*
-    // --- 9. LED-индикация успешной загрузки файла ---
-    if (blink_ok_flag) {
-        blink_ok_flag = false;
-        // Моргаем ТОЛЬКО когда колесо не вращается (нет прохода магнита > 500 мс).
-        // Причина: sendLEDs_DMA использует spi_device_transmit, который при блокировке
-        // отдаёт CPU. renderingTask тут же просыпается и вызывает spi_device_polling_start
-        // на том же SPI-устройстве — конфликт шины → зелёные артефакты на секторах.
-        if (time_since_magnet_us > 500000) {
-            bool _was_active = peripherals_active;
-            if (!_was_active) {
-                digitalWrite(PIN_EN_DCDC, HIGH);
-                digitalWrite(PIN_EN_LEVEL_SHIFT, HIGH);
-                delay(15); // стабилизация уровней
-            }
-            for (int b = 0; b <= 25; b++) { fill_solid(leds, NUM_LEDS, CRGB(0, b, 0)); sendLEDs_DMA(); delay(8); }
-            for (int b = 25; b >= 0; b--) { fill_solid(leds, NUM_LEDS, CRGB(0, b, 0)); sendLEDs_DMA(); delay(8); }
-            fill_solid(leds, NUM_LEDS, CRGB::Black); sendLEDs_DMA();
-            if (!_was_active) {
-                digitalWrite(PIN_EN_DCDC, LOW);
-                digitalWrite(PIN_EN_LEVEL_SHIFT, LOW);
-                last_dcdc_off_time = millis();
-            }
-        }
-        // Если колесо вращается — renderingTask управляет SPI, не вмешиваемся.
-        // Новая анимация сразу появится на экране — это само по себе подтверждение.
-    }*/
-
-    // --- 10. LED-индикация статуса WiFi ---
-    // Вспомогательные макросы: временно включаем питание LED, если оно было выключено
-    #define WIFI_BLINK_POWER_ON  bool _was_active = peripherals_active; \
-        if (!_was_active) { digitalWrite(PIN_EN_DCDC, HIGH); digitalWrite(PIN_EN_LEVEL_SHIFT, HIGH); delay(15); }
-    #define WIFI_BLINK_POWER_OFF \
-        fill_solid(leds, NUM_LEDS, CRGB::Black); sendLEDs_DMA(); \
-        if (!_was_active) { digitalWrite(PIN_EN_DCDC, LOW); digitalWrite(PIN_EN_LEVEL_SHIFT, LOW); last_dcdc_off_time = millis(); }
-
-    // Зеленое плавное мигание: подключились к домашней сети WiFi
-    // Выполняем ТОЛЬКО когда колесо не вращается (> 500 мс без прохода магнита).
-    // Причина: sendLEDs_DMA() → spi_device_transmit() отдаёт CPU при блокировке.
-    // renderingTask (приоритет 18) немедленно просыпается и вызывает
-    // spi_device_polling_start() на том же SPI-устройстве — конфликт шины →
-    // зелёные артефакты на секторах. Флаг остаётся до остановки колеса.
-    if (blink_wifi_ok_flag && time_since_magnet_us > 500000) {
-        blink_wifi_ok_flag = false;
-        WIFI_BLINK_POWER_ON
-        for (int b = 0; b <= 25; b++) { fill_solid(leds, NUM_LEDS, CRGB(0, b, 0)); sendLEDs_DMA(); delay(8); }
-        for (int b = 25; b >= 0; b--) { fill_solid(leds, NUM_LEDS, CRGB(0, b, 0)); sendLEDs_DMA(); delay(8); }
-        WIFI_BLINK_POWER_OFF
-    }
-
-    // Красное тройное мигание: подключение к домашней сети не удалось
-    if (blink_wifi_fail_flag && time_since_magnet_us > 500000) {
-        blink_wifi_fail_flag = false;
-        WIFI_BLINK_POWER_ON
-        for (int rep = 0; rep < 3; rep++) {
-            fill_solid(leds, NUM_LEDS, CRGB(25, 0, 0)); sendLEDs_DMA(); delay(150);
-            fill_solid(leds, NUM_LEDS, CRGB::Black);    sendLEDs_DMA(); delay(150);
-        }
-        WIFI_BLINK_POWER_OFF
-    }
-
-    // Желтое плавное мигание: клиент подключился к нашей точке доступа
-    if (blink_ap_client_flag && time_since_magnet_us > 500000) {
-        blink_ap_client_flag = false;
-        WIFI_BLINK_POWER_ON
-        for (int b = 0; b <= 22; b++) { fill_solid(leds, NUM_LEDS, CRGB(b, b, 0)); sendLEDs_DMA(); delay(8); }
-        for (int b = 22; b >= 0; b--) { fill_solid(leds, NUM_LEDS, CRGB(b, b, 0)); sendLEDs_DMA(); delay(8); }
-        WIFI_BLINK_POWER_OFF
-    }
-
-    #undef WIFI_BLINK_POWER_ON
-    #undef WIFI_BLINK_POWER_OFF
-
 }
