@@ -315,14 +315,20 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
     uint8_t* led_ptr     = buf + 4;
 
     for (int ray = 0; ray < 4; ray++) {
-        int sector_to_draw = (current_sector + ray * 90) % 360;
-        const uint8_t* src = frameBuffer + anim_offset + sector_to_draw * 38 * 3;
+        // Передняя сторона луча: сектора идут в порядке вращения
+        int sector_front = (current_sector + ray * 90) % 360;
+        // Задняя сторона луча: зеркало по горизонтали + сдвиг горизонта на 180°,
+        // чтобы изображение обеих сторон было в одном горизонте.
+        int sector_back  = (540 - sector_front) % 360;
+
+        const uint8_t* src_f = frameBuffer + anim_offset + sector_front * 38 * 3;
+        const uint8_t* src_b = frameBuffer + anim_offset + sector_back  * 38 * 3;
 
         for (int i = 0; i < 38; i++) {
-            uint8_t r = gamma_lut[src[i * 3]];
-            uint8_t g = gamma_lut[src[i * 3 + 1]];
-            uint8_t b = gamma_lut[src[i * 3 + 2]];
-
+            // --- Передняя половина луча (LEDs 0-37) ---
+            uint8_t r = gamma_lut[src_f[i * 3]];
+            uint8_t g = gamma_lut[src_f[i * 3 + 1]];
+            uint8_t b = gamma_lut[src_f[i * 3 + 2]];
             if (sat_fxp != 256) {
                 int16_t L  = (int16_t)((77 * r + 150 * g + 29 * b) >> 8);
                 int16_t r2 = L + (((int16_t)r - L) * sat_fxp >> 8);
@@ -332,14 +338,26 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
                 g = (uint8_t)constrain(g2, 0, 255);
                 b = (uint8_t)constrain(b2, 0, 255);
             }
-
             int idx_a = (ray * 76 + i) * 4;
-            int idx_b = (ray * 76 + 75 - i) * 4;
-
             led_ptr[idx_a + 0] = bri_byte; led_ptr[idx_a + 1] = b;
             led_ptr[idx_a + 2] = g;        led_ptr[idx_a + 3] = r;
-            led_ptr[idx_b + 0] = bri_byte; led_ptr[idx_b + 1] = b;
-            led_ptr[idx_b + 2] = g;        led_ptr[idx_b + 3] = r;
+
+            // --- Задняя половина луча (LEDs 38-75, зеркальный сектор + 180°) ---
+            uint8_t rb = gamma_lut[src_b[i * 3]];
+            uint8_t gb = gamma_lut[src_b[i * 3 + 1]];
+            uint8_t bb = gamma_lut[src_b[i * 3 + 2]];
+            if (sat_fxp != 256) {
+                int16_t L  = (int16_t)((77 * rb + 150 * gb + 29 * bb) >> 8);
+                int16_t r2 = L + (((int16_t)rb - L) * sat_fxp >> 8);
+                int16_t g2 = L + (((int16_t)gb - L) * sat_fxp >> 8);
+                int16_t b2 = L + (((int16_t)bb - L) * sat_fxp >> 8);
+                rb = (uint8_t)constrain(r2, 0, 255);
+                gb = (uint8_t)constrain(g2, 0, 255);
+                bb = (uint8_t)constrain(b2, 0, 255);
+            }
+            int idx_b = (ray * 76 + 75 - i) * 4;
+            led_ptr[idx_b + 0] = bri_byte; led_ptr[idx_b + 1] = bb;
+            led_ptr[idx_b + 2] = gb;        led_ptr[idx_b + 3] = rb;
         }
     }
 }
