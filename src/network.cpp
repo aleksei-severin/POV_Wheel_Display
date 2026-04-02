@@ -248,7 +248,7 @@ void setupNetwork() {
 
     server.on("/upload", HTTP_POST, [](AsyncWebServerRequest *request){
         last_web_activity_time = millis();
-        blink_ok_flag = true; // Trigger green blink on upload complete
+        //blink_ok_flag = true; // Trigger green blink on upload complete
         request->send(200, "text/plain", "OK");
     }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
         last_web_activity_time = millis();

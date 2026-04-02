@@ -62,7 +62,7 @@ volatile bool bq_interrupt_flag = false;
 
 volatile uint32_t last_dcdc_off_time = 0;
 bool peripherals_active = true;
-volatile bool blink_ok_flag = false;
+//volatile bool blink_ok_flag = false;
 volatile float last_lux_value = 0.0f; // Последнее валидное показание BH1750 (lux)
 
 // --- ESP-IDF SPI DMA для SK9822 ---
@@ -736,13 +736,12 @@ void loop() {
     }
 
     // --- 2. Логика остановки (Таймаут 1 секунда) ---
-    // 2-секундная защита после запроса /play: loadFrameFromFile читает до 500 мс,
+    // 5-секундная защита после запроса /play: loadFrameFromFile читает до 500 мс,
     // и без защиты peripherals сразу отключатся — колесо не успеет начать крутиться.
     // Используем last_play_ms (не last_web_activity_time, иначе страница пингует
     // каждые 500 мс и peripherals никогда не выключатся).
     if (peripherals_active && time_since_magnet_us > 1000000 && !force_stop_display &&
-        (now_ms - last_play_ms) > 2000) {
-        Serial.println("Остановка рендеринга (Таймаут 1с). Отключение питания LED");
+        (now_ms - last_play_ms) > 5000) {
         FastLED.clear(); sendLEDs_DMA();
         digitalWrite(PIN_EN_LEVEL_SHIFT, LOW);
         digitalWrite(PIN_EN_DCDC, LOW);
@@ -752,7 +751,6 @@ void loop() {
 
     // --- 3. Принудительная остановка из Web UI (Stop Display) ---
     if (force_stop_display && peripherals_active) {
-        Serial.println("Web Interface: Принудительная остановка рендеринга");
         FastLED.clear(); sendLEDs_DMA();
         digitalWrite(PIN_EN_LEVEL_SHIFT, LOW);
         digitalWrite(PIN_EN_DCDC, LOW);
@@ -892,7 +890,7 @@ void loop() {
         currentSlideIndex++;
         if (currentSlideIndex >= savedFiles.size()) currentSlideIndex = 0;
     }
-
+/*
     // --- 9. LED-индикация успешной загрузки файла ---
     if (blink_ok_flag) {
         blink_ok_flag = false;
@@ -918,7 +916,7 @@ void loop() {
         }
         // Если колесо вращается — renderingTask управляет SPI, не вмешиваемся.
         // Новая анимация сразу появится на экране — это само по себе подтверждение.
-    }
+    }*/
 
     // --- 10. LED-индикация статуса WiFi ---
     // Вспомогательные макросы: временно включаем питание LED, если оно было выключено
