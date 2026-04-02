@@ -395,7 +395,12 @@ void renderingTask(void* pvParameters) {
         uint32_t period = rotation_period;
         interrupts();
 
-        if (period == 0) continue;
+        // Пропускаем рендеринг ниже 100 RPM (period > 600 мс).
+        // Критично: при первом обороте после долгой остановки
+        // rotation_period = micros() - last_hall_time = десятки миллионов мкс.
+        // Без этой проверки renderingTask уходит в busy-wait на минуты,
+        // вытесняя WiFi/loop, WDT срабатывает через 5 с → краш → перезагрузка.
+        if (period == 0 || period > 600000) continue;
 
         int last_sector = -1;
         tx_pending      = false;
@@ -927,7 +932,12 @@ void loop() {
         if (!_was_active) { digitalWrite(PIN_EN_DCDC, LOW); digitalWrite(PIN_EN_LEVEL_SHIFT, LOW); last_dcdc_off_time = millis(); }
 
     // Зеленое плавное мигание: подключились к домашней сети WiFi
-    if (blink_wifi_ok_flag) {
+    // Выполняем ТОЛЬКО когда колесо не вращается (> 500 мс без прохода магнита).
+    // Причина: sendLEDs_DMA() → spi_device_transmit() отдаёт CPU при блокировке.
+    // renderingTask (приоритет 18) немедленно просыпается и вызывает
+    // spi_device_polling_start() на том же SPI-устройстве — конфликт шины →
+    // зелёные артефакты на секторах. Флаг остаётся до остановки колеса.
+    if (blink_wifi_ok_flag && time_since_magnet_us > 500000) {
         blink_wifi_ok_flag = false;
         WIFI_BLINK_POWER_ON
         for (int b = 0; b <= 25; b++) { fill_solid(leds, NUM_LEDS, CRGB(0, b, 0)); sendLEDs_DMA(); delay(8); }
@@ -936,7 +946,7 @@ void loop() {
     }
 
     // Красное тройное мигание: подключение к домашней сети не удалось
-    if (blink_wifi_fail_flag) {
+    if (blink_wifi_fail_flag && time_since_magnet_us > 500000) {
         blink_wifi_fail_flag = false;
         WIFI_BLINK_POWER_ON
         for (int rep = 0; rep < 3; rep++) {
@@ -947,7 +957,7 @@ void loop() {
     }
 
     // Желтое плавное мигание: клиент подключился к нашей точке доступа
-    if (blink_ap_client_flag) {
+    if (blink_ap_client_flag && time_since_magnet_us > 500000) {
         blink_ap_client_flag = false;
         WIFI_BLINK_POWER_ON
         for (int b = 0; b <= 22; b++) { fill_solid(leds, NUM_LEDS, CRGB(b, b, 0)); sendLEDs_DMA(); delay(8); }
