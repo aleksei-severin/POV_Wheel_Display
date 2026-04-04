@@ -38,18 +38,11 @@ void loadFrameFromFile(String path) {
     File f = LittleFS.open(path, "r");
     if (!f) return;
 
-    // Останавливаем рендеринг ДО освобождения буфера: renderingTask (Core 1) может
-    // работать параллельно (Core 0), и увидеть frameBuffer = nullptr → краш.
-    newFrameReady = false;
-
-    if (frameBuffer != nullptr) {
-        free(frameBuffer);
-        frameBuffer = nullptr;
-    }
-
-    totalFrames = 1;
-    frameDelay = 100;
-    currentFrameIndex = 0;
+    // Читаем новый файл в ВРЕМЕННЫЙ буфер, не трогая frameBuffer.
+    // Старая анимация продолжает рендериться на Core 1 всё время загрузки.
+    uint8_t*  newBuf        = nullptr;
+    uint32_t  newTotalFrames = 1;
+    uint16_t  newFrameDelay  = 100;
 
     size_t fileSize = f.size();
 
@@ -57,35 +50,49 @@ void loadFrameFromFile(String path) {
         char magic[4];
         f.read((uint8_t*)magic, 4);
         if (magic[0] == 'A' && magic[1] == 'N' && magic[2] == 'I' && magic[3] == 'M') {
-            f.read((uint8_t*)&totalFrames, 2);
-            f.read((uint8_t*)&frameDelay, 2);
+            f.read((uint8_t*)&newTotalFrames, 2);
+            f.read((uint8_t*)&newFrameDelay,  2);
 
-            size_t dataSize = totalFrames * FRAME_SIZE;
-            frameBuffer = (uint8_t*)ps_malloc(dataSize);
+            size_t dataSize = newTotalFrames * FRAME_SIZE;
+            newBuf = (uint8_t*)ps_malloc(dataSize);
 
-            if (frameBuffer) {
-                f.read(frameBuffer, dataSize);
+            if (newBuf) {
+                f.read(newBuf, dataSize);
             } else {
-                totalFrames = 0;
+                newTotalFrames = 0;
                 Serial.println("PSRAM alloc error loading animation!");
             }
         } else {
             f.seek(0);
-            frameBuffer = (uint8_t*)ps_malloc(FRAME_SIZE);
-            if (frameBuffer) f.read(frameBuffer, FRAME_SIZE);
+            newBuf = (uint8_t*)ps_malloc(FRAME_SIZE);
+            if (newBuf) f.read(newBuf, FRAME_SIZE);
         }
     } else {
-        frameBuffer = (uint8_t*)ps_malloc(FRAME_SIZE);
-        if (frameBuffer) f.read(frameBuffer, FRAME_SIZE);
+        newBuf = (uint8_t*)ps_malloc(FRAME_SIZE);
+        if (newBuf) f.read(newBuf, FRAME_SIZE);
     }
 
     f.close();
-    // Если выделить память не удалось — не запускаем рендеринг с нулевым буфером.
-    // renderingTask обратится к frameBuffer по нулевому указателю → паника.
-    if (frameBuffer == nullptr) return;
+
+    // Если выделить память не удалось — оставляем старую анимацию, не меняем ничего.
+    if (newBuf == nullptr) return;
+
+    // Новый буфер готов. Атомарно переключаем: останавливаем рендеринг только на
+    // одну итерацию loop renderingTask, чтобы безопасно заменить указатель.
+    newFrameReady = false;          // renderingTask сделает continue на следующем обороте
+
+    uint8_t* oldBuf = frameBuffer;  // Запоминаем старый указатель для free()
+
+    // Устанавливаем новые параметры и буфер
+    totalFrames       = newTotalFrames;
+    frameDelay        = newFrameDelay;
+    currentFrameIndex = 0;
+    frameBuffer       = newBuf;
+
+    if (oldBuf != nullptr) free(oldBuf);
+
     // Запускаем таймер кадров только ПОСЛЕ завершения чтения файла:
-    // если поставить в начало, то при медленном чтении (100–500 мс) первый кадр
-    // будет немедленно пропущен в renderingTask, т.к. frameDelay уже истёк.
+    // если поставить в начало, первый кадр будет немедленно пропущен в renderingTask.
     lastFrameSwitchTime = millis();
     newFrameReady = true;
 }
