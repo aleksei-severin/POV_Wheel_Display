@@ -178,6 +178,22 @@ canvas {
 }
 .ota-footer button:hover { background: #ff6600; color: #fff; box-shadow: 0 0 10px #ff6600; }
 
+/* ---- Log panel ---- */
+.log-box {
+    /* 100 строк: line-height 1.55 × font-size 0.68em ≈ 15.4px/строка */
+    height: 1540px; overflow-y: auto; background: #020810;
+    border: 1px solid var(--border); padding: 6px 8px;
+    font-size: 0.68em; line-height: 1.55;
+}
+.log-box .log-line { color: var(--text); white-space: pre-wrap; word-break: break-all; }
+.log-controls { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+.log-controls button { padding: 3px 10px; font-size: 0.65em; clip-path: none; }
+.log-status { display: flex; align-items: center; gap: 6px; font-size: 0.68em; }
+.log-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+.log-dot.online  { background: var(--ok);     box-shadow: 0 0 6px var(--ok); }
+.log-dot.offline { background: var(--danger); box-shadow: 0 0 6px var(--danger); }
+.log-badge { font-size: 0.62em; color: var(--dim); }
+
 @media (max-width: 580px) { .grid { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -286,6 +302,24 @@ canvas {
 </div>
 
 </div><!-- /grid -->
+
+<!-- LOG PANEL -->
+<div class="panel full" style="max-width:860px;margin:16px auto 0;">
+    <div class="log-controls">
+        <div style="display:flex;align-items:center;gap:10px;">
+            <div class="panel-title" style="margin:0;">// Device Log</div>
+            <div class="log-status">
+                <span class="log-dot offline" id="logDot"></span>
+                <span id="logStatusText" style="color:var(--danger);">OFFLINE</span>
+            </div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;">
+            <span class="log-badge" id="logBadge"></span>
+            <button onclick="clearLogView()">&#10005; Clear</button>
+        </div>
+    </div>
+    <div class="log-box" id="logBox"></div>
+</div>
 
 <div class="ota-footer">
     <button onclick="fetch('/ping').then(()=>window.location.href='/update')">&#8679; OTA Firmware Update</button>
@@ -749,6 +783,148 @@ function setStatus(id, msg, cls) {
     el.className = 'status-bar' + (cls ? ' ' + cls : '');
 }
 
+// ===================== WEB LOG =====================
+// История хранится в JS — переживает переподключения и выход из сна устройства.
+// Инкрементальный polling: запрашиваем только строки с индекса _logNextIdx.
+let _logNextIdx    = 0;      // Следующий глобальный индекс для запроса
+let _logLines      = [];     // Вся накопленная история в браузере
+let _logAutoScroll = true;
+let _logOnline     = false;  // Текущий статус связи
+let _logOfflineCnt = 0;
+
+function _setLogStatus(online) {
+    if (_logOnline === online) return;
+    _logOnline = online;
+    const dot  = document.getElementById('logDot');
+    const text = document.getElementById('logStatusText');
+    if (online) {
+        dot.className  = 'log-dot online';
+        text.textContent = 'ONLINE';
+        text.style.color = 'var(--ok)';
+    } else {
+        dot.className  = 'log-dot offline';
+        text.textContent = 'OFFLINE';
+        text.style.color = 'var(--danger)';
+    }
+}
+
+function _logColor(msg) {
+    if (msg.includes('[NET]'))  return '#00d4ff';
+    if (msg.includes('[PWR]'))  return '#ff8800';
+    if (msg.includes('[BMS]'))  return '#ffcc00';
+    if (msg.includes('[DISP]')) return '#00ff88';
+    if (msg.includes('[ERR]'))  return '#ff2244';
+    if (msg.includes('[SYS]'))  return '#c8e0f4';
+    return '#a0d8ef';
+}
+
+function _logRender() {
+    const box = document.getElementById('logBox');
+    box.innerHTML = _logLines.map(l => {
+        if (l.special === 'restart') {
+            return `<div class="log-line" style="color:#ff8800;text-align:center;border-top:1px solid #ff880044;border-bottom:1px solid #ff880044;padding:2px 0;margin:2px 0;">${_escHtml(l.msg)}</div>`;
+        }
+        return `<div class="log-line" style="color:${_logColor(l.msg)}">${_escHtml(l.msg)}</div>`;
+    }).join('');
+    if (_logAutoScroll) box.scrollTop = box.scrollHeight;
+    const badge = document.getElementById('logBadge');
+    badge.textContent = _logLines.length > 0 ? `${_logLines.length} lines` : '';
+}
+
+function _escHtml(s) {
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function clearLogView() {
+    _logLines = [];
+    _logRender();
+}
+
+// Авто-скролл: если пользователь прокрутил вверх — отключаем
+document.addEventListener('DOMContentLoaded', () => {
+    const box = document.getElementById('logBox');
+    if (box) box.addEventListener('scroll', () => {
+        _logAutoScroll = box.scrollHeight - box.scrollTop - box.clientHeight < 30;
+    });
+});
+
+// Вспомогательная fetch с таймаутом — без него при недоступном устройстве
+// браузер висит ~90с, новые poll-ы накапливаются и статус не переходит в OFFLINE.
+function _fetchTimeout(url, opts, ms) {
+    const ctrl = new AbortController();
+    const tid = setTimeout(() => ctrl.abort(), ms);
+    return fetch(url, { ...opts, signal: ctrl.signal })
+        .finally(() => clearTimeout(tid));
+}
+
+// Синхронизация времени: отправляем UTC epoch + смещение часового пояса браузера.
+// Возвращает true если POST был успешно отправлен (сервер исправил ??:??:?? метки).
+async function _syncTime(deviceNow) {
+    const browserNow = Math.floor(Date.now() / 1000);
+    const tzOffset = -new Date().getTimezoneOffset() * 60;
+    if (deviceNow === 0 || Math.abs(browserNow - deviceNow) > 5) {
+        try {
+            await _fetchTimeout(
+                `/settime?t=${browserNow}&tz=${tzOffset}`,
+                { method: 'POST' }, 3000
+            );
+            return true;
+        } catch(e) { return false; }
+    }
+    return false;
+}
+
+let _logPollRunning = false;  // Защита от одновременных параллельных запросов
+
+async function _logPoll() {
+    if (_logPollRunning) return;
+    _logPollRunning = true;
+    try {
+        const r = await _fetchTimeout(`/logs?since=${_logNextIdx}`, {}, 4000);
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const d = await r.json();
+
+        _logOfflineCnt = 0;
+        _setLogStatus(true);
+
+        // Обнаружение перезапуска устройства: total уменьшился → очищаем старые логи
+        if (d.total < _logNextIdx) {
+            _logLines = [];
+            _logLines.push({ msg: '──────── DEVICE RESTARTED ────────', special: 'restart' });
+            _logNextIdx = 0;
+            _logRender();
+        }
+
+        // Синхронизация времени. Если устройство ещё не знало времени (d.now=0),
+        // после успешного POST сервер проставил правильные метки ретроспективно.
+        // Перезагружаем все строки с нуля, заменяя ??:??:?? метки на правильные.
+        // Специальные строки (разделитель рестарта) сохраняем.
+        const firstSync = (d.now === 0 || d.now === undefined);
+        const synced = await _syncTime(d.now || 0);
+        if (firstSync && synced) {
+            const specials = _logLines.filter(l => l.special);
+            _logLines = specials;
+            _logNextIdx = 0;
+            return;  // Следующий poll заберёт всё с исправленными временны́ми метками
+        }
+
+        if (d.lines && d.lines.length > 0) {
+            d.lines.forEach(msg => _logLines.push({ msg }));
+            _logNextIdx = d.total;
+            _logRender();
+        } else if (d.total !== _logNextIdx) {
+            _logNextIdx = d.total;
+        }
+    } catch(e) {
+        _logOfflineCnt++;
+        if (_logOfflineCnt >= 2) {
+            _setLogStatus(false);
+        }
+    } finally {
+        _logPollRunning = false;
+    }
+}
+
 // ===================== INIT =====================
 window.onload = () => {
     fetch('/ping').then(() => {
@@ -769,6 +945,9 @@ window.onload = () => {
     // RPM/Speed: 500 мс
     updateInfo();
     setInterval(updateInfo, 500);
+    // Логи: первый запрос сразу, далее каждые 2 с
+    _logPoll();
+    setInterval(_logPoll, 2000);
 };
 </script>
 </body>

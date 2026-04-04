@@ -14,6 +14,7 @@
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_heap_caps.h"
+#include "esp_system.h"
 
 // Экспортируем сервер из network.cpp для добавления нового эндпоинта
 extern AsyncWebServer server;
@@ -249,7 +250,7 @@ void initSK9822_DMA() {
     }
     dma_tx_buffer = dma_buf[0]; // sendLEDs_DMA использует dma_buf[0]
     dmaMutex = xSemaphoreCreateMutex();
-    Serial.println("SK9822 DMA initialized (double buffer)");
+    webLog("[SYS] SK9822 DMA ready");
 }
 
 // Заменитель FastLED.show() для статусных заливок и очистки
@@ -365,7 +366,8 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
 // spi_device_polling_start/end — детерминированный busy-wait, исключает джиттер
 // от задержки пробуждения FreeRTOS (источник дрожания изображения 3–5°).
 void renderingTask(void* pvParameters) {
-    static uint32_t last_bri_time = 0;
+    static uint32_t last_bri_time   = 0;
+    static bool     rendering_active = false; // Флаг: были ли обороты >100 RPM (для лога при снижении)
     uint8_t active     = 0;
     bool    tx_pending = false;
 
@@ -415,7 +417,21 @@ void renderingTask(void* pvParameters) {
         // rotation_period = micros() - last_hall_time = десятки миллионов мкс.
         // Без этой проверки renderingTask уходит в busy-wait на минуты,
         // вытесняя WiFi/loop, WDT срабатывает через 5 с → краш → перезагрузка.
-        if (period == 0 || period > 600000) continue;
+        if (period == 0 || period > 600000) {
+            if (rendering_active) {
+                rendering_active = false;
+                webLog("[PWR] RPM <100, rendering paused");
+                FastLED.clear();
+                sendLEDs_DMA();
+            }
+            continue;
+        }
+        if (!rendering_active) {
+            rendering_active = true;
+            // Питание уже включено hall_event'ом в loop() — здесь только логируем
+            // факт достижения порога рендеринга.
+            webLog("[PWR] RPM >=100, rendering started");
+        }
 
         int last_sector = -1;
         tx_pending      = false;
@@ -487,8 +503,9 @@ void fileLoaderTask(void* pvParameters) {
 }
 
 void setup() {
-    Serial.begin(115200);
-    delay(2000);
+    // millis() сбрасывается при каждом запуске — старая millis-база из RTC недействительна.
+    // Без этого _currentEpoch() вычисляет неверное UTC время вместо ??:??:??
+    resetTimeSync();
 
     // Снимаем глобальную блокировку пинов после сна
     gpio_deep_sleep_hold_dis();
@@ -513,19 +530,35 @@ void setup() {
     is_adapter_connected = ((stat >> 5) & 0x07) != 0;
 
     esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-    Serial.printf("\n--- BOOT --- Wakeup reason: %d\n", wakeup_reason);
-    
+
     if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
-        Serial.println("ПРОСНУЛИСЬ ОТ PIN_WAKEUP (IO5) - Глитч подтвержден!");
+        webLog("[SYS] Wakeup: Let's ride! (IO5)");
     } else if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT1) {
-        Serial.println("ПРОСНУЛИСЬ ОТ BQ25798 (GPIO 21) - Залипло прерывание зарядки!");
+        webLog("[SYS] Wakeup: charger (GPIO21)");
     } else if (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED) {
-        Serial.println("ПОЛНАЯ ПЕРЕЗАГРУЗКА (Возможно краш, WDT или Brownout)");
+        esp_reset_reason_t rr = esp_reset_reason();
+        const char* rr_str = "unknown";
+        switch (rr) {
+            case ESP_RST_POWERON:   rr_str = "power-on";       break;
+            case ESP_RST_EXT:       rr_str = "ext-reset";      break;
+            case ESP_RST_SW:        rr_str = "sw-reset";       break;
+            case ESP_RST_PANIC:     rr_str = "panic/crash";    break;
+            case ESP_RST_INT_WDT:   rr_str = "WDT-interrupt";  break;
+            case ESP_RST_TASK_WDT:  rr_str = "WDT-task";       break;
+            case ESP_RST_WDT:       rr_str = "WDT-other";      break;
+            case ESP_RST_DEEPSLEEP: rr_str = "deep-sleep";     break;
+            case ESP_RST_BROWNOUT:  rr_str = "brownout";       break;
+            case ESP_RST_SDIO:      rr_str = "SDIO";           break;
+            default:                                            break;
+        }
+        webLogf("[SYS] Full reset: %s", rr_str);
+    } else {
+        webLogf("[SYS] Boot, wakeup cause: %d", (int)wakeup_reason);
     }
-    
+
     // Если пробуждение не от кнопки (EXT0) и не от зарядки (EXT1) и адаптер не подключен
     if (wakeup_reason != ESP_SLEEP_WAKEUP_EXT0 && wakeup_reason != ESP_SLEEP_WAKEUP_EXT1 && !is_adapter_connected) {
-        Serial.println("Not an EXT0/EXT1 wakeup and no charger. Going to Deep Sleep...");
+        webLog("[SYS] No wakeup source + no charger, sleeping...");
         digitalWrite(PIN_EN_DCDC, LOW); 
         digitalWrite(PIN_EN_LEVEL_SHIFT, LOW);
 
@@ -546,9 +579,12 @@ void setup() {
         esp_deep_sleep_start();
     }
 
-    Serial.println("Wakeup Detected! Initializing...");
-    digitalWrite(PIN_EN_DCDC, HIGH); 
-    digitalWrite(PIN_EN_LEVEL_SHIFT, HIGH);
+    webLog("[SYS] Initializing...");
+    // DCDC и level shifter пока выключены — включим позже:
+    // либо при автоплее (если есть last_file), либо по hall-событию в loop().
+    digitalWrite(PIN_EN_DCDC, LOW);
+    digitalWrite(PIN_EN_LEVEL_SHIFT, LOW);
+    peripherals_active = false;
 
     // Если проснулись от зарядки или она была подключена, инициируем настройку BQ
     if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT1 || is_adapter_connected) {
@@ -598,34 +634,13 @@ void setup() {
         uint8_t chg_state = (reg1B >> 3) & 0x03;
         bool ilim_active = (reg1C >> 6) & 0x01;
 
-        Serial.println("\n=== BQ25798 CHARGER DEBUG ===");
-        Serial.printf("Charge current register (0x03-0x04): 0x%04X (%d mA)\n", chg_i_limit, chg_i_limit * 10);
-        Serial.printf("Charge voltage register (0x01-0x02): 0x%04X (%d mV)\n", chg_v_limit, chg_v_limit * 10);
-        Serial.printf("Input current limit (0x06-0x07): 0x%04X (%d mA)\n", in_i_limit, in_i_limit * 10);
-        Serial.printf("VSYSMIN register (0x00): 0x%02X (%d mV)\n", reg00, 2500 + (reg00 & 0x3F) * 250);
-        Serial.printf("Charger control register (0x0F): 0x%02X\n", reg0F);
-        Serial.printf("Charger status register (0x1B): 0x%02X\n", reg1B);
-        Serial.printf("Power status register (0x1C): 0x%02X\n", reg1C);
-        Serial.printf("Fault status register (0x20-0x21): 0x%02X 0x%02X\n", reg20, reg21);
-
-        Serial.println("\n--- DECODED MEANINGS ---");
-        Serial.printf("Adapter present: %s\n", vbus_present ? "YES" : "NO");
-        Serial.printf("Charging enabled: %s\n", charge_enabled ? "YES" : "NO");
-        
         String state_str = "Unknown";
         switch(chg_state) {
             case 0: state_str = "Not Charging"; break;
-            case 1: state_str = "Trickle / Pre-charge"; break;
+            case 1: state_str = "Trickle/Pre-charge"; break;
             case 2: state_str = "Fast Charging"; break;
             case 3: state_str = "Taper Charge"; break;
         }
-        Serial.printf("Charging state: %s\n", state_str.c_str());
-        
-        Serial.printf("Input limit active (IINDPM): %s\n", ilim_active ? "YES" : "NO");
-        Serial.printf("Fault flags: ");
-        if(reg20 == 0 && reg21 == 0) Serial.print("NONE\n");
-        else Serial.printf("0x%02X 0x%02X\n", reg20, reg21);
-        Serial.println("===============================\n");
         // ----------------------------------------
 
         bool connected = vbus_present;
@@ -644,7 +659,14 @@ void setup() {
 
     String last_file = prefs.getString("last_file", "");
     if (last_file != "" && LittleFS.exists("/" + last_file)) {
-        Serial.println("Автозагрузка последнего изображения: " + last_file);
+        webLogf("[DISP] Autoplay: %s", last_file.c_str());
+        // Есть файл для отображения — включаем питание заранее.
+        // Hall-событие придёт чуть позже, после стабилизации DCDC.
+        webLog("[PWR] Autoplay: LEDs power on");
+        digitalWrite(PIN_EN_DCDC, HIGH);
+        digitalWrite(PIN_EN_LEVEL_SHIFT, HIGH);
+        peripherals_active = true;
+        last_dcdc_on_time = millis();
         loadFrameFromFile("/" + last_file);
     }
 
@@ -687,6 +709,7 @@ void loop() {
         if (!peripherals_active) {
             // Явно включаем питание LED: датчик Холла может быть обесточен,
             // поэтому нельзя ждать hall_event — включаем сами.
+            webLogf("[PWR] Play \"%s\": LEDs power on", pendingFilePath.c_str());
             digitalWrite(PIN_EN_DCDC, HIGH);
             digitalWrite(PIN_EN_LEVEL_SHIFT, HIGH);
             peripherals_active = true;
@@ -699,15 +722,9 @@ void loop() {
         last_play_ms = millis();
     }
 
-    // --- БЕЗОПАСНОЕ ЧТЕНИЕ ПРЕРЫВАНИЙ ---
-    // Защита от race conditions: читаем volatile переменные с отключенными прерываниями,
-    // чтобы ISR не изменил их прямо во время математических расчетов.
-    uint32_t safe_last_hall_time;
-    uint32_t safe_rotation_period;
-    noInterrupts();
-    safe_last_hall_time = last_hall_time;
-    safe_rotation_period = rotation_period;
-    interrupts();
+    // safe_rotation_period используется в /info endpoint через глобальную переменную rotation_period.
+    // Здесь дополнительное чтение не нужно — time_since_magnet_us вычисляется свежим micros()
+    // непосредственно перед проверкой таймаута (см. секцию 2).
 
     // --- Обработка прерывания зарядного устройства BQ25798 ---
    if (bq_interrupt_flag) {
@@ -717,20 +734,23 @@ void loop() {
         uint8_t stat = readBQ8(0x1B);
         bool vbus_present = ((stat >> 5) & 0x07) != 0;
         uint8_t charge_state = (stat >> 3) & 0x03;
-        Serial.println("=== BQ25798 INT ===");
-        Serial.printf("VBUS present: %s\n", vbus_present ? "YES" : "NO");
-        Serial.printf("Charge state: %d\n", charge_state);
-        Serial.printf("Fault: 0x%02X 0x%02X\n", fault0, fault1);
+        webLogf("[BMS] BQ: VBUS=%s chg=%d fault=%02X%02X",
+            vbus_present ? "YES" : "NO", charge_state, fault0, fault1);
     }
 
     // --- 1. Обработка прерывания Холла (Event Handler) ---
     if (hall_event) {
         hall_event = false;
-        if (!force_stop_display && !peripherals_active) {
+        // Включаем питание только если есть файл для показа.
+        // Без файла DCDC остаётся выключенным до нажатия Play.
+        if (!force_stop_display && !peripherals_active && newFrameReady) {
+            // Включаем питание немедленно по первому hall-сигналу.
+            // Лог о начале рендеринга выводит renderingTask когда period подтвердит >=100 RPM.
             digitalWrite(PIN_EN_DCDC, HIGH);
             digitalWrite(PIN_EN_LEVEL_SHIFT, HIGH);
             peripherals_active = true;
             last_dcdc_on_time = millis();
+            webLog("[PWR] Hall: LEDs power on (waiting for >=100 RPM)");
         }
         // Рендеринг управляется renderingTask через hallSemaphore
     }
@@ -740,10 +760,25 @@ void loop() {
     // Обороты не считаем по IO5 — не обновляем last_hall_time и rotation_period.
     // Реальные обороты считывает IO4 (5В Hall), он начнёт выдавать корректные
     // сигналы после стабилизации DCDC (~500мс).
+    //
+    // ВАЖНО: не реагируем на IO5 если IO4 работал недавно (< 2с назад).
+    // При высоких оборотах renderingTask (приоритет 18, Core 1) вытесняет loop()
+    // на > 1с, и DCDC успевает выключиться по таймауту — IO5 тут же его включает
+    // обратно, вызывая мигание. Защита: если last_hall_time свежий — IO4 живёт,
+    // включать DCDC не нужно (он уже включён или выключился только что).
     if (wakeup_event) {
         wakeup_event = false;
-        if (!peripherals_active && !force_stop_display) {
-            Serial.println("Rotation detected via PIN_WAKEUP (IO5) - restarting DCDC");
+        // Читаем last_hall_time атомарно
+        noInterrupts();
+        uint32_t hall_t = last_hall_time;
+        interrupts();
+        uint32_t io4_age_us = (now_us >= hall_t) ? (now_us - hall_t)
+                                                  : (0xFFFFFFFFUL - hall_t + now_us + 1);
+        // IO4 молчит дольше 3с — значит DCDC действительно выключен и колесо крутится:
+        // включаем питание. Если IO4 работал недавно — игнорируем IO5.
+        // Без файла для показа DCDC не включаем — ждём нажатия Play.
+        if (!peripherals_active && !force_stop_display && newFrameReady && io4_age_us > 3000000UL) {
+            webLog("[PWR] IO5: LEDs power on");
             digitalWrite(PIN_EN_DCDC, HIGH);
             digitalWrite(PIN_EN_LEVEL_SHIFT, HIGH);
             peripherals_active = true;
@@ -752,25 +787,33 @@ void loop() {
         }
     }
 
-    // Вычисляем реальное время с последнего прохода магнита (с защитой от переполнения)
+    // Вычисляем реальное время с последнего прохода магнита.
+    // ВАЖНО: используем свежий micros() и читаем last_hall_time заново —
+    // renderingTask (приоритет 18, Core 1) вытесняет loop() на целые обороты,
+    // и safe_last_hall_time, прочитанный в начале loop(), может быть устаревшим.
+    // Прямое чтение ISR-переменной с запретом прерываний — единственный надёжный способ.
+    noInterrupts();
+    uint32_t fresh_hall_time = last_hall_time;
+    interrupts();
+    uint32_t fresh_now_us = micros();
     uint32_t time_since_magnet_us = 0;
-    if (safe_last_hall_time > 0) {
-        if (now_us >= safe_last_hall_time) {
-            time_since_magnet_us = now_us - safe_last_hall_time;
-        } else {
-            time_since_magnet_us = (0xFFFFFFFF - safe_last_hall_time) + now_us + 1;
-        }
+    if (fresh_hall_time > 0) {
+        time_since_magnet_us = (fresh_now_us >= fresh_hall_time)
+            ? (fresh_now_us - fresh_hall_time)
+            : (0xFFFFFFFFUL - fresh_hall_time + fresh_now_us + 1);
     }
 
-    // --- 2. Логика остановки (Таймаут 1 секунда) ---
-    // 5-секундная защита после запроса /play: loadFrameFromFile читает до 500 мс,
-    // и без защиты peripherals сразу отключатся — колесо не успеет начать крутиться.
-    // Используем last_play_ms (не last_web_activity_time, иначе страница пингует
-    // каждые 500 мс и peripherals никогда не выключатся).
-    // Дополнительно: 2-секундная защита после включения DCDC — IO4 питается от 5В,
-    // ему нужно время на стабилизацию перед первым корректным импульсом Холла.
-    if (peripherals_active && time_since_magnet_us > 1000000 && !force_stop_display &&
+    // --- 2. Логика остановки (Таймаут 3 секунды) ---
+    // Увеличено с 1с до 3с: при >200 RPM renderingTask занимает Core 1 настолько
+    // плотно, что loop() может не запускаться >1с подряд. За это время IO4 ISR
+    // исправно обновляет last_hall_time, но если таймаут слишком короткий —
+    // DCDC успевает выключиться до следующей итерации loop().
+    // 3с — достаточно для любых реалистичных пауз планировщика, но быстро
+    // реагирует на реальную остановку колеса.
+    // 5-секундная защита после /play и 2с после включения DCDC остаются.
+    if (peripherals_active && time_since_magnet_us > 3000000 && !force_stop_display &&
         (now_ms - last_play_ms) > 5000 && (now_ms - last_dcdc_on_time) > 2000) {
+        webLog("[PWR] No rotation >3s, LEDs power off");
         FastLED.clear(); sendLEDs_DMA();
         digitalWrite(PIN_EN_LEVEL_SHIFT, LOW);
         digitalWrite(PIN_EN_DCDC, LOW);
@@ -780,6 +823,7 @@ void loop() {
 
     // --- 3. Принудительная остановка из Web UI (Stop Display) ---
     if (force_stop_display && peripherals_active) {
+        webLog("[PWR] Force stop, LEDs power off");
         FastLED.clear(); sendLEDs_DMA();
         digitalWrite(PIN_EN_LEVEL_SHIFT, LOW);
         digitalWrite(PIN_EN_DCDC, LOW);
@@ -800,9 +844,10 @@ void loop() {
         
         if (is_adapter_connected) {
             last_hall_time = now_us;
-            Serial.println("External adapter connected. Preventing Deep Sleep.");
+            webLog("[SYS] Charger connected, sleep cancelled");
         } else {
-        Serial.println("Таймаут. Подготовка к Deep Sleep...");
+        webLogf("[SYS] Idle >60s (web: %lus, hall: %lus), sleeping...",
+            time_since_web_activity_ms / 1000, time_since_magnet_us / 1000000);
             
             // 1. Отключаем АЦП BQ25798 (чтобы он не дернул INT во сне по окончании замера)
             Wire.beginTransmission(BQ25792_ADDR);
@@ -843,15 +888,16 @@ void loop() {
             
             // Проверка "на дурака": если пин всё ещё в нуле - мы где-то не дочитали регистр BQ
             if (digitalRead(21) == LOW) {
-                Serial.println("ОШИБКА: Пин BQ25798 INT все еще LOW. Сон будет прерван!");
+                webLog("[ERR] GPIO21 LOW before sleep, will wake immediately!");
             }
-            
+
             esp_sleep_enable_ext1_wakeup(1ULL << 21, ESP_EXT1_WAKEUP_ANY_LOW);
-            
-            Serial.println("Ушел в сон.");
-            Serial.flush();
-            delay(10); 
-            
+
+            webLog("[SYS] Sleeping...");
+            // Ждём минимум 3 поллинга браузера (интервал 2с) — лог об уходе в сон
+            // должен дойти до UI до фактического отключения.
+            delay(3000);
+
             esp_deep_sleep_start();
         }
     }
@@ -880,7 +926,7 @@ void loop() {
         Wire.endTransmission();
         FastLED.clear(); sendLEDs_DMA();
         last_bms_recovery_time = now_ms;
-        Serial.println("BMS Recovery Complete.");
+        webLog("[BMS] Recovery complete");
     }
 
     // Проверка раз в секунду, только если восстановление не идёт
@@ -896,7 +942,7 @@ void loop() {
 
         if (vbat_raw >= 1000 && vbat_raw <= 1400) {
             if (now_ms - last_bms_recovery_time > 30000) {
-                Serial.println("BMS Latch Detected (VBAT 1.0-1.4V)! Initiating Recovery Sequence...");
+                webLogf("[BMS] Latch! VBAT=%dmV, recovering...", vbat_raw);
 
                 Wire.beginTransmission(BQ25792_ADDR);
                 Wire.write(0x0F);
@@ -912,7 +958,7 @@ void loop() {
 
                 bms_recovery_in_progress = true;
                 bms_recovery_off_time = now_ms;
-                Serial.println("Power off. Waiting 5s non-blocking...");
+                webLog("[BMS] LEDs Power off, wait 5s...");
             }
         }
     }

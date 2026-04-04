@@ -8,12 +8,126 @@
 #include <Preferences.h>
 #include <FastLED.h>
 #include <HTTPClient.h>
+#include <stdarg.h>
 
 AsyncWebServer server(80);
 Preferences prefs;
 File uploadFile;
 
 String hostName;
+String currentDisplayFile = "";   // Имя файла, загруженного в frameBuffer
+
+// ===================== WEB LOG BUFFER =====================
+// Кольцевой буфер в RTC SLOW RAM — переживает deep sleep.
+// ESP32-S3 RTC SLOW RAM = 8192 байт, из них ~1 кБ занимает ESP-IDF.
+// 64 строки × 96 байт = 6144 байт — укладываемся с запасом.
+#define WEB_LOG_COUNT   64
+#define WEB_LOG_LINE    96
+
+// Хранит строку сообщения без временно́й метки (она добавляется при записи в буфер)
+// Формат в буфере: "HH:MM:SS msg\0"
+RTC_DATA_ATTR static char     _log_buf[WEB_LOG_COUNT][WEB_LOG_LINE];
+RTC_DATA_ATTR static uint32_t _log_ms[WEB_LOG_COUNT];  // millis() в момент записи каждой строки
+RTC_DATA_ATTR static uint32_t _log_head  = 0;  // Индекс следующей записи (кольцо)
+RTC_DATA_ATTR static uint32_t _log_total = 0;  // Всего записей с начала времён
+
+// Unix-время в момент последней синхронизации + millis() в тот же момент.
+// Переживают deep sleep — позволяют считать текущее время без NTP.
+RTC_DATA_ATTR static uint32_t _time_epoch_base  = 0;  // Unix timestamp при синхронизации
+RTC_DATA_ATTR static uint32_t _time_millis_base = 0;  // millis() при синхронизации
+RTC_DATA_ATTR static int32_t  _time_tz_offset   = 0;  // Смещение часового пояса в секундах (UTC+2 = +7200)
+
+static portMUX_TYPE _log_mux = portMUX_INITIALIZER_UNLOCKED;
+
+// Возвращает текущий Unix timestamp (секунды), используя сохранённую базу + millis().
+// После deep sleep millis() сбрасывается в 0, поэтому _time_epoch_base = 0 устанавливается
+// явно в resetTimeSync() вызываемом из setup() — это гарантирует ??:??:?? для загрузочных
+// сообщений и корректную ретроспективную расстановку меток после первой синхронизации.
+static uint32_t _currentEpoch() {
+    if (_time_epoch_base == 0) return 0;
+    // Защита от uint32_t underflow когда millis() < _time_millis_base:
+    // такое случается если база была сохранена RTC, а millis() ещё не догнал её.
+    uint32_t now_ms = millis();
+    if (now_ms < _time_millis_base) return 0;
+    return _time_epoch_base + (now_ms - _time_millis_base) / 1000;
+}
+
+// Сбрасывает временну́ю базу — вызывать в начале setup().
+// Без этого после deep sleep _time_epoch_base != 0, но _time_millis_base стала,
+// из-за чего _currentEpoch() даёт UTC вместо локального времени до первой синхронизации.
+void resetTimeSync() {
+    _time_epoch_base  = 0;
+    _time_millis_base = 0;
+    // _time_tz_offset не сбрасываем: браузер отправит его вместе со временем
+}
+
+// Форматирует HH:MM:SS из Unix timestamp с учётом часового пояса в буфер buf[9].
+static void _fmtTime(uint32_t epoch, char* buf) {
+    if (epoch == 0) {
+        strcpy(buf, "??:??:??");
+        return;
+    }
+    // Добавляем смещение часового пояса: сначала знаковая арифметика, потом % 86400
+    int32_t  local_s = (int32_t)(epoch % 86400) + _time_tz_offset;
+    if (local_s < 0)      local_s += 86400;
+    if (local_s >= 86400) local_s -= 86400;
+    uint32_t s = (uint32_t)local_s;
+    snprintf(buf, 9, "%02u:%02u:%02u", s / 3600, (s % 3600) / 60, s % 60);
+}
+
+// Ретроспективно проставляет метки времени строкам у которых метка "??:??:??".
+// Вызывается из /settime после первой синхронизации с браузером.
+// Использует сохранённый millis() каждой строки для восстановления точного времени.
+static void _retroFillTimestamps() {
+    // Граница буфера: строки доступны от (total - min(total, COUNT)) до total
+    uint32_t count = (_log_total < WEB_LOG_COUNT) ? _log_total : WEB_LOG_COUNT;
+    uint32_t from  = _log_total - count;
+    for (uint32_t i = from; i < _log_total; i++) {
+        uint32_t idx = i % WEB_LOG_COUNT;
+        if (strncmp(_log_buf[idx], "??:??:??", 8) != 0) continue;  // Уже есть метка
+        // Вычисляем epoch момента записи по сохранённому millis()
+        uint32_t ms_at_write = _log_ms[idx];
+        uint32_t epoch_at_write = _time_epoch_base
+            + (uint32_t)(((int64_t)ms_at_write - (int64_t)_time_millis_base) / 1000);
+        char ts[9];
+        _fmtTime(epoch_at_write, ts);
+        // Перезаписываем только первые 8 символов (метку), остальное не трогаем
+        memcpy(_log_buf[idx], ts, 8);
+    }
+}
+
+void webLog(const char* msg) {
+    // Дедупликация: не записываем если последнее сообщение идентично текущему.
+    // Сравниваем только текст без временно́й метки (метка занимает первые 9 символов).
+    portENTER_CRITICAL(&_log_mux);
+    if (_log_total > 0) {
+        const char* last = _log_buf[(_log_head - 1) % WEB_LOG_COUNT];
+        const char* last_msg = (strlen(last) > 9) ? last + 9 : last;
+        if (strcmp(last_msg, msg) == 0) {
+            portEXIT_CRITICAL(&_log_mux);
+            return;  // Дубликат — не пишем
+        }
+    }
+
+    char ts[9];
+    _fmtTime(_currentEpoch(), ts);
+
+    uint32_t idx = _log_head % WEB_LOG_COUNT;
+    _log_ms[idx] = millis();  // Сохраняем millis() для ретроспективной метки
+    snprintf(_log_buf[idx], WEB_LOG_LINE, "%s %s", ts, msg);
+    _log_head++;
+    _log_total++;
+    portEXIT_CRITICAL(&_log_mux);
+}
+
+void webLogf(const char* fmt, ...) {
+    char tmp[WEB_LOG_LINE];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(tmp, sizeof(tmp), fmt, args);
+    va_end(args);
+    webLog(tmp);
+}
 
 // --- WiFi credentials ---
 const char* HOTSPOT_SSID = "Bunnies Stan 2.4G";
@@ -60,7 +174,7 @@ void loadFrameFromFile(String path) {
                 f.read(newBuf, dataSize);
             } else {
                 newTotalFrames = 0;
-                Serial.println("PSRAM alloc error loading animation!");
+                webLog("[ERR] PSRAM alloc failed");
             }
         } else {
             f.seek(0);
@@ -95,6 +209,13 @@ void loadFrameFromFile(String path) {
     // если поставить в начало, первый кадр будет немедленно пропущен в renderingTask.
     lastFrameSwitchTime = millis();
     newFrameReady = true;
+    currentDisplayFile = path;
+
+    if (newTotalFrames > 1) {
+        webLogf("[DISP] Loaded: %s  %lu frames @ %ums", path.c_str(), (unsigned long)newTotalFrames, (unsigned)newFrameDelay);
+    } else {
+        webLogf("[DISP] Loaded: %s", path.c_str());
+    }
 }
 
 void setupNetwork() {
@@ -135,10 +256,10 @@ void setupNetwork() {
     if (connected) {
         sta_was_connected = true;
         blink_wifi_ok_flag = true;
-        Serial.printf("WiFi STA: подключено, IP: %s\n", WiFi.localIP().toString().c_str());
+        webLogf("[NET] WiFi connected, IP: %s", WiFi.localIP().toString().c_str());
     } else {
         blink_wifi_fail_flag = true;
-        Serial.println("WiFi STA: подключение не удалось. Повтор через 30 с.");
+        webLog("[NET] WiFi failed, retry in 30s");
     }
     initial_connect_done  = true;
     last_reconnect_attempt = millis();
@@ -228,6 +349,7 @@ void setupNetwork() {
             pendingFilePath = "/" + fname;
             request_play_flag = true;
             xSemaphoreGive(fileLoaderSemaphore);
+            webLogf("[DISP] Play: %s", fname.c_str());
             request->send(200, "text/plain", "Playing");
         }
     });
@@ -235,6 +357,7 @@ void setupNetwork() {
     server.on("/stop", HTTP_GET, [](AsyncWebServerRequest *request){
         last_web_activity_time = millis();
         force_stop_display = true;
+        webLog("[DISP] Stop");
         request->send(200, "text/plain", "Stopped");
     });
 
@@ -280,6 +403,62 @@ void setupNetwork() {
         request->send(200, "application/json", json);
     });
 
+    // POST /settime?t=<unix>&tz=<секунды> — синхронизирует время и часовой пояс.
+    // t  — Unix timestamp UTC (секунды с 1970-01-01)
+    // tz — смещение часового пояса в секундах (UTC+2 → +7200, передаётся браузером)
+    server.on("/settime", HTTP_POST, [](AsyncWebServerRequest *request){
+        if (request->hasParam("t")) {
+            _time_epoch_base  = (uint32_t)request->getParam("t")->value().toInt();
+            _time_millis_base = millis();
+        }
+        if (request->hasParam("tz")) {
+            _time_tz_offset = (int32_t)request->getParam("tz")->value().toInt();
+        }
+        // Ретроспективно проставляем метки строкам записанным до синхронизации (??)
+        portENTER_CRITICAL(&_log_mux);
+        _retroFillTimestamps();
+        portEXIT_CRITICAL(&_log_mux);
+        request->send(200, "text/plain", "OK");
+    });
+
+    // GET /logs?since=N — возвращает JSON с записями начиная с глобального индекса N.
+    // Клиент передаёт последний полученный total, получает только новые строки.
+    // Формат: {"total":42,"lines":["msg1","msg2",...]}
+    server.on("/logs", HTTP_GET, [](AsyncWebServerRequest *request){
+        uint32_t since = 0;
+        if (request->hasParam("since")) since = request->getParam("since")->value().toInt();
+
+        portENTER_CRITICAL(&_log_mux);
+        uint32_t total = _log_total;
+        uint32_t head  = _log_head;
+        portEXIT_CRITICAL(&_log_mux);
+
+        // Определяем диапазон записей для отдачи: [since, total)
+        uint32_t from = since;
+        if (from > total) from = 0;                            // Устройство перезагрузилось — отдаём с начала
+        if (total - from > WEB_LOG_COUNT) from = total - WEB_LOG_COUNT; // Буфер уже перезаписан
+
+        String json = "{\"total\":" + String(total) +
+                      ",\"now\":" + String(_currentEpoch()) +
+                      ",\"lines\":[";
+        bool first = true;
+        for (uint32_t i = from; i < total; i++) {
+            uint32_t idx = i % WEB_LOG_COUNT;
+            if (!first) json += ',';
+            first = false;
+            // Экранируем кавычки и обратные слэши для корректного JSON
+            json += '"';
+            const char* p = _log_buf[idx];
+            while (*p) {
+                if (*p == '"' || *p == '\\') json += '\\';
+                json += *p++;
+            }
+            json += '"';
+        }
+        json += "]}";
+        request->send(200, "application/json", json);
+    });
+
     ElegantOTA.begin(&server);
     ElegantOTA.onStart(safeOTAShutdown);
     server.begin();
@@ -302,17 +481,17 @@ void loopNetwork() {
             // Новое соединение установлено (первичное или после обрыва)
             sta_was_connected = true;
             blink_wifi_ok_flag = true;
-            Serial.printf("WiFi STA: подключено, IP: %s\n", WiFi.localIP().toString().c_str());
+            webLogf("[NET] WiFi reconnected, IP: %s", WiFi.localIP().toString().c_str());
         } else if (sta_status != WL_CONNECTED && sta_was_connected) {
             // Соединение потеряно
             sta_was_connected = false;
-            Serial.println("WiFi STA: соединение потеряно");
+            webLog("[NET] WiFi lost");
         }
 
         // Периодическая попытка переподключения каждые 30 секунд
         if (sta_status != WL_CONNECTED && now_ms - last_reconnect_attempt > 30000) {
             last_reconnect_attempt = now_ms;
-            Serial.println("WiFi STA: попытка переподключения...");
+            webLog("[NET] WiFi reconnecting...");
             WiFi.begin(HOTSPOT_SSID, HOTSPOT_PASS);
         }
     }

@@ -1,0 +1,6 @@
+# Task WDT: не следить за IDLE-задачами автоматически.
+# renderingTask (приоритет 18) делает намеренный busy-wait весь оборот колеса
+# и не даёт IDLE Core 1 выполниться. Вместо этого renderingTask сам
+# зарегистрирован в WDT и сбрасывает его явно в начале каждого оборота.
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
