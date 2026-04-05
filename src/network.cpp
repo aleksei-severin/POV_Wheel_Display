@@ -17,6 +17,11 @@ File uploadFile;
 String hostName;
 String currentDisplayFile = "";   // Имя файла, загруженного в frameBuffer
 
+// Счётчик версии состояния: инкрементируется при любом изменении (настройки,
+// файлы, воспроизведение). Клиенты сравнивают с последней известной версией
+// и обновляют UI при расхождении — синхронизация нескольких браузеров.
+static uint32_t state_version = 0;
+
 // ===================== WEB LOG BUFFER =====================
 // Кольцевой буфер в RTC SLOW RAM — переживает deep sleep.
 // ESP32-S3 RTC SLOW RAM = 8192 байт, из них ~1 кБ занимает ESP-IDF.
@@ -293,6 +298,7 @@ void setupNetwork() {
             (int)min_brightness,
             (int)max_brightness
         );
+        state_version++;
         request->send(200, "text/plain", "OK");
     });
 
@@ -304,7 +310,8 @@ void setupNetwork() {
         json += "\"angle\":" + String(global_angle_offset) + ",";
         json += "\"brightness\":" + String(global_brightness) + ",";
         json += "\"gamma\":" + String(global_gamma, 1) + ",";
-        json += "\"saturation\":" + String(global_saturation, 1);
+        json += "\"saturation\":" + String(global_saturation, 1) + ",";
+        json += "\"ver\":" + String(state_version);
         json += "}";
         request->send(200, "application/json", json);
     });
@@ -349,6 +356,7 @@ void setupNetwork() {
             pendingFilePath = "/" + fname;
             request_play_flag = true;
             xSemaphoreGive(fileLoaderSemaphore);
+            state_version++;
             webLogf("[DISP] Play: %s", fname.c_str());
             request->send(200, "text/plain", "Playing");
         }
@@ -357,6 +365,7 @@ void setupNetwork() {
     server.on("/stop", HTTP_GET, [](AsyncWebServerRequest *request){
         last_web_activity_time = millis();
         force_stop_display = true;
+        state_version++;
         webLog("[DISP] Stop");
         request->send(200, "text/plain", "Stopped");
     });
@@ -365,6 +374,7 @@ void setupNetwork() {
         last_web_activity_time = millis();
         if (request->hasParam("file")) {
             LittleFS.remove("/" + request->getParam("file")->value());
+            state_version++;
             request->send(200, "text/plain", "Deleted");
         }
     });
@@ -378,7 +388,7 @@ void setupNetwork() {
         String filepath = "/" + (request->hasParam("name") ? request->getParam("name")->value() : "temp.bin");
         if (index == 0) uploadFile = LittleFS.open(filepath, "w");
         if (uploadFile) uploadFile.write(data, len);
-        if (index + len == total && uploadFile) uploadFile.close();
+        if (index + len == total && uploadFile) { uploadFile.close(); state_version++; }
     });
 
     server.on("/ping", HTTP_GET, [](AsyncWebServerRequest *request){

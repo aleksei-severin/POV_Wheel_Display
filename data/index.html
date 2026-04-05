@@ -457,6 +457,10 @@ function renderGIFFrames(gif) {
 }
 
 // ===================== STATE =====================
+// Версия состояния устройства: синхронизирует несколько браузерных вкладок.
+// Обновляется сервером при изменении настроек, файлов или воспроизведения.
+let _stateVersion = null;  // null = ещё не получено (первый запрос)
+
 window.currentUploadBuffer = null;
 const previewCanvas = document.getElementById('preview'); // 200×200 buffer, 160×160 display
 const previewCtx = previewCanvas.getContext('2d', {willReadFrequently: true});
@@ -936,9 +940,33 @@ window.onload = () => {
     loadSettings();
     updateBatteryStatus();
 
-    // NOW-яркость: 500 мс — быстрый отклик при изменении освещения или ползунков
+    // NOW-яркость + синхронизация между браузерами: 500 мс.
+    // Поле ver: если версия изменилась на другом клиенте — перезагружаем файлы и
+    // применяем настройки без лишнего запроса (данные уже есть в ответе).
     setInterval(() => {
-        fetch('/get_settings').then(r => r.json()).then(d => updateBriCursor(d.brightness)).catch(() => {});
+        fetch('/get_settings').then(r => r.json()).then(d => {
+            updateBriCursor(d.brightness);
+            if (_stateVersion !== null && d.ver !== _stateVersion) {
+                // Применяем настройки из текущего ответа
+                document.getElementById('bMinSlide').value = d.bmin;
+                document.getElementById('bMaxSlide').value = d.bmax;
+                document.getElementById('aSlide').value    = d.angle;
+                document.getElementById('aVal').textContent = d.angle;
+                if (d.gamma !== undefined) {
+                    document.getElementById('gSlide').value = Math.round(d.gamma * 10);
+                    document.getElementById('gVal').textContent = parseFloat(d.gamma).toFixed(1);
+                }
+                if (d.saturation !== undefined) {
+                    document.getElementById('sSlide').value = Math.round(d.saturation * 10);
+                    document.getElementById('sVal').textContent = parseFloat(d.saturation).toFixed(1);
+                }
+                updateDualRange();
+                // Обновляем список файлов и инфо о памяти
+                loadFiles();
+                loadFSInfo();
+            }
+            _stateVersion = d.ver;
+        }).catch(() => {});
     }, 500);
     // Батарея: 2 с — медленный опрос, т.к. требует I2C ADC замеров
     setInterval(updateBatteryStatus, 2000);
