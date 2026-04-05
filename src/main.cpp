@@ -372,7 +372,10 @@ void renderingTask(void* pvParameters) {
     bool    tx_pending = false;
 
     while (true) {
-        xSemaphoreTake(hallSemaphore, portMAX_DELAY);
+        // Таймаут 600мс: если холл молчит дольше 600мс — скорость точно <100RPM.
+        // При portMAX_DELAY задача зависала в ожидании и не успевала погасить
+        // светодиоды при резкой остановке — loop() выключал питание только через 3с.
+        xSemaphoreTake(hallSemaphore, pdMS_TO_TICKS(600));
 
         if (force_stop_display || !peripherals_active || !newFrameReady) continue;
 
@@ -417,7 +420,12 @@ void renderingTask(void* pvParameters) {
         // rotation_period = micros() - last_hall_time = десятки миллионов мкс.
         // Без этой проверки renderingTask уходит в busy-wait на минуты,
         // вытесняя WiFi/loop, WDT срабатывает через 5 с → краш → перезагрузка.
-        if (period == 0 || period > 600000) {
+        //
+        // Дополнительно: если с момента последнего сигнала холла прошло >600мс —
+        // обороты точно <100RPM независимо от сохранённого rotation_period.
+        uint32_t now_us = micros();
+        uint32_t age_us = (now_us >= t0) ? (now_us - t0) : (0xFFFFFFFFUL - t0 + now_us + 1);
+        if (period == 0 || period > 600000 || age_us > 600000) {
             if (rendering_active) {
                 rendering_active = false;
                 webLog("[PWR] RPM <100, rendering paused");
