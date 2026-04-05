@@ -610,10 +610,11 @@ void setup() {
     lightMeter.begin(BH1750::CONTINUOUS_LOW_RES_MODE, 0x23, &Wire);
 
     setupNetwork();
+    last_web_activity_time = millis();  // Считаем загрузку страницы активностью
 
     // Эндпоинт для телеметрии батареи с добавленным полным дебагом конфигурации ЗУ
     server.on("/battery", HTTP_GET, [](AsyncWebServerRequest *request){
-        last_web_activity_time = millis();
+        // Фоновый поллинг — не сбрасывает таймер активности
         // Включаем ADC (на случай если он был отключен)
         Wire.beginTransmission(BQ25792_ADDR);
         Wire.write(0x2E);
@@ -804,7 +805,10 @@ void loop() {
     uint32_t fresh_hall_time = last_hall_time;
     interrupts();
     uint32_t fresh_now_us = micros();
-    uint32_t time_since_magnet_us = 0;
+    // Если колесо ни разу не крутилось (last_hall_time == 0) — считаем что магнита
+    // не было "с начала времён": используем UINT32_MAX чтобы условие засыпания
+    // по hall не блокировало переход в deep sleep.
+    uint32_t time_since_magnet_us = UINT32_MAX;
     if (fresh_hall_time > 0) {
         time_since_magnet_us = (fresh_now_us >= fresh_hall_time)
             ? (fresh_now_us - fresh_hall_time)
@@ -845,6 +849,52 @@ void loop() {
     // IO5 (20Гц Hall) мог разбудить устройство совсем недавно — не уходим в сон
     // раньше чем через 1 минуту с момента включения.
     uint32_t time_since_dcdc_on_ms = now_ms - last_dcdc_on_time;
+
+    // Обратный отсчёт до сна: лог каждые 10 секунд + уведомление при сбросе таймера.
+    // "Ведущий" таймер — тот из трёх, который истёк позже всего (наибольший остаток).
+    {
+        static uint32_t last_activity_snap = 0;  // Snapshot last_web_activity_time на прошлой итерации
+        static uint32_t last_dcdc_snap     = 0;  // Snapshot last_dcdc_on_time на прошлой итерации
+        static int      last_logged_tick   = -1; // Последний напечатанный tick (0,10,20,30,40,50)
+
+        // Вычисляем реальный "возраст" каждого таймера (сколько секунд прошло).
+        // hall_age_s: если колесо не крутилось (UINT32_MAX) — берём 60 чтобы
+        // он не влиял на min_age_s (условие уже выполнено).
+        uint32_t web_age_s  = time_since_web_activity_ms / 1000;
+        uint32_t hall_age_s = (time_since_magnet_us == UINT32_MAX) ? 60
+                              : (uint32_t)(time_since_magnet_us / 1000000);
+        uint32_t dcdc_age_s = time_since_dcdc_on_ms / 1000;
+
+        // Минимальный возраст = сколько прошло с последнего ЛЮБОГО события,
+        // которое сдвигает момент засыпания. Спим через 60с после самого позднего.
+        uint32_t min_age_s = web_age_s;
+        if (hall_age_s < min_age_s) min_age_s = hall_age_s;
+        if (dcdc_age_s < min_age_s) min_age_s = dcdc_age_s;
+
+        // Определяем сброс таймера: кто-то нажал кнопку/двинул слайдер (web),
+        // или включился DCDC.
+        bool activity_reset = (last_web_activity_time != last_activity_snap) ||
+                              (last_dcdc_on_time      != last_dcdc_snap);
+        last_activity_snap = last_web_activity_time;
+        last_dcdc_snap     = last_dcdc_on_time;
+
+        if (activity_reset) {
+            if (last_logged_tick >= 0) {
+                webLog("[NET] Activity detected, sleep timer reset");
+            }
+            last_logged_tick = -1;
+        }
+
+        // Логируем на отметках 10, 20, 30, 40, 50 секунд бездействия (каждые 10с).
+        // tick = округление min_age_s вниз до кратного 10, диапазон [10..50].
+        if (min_age_s >= 10 && min_age_s < 60) {
+            int tick = (int)(min_age_s / 10) * 10;  // 10, 20, 30, 40, 50
+            if (tick != last_logged_tick) {
+                last_logged_tick = tick;
+                webLogf("[NET] Idle, sleep in %ds", 60 - tick);
+            }
+        }
+    }
 
     if (!peripherals_active && time_since_magnet_us > 60000000 &&
         time_since_web_activity_ms > 60000 && time_since_dcdc_on_ms > 60000) {
