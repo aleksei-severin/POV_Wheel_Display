@@ -238,10 +238,20 @@ void setupNetwork() {
     WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
     WiFi.softAP(hostName.c_str(), "", 1);
 
-    // Мигание желтым, когда кто-то подключается к нашей точке доступа
+    // Подключение клиента к нашей точке доступа
     WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
         blink_ap_client_flag = true;
+        uint8_t* mac = info.wifi_ap_staconnected.mac;
+        webLogf("[NET] AP client connected: %02X:%02X:%02X:%02X:%02X:%02X",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }, ARDUINO_EVENT_WIFI_AP_STACONNECTED);
+
+    // Отключение клиента от нашей точки доступа
+    WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+        uint8_t* mac = info.wifi_ap_stadisconnected.mac;
+        webLogf("[NET] AP client disconnected: %02X:%02X:%02X:%02X:%02X:%02X",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }, ARDUINO_EVENT_WIFI_AP_STADISCONNECTED);
 
     WiFi.begin(HOTSPOT_SSID, HOTSPOT_PASS);
 
