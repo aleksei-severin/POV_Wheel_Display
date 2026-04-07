@@ -656,10 +656,11 @@ void setup() {
         uint16_t chg_i_limit = readBQ16(0x03); // Charge Current Limit
         uint16_t in_i_limit = readBQ16(0x06);  // Input Current Limit
 
-        bool vbus_present = ((reg1B >> 5) & 0x07) != 0;
+        bool vbus_present   = (reg1B & 0x01) != 0;  // bit[0] = VBUS_PRESENT_STAT
         bool charge_enabled = (reg0F >> 5) & 0x01;
-        uint8_t chg_state = (reg1B >> 3) & 0x03;
-        bool ilim_active = (reg1C >> 6) & 0x01;
+        // CHG_STAT реально в bits[7:6] регистра 0x1B: 0=Not charging, 1=Trickle/Pre, 2=Fast CC, 3=Taper CV
+        uint8_t chg_state   = (reg1B >> 6) & 0x03;
+        bool ilim_active    = (reg1C >> 6) & 0x01;
 
         String state_str = "Unknown";
         switch(chg_state) {
@@ -673,10 +674,12 @@ void setup() {
         bool connected = vbus_present;
 
         String json = "{";
-        json += "\"vbat\":" + String(vbat) + ","; 
-        json += "\"ibat\":" + String(ibat) + ","; 
+        json += "\"vbat\":" + String(vbat) + ",";
+        json += "\"ibat\":" + String(ibat) + ",";
         json += "\"vbus\":" + String(vbus) + ",";
         json += "\"ibus\":" + String(ibus) + ",";
+        json += "\"chg_stat\":" + String(chg_state) + ",";
+        json += "\"vbus_ok\":" + String(vbus_present ? "true" : "false") + ",";
         json += "\"connected\":" + String(connected ? "true" : "false");
         json += "}";
         request->send(200, "application/json", json);

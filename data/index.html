@@ -280,10 +280,34 @@ canvas {
 <!-- POWER + INFO -->
 <div class="panel">
     <div class="panel-title">// Power Status</div>
-    <div class="stat-row"><span class="lbl">BATTERY VOLTAGE</span><span class="val" id="batV">--</span>&nbsp;V</div>
-    <div class="stat-row"><span class="lbl">CHARGE CURRENT</span><span class="val" id="batI">--</span>&nbsp;A</div>
-    <div class="stat-row"><span class="lbl">INPUT VOLTAGE</span><span class="val" id="busV">--</span>&nbsp;V</div>
-    <div class="stat-row"><span class="lbl">INPUT CURRENT</span><span class="val" id="busI">--</span>&nbsp;A</div>
+    <div class="stat-row">
+        <span class="lbl">BATTERY VOLTAGE</span>
+        <span style="display:flex;align-items:baseline;gap:3px;">
+            <span class="val" id="batV">--</span><span style="color:var(--dim);font-size:0.85em;">V</span>
+        </span>
+    </div>
+    <div class="stat-row">
+        <span class="lbl">CHARGE CURRENT</span>
+        <span style="display:flex;align-items:baseline;gap:3px;">
+            <span class="val" id="batI">--</span><span style="color:var(--dim);font-size:0.85em;">A</span>
+        </span>
+    </div>
+    <div class="stat-row">
+        <span class="lbl">INPUT VOLTAGE</span>
+        <span style="display:flex;align-items:baseline;gap:3px;">
+            <span class="val" id="busV">--</span><span style="color:var(--dim);font-size:0.85em;">V</span>
+        </span>
+    </div>
+    <div class="stat-row">
+        <span class="lbl">INPUT CURRENT</span>
+        <span style="display:flex;align-items:baseline;gap:3px;">
+            <span class="val" id="busI">--</span><span style="color:var(--dim);font-size:0.85em;">A</span>
+        </span>
+    </div>
+    <div class="stat-row" style="margin-top:6px;">
+        <span class="lbl">CHARGING STATUS</span>
+        <span class="val" id="chgStat" style="font-size:0.72em;text-align:right;max-width:55%;">--</span>
+    </div>
 
     <div style="height:1px;background:var(--border);margin:13px 0 11px;"></div>
 
@@ -806,6 +830,30 @@ function updateBatteryStatus() {
         document.getElementById('batI').textContent = (d.ibat/1000).toFixed(2);
         document.getElementById('busV').textContent = (d.vbus/1000).toFixed(2);
         document.getElementById('busI').textContent = (d.ibus/1000).toFixed(2);
+        if (d.chg_stat !== undefined) {
+            const el = document.getElementById('chgStat');
+            // chg_stat=0 при подключённом зарядном = зарядка завершена
+            // chg_stat=0 без зарядного = не заряжается
+            if (d.chg_stat === 0 && d.vbus_ok) {
+                el.textContent = 'Charge Done (100%)';
+                el.style.color = 'var(--ok)';
+            } else if (d.chg_stat === 0) {
+                el.textContent = 'Not Charging';
+                el.style.color = 'var(--dim)';
+            } else if (d.chg_stat === 1) {
+                el.textContent = 'Trickle / Pre-charge';
+                el.style.color = 'var(--acc)';
+            } else if (d.chg_stat === 2) {
+                el.textContent = 'Fast Charge (CC)';
+                el.style.color = 'var(--acc)';
+            } else if (d.chg_stat === 3) {
+                el.textContent = 'Taper Charge (CV)';
+                el.style.color = 'var(--acc)';
+            } else {
+                el.textContent = '--';
+                el.style.color = 'var(--dim)';
+            }
+        }
     }).catch(() => {});
 }
 
