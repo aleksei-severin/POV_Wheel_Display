@@ -373,7 +373,6 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
 // spi_device_polling_start/end — детерминированный busy-wait, исключает джиттер
 // от задержки пробуждения FreeRTOS (источник дрожания изображения 3–5°).
 void renderingTask(void* pvParameters) {
-    static uint32_t last_bri_time   = 0;
     static bool     rendering_active = false; // Флаг: были ли обороты >100 RPM (для лога при снижении)
     uint8_t active     = 0;
     bool    tx_pending = false;
@@ -403,12 +402,24 @@ void renderingTask(void* pvParameters) {
             }
         }
 
-        // Авто-яркость: раз в 100 мс — loop() вытесняется этой задачей
-        uint32_t now_rt = millis();
-        if (now_rt - last_bri_time >= 100) {
-            last_bri_time = now_rt;
+        // Авто-яркость: HIGH_RES_MODE (~120 мс/замер), среднее по 10 замерам
+        // measurementReady() гарантирует что датчик завершил текущий цикл перед чтением
+        if (lightMeter.measurementReady()) {
             float lux = lightMeter.readLightLevel();
-            if (lux >= 0) last_lux_value = lux;
+            if (lux >= 0) {
+                // Кольцевой буфер 10 замеров
+                static float   lux_buf[10] = {};
+                static uint8_t lux_idx     = 0;
+                static uint8_t lux_count   = 0;
+
+                lux_buf[lux_idx] = lux;
+                lux_idx = (lux_idx + 1) % 10;
+                if (lux_count < 10) lux_count++;
+
+                float sum = 0;
+                for (uint8_t i = 0; i < lux_count; i++) sum += lux_buf[i];
+                last_lux_value = sum / lux_count;
+            }
             float ratio = constrain(last_lux_value / 1000.0f, 0.0f, 1.0f);
             global_brightness = (uint8_t)constrain(
                 (int)(ratio * (float)max_brightness),
@@ -613,8 +624,8 @@ void setup() {
     LittleFS.begin(true);
 
     initBQ25792();
-    // LOW_RES_MODE: 16 мс на замер (против 120 мс у HIGH_RES) — нужно для быстрой реакции
-    lightMeter.begin(BH1750::CONTINUOUS_LOW_RES_MODE, 0x23, &Wire);
+    // HIGH_RES_MODE: 1 lx точность, ~120 мс на замер — усредняем по 10 замерам для плавности
+    lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &Wire);
 
     setupNetwork();
     last_web_activity_time = millis();  // Считаем загрузку страницы активностью
