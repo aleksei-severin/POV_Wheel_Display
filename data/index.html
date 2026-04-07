@@ -268,6 +268,13 @@ canvas {
         <input class="angle-slide" type="range" id="sSlide" min="10" max="30" value="10"
                oninput="document.getElementById('sVal').textContent=(this.value/10).toFixed(1); syncSettings()">
     </div>
+
+    <!-- Contrast -->
+    <div class="slider-row">
+        <label>CONTRAST <span id="coVal">0%</span></label>
+        <input class="angle-slide" type="range" id="coSlide" min="0" max="100" value="0"
+               oninput="document.getElementById('coVal').textContent=this.value+'%'; syncSettings()">
+    </div>
 </div>
 
 <!-- POWER + INFO -->
@@ -646,7 +653,7 @@ function loadFiles() {
         }
         list.innerHTML = files.map(f =>
             `<div class="file-item">
-                <span class="fname">${f.name}</span>
+                <span class="fname">${f.name}${f.frames ? `<span style="color:var(--dim);font-size:0.85em;margin-left:6px;">${f.frames}&nbsp;fr</span>` : ''}</span>
                 <span class="fsize">${(f.size/1024).toFixed(1)}&nbsp;kB</span>
                 <div class="acts">
                     <button onclick="playFile('${f.name}')">&#9654;</button>
@@ -708,8 +715,9 @@ function syncSettings() {
         const a    = document.getElementById('aSlide').value;
         const g    = (document.getElementById('gSlide').value / 10).toFixed(1);
         const s    = (document.getElementById('sSlide').value / 10).toFixed(1);
+        const co   = document.getElementById('coSlide').value;
         const circ = document.getElementById('wheelCirc').value || wheelCircMm;
-        fetch(`/settings?bmin=${bmin}&bmax=${bmax}&a=${a}&g=${g}&s=${s}&circ=${circ}`);
+        fetch(`/settings?bmin=${bmin}&bmax=${bmax}&a=${a}&g=${g}&s=${s}&co=${co}&circ=${circ}`);
         _syncTimer = null;
     }, 50);
 }
@@ -747,6 +755,11 @@ function _applySettings(d) {
     if (d.saturation !== undefined) {
         document.getElementById('sSlide').value = Math.round(d.saturation * 10);
         document.getElementById('sVal').textContent = parseFloat(d.saturation).toFixed(1);
+    }
+    if (d.contrast !== undefined) {
+        const co = Math.round(d.contrast);
+        document.getElementById('coSlide').value = co;
+        document.getElementById('coVal').textContent = co + '%';
     }
     if (d.circ !== undefined && d.circ > 0) {
         const c = Math.max(2000, Math.min(2500, d.circ));

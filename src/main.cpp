@@ -81,6 +81,7 @@ volatile bool request_play_flag = false;
 
 RTC_DATA_ATTR volatile float global_gamma         = 3.5f; // Сохраняется в RTC-памяти (переживает deep sleep)
 RTC_DATA_ATTR volatile float global_saturation    = 1.0f; // 1.0 = без изменений, >1 усиливает насыщенность
+RTC_DATA_ATTR volatile float global_contrast      = 10.0f; // 0..100 %, 0 = без изменений (factor 1.0)
 RTC_DATA_ATTR volatile uint16_t wheel_circumference = 2355; // Длина окружности колеса в мм
 uint8_t gamma_lut[256];
 
@@ -272,12 +273,15 @@ void sendLEDs_DMA() {
     xSemaphoreGive(dmaMutex);
 }
 
-// Перестраивает LUT гамма-коррекции; вызывается из setup() и loop()
-// 256 итераций powf — быстро (однократно), в рендеринге — только табличный поиск
+// Перестраивает LUT гамма-коррекции с контрастом; вызывается из setup() и при изменении параметров.
+// Контраст совмещён с гаммой в одной таблице — горячий цикл рендера не меняется.
 void rebuildGammaLUT() {
-    float g = global_gamma;
+    float g      = global_gamma;
+    float factor = 1.0f + global_contrast * 0.02f;  // 0% → 1.0 (норма), 100% → 3.0 (максимум)
     for (int i = 0; i < 256; i++) {
-        gamma_lut[i] = (uint8_t)(powf(i / 255.0f, g) * 255.0f + 0.5f);
+        float v = powf(i / 255.0f, g) * 255.0f;      // гамма-коррекция
+        v = 128.0f + (v - 128.0f) * factor;           // контраст вокруг средней точки
+        gamma_lut[i] = (uint8_t)constrain((int)(v + 0.5f), 0, 255);
     }
 }
 
@@ -296,13 +300,15 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
         }
         return;
     }
-    static float   last_built_gamma = -1.0f;
-    static float   last_built_sat   = -1.0f;
-    static int16_t sat_fxp          = 256;
+    static float   last_built_gamma    = -1.0f;
+    static float   last_built_contrast = -999.0f;
+    static float   last_built_sat      = -1.0f;
+    static int16_t sat_fxp             = 256;
 
-    if (global_gamma != last_built_gamma) {
+    if (global_gamma != last_built_gamma || global_contrast != last_built_contrast) {
         rebuildGammaLUT();
-        last_built_gamma = global_gamma;
+        last_built_gamma    = global_gamma;
+        last_built_contrast = global_contrast;
     }
     if (global_saturation != last_built_sat) {
         sat_fxp = (int16_t)(global_saturation * 256.0f);

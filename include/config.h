@@ -76,6 +76,9 @@ extern uint8_t        gamma_lut[256];    // ЛУТ, перестраиваетс
 // Коррекция насыщенности
 extern volatile float global_saturation; // 1.0 = без изменений, до 3.0 = максимум
 
+// Контраст: 0..100 %, 0 = без изменений (factor 1.0..3.0)
+extern volatile float global_contrast;
+
 // Длина окружности колеса в мм (для расчёта скорости)
 extern volatile uint16_t wheel_circumference;
 

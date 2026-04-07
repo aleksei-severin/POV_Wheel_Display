@@ -322,6 +322,10 @@ void setupNetwork() {
             int cv = request->getParam("circ")->value().toInt();
             if (cv >= 2000 && cv <= 2500) wheel_circumference = (uint16_t)cv;
         }
+        if (request->hasParam("co")) {
+            float cov = request->getParam("co")->value().toFloat();
+            if (cov >= 0.0f && cov <= 100.0f) global_contrast = cov;
+        }
         // Мгновенный пересчёт яркости — не ждём следующего тика датчика (50 мс)
         float ratio = constrain(last_lux_value / 1000.0f, 0.0f, 1.0f);
         global_brightness = (uint8_t)constrain(
@@ -342,6 +346,7 @@ void setupNetwork() {
         json += "\"brightness\":" + String(global_brightness) + ",";
         json += "\"gamma\":" + String(global_gamma, 1) + ",";
         json += "\"saturation\":" + String(global_saturation, 1) + ",";
+        json += "\"contrast\":" + String(global_contrast, 1) + ",";
         json += "\"circ\":" + String(wheel_circumference) + ",";
         json += "\"ver\":" + String(state_version);
         json += "}";
@@ -358,7 +363,18 @@ void setupNetwork() {
             String fn = String(file.name());
             if(fn.endsWith(".bin")) {
                 if(!first) json += ",";
-                json += "{\"name\":\"" + fn + "\",\"size\":" + String(file.size()) + "}";
+                // Читаем заголовок: если файл начинается с "ANIM" — это GIF, берём кол-во кадров
+                uint16_t frames = 0;
+                if (file.size() > 6) {
+                    uint8_t hdr[6];
+                    file.read(hdr, 6);
+                    if (hdr[0]=='A' && hdr[1]=='N' && hdr[2]=='I' && hdr[3]=='M') {
+                        frames = hdr[4] | (hdr[5] << 8);
+                    }
+                }
+                json += "{\"name\":\"" + fn + "\",\"size\":" + String(file.size());
+                if (frames > 0) json += ",\"frames\":" + String(frames);
+                json += "}";
                 first = false;
             }
             file = root.openNextFile();
