@@ -209,10 +209,10 @@ canvas {
 <!-- UPLOAD -->
 <div class="panel full">
     <div class="panel-title">// Upload Animation</div>
-    <input type="file" id="fileInput" accept="image/*">
-    <input type="text" id="fileNameInput" placeholder="Custom name (optional)">
+    <input type="file" id="fileInput" accept="image/*" multiple>
     <!-- Canvas buffer 200×200, displayed at 160×160 -->
     <canvas id="preview" width="200" height="200" style="display:none;"></canvas>
+    <div id="uploadQueue" style="display:none; margin:6px 0; font-size:0.68em; color:var(--dim);"></div>
     <button class="full-w" onclick="processAndUpload()">&#9654; Convert &amp; Upload</button>
     <div class="status-bar" id="uploadStatus">Waiting for file...</div>
     <div id="uploadProgressWrap" style="display:none; margin-top:5px;">
@@ -492,60 +492,34 @@ function renderGIFFrames(gif) {
 // Обновляется сервером при изменении настроек, файлов или воспроизведения.
 let _stateVersion = null;  // null = ещё не получено (первый запрос)
 
-window.currentUploadBuffer = null;
 const previewCanvas = document.getElementById('preview'); // 200×200 buffer, 160×160 display
 const previewCtx = previewCanvas.getContext('2d', {willReadFrequently: true});
 
 // ===================== FILE INPUT =====================
 document.getElementById('fileInput').addEventListener('change', function(e) {
-    const file = e.target.files[0];
-    if (!file) return;
-    previewCanvas.style.display = 'inline-block';
-    window.currentUploadBuffer = null;
-    setStatus('uploadStatus', `Reading "${file.name}"...`, '');
+    const files = Array.from(e.target.files);
+    if (!files.length) return;
 
-    if (file.name.toLowerCase().endsWith('.gif')) {
-        const reader = new FileReader();
-        reader.onload = ev => {
-            try {
-                setStatus('uploadStatus', 'Decoding GIF frames...', '');
-                const gif = new MinimalGIF(ev.target.result);
-                gif.parse();
-                const frames = renderGIFFrames(gif);
-                const frameBytes = 360 * 38 * 3;
-                const totalSize = 8 + frames.length * frameBytes;
-                const outBuf = new Uint8Array(totalSize);
-                outBuf[0]=65;outBuf[1]=78;outBuf[2]=73;outBuf[3]=77; // "ANIM"
-                outBuf[4]=frames.length&0xFF; outBuf[5]=(frames.length>>8)&0xFF;
-                const dd = frames[0].delay || 100;
-                outBuf[6]=dd&0xFF; outBuf[7]=(dd>>8)&0xFF;
-                let off = 8;
-                for (const f of frames) { outBuf.set(f.data, off); off += f.data.length; }
-                window.currentUploadBuffer = outBuf;
-                setStatus('uploadStatus', `GIF ready — ${frames.length} frame(s), ${(totalSize/1024).toFixed(1)} kB`, 'ok');
-            } catch(err) { setStatus('uploadStatus', 'GIF parse error: ' + err.message, 'err'); }
-        };
-        reader.readAsArrayBuffer(file);
-        // Preview first GIF frame via browser
-        const r2 = new FileReader();
-        r2.onload = ev => {
-            const img = new Image();
-            img.onload = () => drawCenteredSquare(img, previewCtx, 200);
-            img.src = ev.target.result;
-        };
-        r2.readAsDataURL(file);
+    const queueEl = document.getElementById('uploadQueue');
+    if (files.length > 1) {
+        queueEl.style.display = 'block';
+        queueEl.textContent = `${files.length} files selected: ` + files.map(f => f.name).join(', ');
     } else {
-        const reader = new FileReader();
-        reader.onload = ev => {
-            const img = new Image();
-            img.onload = () => {
-                drawCenteredSquare(img, previewCtx, 200);
-                setStatus('uploadStatus', `Image loaded (${img.width}×${img.height}). Ready to upload.`, 'ok');
-            };
-            img.src = ev.target.result;
-        };
-        reader.readAsDataURL(file);
+        queueEl.style.display = 'none';
     }
+
+    // Превью только первого файла
+    const first = files[0];
+    previewCanvas.style.display = 'inline-block';
+    setStatus('uploadStatus', `${files.length} file(s) ready. Press Upload.`, 'ok');
+
+    const r2 = new FileReader();
+    r2.onload = ev => {
+        const img = new Image();
+        img.onload = () => drawCenteredSquare(img, previewCtx, 200);
+        img.src = ev.target.result;
+    };
+    r2.readAsDataURL(first);
 });
 
 // Draw image centered and square-cropped into a ctx of given size
@@ -584,53 +558,64 @@ function buildFileName(prefix, rawBase) {
     return { name: safe, warning: `"${rawBase}" — ${reason}. Saving as: ${safe}` };
 }
 
-async function processAndUpload() {
-    const fileEl = document.getElementById('fileInput');
-    if (!fileEl.files[0]) { setStatus('uploadStatus', 'Select a file first.', 'err'); return; }
-    const file = fileEl.files[0];
+// Конвертирует один File в Uint8Array (polar bin). Возвращает {buf, fileName} или бросает ошибку.
+async function _convertFile(file) {
     const isGif = file.name.toLowerCase().endsWith('.gif');
     const prefix = isGif ? 'gif_' : 'img_';
-    const baseName = file.name.replace(/\.[^/.]+$/, '');
-    const nameInput = document.getElementById('fileNameInput').value.trim();
-    const rawBase = nameInput || baseName;
-
+    const rawBase = file.name.replace(/\.[^/.]+$/, '');
     const { name: fileName, warning: nameWarning } = buildFileName(prefix, rawBase);
+    if (nameWarning) setStatus('uploadStatus', nameWarning, '');
 
-    setStatus('uploadStatus', `Converting → ${fileName}...`, '');
-
-    let outputBuffer;
-    if (window.currentUploadBuffer) {
-        outputBuffer = window.currentUploadBuffer;
+    if (isGif) {
+        const ab = await new Promise((res, rej) => {
+            const r = new FileReader();
+            r.onload = e => res(e.target.result);
+            r.onerror = rej;
+            r.readAsArrayBuffer(file);
+        });
+        const gif = new MinimalGIF(ab);
+        gif.parse();
+        const frames = renderGIFFrames(gif);
+        const frameBytes = 360 * 38 * 3;
+        const totalSize = 8 + frames.length * frameBytes;
+        const buf = new Uint8Array(totalSize);
+        buf[0]=65;buf[1]=78;buf[2]=73;buf[3]=77; // "ANIM"
+        buf[4]=frames.length&0xFF; buf[5]=(frames.length>>8)&0xFF;
+        const dd = frames[0].delay || 100;
+        buf[6]=dd&0xFF; buf[7]=(dd>>8)&0xFF;
+        let off = 8;
+        for (const f of frames) { buf.set(f.data, off); off += f.data.length; }
+        return { buf, fileName };
     } else {
-        // Static image: use previewCanvas (200×200 buffer with centered crop)
-        outputBuffer = toPolarBuffer(previewCanvas);
+        const dataUrl = await new Promise((res, rej) => {
+            const r = new FileReader();
+            r.onload = e => res(e.target.result);
+            r.onerror = rej;
+            r.readAsDataURL(file);
+        });
+        const img = await new Promise((res, rej) => {
+            const i = new Image();
+            i.onload = () => res(i);
+            i.onerror = rej;
+            i.src = dataUrl;
+        });
+        // Рисуем в offscreen canvas 200×200 для полярного преобразования
+        const oc = document.createElement('canvas');
+        oc.width = 200; oc.height = 200;
+        const ctx = oc.getContext('2d', {willReadFrequently: true});
+        drawCenteredSquare(img, ctx, 200);
+        return { buf: toPolarBuffer(oc), fileName };
     }
+}
 
-    // --- Проверка свободного места ДО загрузки ---
-    try {
-        const fsData = await fetch('/fs_info').then(r => r.json());
-        if (outputBuffer.length > fsData.free) {
-            setStatus('uploadStatus',
-                `Not enough space: need ${(outputBuffer.length/1024).toFixed(1)} kB, ` +
-                `only ${(fsData.free/1024).toFixed(1)} kB free — delete files first.`,
-                'err');
-            return;
-        }
-    } catch(e) { /* продолжаем если /fs_info недоступен */ }
-
-    // --- Предупреждение о переименовании ---
-    if (nameWarning) {
-        setStatus('uploadStatus', nameWarning, '');
-        await new Promise(r => setTimeout(r, 1800));
-    }
-
+// Загружает готовый буфер на устройство. Возвращает true при успехе.
+async function _uploadBuffer(buf, fileName, label) {
     const progBar  = document.getElementById('uploadProgressBar');
     const progWrap = document.getElementById('uploadProgressWrap');
     progWrap.style.display = 'block';
     progBar.style.width = '0%';
-    setStatus('uploadStatus', `Uploading 0%  ·  0 / ${(outputBuffer.length/1024).toFixed(1)} kB`, '');
 
-    await new Promise(resolve => {
+    return new Promise(resolve => {
         const xhr = new XMLHttpRequest();
         xhr.open('POST', `/upload?name=${encodeURIComponent(fileName)}`);
         xhr.upload.addEventListener('progress', e => {
@@ -638,33 +623,91 @@ async function processAndUpload() {
                 const p = e.loaded / e.total * 100;
                 progBar.style.width = p.toFixed(1) + '%';
                 setStatus('uploadStatus',
-                    `Uploading ${p.toFixed(0)}%  ·  ${(e.loaded/1024).toFixed(1)} / ${(e.total/1024).toFixed(1)} kB`, '');
+                    `${label} — ${p.toFixed(0)}%  ·  ${(e.loaded/1024).toFixed(1)} / ${(e.total/1024).toFixed(1)} kB`, '');
             }
         });
         xhr.onload = () => {
             progWrap.style.display = 'none';
             if (xhr.status === 200) {
-                setStatus('uploadStatus', `Uploaded: ${fileName}`, 'ok');
-                document.getElementById('fileNameInput').value = '';
-                loadFiles(); loadFSInfo();
+                resolve(true);
             } else {
-                // Сервер вернул ошибку (500 = Upload incomplete): незавершённый файл
-                // уже удалён на сервере — обновляем список чтобы он исчез из UI.
-                setStatus('uploadStatus', 'Upload failed — file removed. Try stopping the display first.', 'err');
+                setStatus('uploadStatus', `${label} — upload failed. Try stopping the display first.`, 'err');
                 loadFiles(); loadFSInfo();
+                resolve(false);
             }
-            resolve();
         };
         xhr.onerror = () => {
             progWrap.style.display = 'none';
-            // Соединение оборвалось до ответа сервера — незавершённый файл
-            // будет удалён сервером при следующем обращении. Обновляем список.
-            setStatus('uploadStatus', 'Upload error — connection lost. Try stopping the display first.', 'err');
+            setStatus('uploadStatus', `${label} — connection lost. Try stopping the display first.`, 'err');
             loadFiles(); loadFSInfo();
-            resolve();
+            resolve(false);
         };
-        xhr.send(outputBuffer);
+        xhr.send(buf);
     });
+}
+
+async function processAndUpload() {
+    const fileEl = document.getElementById('fileInput');
+    const files  = Array.from(fileEl.files);
+    if (!files.length) { setStatus('uploadStatus', 'Select a file first.', 'err'); return; }
+
+    const total = files.length;
+    let ok = 0, fail = 0;
+
+    // Проверяем свободное место один раз перед началом
+    let fsFree = Infinity;
+    try { fsFree = (await fetch('/fs_info').then(r => r.json())).free; } catch(e) {}
+
+    for (let i = 0; i < total; i++) {
+        const file = files[i];
+        const label = total > 1 ? `[${i+1}/${total}] ${file.name}` : file.name;
+
+        setStatus('uploadStatus', `${label} — converting...`, '');
+        let buf, fileName;
+        try {
+            ({ buf, fileName } = await _convertFile(file));
+        } catch(err) {
+            setStatus('uploadStatus', `${label} — convert error: ${err.message}`, 'err');
+            fail++;
+            continue;
+        }
+
+        if (buf.length > fsFree) {
+            setStatus('uploadStatus',
+                `${label} — not enough space (need ${(buf.length/1024).toFixed(1)} kB, ` +
+                `only ${(fsFree/1024).toFixed(1)} kB free).`, 'err');
+            fail++;
+            break;  // дальше смысла нет — места точно не хватит
+        }
+
+        setStatus('uploadStatus', `${label} — uploading...`, '');
+        const success = await _uploadBuffer(buf, fileName, label);
+        if (success) {
+            fsFree -= buf.length;  // обновляем оценку свободного места
+            ok++;
+            loadFiles(); loadFSInfo();
+        } else {
+            fail++;
+        }
+    }
+
+    // Итоговый статус
+    if (total === 1) {
+        if (ok) setStatus('uploadStatus', `Uploaded: ${files[0].name}`, 'ok');
+        // ошибка уже показана внутри _uploadBuffer
+    } else {
+        if (fail === 0) {
+            setStatus('uploadStatus', `All ${ok} file(s) uploaded successfully.`, 'ok');
+        } else if (ok === 0) {
+            setStatus('uploadStatus', `Upload failed: all ${fail} file(s) had errors.`, 'err');
+        } else {
+            setStatus('uploadStatus', `Done: ${ok} uploaded, ${fail} failed.`, '');
+        }
+    }
+    // Сбрасываем input чтобы можно было выбрать те же файлы снова
+    fileEl.value = '';
+    document.getElementById('uploadQueue').style.display = 'none';
+    previewCanvas.style.display = 'none';
 }
 
 // ===================== FILE MANAGER =====================
