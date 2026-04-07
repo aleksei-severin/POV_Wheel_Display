@@ -173,6 +173,12 @@ void safeOTAShutdown() {
 void loadFrameFromFile(String path) {
     File f = LittleFS.open(path, "r");
     if (!f) return;
+    if (f.size() == 0) {
+        f.close();
+        LittleFS.remove(path);
+        webLogf("[WARN] Removed zero-size file on play: %s", path.c_str());
+        return;
+    }
 
     // Читаем новый файл в ВРЕМЕННЫЙ буфер, не трогая frameBuffer.
     // Старая анимация продолжает рендериться на Core 1 всё время загрузки.
@@ -362,6 +368,14 @@ void setupNetwork() {
         while(file) {
             String fn = String(file.name());
             if(fn.endsWith(".bin")) {
+                // Удаляем битые файлы нулевого размера — результат прерванной загрузки
+                if (file.size() == 0) {
+                    file.close();
+                    LittleFS.remove("/" + fn);
+                    webLogf("[WARN] Removed zero-size file: %s", fn.c_str());
+                    file = root.openNextFile();
+                    continue;
+                }
                 if(!first) json += ",";
                 // Читаем заголовок: если файл начинается с "ANIM" — это GIF, берём кол-во кадров
                 uint16_t frames = 0;
