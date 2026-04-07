@@ -239,13 +239,13 @@ canvas {
         <div class="bri-track"></div>
         <div class="bri-fill" id="drFill"></div>
         <div class="bri-cursor" id="drCursor" style="left:0%"></div>
-        <input type="range" id="bMinSlide" min="10" max="50" value="10">
-        <input type="range" id="bMaxSlide" min="10" max="50" value="50">
+        <input type="range" id="bMinSlide" min="5" max="40" value="5">
+        <input type="range" id="bMaxSlide" min="5" max="40" value="40">
     </div>
     <div class="bri-labels">
-        <span>MIN&nbsp;<b id="bMinVal">10</b>%</span>
+        <span>MIN&nbsp;<b id="bMinVal">5</b>%</span>
         <span class="now">NOW&nbsp;<b id="briVal">--</b>%</span>
-        <span>MAX&nbsp;<b id="bMaxVal">50</b>%</span>
+        <span>MAX&nbsp;<b id="bMaxVal">40</b>%</span>
     </div>
 
     <!-- Angle -->
@@ -617,13 +617,19 @@ async function processAndUpload() {
                 document.getElementById('fileNameInput').value = '';
                 loadFiles(); loadFSInfo();
             } else {
-                setStatus('uploadStatus', 'Upload failed (server error).', 'err');
+                // Сервер вернул ошибку (500 = Upload incomplete): незавершённый файл
+                // уже удалён на сервере — обновляем список чтобы он исчез из UI.
+                setStatus('uploadStatus', 'Upload failed — file removed. Try stopping the display first.', 'err');
+                loadFiles(); loadFSInfo();
             }
             resolve();
         };
         xhr.onerror = () => {
             progWrap.style.display = 'none';
-            setStatus('uploadStatus', 'Upload error.', 'err');
+            // Соединение оборвалось до ответа сервера — незавершённый файл
+            // будет удалён сервером при следующем обращении. Обновляем список.
+            setStatus('uploadStatus', 'Upload error — connection lost. Try stopping the display first.', 'err');
+            loadFiles(); loadFSInfo();
             resolve();
         };
         xhr.send(outputBuffer);
@@ -665,7 +671,7 @@ function stopDisplay()    { fetch('/stop'); }
 function deleteFile(name) { fetch(`/delete?file=${encodeURIComponent(name)}`).then(() => { loadFiles(); loadFSInfo(); }); }
 
 // ===================== DUAL-RANGE BRIGHTNESS SLIDER =====================
-function pct(v) { return (v - 10) / 40 * 100; }
+function pct(v) { return (v - 5) / 35 * 100; }
 
 // Хранит последнее известное значение NOW для пересчёта при движении ползунков
 let currentBrightness = 0;
@@ -702,7 +708,8 @@ function syncSettings() {
         const a    = document.getElementById('aSlide').value;
         const g    = (document.getElementById('gSlide').value / 10).toFixed(1);
         const s    = (document.getElementById('sSlide').value / 10).toFixed(1);
-        fetch(`/settings?bmin=${bmin}&bmax=${bmax}&a=${a}&g=${g}&s=${s}`);
+        const circ = document.getElementById('wheelCirc').value || wheelCircMm;
+        fetch(`/settings?bmin=${bmin}&bmax=${bmax}&a=${a}&g=${g}&s=${s}&circ=${circ}`);
         _syncTimer = null;
     }, 50);
 }
@@ -728,36 +735,45 @@ document.getElementById('bMaxSlide').addEventListener('input', function() {
 });
 
 // ===================== SETTINGS =====================
+function _applySettings(d) {
+    document.getElementById('bMinSlide').value = d.bmin;
+    document.getElementById('bMaxSlide').value = d.bmax;
+    document.getElementById('aSlide').value    = d.angle;
+    document.getElementById('aVal').textContent = d.angle;
+    if (d.gamma !== undefined) {
+        document.getElementById('gSlide').value = Math.round(d.gamma * 10);
+        document.getElementById('gVal').textContent = parseFloat(d.gamma).toFixed(1);
+    }
+    if (d.saturation !== undefined) {
+        document.getElementById('sSlide').value = Math.round(d.saturation * 10);
+        document.getElementById('sVal').textContent = parseFloat(d.saturation).toFixed(1);
+    }
+    if (d.circ !== undefined && d.circ > 0) {
+        const c = Math.max(2000, Math.min(2500, d.circ));
+        wheelCircMm = c;
+        document.getElementById('wheelCirc').value = c;
+    }
+    updateDualRange();
+}
+
 function loadSettings() {
     fetch('/get_settings').then(r => r.json()).then(d => {
-        document.getElementById('bMinSlide').value = d.bmin;
-        document.getElementById('bMaxSlide').value = d.bmax;
-        document.getElementById('aSlide').value    = d.angle;
-        document.getElementById('aVal').textContent = d.angle;
-        if (d.gamma !== undefined) {
-            document.getElementById('gSlide').value = Math.round(d.gamma * 10);
-            document.getElementById('gVal').textContent = parseFloat(d.gamma).toFixed(1);
-        }
-        if (d.saturation !== undefined) {
-            document.getElementById('sSlide').value = Math.round(d.saturation * 10);
-            document.getElementById('sVal').textContent = parseFloat(d.saturation).toFixed(1);
-        }
-        updateDualRange();
+        _applySettings(d);
         updateBriCursor(d.brightness);
     }).catch(() => {});
 }
 
 // ===================== INFO (RPM + SPEED) =====================
-let wheelCircMm = parseInt(localStorage.getItem('wheelCirc') || '2355');
-document.getElementById('wheelCirc').value = wheelCircMm;
+let wheelCircMm = 2355;
 
 document.getElementById('wheelCirc').addEventListener('change', function() {
-    const v = parseInt(this.value);
-    if (v > 0 && v < 10000) {
-        wheelCircMm = v;
-        localStorage.setItem('wheelCirc', v);
-        updateInfo();
-    }
+    let v = parseInt(this.value);
+    if (isNaN(v)) v = wheelCircMm;
+    v = Math.max(2000, Math.min(2500, v));
+    this.value = v;
+    wheelCircMm = v;
+    syncSettings();
+    updateInfo();
 });
 
 function updateInfo() {
@@ -862,7 +878,7 @@ function _fetchTimeout(url, opts, ms) {
 }
 
 // Синхронизация времени: отправляем UTC epoch + смещение часового пояса браузера.
-// Возвращает true если POST был успешно отправлен (сервер исправил ??:??:?? метки).
+// Возвращает true если POST был успешно отправлен (сервер исправил ?????... метки).
 async function _syncTime(deviceNow) {
     const browserNow = Math.floor(Date.now() / 1000);
     const tzOffset = -new Date().getTimezoneOffset() * 60;
@@ -901,7 +917,7 @@ async function _logPoll() {
 
         // Синхронизация времени. Если устройство ещё не знало времени (d.now=0),
         // после успешного POST сервер проставил правильные метки ретроспективно.
-        // Перезагружаем все строки с нуля, заменяя ??:??:?? метки на правильные.
+        // Перезагружаем все строки с нуля, заменяя "?..." метки на правильные.
         // Специальные строки (разделитель рестарта) сохраняем.
         const firstSync = (d.now === 0 || d.now === undefined);
         const synced = await _syncTime(d.now || 0);
@@ -948,19 +964,7 @@ window.onload = () => {
             updateBriCursor(d.brightness);
             if (_stateVersion !== null && d.ver !== _stateVersion) {
                 // Применяем настройки из текущего ответа
-                document.getElementById('bMinSlide').value = d.bmin;
-                document.getElementById('bMaxSlide').value = d.bmax;
-                document.getElementById('aSlide').value    = d.angle;
-                document.getElementById('aVal').textContent = d.angle;
-                if (d.gamma !== undefined) {
-                    document.getElementById('gSlide').value = Math.round(d.gamma * 10);
-                    document.getElementById('gVal').textContent = parseFloat(d.gamma).toFixed(1);
-                }
-                if (d.saturation !== undefined) {
-                    document.getElementById('sSlide').value = Math.round(d.saturation * 10);
-                    document.getElementById('sVal').textContent = parseFloat(d.saturation).toFixed(1);
-                }
-                updateDualRange();
+                _applySettings(d);
                 // Обновляем список файлов и инфо о памяти
                 loadFiles();
                 loadFSInfo();

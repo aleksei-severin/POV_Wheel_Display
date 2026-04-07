@@ -22,8 +22,8 @@ extern AsyncWebServer server;
 // --- ИНИЦИАЛИЗАЦИЯ ГЛОБАЛЬНЫХ ПЕРЕМЕННЫХ ---
 volatile uint8_t global_brightness = 20; 
 
-RTC_DATA_ATTR uint8_t min_brightness = 10;
-RTC_DATA_ATTR uint8_t max_brightness = 50;
+RTC_DATA_ATTR uint8_t min_brightness = 5;
+RTC_DATA_ATTR uint8_t max_brightness = 40;
 RTC_DATA_ATTR volatile int global_angle_offset = 86;
 
 uint8_t* frameBuffer = nullptr; 
@@ -79,8 +79,9 @@ String                     pendingFilePath;
 volatile bool wakeup_event = false;
 volatile bool request_play_flag = false;
 
-RTC_DATA_ATTR volatile float global_gamma      = 3.5f; // Сохраняется в RTC-памяти (переживает deep sleep)
-RTC_DATA_ATTR volatile float global_saturation = 1.0f; // 1.0 = без изменений, >1 усиливает насыщенность
+RTC_DATA_ATTR volatile float global_gamma         = 3.5f; // Сохраняется в RTC-памяти (переживает deep sleep)
+RTC_DATA_ATTR volatile float global_saturation    = 1.0f; // 1.0 = без изменений, >1 усиливает насыщенность
+RTC_DATA_ATTR volatile uint16_t wheel_circumference = 2355; // Длина окружности колеса в мм
 uint8_t gamma_lut[256];
 
 // Хелперы для I2C чтения BQ25798

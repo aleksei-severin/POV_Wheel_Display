@@ -30,7 +30,7 @@ static uint32_t state_version = 0;
 #define WEB_LOG_LINE    96
 
 // Хранит строку сообщения без временно́й метки (она добавляется при записи в буфер)
-// Формат в буфере: "HH:MM:SS msg\0"
+// Формат в буфере: "YYYY-MM-DD HH:MM:SS msg\0"
 RTC_DATA_ATTR static char     _log_buf[WEB_LOG_COUNT][WEB_LOG_LINE];
 RTC_DATA_ATTR static uint32_t _log_ms[WEB_LOG_COUNT];  // millis() в момент записи каждой строки
 RTC_DATA_ATTR static uint32_t _log_head  = 0;  // Индекс следующей записи (кольцо)
@@ -66,21 +66,38 @@ void resetTimeSync() {
     // _time_tz_offset не сбрасываем: браузер отправит его вместе со временем
 }
 
-// Форматирует HH:MM:SS из Unix timestamp с учётом часового пояса в буфер buf[9].
-static void _fmtTime(uint32_t epoch, char* buf) {
+// Форматирует "YYYY-MM-DD HH:MM:SS" из Unix timestamp с учётом часового пояса в буфер buf[20].
+static void _fmtDateTime(uint32_t epoch, char* buf) {
     if (epoch == 0) {
-        strcpy(buf, "??:??:??");
+        strcpy(buf, "???? ?? ?? ??:??:??");
         return;
     }
-    // Добавляем смещение часового пояса: сначала знаковая арифметика, потом % 86400
-    int32_t  local_s = (int32_t)(epoch % 86400) + _time_tz_offset;
-    if (local_s < 0)      local_s += 86400;
-    if (local_s >= 86400) local_s -= 86400;
-    uint32_t s = (uint32_t)local_s;
-    snprintf(buf, 9, "%02u:%02u:%02u", s / 3600, (s % 3600) / 60, s % 60);
+    // Применяем смещение часового пояса
+    int64_t local_epoch = (int64_t)epoch + (int64_t)_time_tz_offset;
+    if (local_epoch < 0) local_epoch = 0;
+
+    // Расчёт даты (алгоритм Томаса — без libc mktime/localtime)
+    uint32_t days = (uint32_t)(local_epoch / 86400);
+    uint32_t secs = (uint32_t)(local_epoch % 86400);
+
+    // Преобразование количества дней с 1970-01-01 → год/месяц/день
+    uint32_t z = days + 719468;
+    uint32_t era = z / 146097;
+    uint32_t doe = z - era * 146097;
+    uint32_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    uint32_t y   = yoe + era * 400;
+    uint32_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    uint32_t mp  = (5 * doy + 2) / 153;
+    uint32_t d   = doy - (153 * mp + 2) / 5 + 1;
+    uint32_t m   = (mp < 10) ? (mp + 3) : (mp - 9);
+    y += (m <= 2) ? 1 : 0;
+
+    snprintf(buf, 20, "%04u-%02u-%02u %02u:%02u:%02u",
+             y, m, d,
+             secs / 3600, (secs % 3600) / 60, secs % 60);
 }
 
-// Ретроспективно проставляет метки времени строкам у которых метка "??:??:??".
+// Ретроспективно проставляет метки времени строкам у которых метка начинается с '?'.
 // Вызывается из /settime после первой синхронизации с браузером.
 // Использует сохранённый millis() каждой строки для восстановления точного времени.
 static void _retroFillTimestamps() {
@@ -89,33 +106,33 @@ static void _retroFillTimestamps() {
     uint32_t from  = _log_total - count;
     for (uint32_t i = from; i < _log_total; i++) {
         uint32_t idx = i % WEB_LOG_COUNT;
-        if (strncmp(_log_buf[idx], "??:??:??", 8) != 0) continue;  // Уже есть метка
+        if (_log_buf[idx][0] != '?') continue;  // Уже есть метка
         // Вычисляем epoch момента записи по сохранённому millis()
         uint32_t ms_at_write = _log_ms[idx];
         uint32_t epoch_at_write = _time_epoch_base
             + (uint32_t)(((int64_t)ms_at_write - (int64_t)_time_millis_base) / 1000);
-        char ts[9];
-        _fmtTime(epoch_at_write, ts);
-        // Перезаписываем только первые 8 символов (метку), остальное не трогаем
-        memcpy(_log_buf[idx], ts, 8);
+        char ts[20];
+        _fmtDateTime(epoch_at_write, ts);
+        // Перезаписываем только первые 19 символов (метку "YYYY-MM-DD HH:MM:SS"), остальное не трогаем
+        memcpy(_log_buf[idx], ts, 19);
     }
 }
 
 void webLog(const char* msg) {
     // Дедупликация: не записываем если последнее сообщение идентично текущему.
-    // Сравниваем только текст без временно́й метки (метка занимает первые 9 символов).
+    // Сравниваем только текст без временно́й метки (метка занимает первые 20 символов: "YYYY-MM-DD HH:MM:SS ").
     portENTER_CRITICAL(&_log_mux);
     if (_log_total > 0) {
         const char* last = _log_buf[(_log_head - 1) % WEB_LOG_COUNT];
-        const char* last_msg = (strlen(last) > 9) ? last + 9 : last;
+        const char* last_msg = (strlen(last) > 20) ? last + 20 : last;
         if (strcmp(last_msg, msg) == 0) {
             portEXIT_CRITICAL(&_log_mux);
             return;  // Дубликат — не пишем
         }
     }
 
-    char ts[9];
-    _fmtTime(_currentEpoch(), ts);
+    char ts[20];
+    _fmtDateTime(_currentEpoch(), ts);
 
     uint32_t idx = _log_head % WEB_LOG_COUNT;
     _log_ms[idx] = millis();  // Сохраняем millis() для ретроспективной метки
@@ -301,6 +318,10 @@ void setupNetwork() {
             float sv = request->getParam("s")->value().toFloat();
             if (sv >= 1.0f && sv <= 3.0f) global_saturation = sv;
         }
+        if (request->hasParam("circ")) {
+            int cv = request->getParam("circ")->value().toInt();
+            if (cv >= 2000 && cv <= 2500) wheel_circumference = (uint16_t)cv;
+        }
         // Мгновенный пересчёт яркости — не ждём следующего тика датчика (50 мс)
         float ratio = constrain(last_lux_value / 1000.0f, 0.0f, 1.0f);
         global_brightness = (uint8_t)constrain(
@@ -321,6 +342,7 @@ void setupNetwork() {
         json += "\"brightness\":" + String(global_brightness) + ",";
         json += "\"gamma\":" + String(global_gamma, 1) + ",";
         json += "\"saturation\":" + String(global_saturation, 1) + ",";
+        json += "\"circ\":" + String(wheel_circumference) + ",";
         json += "\"ver\":" + String(state_version);
         json += "}";
         request->send(200, "application/json", json);
@@ -391,14 +413,35 @@ void setupNetwork() {
 
     server.on("/upload", HTTP_POST, [](AsyncWebServerRequest *request){
         last_web_activity_time = millis();
-        //blink_ok_flag = true; // Trigger green blink on upload complete
+        // Если uploadFile всё ещё открыт — передача прервалась на полуслове.
+        // Закрываем и удаляем незавершённый файл, чтобы не оставлять мусор 0 kB.
+        if (uploadFile) {
+            String badPath = uploadFile.path();
+            uploadFile.close();
+            LittleFS.remove(badPath);
+            webLogf("[ERR] Upload aborted, removed: %s", badPath.c_str());
+            request->send(500, "text/plain", "Upload incomplete");
+            return;
+        }
+        state_version++;
         request->send(200, "text/plain", "OK");
     }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
         last_web_activity_time = millis();
         String filepath = "/" + (request->hasParam("name") ? request->getParam("name")->value() : "temp.bin");
-        if (index == 0) uploadFile = LittleFS.open(filepath, "w");
+        if (index == 0) {
+            // Если предыдущая загрузка не завершилась корректно — убираем мусор
+            if (uploadFile) {
+                String badPath = uploadFile.path();
+                uploadFile.close();
+                LittleFS.remove(badPath);
+                webLogf("[ERR] Stale upload removed: %s", badPath.c_str());
+            }
+            uploadFile = LittleFS.open(filepath, "w");
+        }
         if (uploadFile) uploadFile.write(data, len);
-        if (index + len == total && uploadFile) { uploadFile.close(); state_version++; }
+        if (index + len == total && uploadFile) {
+            uploadFile.close();  // после close() объект становится false — сигнал onRequest об успехе
+        }
     });
 
     server.on("/ping", HTTP_GET, [](AsyncWebServerRequest *request){
