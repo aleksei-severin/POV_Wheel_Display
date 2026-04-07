@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>POV WHEEL CONTROL</title>
 <style>
 :root {
@@ -11,10 +11,14 @@
     --ok: #00ff88; --glow: rgba(0,212,255,0.15);
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
+html { overflow-x: hidden; }
 body {
     font-family: 'Courier New', Consolas, monospace;
     background: var(--bg); color: var(--text);
     padding: 16px; min-height: 100vh;
+    overflow-x: hidden;
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
     background-image:
         linear-gradient(rgba(0,212,255,0.025) 1px, transparent 1px),
         linear-gradient(90deg, rgba(0,212,255,0.025) 1px, transparent 1px);
@@ -23,16 +27,23 @@ body {
 header {
     text-align: center; margin-bottom: 20px; padding: 14px 0;
     border-bottom: 1px solid var(--border);
+    width: 100%; overflow: hidden;
 }
 header h1 {
     font-size: 1.4em; letter-spacing: 0.25em; color: var(--c);
     text-shadow: 0 0 18px var(--c);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-header .sub { font-size: 0.68em; color: var(--dim); letter-spacing: 0.15em; margin-top: 5px; }
+header .sub {
+    font-size: 0.68em; color: var(--dim); letter-spacing: 0.15em; margin-top: 5px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    min-height: 1.2em; /* резервируем место до появления текста — предотвращает reflow */
+}
 .grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 16px; max-width: 860px; margin: 0 auto;
+    width: 100%;
 }
 .full { grid-column: 1 / -1; }
 .panel {
@@ -121,17 +132,17 @@ input[type="file"] { cursor: pointer; color: var(--dim); }
 .slider-row label span { color: var(--c); }
 input.angle-slide {
     -webkit-appearance: none; appearance: none; width: 100%; height: 3px;
-    background: #0a2040; outline: none; pointer-events: all;
+    background: #0a2040; outline: none; pointer-events: none;
 }
 input.angle-slide::-webkit-slider-thumb {
     -webkit-appearance: none; appearance: none;
     width: 14px; height: 14px; background: var(--c);
     clip-path: polygon(50% 0%,100% 50%,50% 100%,0% 50%);
-    cursor: pointer; box-shadow: 0 0 8px var(--c);
+    cursor: pointer; pointer-events: all; box-shadow: 0 0 8px var(--c);
 }
 input.angle-slide::-moz-range-thumb {
     width: 14px; height: 14px; background: var(--c);
-    border: none; cursor: pointer; border-radius: 0;
+    border: none; cursor: pointer; pointer-events: all; border-radius: 0;
 }
 
 /* ---- File list ---- */
@@ -808,6 +819,7 @@ document.getElementById('bMaxSlide').addEventListener('input', function() {
     updateDualRange();
     syncSettings();
 });
+
 
 // ===================== SETTINGS =====================
 function _applySettings(d) {
