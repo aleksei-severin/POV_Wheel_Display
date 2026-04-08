@@ -656,18 +656,22 @@ void setup() {
         uint16_t chg_i_limit = readBQ16(0x03); // Charge Current Limit
         uint16_t in_i_limit = readBQ16(0x06);  // Input Current Limit
 
-        bool vbus_present   = (reg1B & 0x01) != 0;  // bit[0] = VBUS_PRESENT_STAT
+        bool vbus_present   = (reg1B & 0x08) != 0;  // bit[3] = VBUS_PRESENT_STAT (подтверждено: reg1B=0x0F)
         bool charge_enabled = (reg0F >> 5) & 0x01;
-        // CHG_STAT реально в bits[7:6] регистра 0x1B: 0=Not charging, 1=Trickle/Pre, 2=Fast CC, 3=Taper CV
-        uint8_t chg_state   = (reg1B >> 6) & 0x03;
+        // CHG_STAT в bits[7:5] регистра 0x1C (подтверждено эмпирически: reg1C=0x8A → bits[7:5]=100 = Taper CV)
+        uint8_t chg_state   = (reg1C >> 5) & 0x07;
         bool ilim_active    = (reg1C >> 6) & 0x01;
 
         String state_str = "Unknown";
         switch(chg_state) {
             case 0: state_str = "Not Charging"; break;
-            case 1: state_str = "Trickle/Pre-charge"; break;
-            case 2: state_str = "Fast Charging"; break;
-            case 3: state_str = "Taper Charge"; break;
+            case 1: state_str = "Trickle Charge"; break;
+            case 2: state_str = "Pre-charge"; break;
+            case 3: state_str = "Fast Charge (CC)"; break;
+            case 4: state_str = "Taper Charge (CV)"; break;
+            case 5: state_str = "Top-off Charging"; break;
+            case 6: state_str = "Charge Done"; break;
+            default: state_str = "Reserved"; break;
         }
         // ----------------------------------------
 
@@ -761,9 +765,9 @@ void loop() {
         bq_interrupt_flag = false;
         uint8_t fault0 = readBQ8(0x20);
         uint8_t fault1 = readBQ8(0x21);
-        uint8_t stat = readBQ8(0x1B);
-        bool vbus_present = ((stat >> 5) & 0x07) != 0;
-        uint8_t charge_state = (stat >> 3) & 0x03;
+        uint8_t stat1C = readBQ8(0x1C);
+        bool vbus_present = ((stat1C >> 5) & 0x07) != 0;  // CHG_STAT в reg1C bits[7:5]
+        uint8_t charge_state = (stat1C >> 5) & 0x07;
         webLogf("[BMS] BQ: VBUS=%s chg=%d fault=%02X%02X",
             vbus_present ? "YES" : "NO", charge_state, fault0, fault1);
     }
@@ -919,7 +923,7 @@ void loop() {
 
     if (!peripherals_active && time_since_magnet_us > 60000000 &&
         time_since_web_activity_ms > 60000 && time_since_dcdc_on_ms > 60000) {
-        bool is_adapter_connected = ((readBQ8(0x1B) >> 5) & 0x07) != 0;
+        bool is_adapter_connected = (readBQ8(0x1B) & 0x08) != 0;  // VBUS_PRESENT_STAT: reg1B bit[3]
         
         if (is_adapter_connected) {
             last_hall_time = now_us;

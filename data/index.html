@@ -16,6 +16,7 @@ body {
     font-family: 'Courier New', Consolas, monospace;
     background: var(--bg); color: var(--text);
     padding: 16px; min-height: 100vh;
+    width: 100%; max-width: 100%;
     overflow-x: hidden;
     -webkit-text-size-adjust: 100%;
     text-size-adjust: 100%;
@@ -27,16 +28,16 @@ body {
 header {
     text-align: center; margin-bottom: 20px; padding: 14px 0;
     border-bottom: 1px solid var(--border);
-    width: 100%; overflow: hidden;
+    width: 100%; max-width: 100%; overflow: hidden;
 }
 header h1 {
-    font-size: 1.4em; letter-spacing: 0.25em; color: var(--c);
+    font-size: 1.4em; letter-spacing: 0.12em; color: var(--c);
     text-shadow: 0 0 18px var(--c);
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    overflow: hidden; text-overflow: ellipsis; overflow-wrap: anywhere;
 }
 header .sub {
     font-size: 0.68em; color: var(--dim); letter-spacing: 0.15em; margin-top: 5px;
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    overflow: hidden; text-overflow: ellipsis; overflow-wrap: anywhere;
     min-height: 1.2em; /* резервируем место до появления текста — предотвращает reflow */
 }
 .grid {
@@ -211,7 +212,7 @@ canvas {
 <body>
 
 <header>
-    <h1>&#9674; POV WHEEL CONTROL &#9674;</h1>
+    <h1>Pixels Of Velocity</h1>
     <div class="sub" id="deviceName">CONNECTING...</div>
 </header>
 
@@ -887,27 +888,19 @@ function updateBatteryStatus() {
         document.getElementById('busI').textContent = (d.ibus/1000).toFixed(2);
         if (d.chg_stat !== undefined) {
             const el = document.getElementById('chgStat');
-            // chg_stat=0 при подключённом зарядном = зарядка завершена
-            // chg_stat=0 без зарядного = не заряжается
-            if (d.chg_stat === 0 && d.vbus_ok) {
-                el.textContent = 'Charge Done (100%)';
-                el.style.color = 'var(--ok)';
-            } else if (d.chg_stat === 0) {
-                el.textContent = 'Not Charging';
-                el.style.color = 'var(--dim)';
-            } else if (d.chg_stat === 1) {
-                el.textContent = 'Trickle / Pre-charge';
-                el.style.color = 'var(--acc)';
-            } else if (d.chg_stat === 2) {
-                el.textContent = 'Fast Charge (CC)';
-                el.style.color = 'var(--acc)';
-            } else if (d.chg_stat === 3) {
-                el.textContent = 'Taper Charge (CV)';
-                el.style.color = 'var(--acc)';
-            } else {
-                el.textContent = '--';
-                el.style.color = 'var(--dim)';
-            }
+            // CHG_STAT bits[7:5] регистра 0x1B, 3 бита (BQ25792 datasheet)
+            const chgMap = [
+                ['Not Charging',      'var(--dim)'],
+                ['Trickle Charge',    'var(--acc)'],
+                ['Pre-charge',        'var(--acc)'],
+                ['Fast Charge (CC)',  'var(--acc)'],
+                ['Taper Charge (CV)', 'var(--acc)'],
+                ['Top-off Charging',  'var(--acc)'],
+                ['Charge Done',       'var(--ok)'],
+            ];
+            const entry = chgMap[d.chg_stat];
+            el.textContent   = entry ? entry[0] : '--';
+            el.style.color   = entry ? entry[1] : 'var(--dim)';
         }
     }).catch(() => {});
 }
