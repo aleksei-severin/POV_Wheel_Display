@@ -640,18 +640,10 @@ async function _uploadBuffer(buf, fileName, label) {
         });
         xhr.onload = () => {
             progWrap.style.display = 'none';
-            if (xhr.status === 200) {
-                resolve(true);
-            } else {
-                setStatus('uploadStatus', `${label} — upload failed. Try stopping the display first.`, 'err');
-                loadFiles(); loadFSInfo();
-                resolve(false);
-            }
+            resolve(xhr.status === 200);
         };
         xhr.onerror = () => {
             progWrap.style.display = 'none';
-            setStatus('uploadStatus', `${label} — connection lost. Try stopping the display first.`, 'err');
-            loadFiles(); loadFSInfo();
             resolve(false);
         };
         xhr.send(buf);
@@ -692,8 +684,21 @@ async function processAndUpload() {
             break;  // дальше смысла нет — места точно не хватит
         }
 
-        setStatus('uploadStatus', `${label} — uploading...`, '');
-        const success = await _uploadBuffer(buf, fileName, label);
+        const MAX_ATTEMPTS = 3;
+        let success = false;
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+            const attemptLabel = attempt > 1 ? `${label} — attempt ${attempt}/${MAX_ATTEMPTS}` : label;
+            setStatus('uploadStatus', `${attemptLabel} — uploading...`, '');
+            success = await _uploadBuffer(buf, fileName, attemptLabel);
+            if (success) break;
+            if (attempt < MAX_ATTEMPTS) {
+                setStatus('uploadStatus', `${attemptLabel} — failed, retrying in 2s...`, 'err');
+                await new Promise(r => setTimeout(r, 2000));
+            } else {
+                setStatus('uploadStatus', `${attemptLabel} — failed after ${MAX_ATTEMPTS} attempts.`, 'err');
+                loadFiles(); loadFSInfo();
+            }
+        }
         if (success) {
             fsFree -= buf.length;  // обновляем оценку свободного места
             ok++;

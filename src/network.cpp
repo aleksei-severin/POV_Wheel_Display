@@ -447,7 +447,14 @@ void setupNetwork() {
     server.on("/delete", HTTP_GET, [](AsyncWebServerRequest *request){
         last_web_activity_time = millis();
         if (request->hasParam("file")) {
-            LittleFS.remove("/" + request->getParam("file")->value());
+            String path = "/" + request->getParam("file")->value();
+            // Если файл сейчас открыт на запись (прерванная загрузка) — закрываем его,
+            // иначе LittleFS не освободит блоки при удалении
+            if (uploadFile && String(uploadFile.path()) == path) {
+                uploadFile.close();
+                webLogf("[WARN] Closed open upload before delete: %s", path.c_str());
+            }
+            LittleFS.remove(path);
             state_version++;
             request->send(200, "text/plain", "Deleted");
         }
@@ -482,6 +489,18 @@ void setupNetwork() {
             // освободит старые блоки до выделения новых, а не после.
             if (LittleFS.exists(filepath)) LittleFS.remove(filepath);
             uploadFile = LittleFS.open(filepath, "w");
+
+            // Регистрируем обработчик разрыва соединения (обновление страницы,
+            // потеря связи): закрываем и удаляем незавершённый файл немедленно.
+            // onDisconnect — метод request, вызывается при TCP disconnect.
+            request->onDisconnect([](){
+                if (uploadFile) {
+                    String badPath = uploadFile.path();
+                    uploadFile.close();
+                    LittleFS.remove(badPath);
+                    webLogf("[ERR] Upload interrupted (disconnect), removed: %s", badPath.c_str());
+                }
+            });
         }
         if (uploadFile) uploadFile.write(data, len);
         if (index + len == total && uploadFile) {
