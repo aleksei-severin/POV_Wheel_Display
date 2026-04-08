@@ -9,6 +9,7 @@
 #include <FastLED.h>
 #include <HTTPClient.h>
 #include <stdarg.h>
+#include <vector>
 
 AsyncWebServer server(80);
 Preferences prefs;
@@ -361,6 +362,25 @@ void setupNetwork() {
 
     server.on("/list", HTTP_GET, [](AsyncWebServerRequest *request){
         last_web_activity_time = millis();
+
+        // Первый проход: собираем нулевые файлы для удаления.
+        // Нельзя удалять во время итерации — LittleFS теряет позицию в директории.
+        {
+            std::vector<String> toDelete;
+            File root = LittleFS.open("/");
+            File f = root.openNextFile();
+            while (f) {
+                String fn = String(f.name());
+                if (fn.endsWith(".bin") && f.size() == 0) toDelete.push_back("/" + fn);
+                f = root.openNextFile();
+            }
+            for (auto& p : toDelete) {
+                LittleFS.remove(p);
+                webLogf("[WARN] Removed zero-size file: %s", p.c_str());
+            }
+        }
+
+        // Второй проход: строим JSON списка файлов
         File root = LittleFS.open("/");
         String json = "[";
         File file = root.openNextFile();
@@ -368,14 +388,6 @@ void setupNetwork() {
         while(file) {
             String fn = String(file.name());
             if(fn.endsWith(".bin")) {
-                // Удаляем битые файлы нулевого размера — результат прерванной загрузки
-                if (file.size() == 0) {
-                    file.close();
-                    LittleFS.remove("/" + fn);
-                    webLogf("[WARN] Removed zero-size file: %s", fn.c_str());
-                    file = root.openNextFile();
-                    continue;
-                }
                 if(!first) json += ",";
                 // Читаем заголовок: если файл начинается с "ANIM" — это GIF, берём кол-во кадров
                 uint16_t frames = 0;
@@ -466,6 +478,9 @@ void setupNetwork() {
                 LittleFS.remove(badPath);
                 webLogf("[ERR] Stale upload removed: %s", badPath.c_str());
             }
+            // Явно удаляем файл перед созданием: гарантирует что LittleFS
+            // освободит старые блоки до выделения новых, а не после.
+            if (LittleFS.exists(filepath)) LittleFS.remove(filepath);
             uploadFile = LittleFS.open(filepath, "w");
         }
         if (uploadFile) uploadFile.write(data, len);
