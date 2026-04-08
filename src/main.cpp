@@ -671,7 +671,7 @@ void setup() {
             case 4: state_str = "Taper Charge (CV)"; break;
             case 5: state_str = "Top-off Charging"; break;
             case 6: state_str = "Charge Done"; break;
-            default: state_str = "Reserved"; break;
+            case 7: state_str = "Charge Done"; break;
         }
         // ----------------------------------------
 
