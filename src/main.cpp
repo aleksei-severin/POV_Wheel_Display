@@ -373,15 +373,15 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
 // spi_device_polling_start/end — детерминированный busy-wait, исключает джиттер
 // от задержки пробуждения FreeRTOS (источник дрожания изображения 3–5°).
 void renderingTask(void* pvParameters) {
-    static bool     rendering_active = false; // Флаг: были ли обороты >100 RPM (для лога при снижении)
+    static bool     rendering_active = false; // Флаг: были ли обороты >125 RPM (для лога при снижении)
     uint8_t active     = 0;
     bool    tx_pending = false;
 
     while (true) {
-        // Таймаут 600мс: если холл молчит дольше 600мс — скорость точно <100RPM.
+        // Таймаут 500мс: если холл молчит дольше 500мс — скорость точно <125RPM.
         // При portMAX_DELAY задача зависала в ожидании и не успевала погасить
         // светодиоды при резкой остановке — loop() выключал питание только через 3с.
-        xSemaphoreTake(hallSemaphore, pdMS_TO_TICKS(600));
+        xSemaphoreTake(hallSemaphore, pdMS_TO_TICKS(500));
 
         if (force_stop_display || !peripherals_active || !newFrameReady) continue;
 
@@ -433,20 +433,20 @@ void renderingTask(void* pvParameters) {
         uint32_t period = rotation_period;
         interrupts();
 
-        // Пропускаем рендеринг ниже 100 RPM (period > 600 мс).
+        // Пропускаем рендеринг ниже 125 RPM (period > 480 мс).
         // Критично: при первом обороте после долгой остановки
         // rotation_period = micros() - last_hall_time = десятки миллионов мкс.
         // Без этой проверки renderingTask уходит в busy-wait на минуты,
         // вытесняя WiFi/loop, WDT срабатывает через 5 с → краш → перезагрузка.
         //
-        // Дополнительно: если с момента последнего сигнала холла прошло >600мс —
-        // обороты точно <100RPM независимо от сохранённого rotation_period.
+        // Дополнительно: если с момента последнего сигнала холла прошло >480мс —
+        // обороты точно <125RPM независимо от сохранённого rotation_period.
         uint32_t now_us = micros();
         uint32_t age_us = (now_us >= t0) ? (now_us - t0) : (0xFFFFFFFFUL - t0 + now_us + 1);
-        if (period == 0 || period > 600000 || age_us > 600000) {
+        if (period == 0 || period > 480000 || age_us > 480000) {
             if (rendering_active) {
                 rendering_active = false;
-                webLog("[PWR] RPM <100, rendering paused");
+                webLog("[PWR] RPM <125, rendering paused");
                 FastLED.clear();
                 sendLEDs_DMA();
             }
@@ -456,7 +456,7 @@ void renderingTask(void* pvParameters) {
             rendering_active = true;
             // Питание уже включено hall_event'ом в loop() — здесь только логируем
             // факт достижения порога рендеринга.
-            webLog("[PWR] RPM >=100, rendering started");
+            webLog("[PWR] RPM >=125, rendering started");
         }
 
         int last_sector = -1;
@@ -784,7 +784,7 @@ void loop() {
             digitalWrite(PIN_EN_LEVEL_SHIFT, HIGH);
             peripherals_active = true;
             last_dcdc_on_time = millis();
-            webLog("[PWR] Hall: LEDs power on (waiting for >=100 RPM)");
+            webLog("[PWR] Hall: LEDs power on (waiting for >=125 RPM)");
         }
         // Рендеринг управляется renderingTask через hallSemaphore
     }
