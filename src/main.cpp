@@ -160,7 +160,7 @@ void initBQ25792() {
     Wire.write(0x0F); // Регистр Charger Control 0
     Wire.write(0x82); // Значение 0x82: EN_CHG = 0, EN_HIZ = 0
     Wire.endTransmission(); 
-    delay(200);       // Пауза 200 мс для стабилизации
+    delay(500);       // Пауза 500 мс для стабилизации
 
     // 2. Включаем зарядку обратно (ИСПРАВЛЕНО: 0xA2 вместо 0x3A, чтобы не включать HIZ)
     Wire.beginTransmission(BQ25792_ADDR); 
