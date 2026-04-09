@@ -44,13 +44,14 @@ header .sub {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 16px; max-width: 860px; margin: 0 auto;
-    width: 100%;
+    width: 100%; overflow-x: hidden;
 }
 .full { grid-column: 1 / -1; }
 .panel {
     background: var(--card); border: 1px solid var(--border);
     padding: 16px; position: relative;
     box-shadow: 0 0 18px var(--glow), inset 0 0 18px rgba(0,212,255,0.03);
+    min-width: 0; overflow-x: hidden;
 }
 .panel::before {
     content: ''; position: absolute; top: 0; left: 0;
@@ -206,7 +207,7 @@ canvas {
 .log-dot.offline { background: var(--danger); box-shadow: 0 0 6px var(--danger); }
 .log-badge { font-size: 0.62em; color: var(--dim); }
 
-@media (max-width: 580px) { .grid { grid-template-columns: 1fr; } }
+@media (max-width: 700px) { .grid { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
