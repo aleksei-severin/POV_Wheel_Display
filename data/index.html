@@ -729,7 +729,7 @@ async function processAndUpload() {
 
 // ===================== FILE MANAGER =====================
 function loadFiles() {
-    fetch('/list').then(r => r.json()).then(files => {
+    return fetch('/list').then(r => r.json()).then(files => {
         const list = document.getElementById('fileList');
         if (!files.length) {
             list.innerHTML = '<div style="color:var(--dim);font-size:0.72em;padding:8px;">No files stored.</div>';
@@ -749,7 +749,7 @@ function loadFiles() {
 }
 
 function loadFSInfo() {
-    fetch('/fs_info').then(r => r.json()).then(d => {
+    return fetch('/fs_info').then(r => r.json()).then(d => {
         const pct = d.total ? (d.used / d.total * 100) : 0;
         document.getElementById('fsFill').style.width = pct.toFixed(1) + '%';
         document.getElementById('fsLabel').textContent =
@@ -855,7 +855,7 @@ function _applySettings(d) {
 }
 
 function loadSettings() {
-    fetch('/get_settings').then(r => r.json()).then(d => {
+    return fetch('/get_settings').then(r => r.json()).then(d => {
         _applySettings(d);
         updateBriCursor(d.brightness);
     }).catch(() => {});
@@ -875,25 +875,25 @@ document.getElementById('wheelCirc').addEventListener('change', function() {
 });
 
 function updateInfo() {
-    fetch('/info').then(r => r.json()).then(d => {
+    return fetch('/info').then(r => r.json()).then(d => {
         const rpm = d.rpm;
         document.getElementById('infoRpm').textContent = rpm.toFixed(0);
         // speed (km/h) = circumference(mm) * rpm / 60 / 1000 * 3.6
         const kmh = wheelCircMm * rpm * 0.00006;
         document.getElementById('infoSpeed').textContent = kmh.toFixed(1);
-    }).catch(() => {});
+    });
+    // Нет .catch() — ошибка пробрасывается в _pollInfo для остановки цепочки
 }
 
 // ===================== BATTERY =====================
 function updateBatteryStatus() {
-    fetch('/battery').then(r => r.json()).then(d => {
+    return fetch('/battery').then(r => r.json()).then(d => {
         document.getElementById('batV').textContent = (d.vbat/1000).toFixed(2);
         document.getElementById('batI').textContent = (d.ibat/1000).toFixed(2);
         document.getElementById('busV').textContent = (d.vbus/1000).toFixed(2);
         document.getElementById('busI').textContent = (d.ibus/1000).toFixed(2);
         if (d.chg_stat !== undefined) {
             const el = document.getElementById('chgStat');
-            // CHG_STAT bits[7:5] регистра 0x1B, 3 бита (BQ25792 datasheet)
             const chgMap = [
                 ['Not Charging',      'var(--dim)'],
                 ['Trickle Charge',    'var(--acc)'],
@@ -908,7 +908,8 @@ function updateBatteryStatus() {
             el.textContent   = entry ? entry[0] : '--';
             el.style.color   = entry ? entry[1] : 'var(--dim)';
         }
-    }).catch(() => {});
+    });
+    // Нет .catch() — ошибка пробрасывается в _pollBattery для остановки цепочки
 }
 
 // ===================== HELPERS =====================
@@ -924,24 +925,6 @@ function setStatus(id, msg, cls) {
 let _logNextIdx    = 0;      // Следующий глобальный индекс для запроса
 let _logLines      = [];     // Вся накопленная история в браузере
 let _logAutoScroll = true;
-let _logOnline     = false;  // Текущий статус связи
-let _logOfflineCnt = 0;
-
-function _setLogStatus(online) {
-    if (_logOnline === online) return;
-    _logOnline = online;
-    const dot  = document.getElementById('logDot');
-    const text = document.getElementById('logStatusText');
-    if (online) {
-        dot.className  = 'log-dot online';
-        text.textContent = 'ONLINE';
-        text.style.color = 'var(--ok)';
-    } else {
-        dot.className  = 'log-dot offline';
-        text.textContent = 'OFFLINE';
-        text.style.color = 'var(--danger)';
-    }
-}
 
 function _logColor(msg) {
     if (msg.includes('[NET]'))  return '#00d4ff';
@@ -1019,9 +1002,6 @@ async function _logPoll() {
         if (!r.ok) throw new Error('HTTP ' + r.status);
         const d = await r.json();
 
-        _logOfflineCnt = 0;
-        _setLogStatus(true);
-
         // Обнаружение перезапуска устройства: total уменьшился → очищаем старые логи
         if (d.total < _logNextIdx) {
             _logLines = [];
@@ -1050,51 +1030,160 @@ async function _logPoll() {
         } else if (d.total !== _logNextIdx) {
             _logNextIdx = d.total;
         }
-    } catch(e) {
-        _logOfflineCnt++;
-        if (_logOfflineCnt >= 2) {
-            _setLogStatus(false);
-        }
     } finally {
         _logPollRunning = false;
     }
 }
 
-// ===================== INIT =====================
+// ===================== CONNECTION MANAGER =====================
+// Единая точка управления соединением. Все polling-функции работают только
+// когда _conn.online === true. При переходе офлайн→онлайн сначала выполняется
+// полный начальный цикл синхронизации, только потом стартует polling.
+// Это исключает отправку запросов к устройству пока оно ещё недоступно,
+// и гарантирует что UI синхронизируется с чистого листа после переподключения.
+
+const _conn = {
+    online:       false,   // Текущее состояние соединения
+    failCount:    0,       // Количество последовательных неудач ping
+    pollActive:   false,   // true пока polling-цепочки запущены
+    pingTimer:    null,    // Таймер следующего ping
+};
+
+// Обновляет индикатор статуса (ONLINE/OFFLINE) в UI
+function _setOnline(online) {
+    if (_conn.online === online) return;
+    _conn.online = online;
+    // Обновляем тот же индикатор что использовал _logPoll
+    const dot  = document.getElementById('logDot');
+    const text = document.getElementById('logStatusText');
+    if (online) {
+        dot.className    = 'log-dot online';
+        text.textContent = 'ONLINE';
+        text.style.color = 'var(--ok)';
+    } else {
+        dot.className    = 'log-dot offline';
+        text.textContent = 'OFFLINE';
+        text.style.color = 'var(--danger)';
+    }
+}
+
+// Полная начальная синхронизация после установления соединения.
+// Все запросы идут параллельно — ESP32 уже готов (ping прошёл).
+// _logPoll идёт последним т.к. он делает POST /settime и зависит от готовности сервера.
+async function _initialSync() {
+    document.getElementById('deviceName').textContent = window.location.hostname || 'pov-wheel';
+    // Сбрасываем stateVersion — иначе polling не применит изменения после ребута.
+    _stateVersion = null;
+    _logNextIdx   = 0;
+
+    await Promise.allSettled([
+        loadSettings(),
+        loadFiles(),
+        loadFSInfo(),
+        updateBatteryStatus(),
+        _logPoll(),
+    ]);
+}
+
+// Polling-цепочки.
+// Правило: при ЛЮБОЙ ошибке цепочка завершается (не планирует следующий вызов).
+// Перезапуск — только через _startPolling() из ping-цикла после восстановления связи.
+// Это исключает burst быстрых retry пока ping ещё не зафиксировал офлайн.
+async function _pollSettings() {
+    if (!_conn.online) return;
+    try {
+        const r = await _fetchTimeout('/get_settings', {}, 3000);
+        if (!r.ok) throw new Error();
+        const d = await r.json();
+        updateBriCursor(d.brightness);
+        if (_stateVersion !== null && d.ver !== _stateVersion) {
+            _applySettings(d);
+            loadFiles();
+            loadFSInfo();
+        }
+        _stateVersion = d.ver;
+        setTimeout(_pollSettings, 500);   // следующий цикл только при успехе
+    } catch(e) {
+        _conn.pollActive = false;          // сигнал ping-циклу что цепочка упала
+    }
+}
+
+async function _pollInfo() {
+    if (!_conn.online) return;
+    try {
+        await updateInfo();
+        setTimeout(_pollInfo, 500);
+    } catch(e) {
+        _conn.pollActive = false;
+    }
+}
+
+async function _pollBattery() {
+    if (!_conn.online) return;
+    try {
+        await updateBatteryStatus();
+        setTimeout(_pollBattery, 2000);
+    } catch(e) {
+        _conn.pollActive = false;
+    }
+}
+
+async function _pollLogs() {
+    if (!_conn.online) return;
+    try {
+        await _logPoll();
+        setTimeout(_pollLogs, 2000);
+    } catch(e) {
+        _conn.pollActive = false;
+    }
+}
+
+// Запускает все polling-цепочки. Защита от двойного запуска через _conn.pollActive.
+function _startPolling() {
+    if (_conn.pollActive) return;
+    _conn.pollActive = true;
+    _pollSettings();
+    setTimeout(_pollInfo,    150);
+    setTimeout(_pollBattery, 300);
+    setTimeout(_pollLogs,    450);
+}
+
+// Останавливает polling — цепочки не перезапустятся при следующей ошибке.
+function _stopPolling() {
+    _conn.pollActive = false;
+}
+
+// Главный ping-цикл: единственная функция которая определяет онлайн/офлайн.
+// Интервал: 1с. Синхронизация и polling запускаются асинхронно — ping не блокируется.
+async function _pingLoop() {
+    try {
+        const r = await _fetchTimeout('/ping', {}, 2000);
+        if (!r.ok) throw new Error();
+        _conn.failCount = 0;
+        if (!_conn.online) {
+            // Переход офлайн → онлайн: синхронизируем и запускаем polling параллельно с ping.
+            _setOnline(true);
+            _initialSync().then(() => _startPolling());
+        } else if (!_conn.pollActive) {
+            // Polling упал по ошибке пока мы были онлайн — перезапускаем.
+            _startPolling();
+        }
+    } catch(e) {
+        _conn.failCount++;
+        // 2 неудачи подряд → офлайн
+        if (_conn.failCount >= 2 && _conn.online) {
+            _setOnline(false);
+            _stopPolling();
+        }
+    }
+    _conn.pingTimer = setTimeout(_pingLoop, 1000);
+}
+
 window.onload = () => {
-    fetch('/ping').then(() => {
-        document.getElementById('deviceName').textContent = window.location.hostname || 'pov-wheel';
-    });
-
-    loadFiles();
-    loadFSInfo();
-    loadSettings();
-    updateBatteryStatus();
-
-    // NOW-яркость + синхронизация между браузерами: 500 мс.
-    // Поле ver: если версия изменилась на другом клиенте — перезагружаем файлы и
-    // применяем настройки без лишнего запроса (данные уже есть в ответе).
-    setInterval(() => {
-        fetch('/get_settings').then(r => r.json()).then(d => {
-            updateBriCursor(d.brightness);
-            if (_stateVersion !== null && d.ver !== _stateVersion) {
-                // Применяем настройки из текущего ответа
-                _applySettings(d);
-                // Обновляем список файлов и инфо о памяти
-                loadFiles();
-                loadFSInfo();
-            }
-            _stateVersion = d.ver;
-        }).catch(() => {});
-    }, 500);
-    // Батарея: 2 с — медленный опрос, т.к. требует I2C ADC замеров
-    setInterval(updateBatteryStatus, 2000);
-    // RPM/Speed: 500 мс
-    updateInfo();
-    setInterval(updateInfo, 500);
-    // Логи: первый запрос сразу, далее каждые 2 с
-    _logPoll();
-    setInterval(_logPoll, 2000);
+    // Запускаем только ping-цикл. Он сам определит когда устройство онлайн
+    // и запустит синхронизацию + polling. Это работает корректно и при первой
+    // загрузке страницы, и при переподключении после ребута устройства.
+    _pingLoop();
 };
 </script>
 </body>

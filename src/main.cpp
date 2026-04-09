@@ -15,6 +15,7 @@
 #include "driver/spi_master.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
+#include "esp_task_wdt.h"
 
 // Экспортируем сервер из network.cpp для добавления нового эндпоинта
 extern AsyncWebServer server;
@@ -62,6 +63,19 @@ volatile uint32_t last_dcdc_on_time = 0;  // Момент включения DCD
 bool peripherals_active = true;
 //volatile bool blink_ok_flag = false;
 volatile float last_lux_value = 0.0f; // Последнее валидное показание BH1750 (lux)
+
+// --- КЕШ ДАННЫХ БАТАРЕИ (обновляется из loop(), читается из /battery без Wire) ---
+// Доступ только из Core 1 (loop) на запись и из Core 0 (AsyncWebServer) на чтение.
+// Отдельные поля — примитивы ≤32 бит, запись атомарна на Xtensa — мьютекс не нужен.
+struct BatteryCache {
+    int16_t  vbat      = 0;
+    int16_t  ibat      = 0;
+    int16_t  vbus      = 0;
+    int16_t  ibus      = 0;
+    uint8_t  chg_stat  = 0;
+    bool     vbus_ok   = false;
+};
+static BatteryCache bat_cache;
 
 // --- ESP-IDF SPI DMA для SK9822 ---
 #define SK9822_END_FRAMES 20
@@ -377,11 +391,19 @@ void renderingTask(void* pvParameters) {
     uint8_t active     = 0;
     bool    tx_pending = false;
 
+    // Отписываем IDLE-задачу Core 1 от Task WDT: renderingTask (приоритет 18)
+    // занимает Core 1 почти непрерывно через spi_device_polling busy-wait,
+    // IDLE не получает тиков → WDT срабатывает через 5с.
+    // renderingTask сам сбрасывает WDT в конце каждого оборота.
+    esp_task_wdt_delete(xTaskGetIdleTaskHandleForCPU(1));
+    esp_task_wdt_add(xTaskGetCurrentTaskHandle());
+
     while (true) {
         // Таймаут 500мс: если холл молчит дольше 500мс — скорость точно <125RPM.
         // При portMAX_DELAY задача зависала в ожидании и не успевала погасить
         // светодиоды при резкой остановке — loop() выключал питание только через 3с.
         xSemaphoreTake(hallSemaphore, pdMS_TO_TICKS(500));
+        esp_task_wdt_reset(); // Сбрасываем WDT после каждого ожидания (в т.ч. при pause/stop)
 
         if (force_stop_display || !peripherals_active || !newFrameReady) continue;
 
@@ -479,17 +501,19 @@ void renderingTask(void* pvParameters) {
             if (sector != last_sector) {
                 uint8_t idle = 1 - active;
 
-                // Заполняем свободный буфер ПОКА предыдущая DMA-передача ещё идёт (~50 мкс).
+                // Заполняем свободный буфер ПОКА предыдущая DMA-передача ещё идёт.
                 fillSectorIntoBuffer(dma_buf[idle], sector);
 
-                // Ждём завершения предыдущей передачи детерминированным busy-wait —
-                // без планировщика, без случайных задержек пробуждения задачи.
+                // Ждём завершения предыдущей передачи.
+                // spi_device_get_trans_result не держит критическую секцию —
+                // прерывания разрешены, lwIP/WiFi обрабатывают пакеты во время ожидания.
                 if (tx_pending) {
-                    spi_device_polling_end(sk9822_spi, portMAX_DELAY);
+                    spi_transaction_t* done;
+                    spi_device_get_trans_result(sk9822_spi, &done, portMAX_DELAY);
                 }
 
-                // Немедленно стартуем следующий сектор — минимальная задержка переключения
-                spi_device_polling_start(sk9822_spi, &spi_trans[idle], portMAX_DELAY);
+                // Ставим следующий сектор в очередь DMA (асинхронно, без spinlock).
+                spi_device_queue_trans(sk9822_spi, &spi_trans[idle], portMAX_DELAY);
 
                 active      = idle;
                 tx_pending  = true;
@@ -497,9 +521,10 @@ void renderingTask(void* pvParameters) {
             }
         }
 
-        // Закрываем последнюю незавершённую транзакцию перед следующим оборотом
+        // Забираем последнюю незавершённую транзакцию перед следующим оборотом
         if (tx_pending) {
-            spi_device_polling_end(sk9822_spi, portMAX_DELAY);
+            spi_transaction_t* done;
+            spi_device_get_trans_result(sk9822_spi, &done, portMAX_DELAY);
             tx_pending = false;
         }
     }
@@ -525,6 +550,18 @@ void fileLoaderTask(void* pvParameters) {
             loadFrameFromFile(pendingFilePath);
             pendingFilePath = "";
         }
+    }
+}
+
+// Сетевая задача: ArduinoOTA + ElegantOTA + переподключение WiFi.
+// Вынесена из loop() на Core 0: renderingTask (приоритет 18) на Core 1 полностью
+// вытесняет loop() (приоритет 1) во время рендеринга, из-за чего loopNetwork()
+// не вызывался достаточно часто → Task WDT на loopTask.
+// Core 0 не затронут рендерингом — loopNetwork() выполняется стабильно каждые 5мс.
+void networkTask(void* pvParameters) {
+    for (;;) {
+        loopNetwork();
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 
@@ -630,61 +667,19 @@ void setup() {
     setupNetwork();
     last_web_activity_time = millis();  // Считаем загрузку страницы активностью
 
-    // Эндпоинт для телеметрии батареи с добавленным полным дебагом конфигурации ЗУ
+    // Эндпоинт для телеметрии батареи — отдаёт кешированные данные без Wire.
+    // Данные обновляются из loop() раз в секунду на Core 1.
+    // Wire из Core 0 (AsyncWebServer) вызывался параллельно с loop() → гонка → WDT.
     server.on("/battery", HTTP_GET, [](AsyncWebServerRequest *request){
         // Фоновый поллинг — не сбрасывает таймер активности
-        // Включаем ADC (на случай если он был отключен)
-        Wire.beginTransmission(BQ25792_ADDR);
-        Wire.write(0x2E);
-        Wire.write(0x80); // ADC_EN = 1
-        Wire.endTransmission();
-        
-        int16_t vbus = readBQ16(0x35); // VBUS_ADC (0x35)
-        int16_t ibus = readBQ16(0x31); // IBUS_ADC (0x31)
-        int16_t vbat = readBQ16(0x3B); // VBAT_ADC (0x3B)
-        int16_t ibat = readBQ16(0x33); // IBAT_ADC (0x33)
-        
-        // --- ДЕТАЛЬНЫЙ ДЕБАГ РЕГИСТРОВ ЗАРЯДА ---
-        uint8_t reg00 = readBQ8(0x00); // VSYSMIN
-        uint8_t reg0F = readBQ8(0x0F); // Charger Control 0
-        uint8_t reg1B = readBQ8(0x1B); // Charger Status 0
-        uint8_t reg1C = readBQ8(0x1C); // Charger Status 1
-        uint8_t reg20 = readBQ8(0x20); // Fault Status 0
-        uint8_t reg21 = readBQ8(0x21); // Fault Status 1
-
-        uint16_t chg_v_limit = readBQ16(0x01); // Charge Voltage Limit
-        uint16_t chg_i_limit = readBQ16(0x03); // Charge Current Limit
-        uint16_t in_i_limit = readBQ16(0x06);  // Input Current Limit
-
-        bool vbus_present   = (reg1B & 0x08) != 0;  // bit[3] = VBUS_PRESENT_STAT (подтверждено: reg1B=0x0F)
-        bool charge_enabled = (reg0F >> 5) & 0x01;
-        // CHG_STAT в bits[7:5] регистра 0x1C (подтверждено эмпирически: reg1C=0x8A → bits[7:5]=100 = Taper CV)
-        uint8_t chg_state   = (reg1C >> 5) & 0x07;
-        bool ilim_active    = (reg1C >> 6) & 0x01;
-
-        String state_str = "Unknown";
-        switch(chg_state) {
-            case 0: state_str = "Not Charging"; break;
-            case 1: state_str = "Trickle Charge"; break;
-            case 2: state_str = "Pre-charge"; break;
-            case 3: state_str = "Fast Charge (CC)"; break;
-            case 4: state_str = "Taper Charge (CV)"; break;
-            case 5: state_str = "Top-off Charging"; break;
-            case 6: state_str = "Charge Done"; break;
-            case 7: state_str = "Charge Done"; break;
-        }
-        // ----------------------------------------
-
-        bool connected = vbus_present;
-
         String json = "{";
-        json += "\"vbat\":" + String(vbat) + ",";
-        json += "\"ibat\":" + String(ibat) + ",";
-        json += "\"vbus\":" + String(vbus) + ",";
-        json += "\"ibus\":" + String(ibus) + ",";
-        json += "\"chg_stat\":" + String(chg_state) + ",";
-        json += "\"vbus_ok\":" + String(vbus_present ? "true" : "false") + ",";
-        json += "\"connected\":" + String(connected ? "true" : "false");
+        json += "\"vbat\":"     + String(bat_cache.vbat)    + ",";
+        json += "\"ibat\":"     + String(bat_cache.ibat)    + ",";
+        json += "\"vbus\":"     + String(bat_cache.vbus)    + ",";
+        json += "\"ibus\":"     + String(bat_cache.ibus)    + ",";
+        json += "\"chg_stat\":" + String(bat_cache.chg_stat) + ",";
+        json += "\"vbus_ok\":"  + String(bat_cache.vbus_ok  ? "true" : "false") + ",";
+        json += "\"connected\":" + String(bat_cache.vbus_ok ? "true" : "false");
         json += "}";
         request->send(200, "application/json", json);
     });
@@ -715,6 +710,11 @@ void setup() {
     fileLoaderSemaphore = xSemaphoreCreateBinary();
     xTaskCreatePinnedToCore(fileLoaderTask, "loader", 4096, NULL, 2, NULL, 0);
 
+    // Сетевая задача: ArduinoOTA + ElegantOTA + WiFi reconnect — Core 0, приоритет 3.
+    // Вынесена из loop(): renderingTask на Core 1 полностью вытесняет loop() во время
+    // рендеринга, loopNetwork() не вызывается → WDT на loopTask.
+    xTaskCreatePinnedToCore(networkTask, "network", 4096, NULL, 3, NULL, 0);
+
     // Приоритет 18: выше WiFi/lwIP (1–3), выше loop() (1), ниже системных задач ESP-IDF (22+).
     // Высокий приоритет минимизирует вытеснение во время рендеринга.
     xTaskCreatePinnedToCore(renderingTask, "render", 4096, NULL, 18, NULL, 1);
@@ -722,16 +722,17 @@ void setup() {
     // Подключаем прерывания
     attachInterrupt(digitalPinToInterrupt(PIN_COLOR_INT), magnetInterruptHandler, FALLING);
     attachInterrupt(digitalPinToInterrupt(PIN_WAKEUP), wakeupInterruptHandler, FALLING);
+
+    // Открываем сервер только после полной инициализации:
+    // все эндпоинты зарегистрированы, Wire/I2C готов, задачи созданы.
+    // Это исключает WDT-краш когда браузер открыт заранее и шлёт запросы
+    // пока setup() ещё работает с BQ25792 или LittleFS.
+    server.begin();
+    webLog("[NET] HTTP server started");
 }
 
 void loop() {
-    static uint32_t last_network_us = 0;
-    static uint32_t last_play_ms    = 0; // Время последнего запроса /play (для Section 2)
-    uint32_t now_us_net = micros();
-    if (now_us_net - last_network_us >= 5000) {
-        loopNetwork();
-        last_network_us = micros();
-    }
+    static uint32_t last_play_ms = 0; // Время последнего запроса /play (для Section 2)
 
     uint32_t now_ms = millis();
     uint32_t now_us = micros();
@@ -1022,6 +1023,18 @@ void loop() {
         Wire.endTransmission();
 
         int16_t vbat_raw = readBQ16(0x3B);
+
+        // Обновляем кеш батареи — /battery endpoint читает отсюда без Wire
+        bat_cache.vbat     = vbat_raw;
+        bat_cache.ibat     = readBQ16(0x33); // IBAT_ADC
+        bat_cache.vbus     = readBQ16(0x35); // VBUS_ADC
+        bat_cache.ibus     = readBQ16(0x31); // IBUS_ADC
+        {
+            uint8_t reg1B      = readBQ8(0x1B);
+            uint8_t reg1C      = readBQ8(0x1C);
+            bat_cache.vbus_ok  = (reg1B & 0x08) != 0;
+            bat_cache.chg_stat = (reg1C >> 5) & 0x07;
+        }
 
         if (vbat_raw >= 1000 && vbat_raw <= 1400) {
             if (now_ms - last_bms_recovery_time > 30000) {

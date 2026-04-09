@@ -588,7 +588,12 @@ void setupNetwork() {
 
     ElegantOTA.begin(&server);
     ElegantOTA.onStart(safeOTAShutdown);
-    server.begin();
+    // server.begin() намеренно НЕ вызывается здесь.
+    // AsyncTCP начинает принимать соединения сразу после begin(),
+    // и браузер, открытый до загрузки устройства, немедленно шлёт запросы
+    // пока setup() ещё не завершился (initBQ25792, /battery endpoint и т.д.).
+    // Задача AsyncTCP зависает ожидая lwIP → Task WDT через 5с → перезагрузка.
+    // server.begin() вызывается из setup() после полной инициализации.
 
     ArduinoOTA.setHostname(hostName.c_str());
     ArduinoOTA.onStart(safeOTAShutdown);
