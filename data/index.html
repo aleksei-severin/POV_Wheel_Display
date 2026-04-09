@@ -251,7 +251,7 @@ canvas {
     <div class="bri-wrap">
         <div class="bri-track"></div>
         <div class="bri-fill" id="drFill"></div>
-        <div class="bri-cursor" id="drCursor" style="left:0%"></div>
+        <div class="bri-cursor" id="drCursor"></div>
         <input type="range" id="bMinSlide" min="5" max="40" value="5">
         <input type="range" id="bMaxSlide" min="5" max="40" value="40">
     </div>
@@ -772,8 +772,12 @@ function updateDualRange() {
     const minV = +document.getElementById('bMinSlide').value;
     const maxV = +document.getElementById('bMaxSlide').value;
     const fill = document.getElementById('drFill');
-    fill.style.left  = pct(minV) + '%';
-    fill.style.width = (pct(maxV) - pct(minV)) + '%';
+    const thumbR = 8; // половина ширины thumb (16px / 2)
+    const pMin = pct(minV) / 100;
+    const pMax = pct(maxV) / 100;
+    // Заливка точно совпадает с реальным диапазоном движения thumb'ов
+    fill.style.left  = `calc(${thumbR}px + ${pMin} * (100% - ${2 * thumbR}px))`;
+    fill.style.width = `calc(${(pMax - pMin)} * (100% - ${2 * thumbR}px))`;
     document.getElementById('bMinVal').textContent = minV;
     document.getElementById('bMaxVal').textContent = maxV;
     // Немедленно пересчитать позицию NOW в новых границах
@@ -786,7 +790,13 @@ function updateBriCursor(val) {
     const maxV = +document.getElementById('bMaxSlide').value;
     // NOW всегда внутри диапазона [min, max] — ни визуально, ни реально не выходит за границы
     const displayVal = Math.min(Math.max(val, minV), maxV);
-    document.getElementById('drCursor').style.left = pct(displayVal) + '%';
+    // Браузер рендерит thumb с отступом thumbR от краёв трека.
+    // Компенсируем: реальная позиция = thumbR + pct * (trackWidth - 2*thumbR)
+    // Выражаем через calc(), чтобы не зависеть от пиксельной ширины контейнера.
+    const thumbR = 8; // половина ширины thumb (16px / 2)
+    const p = pct(displayVal) / 100; // 0..1
+    document.getElementById('drCursor').style.left =
+        `calc(${thumbR}px + ${p} * (100% - ${2 * thumbR}px))`;
     document.getElementById('briVal').textContent = displayVal;
 }
 
