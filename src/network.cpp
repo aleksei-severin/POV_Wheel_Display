@@ -314,8 +314,14 @@ void setupNetwork() {
 
     server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *request){
         last_web_activity_time = millis();
-        if (request->hasParam("bmin")) min_brightness = request->getParam("bmin")->value().toInt();
-        if (request->hasParam("bmax")) max_brightness = request->getParam("bmax")->value().toInt();
+        if (request->hasParam("bmin")) {
+            int v = request->getParam("bmin")->value().toInt();
+            if (v >= 0 && v <= 31) min_brightness = (uint8_t)v;
+        }
+        if (request->hasParam("bmax")) {
+            int v = request->getParam("bmax")->value().toInt();
+            if (v >= 0 && v <= 31) max_brightness = (uint8_t)v;
+        }
         if (request->hasParam("a")) global_angle_offset = request->getParam("a")->value().toInt();
         if (request->hasParam("g")) {
             float gv = request->getParam("g")->value().toFloat();
@@ -336,6 +342,18 @@ void setupNetwork() {
         if (request->hasParam("arms")) {
             int av = request->getParam("arms")->value().toInt();
             if (av >= 1 && av <= 8) global_num_arms = (uint8_t)av;
+        }
+        if (request->hasParam("rg")) {
+            float v = request->getParam("rg")->value().toFloat();
+            if (v >= 0.0f && v <= 200.0f) global_r_gain = v;
+        }
+        if (request->hasParam("gg")) {
+            float v = request->getParam("gg")->value().toFloat();
+            if (v >= 0.0f && v <= 200.0f) global_g_gain = v;
+        }
+        if (request->hasParam("bg")) {
+            float v = request->getParam("bg")->value().toFloat();
+            if (v >= 0.0f && v <= 200.0f) global_b_gain = v;
         }
         // Мгновенный пересчёт яркости — не ждём следующего тика датчика (50 мс)
         float ratio = constrain(last_lux_value / 1000.0f, 0.0f, 1.0f);
@@ -360,6 +378,9 @@ void setupNetwork() {
         json += "\"contrast\":" + String(global_contrast, 1) + ",";
         json += "\"circ\":" + String(wheel_circumference) + ",";
         json += "\"arms\":" + String(global_num_arms) + ",";
+        json += "\"rg\":" + String(global_r_gain, 1) + ",";
+        json += "\"gg\":" + String(global_g_gain, 1) + ",";
+        json += "\"bg\":" + String(global_b_gain, 1) + ",";
         json += "\"ver\":" + String(state_version);
         json += "}";
         request->send(200, "application/json", json);

@@ -21,10 +21,10 @@
 extern AsyncWebServer server;
 
 // --- ИНИЦИАЛИЗАЦИЯ ГЛОБАЛЬНЫХ ПЕРЕМЕННЫХ ---
-volatile uint8_t global_brightness = 20; 
+volatile uint8_t global_brightness = 8; // единицы SK9822 (0–31)
 
-RTC_DATA_ATTR uint8_t min_brightness = 5;
-RTC_DATA_ATTR uint8_t max_brightness = 40;
+RTC_DATA_ATTR uint8_t min_brightness = 2;  // единицы SK9822 (0–31)
+RTC_DATA_ATTR uint8_t max_brightness = 16; // единицы SK9822 (0–31)
 RTC_DATA_ATTR volatile int global_angle_offset = 86;
 
 uint8_t* frameBuffer = nullptr; 
@@ -96,12 +96,17 @@ String                     pendingFilePath;
 volatile bool wakeup_event = false;
 volatile bool request_play_flag = false;
 
-RTC_DATA_ATTR volatile float global_gamma         = 3.5f; // Сохраняется в RTC-памяти (переживает deep sleep)
-RTC_DATA_ATTR volatile float global_saturation    = 1.0f; // 1.0 = без изменений, >1 усиливает насыщенность
-RTC_DATA_ATTR volatile float global_contrast      = 10.0f; // 0..100 %, 0 = без изменений (factor 1.0)
-RTC_DATA_ATTR volatile uint16_t wheel_circumference = 2355; // Длина окружности колеса в мм
-RTC_DATA_ATTR volatile uint8_t  global_num_arms     = 4;   // Количество лучей (1–8)
-uint8_t gamma_lut[256];
+RTC_DATA_ATTR volatile float global_gamma         = 3.5f;
+RTC_DATA_ATTR volatile float global_saturation    = 1.0f;
+RTC_DATA_ATTR volatile float global_contrast      = 10.0f;
+RTC_DATA_ATTR volatile float global_r_gain        = 100.0f; // 0..200 %, 100 = без изменений
+RTC_DATA_ATTR volatile float global_g_gain        = 100.0f;
+RTC_DATA_ATTR volatile float global_b_gain        = 100.0f;
+RTC_DATA_ATTR volatile uint16_t wheel_circumference = 2355;
+RTC_DATA_ATTR volatile uint8_t  global_num_arms     = 7;
+uint8_t lut_r[256];
+uint8_t lut_g[256];
+uint8_t lut_b[256];
 
 // Хелперы для I2C чтения BQ25798
 uint8_t readBQ8(uint8_t reg) {
@@ -273,7 +278,9 @@ void initSK9822_DMA() {
     webLog("[SYS] SK9822 DMA ready");
 }
 
-// Заменитель FastLED.show() для статусных заливок и очистки
+// Заменитель FastLED.show() для статусных заливок и очистки.
+// Всегда отправляет полный буфер SK9822_MAX_LEDS — диоды сверх NUM_LEDS явно гасятся,
+// чтобы физически подключённые лучи 5–8 не держали предыдущий кадр.
 void sendLEDs_DMA() {
     if (!dma_tx_buffer || !sk9822_spi || !dmaMutex) return;
     xSemaphoreTake(dmaMutex, portMAX_DELAY);
@@ -284,6 +291,13 @@ void sendLEDs_DMA() {
         led_ptr[i * 4 + 2] = leds[i].g;
         led_ptr[i * 4 + 3] = leds[i].r;
     }
+    // Гасим диоды сверх NUM_LEDS (лучи 5–8)
+    for (int i = NUM_LEDS; i < SK9822_MAX_LEDS; i++) {
+        led_ptr[i * 4 + 0] = 0xE0;
+        led_ptr[i * 4 + 1] = 0;
+        led_ptr[i * 4 + 2] = 0;
+        led_ptr[i * 4 + 3] = 0;
+    }
     spi_transaction_t t = {};
     t.length    = SK9822_BUF_SIZE * 8;
     t.tx_buffer = dma_tx_buffer;
@@ -291,15 +305,20 @@ void sendLEDs_DMA() {
     xSemaphoreGive(dmaMutex);
 }
 
-// Перестраивает LUT гамма-коррекции с контрастом; вызывается из setup() и при изменении параметров.
-// Контраст совмещён с гаммой в одной таблице — горячий цикл рендера не меняется.
+// Перестраивает три LUT (R, G, B): гамма + контраст + gain канала.
+// Все три преобразования объединены в одну таблицу — горячий цикл рендера не меняется.
 void rebuildGammaLUT() {
-    float g      = global_gamma;
-    float factor = 1.0f + global_contrast * 0.02f;  // 0% → 1.0 (норма), 100% → 3.0 (максимум)
-    for (int i = 0; i < 256; i++) {
-        float v = powf(i / 255.0f, g) * 255.0f;      // гамма-коррекция
-        v = 128.0f + (v - 128.0f) * factor;           // контраст вокруг средней точки
-        gamma_lut[i] = (uint8_t)constrain((int)(v + 0.5f), 0, 255);
+    float g        = global_gamma;
+    float factor   = 1.0f + global_contrast * 0.02f; // 0% → 1.0, 100% → 3.0
+    float gain[3]  = { global_r_gain * 0.01f, global_g_gain * 0.01f, global_b_gain * 0.01f };
+    uint8_t* luts[3] = { lut_r, lut_g, lut_b };
+    for (int ch = 0; ch < 3; ch++) {
+        for (int i = 0; i < 256; i++) {
+            float v = powf(i / 255.0f, g) * 255.0f;      // гамма
+            v = 128.0f + (v - 128.0f) * factor;           // контраст
+            v = v * gain[ch];                              // усиление канала
+            luts[ch][i] = (uint8_t)constrain((int)(v + 0.5f), 0, 255);
+        }
     }
 }
 
@@ -320,13 +339,23 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
     }
     static float   last_built_gamma    = -1.0f;
     static float   last_built_contrast = -999.0f;
+    static float   last_built_r        = -1.0f;
+    static float   last_built_g        = -1.0f;
+    static float   last_built_b        = -1.0f;
     static float   last_built_sat      = -1.0f;
     static int16_t sat_fxp             = 256;
 
-    if (global_gamma != last_built_gamma || global_contrast != last_built_contrast) {
+    if (global_gamma    != last_built_gamma    ||
+        global_contrast != last_built_contrast ||
+        global_r_gain   != last_built_r        ||
+        global_g_gain   != last_built_g        ||
+        global_b_gain   != last_built_b) {
         rebuildGammaLUT();
         last_built_gamma    = global_gamma;
         last_built_contrast = global_contrast;
+        last_built_r        = global_r_gain;
+        last_built_g        = global_g_gain;
+        last_built_b        = global_b_gain;
     }
     if (global_saturation != last_built_sat) {
         sat_fxp = (int16_t)(global_saturation * 256.0f);
@@ -334,7 +363,7 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
     }
 
     uint32_t anim_offset = currentFrameIndex * FRAME_SIZE;
-    uint8_t  bri_byte    = 0xE0 | ((global_brightness * 31) / 100);
+    uint8_t  bri_byte    = 0xE0 | (global_brightness & 0x1F); // global_brightness уже в единицах SK9822 (0–31)
     uint8_t* led_ptr     = buf + 4;
 
     // Количество лучей читаем один раз — не меняется в середине кадра
@@ -362,9 +391,9 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
 
         for (int i = 0; i < 38; i++) {
             // --- Передняя половина луча (LEDs 0–37) ---
-            uint8_t r = gamma_lut[src_f[i * 3]];
-            uint8_t g = gamma_lut[src_f[i * 3 + 1]];
-            uint8_t b = gamma_lut[src_f[i * 3 + 2]];
+            uint8_t r = lut_r[src_f[i * 3]];
+            uint8_t g = lut_g[src_f[i * 3 + 1]];
+            uint8_t b = lut_b[src_f[i * 3 + 2]];
             if (sat_fxp != 256) {
                 int16_t L  = (int16_t)((77 * r + 150 * g + 29 * b) >> 8);
                 int16_t r2 = L + (((int16_t)r - L) * sat_fxp >> 8);
@@ -379,9 +408,9 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
             led_ptr[idx_a + 2] = g;        led_ptr[idx_a + 3] = r;
 
             // --- Задняя половина луча (LEDs 38–75, зеркальный сектор + 180°) ---
-            uint8_t rb = gamma_lut[src_b[i * 3]];
-            uint8_t gb = gamma_lut[src_b[i * 3 + 1]];
-            uint8_t bb = gamma_lut[src_b[i * 3 + 2]];
+            uint8_t rb = lut_r[src_b[i * 3]];
+            uint8_t gb = lut_g[src_b[i * 3 + 1]];
+            uint8_t bb = lut_b[src_b[i * 3 + 2]];
             if (sat_fxp != 256) {
                 int16_t L  = (int16_t)((77 * rb + 150 * gb + 29 * bb) >> 8);
                 int16_t r2 = L + (((int16_t)rb - L) * sat_fxp >> 8);
@@ -706,11 +735,15 @@ void setup() {
 
     updateFileList();
 
+    // SPI инициализируется ДО включения DCDC/level-shifter:
+    // пины DATA и CLK переходят под контроль SPI-драйвера (LOW в idle),
+    // и светодиоды не видят мусорный сигнал в момент подачи питания.
+    initSK9822_DMA();
+    sendLEDs_DMA(); // явно гасим все диоды сразу после инициализации шины
+
     String last_file = prefs.getString("last_file", "");
     if (last_file != "" && LittleFS.exists("/" + last_file)) {
         webLogf("[DISP] Autoplay: %s", last_file.c_str());
-        // Есть файл для отображения — включаем питание заранее.
-        // Hall-событие придёт чуть позже, после стабилизации DCDC.
         webLog("[PWR] Autoplay: LEDs power on");
         digitalWrite(PIN_EN_DCDC, HIGH);
         digitalWrite(PIN_EN_LEVEL_SHIFT, HIGH);
@@ -718,10 +751,6 @@ void setup() {
         last_dcdc_on_time = millis();
         loadFrameFromFile("/" + last_file);
     }
-
-    initSK9822_DMA();
-    FastLED.clear();
-    sendLEDs_DMA();
 
     hallSemaphore = xSemaphoreCreateBinary();
 

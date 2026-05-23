@@ -146,6 +146,13 @@ input.angle-slide::-moz-range-thumb {
     width: 14px; height: 14px; background: var(--c);
     border: none; cursor: pointer; pointer-events: all; border-radius: 0;
 }
+/* Цветные thumb'ы для RGB-ползунков */
+input.angle-slide[style*="--thumb-color:#ff4466"]::-webkit-slider-thumb { background: #ff4466; box-shadow: 0 0 8px #ff4466; }
+input.angle-slide[style*="--thumb-color:#ff4466"]::-moz-range-thumb     { background: #ff4466; }
+input.angle-slide[style*="--thumb-color:#00ff88"]::-webkit-slider-thumb { background: #00ff88; box-shadow: 0 0 8px #00ff88; }
+input.angle-slide[style*="--thumb-color:#00ff88"]::-moz-range-thumb     { background: #00ff88; }
+input.angle-slide[style*="--thumb-color:#00aaff"]::-webkit-slider-thumb { background: #00aaff; box-shadow: 0 0 8px #00aaff; }
+input.angle-slide[style*="--thumb-color:#00aaff"]::-moz-range-thumb     { background: #00aaff; }
 
 /* ---- File list ---- */
 .file-item {
@@ -252,13 +259,13 @@ canvas {
         <div class="bri-track"></div>
         <div class="bri-fill" id="drFill"></div>
         <div class="bri-cursor" id="drCursor"></div>
-        <input type="range" id="bMinSlide" min="5" max="40" value="5">
-        <input type="range" id="bMaxSlide" min="5" max="40" value="40">
+        <input type="range" id="bMinSlide" min="0" max="31" value="2">
+        <input type="range" id="bMaxSlide" min="0" max="31" value="16">
     </div>
     <div class="bri-labels">
-        <span>MIN&nbsp;<b id="bMinVal">5</b>%</span>
-        <span class="now">NOW&nbsp;<b id="briVal">--</b>%</span>
-        <span>MAX&nbsp;<b id="bMaxVal">40</b>%</span>
+        <span>MIN&nbsp;<b id="bMinVal">2</b>/31</span>
+        <span class="now">NOW&nbsp;<b id="briVal">--</b>/31</span>
+        <span>MAX&nbsp;<b id="bMaxVal">16</b>/31</span>
     </div>
 
     <!-- Angle -->
@@ -292,8 +299,28 @@ canvas {
     <!-- Arms -->
     <div class="slider-row">
         <label>ARMS <span id="armsVal">4</span></label>
-        <input class="angle-slide" type="range" id="armsSlide" min="1" max="8" value="4" step="1"
+        <input class="angle-slide" type="range" id="armsSlide" min="1" max="8" value="7" step="1"
                oninput="document.getElementById('armsVal').textContent=this.value; syncSettings()">
+    </div>
+
+    <!-- RGB gain -->
+    <div class="slider-row">
+        <label>RED <span id="rgVal" style="color:#ff4466;">100%</span></label>
+        <input class="angle-slide" type="range" id="rgSlide" min="0" max="200" value="100"
+               oninput="document.getElementById('rgVal').textContent=this.value+'%'; syncSettings()"
+               style="--thumb-color:#ff4466;">
+    </div>
+    <div class="slider-row">
+        <label>GREEN <span id="ggVal" style="color:#00ff88;">100%</span></label>
+        <input class="angle-slide" type="range" id="ggSlide" min="0" max="200" value="100"
+               oninput="document.getElementById('ggVal').textContent=this.value+'%'; syncSettings()"
+               style="--thumb-color:#00ff88;">
+    </div>
+    <div class="slider-row">
+        <label>BLUE <span id="bgVal" style="color:#00aaff;">100%</span></label>
+        <input class="angle-slide" type="range" id="bgSlide" min="0" max="200" value="100"
+               oninput="document.getElementById('bgVal').textContent=this.value+'%'; syncSettings()"
+               style="--thumb-color:#00aaff;">
     </div>
 </div>
 
@@ -770,7 +797,7 @@ function stopDisplay()    { fetch('/stop'); }
 function deleteFile(name) { fetch(`/delete?file=${encodeURIComponent(name)}`).then(() => { loadFiles(); loadFSInfo(); }); }
 
 // ===================== DUAL-RANGE BRIGHTNESS SLIDER =====================
-function pct(v) { return (v - 5) / 35 * 100; }
+function pct(v) { return v / 31 * 100; }
 
 // Хранит последнее известное значение NOW для пересчёта при движении ползунков
 let currentBrightness = 0;
@@ -820,7 +847,10 @@ function syncSettings() {
         const co   = document.getElementById('coSlide').value;
         const circ = document.getElementById('wheelCirc').value || wheelCircMm;
         const arms = document.getElementById('armsSlide').value;
-        fetch(`/settings?bmin=${bmin}&bmax=${bmax}&a=${a}&g=${g}&s=${s}&co=${co}&circ=${circ}&arms=${arms}`);
+        const rg   = document.getElementById('rgSlide').value;
+        const gg   = document.getElementById('ggSlide').value;
+        const bg   = document.getElementById('bgSlide').value;
+        fetch(`/settings?bmin=${bmin}&bmax=${bmax}&a=${a}&g=${g}&s=${s}&co=${co}&circ=${circ}&arms=${arms}&rg=${rg}&gg=${gg}&bg=${bg}`);
         _syncTimer = null;
     }, 50);
 }
@@ -874,6 +904,21 @@ function _applySettings(d) {
         const a = Math.max(1, Math.min(8, d.arms));
         document.getElementById('armsSlide').value = a;
         document.getElementById('armsVal').textContent = a;
+    }
+    if (d.rg !== undefined) {
+        const v = Math.round(d.rg);
+        document.getElementById('rgSlide').value = v;
+        document.getElementById('rgVal').textContent = v + '%';
+    }
+    if (d.gg !== undefined) {
+        const v = Math.round(d.gg);
+        document.getElementById('ggSlide').value = v;
+        document.getElementById('ggVal').textContent = v + '%';
+    }
+    if (d.bg !== undefined) {
+        const v = Math.round(d.bg);
+        document.getElementById('bgSlide').value = v;
+        document.getElementById('bgVal').textContent = v + '%';
     }
     updateDualRange();
 }

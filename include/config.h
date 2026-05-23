@@ -71,13 +71,20 @@ extern String pendingFilePath;
 
 // Гамма-коррекция
 extern volatile float global_gamma;      // 1.0 = линейная, до 5.0 = максимум
-extern uint8_t        gamma_lut[256];    // ЛУТ, перестраивается в drawSectorDMA при изменении gamma
+extern uint8_t lut_r[256];  // Гамма + контраст + R-gain
+extern uint8_t lut_g[256];  // Гамма + контраст + G-gain
+extern uint8_t lut_b[256];  // Гамма + контраст + B-gain
 
 // Коррекция насыщенности
 extern volatile float global_saturation; // 1.0 = без изменений, до 3.0 = максимум
 
 // Контраст: 0..100 %, 0 = без изменений (factor 1.0..3.0)
 extern volatile float global_contrast;
+
+// Коррекция каналов RGB: 0..200 %, 100 = без изменений
+extern volatile float global_r_gain;
+extern volatile float global_g_gain;
+extern volatile float global_b_gain;
 
 // Длина окружности колеса в мм (для расчёта скорости)
 extern volatile uint16_t wheel_circumference;
