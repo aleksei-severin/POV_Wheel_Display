@@ -78,8 +78,11 @@ struct BatteryCache {
 static BatteryCache bat_cache;
 
 // --- ESP-IDF SPI DMA для SK9822 ---
-#define SK9822_END_FRAMES 20
-#define SK9822_BUF_SIZE   (4 + NUM_LEDS * 4 + SK9822_END_FRAMES)
+// Буферы и транзакции — фиксированный максимум для 8 лучей × 76 диодов = 608.
+// Неиспользуемые диоды гасятся в fillSectorIntoBuffer — каждый кадр они получают команду выкл.
+#define SK9822_MAX_LEDS   (8 * 76)                              // 608 — максимум при 8 лучах
+#define SK9822_END_FRAMES (SK9822_MAX_LEDS / 2)                // 304 end-frame бита (по спецификации N/2)
+#define SK9822_BUF_SIZE   (4 + SK9822_MAX_LEDS * 4 + SK9822_END_FRAMES) // максимальный размер буфера
 
 static spi_device_handle_t sk9822_spi   = nullptr;
 static uint8_t*            dma_buf[2]   = {nullptr, nullptr}; // Два буфера для ping-pong DMA
@@ -254,16 +257,16 @@ void initSK9822_DMA() {
     ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
     ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &devcfg, &sk9822_spi));
 
-    // Выделяем оба DMA-буфера и инициализируем заголовки/хвосты SK9822
+    // Выделяем оба DMA-буфера под максимум (8 лучей).
+    // End-frame заполняется полностью 0xFF — при меньшем числе лучей
+    // SPI передаёт меньше байт, и хвост не уходит на шину.
     for (int b = 0; b < 2; b++) {
         dma_buf[b] = (uint8_t*)heap_caps_malloc(SK9822_BUF_SIZE, MALLOC_CAP_DMA);
         assert(dma_buf[b] != nullptr);
-        memset(dma_buf[b], 0x00, 4);                                        // Start-frame
-        memset(dma_buf[b] + 4, 0, NUM_LEDS * 4);                           // LED data (выкл.)
-        memset(dma_buf[b] + 4 + NUM_LEDS * 4, 0xFF, SK9822_END_FRAMES);    // End-frame
-        // Предзаполняем транзакции — tx_buffer и length фиксированы навсегда
-        spi_trans[b].length    = SK9822_BUF_SIZE * 8;
+        memset(dma_buf[b], 0x00, SK9822_BUF_SIZE);                              // Весь буфер в 0
+        memset(dma_buf[b] + 4 + SK9822_MAX_LEDS * 4, 0xFF, SK9822_END_FRAMES); // End-frame
         spi_trans[b].tx_buffer = dma_buf[b];
+        spi_trans[b].length    = SK9822_BUF_SIZE * 8;                           // Фиксированная длина навсегда
     }
     dma_tx_buffer = dma_buf[0]; // sendLEDs_DMA использует dma_buf[0]
     dmaMutex = xSemaphoreCreateMutex();
@@ -307,7 +310,7 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
         // Буфер ещё не загружен или уже освобождён — гасим все диоды,
         // чтобы не отправить устаревшие данные из предыдущей анимации.
         uint8_t* led_ptr = buf + 4;
-        for (int i = 0; i < NUM_LEDS; i++) {
+        for (int i = 0; i < SK9822_MAX_LEDS; i++) {
             led_ptr[i * 4 + 0] = 0xE0; // SK9822: 111bbbbb, brightness=0 → ток=0
             led_ptr[i * 4 + 1] = 0;
             led_ptr[i * 4 + 2] = 0;
@@ -335,12 +338,13 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
     uint8_t* led_ptr     = buf + 4;
 
     // Количество лучей читаем один раз — не меняется в середине кадра
-    uint8_t num_arms   = global_num_arms;
-    int     leds_total = num_arms * 76; // 76 диодов на луч (38 спереди + 38 сзади)
-    int     step_deg   = 360 / num_arms; // угловой шаг между лучами
+    uint8_t num_arms  = global_num_arms;           // 1–8
+    int     leds_total = num_arms * 76;
+    int     step_deg  = 360 / num_arms;
 
-    // Лучи сверх текущего num_arms — гасим явно, чтобы не светились остатки
-    for (int i = leds_total; i < NUM_LEDS; i++) {
+    // Лучи сверх num_arms (остаток от предыдущего значения) — гасим явно.
+    // SK9822_MAX_LEDS — верхняя граница буфера; записываем не дальше неё.
+    for (int i = leds_total; i < SK9822_MAX_LEDS; i++) {
         led_ptr[i * 4 + 0] = 0xE0;
         led_ptr[i * 4 + 1] = 0;
         led_ptr[i * 4 + 2] = 0;
@@ -515,6 +519,9 @@ void renderingTask(void* pvParameters) {
                 uint8_t idle = 1 - active;
 
                 // Заполняем свободный буфер ПОКА предыдущая DMA-передача ещё идёт.
+                // Всегда заполняем SK9822_MAX_LEDS диодов — неиспользуемые гасятся внутри.
+                // Это гарантирует что физически подключённые лучи 5–8 получают команду
+                // выключения на каждом кадре, а не держат старое состояние.
                 fillSectorIntoBuffer(dma_buf[idle], sector);
 
                 // Ждём завершения предыдущей передачи.
@@ -525,7 +532,7 @@ void renderingTask(void* pvParameters) {
                     spi_device_get_trans_result(sk9822_spi, &done, portMAX_DELAY);
                 }
 
-                // Ставим следующий сектор в очередь DMA (асинхронно, без spinlock).
+                // length фиксирован в initSK9822_DMA — не меняем, просто ставим в очередь.
                 spi_device_queue_trans(sk9822_spi, &spi_trans[idle], portMAX_DELAY);
 
                 active      = idle;
