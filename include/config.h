@@ -82,6 +82,9 @@ extern volatile float global_contrast;
 // Длина окружности колеса в мм (для расчёта скорости)
 extern volatile uint16_t wheel_circumference;
 
+// Количество лучей (1–8), по умолчанию 4
+extern volatile uint8_t global_num_arms;
+
 // DMA-замена FastLED.show() — определена в main.cpp, используется также в network.cpp
 extern void sendLEDs_DMA();
 

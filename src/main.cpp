@@ -97,6 +97,7 @@ RTC_DATA_ATTR volatile float global_gamma         = 3.5f; // Сохраняет�
 RTC_DATA_ATTR volatile float global_saturation    = 1.0f; // 1.0 = без изменений, >1 усиливает насыщенность
 RTC_DATA_ATTR volatile float global_contrast      = 10.0f; // 0..100 %, 0 = без изменений (factor 1.0)
 RTC_DATA_ATTR volatile uint16_t wheel_circumference = 2355; // Длина окружности колеса в мм
+RTC_DATA_ATTR volatile uint8_t  global_num_arms     = 4;   // Количество лучей (1–8)
 uint8_t gamma_lut[256];
 
 // Хелперы для I2C чтения BQ25798
@@ -333,18 +334,30 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
     uint8_t  bri_byte    = 0xE0 | ((global_brightness * 31) / 100);
     uint8_t* led_ptr     = buf + 4;
 
-    for (int ray = 0; ray < 4; ray++) {
+    // Количество лучей читаем один раз — не меняется в середине кадра
+    uint8_t num_arms   = global_num_arms;
+    int     leds_total = num_arms * 76; // 76 диодов на луч (38 спереди + 38 сзади)
+    int     step_deg   = 360 / num_arms; // угловой шаг между лучами
+
+    // Лучи сверх текущего num_arms — гасим явно, чтобы не светились остатки
+    for (int i = leds_total; i < NUM_LEDS; i++) {
+        led_ptr[i * 4 + 0] = 0xE0;
+        led_ptr[i * 4 + 1] = 0;
+        led_ptr[i * 4 + 2] = 0;
+        led_ptr[i * 4 + 3] = 0;
+    }
+
+    for (int ray = 0; ray < num_arms; ray++) {
         // Передняя сторона луча: сектора идут в порядке вращения
-        int sector_front = (current_sector + ray * 90) % 360;
-        // Задняя сторона луча: зеркало по горизонтали + сдвиг горизонта на 180°,
-        // чтобы изображение обеих сторон было в одном горизонте.
+        int sector_front = (current_sector + ray * step_deg) % 360;
+        // Задняя сторона луча: зеркало + сдвиг на 180°
         int sector_back  = (540 - sector_front) % 360;
 
         const uint8_t* src_f = frameBuffer + anim_offset + sector_front * 38 * 3;
         const uint8_t* src_b = frameBuffer + anim_offset + sector_back  * 38 * 3;
 
         for (int i = 0; i < 38; i++) {
-            // --- Передняя половина луча (LEDs 0-37) ---
+            // --- Передняя половина луча (LEDs 0–37) ---
             uint8_t r = gamma_lut[src_f[i * 3]];
             uint8_t g = gamma_lut[src_f[i * 3 + 1]];
             uint8_t b = gamma_lut[src_f[i * 3 + 2]];
@@ -361,7 +374,7 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
             led_ptr[idx_a + 0] = bri_byte; led_ptr[idx_a + 1] = b;
             led_ptr[idx_a + 2] = g;        led_ptr[idx_a + 3] = r;
 
-            // --- Задняя половина луча (LEDs 38-75, зеркальный сектор + 180°) ---
+            // --- Задняя половина луча (LEDs 38–75, зеркальный сектор + 180°) ---
             uint8_t rb = gamma_lut[src_b[i * 3]];
             uint8_t gb = gamma_lut[src_b[i * 3 + 1]];
             uint8_t bb = gamma_lut[src_b[i * 3 + 2]];

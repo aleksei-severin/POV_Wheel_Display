@@ -288,6 +288,13 @@ canvas {
         <input class="angle-slide" type="range" id="coSlide" min="0" max="100" value="0"
                oninput="document.getElementById('coVal').textContent=this.value+'%'; syncSettings()">
     </div>
+
+    <!-- Arms -->
+    <div class="slider-row">
+        <label>ARMS <span id="armsVal">4</span></label>
+        <input class="angle-slide" type="range" id="armsSlide" min="1" max="8" value="4" step="1"
+               oninput="document.getElementById('armsVal').textContent=this.value; syncSettings()">
+    </div>
 </div>
 
 <!-- POWER + INFO -->
@@ -812,7 +819,8 @@ function syncSettings() {
         const s    = (document.getElementById('sSlide').value / 10).toFixed(1);
         const co   = document.getElementById('coSlide').value;
         const circ = document.getElementById('wheelCirc').value || wheelCircMm;
-        fetch(`/settings?bmin=${bmin}&bmax=${bmax}&a=${a}&g=${g}&s=${s}&co=${co}&circ=${circ}`);
+        const arms = document.getElementById('armsSlide').value;
+        fetch(`/settings?bmin=${bmin}&bmax=${bmax}&a=${a}&g=${g}&s=${s}&co=${co}&circ=${circ}&arms=${arms}`);
         _syncTimer = null;
     }, 50);
 }
@@ -861,6 +869,11 @@ function _applySettings(d) {
         const c = Math.max(2000, Math.min(2500, d.circ));
         wheelCircMm = c;
         document.getElementById('wheelCirc').value = c;
+    }
+    if (d.arms !== undefined) {
+        const a = Math.max(1, Math.min(8, d.arms));
+        document.getElementById('armsSlide').value = a;
+        document.getElementById('armsVal').textContent = a;
     }
     updateDualRange();
 }

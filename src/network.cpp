@@ -333,6 +333,10 @@ void setupNetwork() {
             float cov = request->getParam("co")->value().toFloat();
             if (cov >= 0.0f && cov <= 100.0f) global_contrast = cov;
         }
+        if (request->hasParam("arms")) {
+            int av = request->getParam("arms")->value().toInt();
+            if (av >= 1 && av <= 8) global_num_arms = (uint8_t)av;
+        }
         // Мгновенный пересчёт яркости — не ждём следующего тика датчика (50 мс)
         float ratio = constrain(last_lux_value / 1000.0f, 0.0f, 1.0f);
         global_brightness = (uint8_t)constrain(
@@ -355,6 +359,7 @@ void setupNetwork() {
         json += "\"saturation\":" + String(global_saturation, 1) + ",";
         json += "\"contrast\":" + String(global_contrast, 1) + ",";
         json += "\"circ\":" + String(wheel_circumference) + ",";
+        json += "\"arms\":" + String(global_num_arms) + ",";
         json += "\"ver\":" + String(state_version);
         json += "}";
         request->send(200, "application/json", json);
