@@ -92,6 +92,16 @@ extern volatile uint16_t wheel_circumference;
 // Количество лучей (1–8), по умолчанию 4
 extern volatile uint8_t global_num_arms;
 
+// ABL: лимит суммарного тока 0–100 %, 100 = без ограничения
+extern volatile float global_abl_limit;
+
+// RMS загрузка тока за последний полный оборот, 0.0–1.0 (обновляется renderingTask)
+extern volatile float global_abl_rms;
+
+// Эффективная яркость после применения ABL (0–31). Обновляется каждый сектор.
+// Отличается от global_brightness когда ABL режет ток ниже установленного значения.
+extern volatile uint8_t global_effective_brightness;
+
 // DMA-замена FastLED.show() — определена в main.cpp, используется также в network.cpp
 extern void sendLEDs_DMA();
 

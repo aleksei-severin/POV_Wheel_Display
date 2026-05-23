@@ -84,6 +84,10 @@ static BatteryCache bat_cache;
 #define SK9822_END_FRAMES (SK9822_MAX_LEDS / 2)                // 304 end-frame бита (по спецификации N/2)
 #define SK9822_BUF_SIZE   (4 + SK9822_MAX_LEDS * 4 + SK9822_END_FRAMES) // максимальный размер буфера
 
+// Накопитель RMS за текущий оборот: заполняется в fillSectorIntoBuffer,
+// публикуется в global_abl_rms в конце оборота renderingTask.
+static float rms_accum = 0.0f;
+
 static spi_device_handle_t sk9822_spi   = nullptr;
 static uint8_t*            dma_buf[2]   = {nullptr, nullptr}; // Два буфера для ping-pong DMA
 static uint8_t*            dma_tx_buffer = nullptr;           // = dma_buf[0], для sendLEDs_DMA
@@ -104,6 +108,9 @@ RTC_DATA_ATTR volatile float global_g_gain        = 100.0f;
 RTC_DATA_ATTR volatile float global_b_gain        = 100.0f;
 RTC_DATA_ATTR volatile uint16_t wheel_circumference = 2355;
 RTC_DATA_ATTR volatile uint8_t  global_num_arms     = 7;
+RTC_DATA_ATTR volatile float    global_abl_limit    = 100.0f; // ABL: 0–100 %, 100 = без ограничения
+volatile float                  global_abl_rms      = 0.0f;  // RMS загрузка тока 0.0–1.0, не сохраняем в RTC
+volatile uint8_t                global_effective_brightness = 8; // bri_level после ABL; совпадает с global_brightness пока нет рендеринга
 uint8_t lut_r[256];
 uint8_t lut_g[256];
 uint8_t lut_b[256];
@@ -278,9 +285,29 @@ void initSK9822_DMA() {
     webLog("[SYS] SK9822 DMA ready");
 }
 
-// Заменитель FastLED.show() для статусных заливок и очистки.
-// Всегда отправляет полный буфер SK9822_MAX_LEDS — диоды сверх NUM_LEDS явно гасятся,
-// чтобы физически подключённые лучи 5–8 не держали предыдущий кадр.
+// Гасит все SK9822_MAX_LEDS (608) диодов — ток=0, цвет=0.
+// Используется при включении DCDC и при остановке рендеринга.
+// НЕ читает leds[] — не зависит от содержимого FastLED-массива.
+static void blankAllLEDs_DMA() {
+    if (!dma_tx_buffer || !sk9822_spi || !dmaMutex) return;
+    xSemaphoreTake(dmaMutex, portMAX_DELAY);
+    uint8_t* led_ptr = dma_tx_buffer + 4;
+    for (int i = 0; i < SK9822_MAX_LEDS; i++) {
+        led_ptr[i * 4 + 0] = 0xE0; // SK9822: ток=0
+        led_ptr[i * 4 + 1] = 0;
+        led_ptr[i * 4 + 2] = 0;
+        led_ptr[i * 4 + 3] = 0;
+    }
+    spi_transaction_t t = {};
+    t.length    = SK9822_BUF_SIZE * 8;
+    t.tx_buffer = dma_tx_buffer;
+    spi_device_transmit(sk9822_spi, &t);
+    xSemaphoreGive(dmaMutex);
+}
+
+// Заменитель FastLED.show() для статусных заливок.
+// Отправляет leds[0..NUM_LEDS-1] + гасит лучи 5–8 (NUM_LEDS..SK9822_MAX_LEDS-1).
+// Вызывать только когда leds[] содержит корректные данные (не при старте).
 void sendLEDs_DMA() {
     if (!dma_tx_buffer || !sk9822_spi || !dmaMutex) return;
     xSemaphoreTake(dmaMutex, portMAX_DELAY);
@@ -291,7 +318,6 @@ void sendLEDs_DMA() {
         led_ptr[i * 4 + 2] = leds[i].g;
         led_ptr[i * 4 + 3] = leds[i].r;
     }
-    // Гасим диоды сверх NUM_LEDS (лучи 5–8)
     for (int i = NUM_LEDS; i < SK9822_MAX_LEDS; i++) {
         led_ptr[i * 4 + 0] = 0xE0;
         led_ptr[i * 4 + 1] = 0;
@@ -363,7 +389,6 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
     }
 
     uint32_t anim_offset = currentFrameIndex * FRAME_SIZE;
-    uint8_t  bri_byte    = 0xE0 | (global_brightness & 0x1F); // global_brightness уже в единицах SK9822 (0–31)
     uint8_t* led_ptr     = buf + 4;
 
     // Количество лучей читаем один раз — не меняется в середине кадра
@@ -371,8 +396,10 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
     int     leds_total = num_arms * 76;
     int     step_deg  = 360 / num_arms;
 
-    // Лучи сверх num_arms (остаток от предыдущего значения) — гасим явно.
-    // SK9822_MAX_LEDS — верхняя граница буфера; записываем не дальше неё.
+    uint8_t bri_level = global_brightness & 0x1F; // 0–31
+    float   abl       = global_abl_limit;          // 0–100 %
+
+    // Гасим неиспользуемые лучи сверх num_arms.
     for (int i = leds_total; i < SK9822_MAX_LEDS; i++) {
         led_ptr[i * 4 + 0] = 0xE0;
         led_ptr[i * 4 + 1] = 0;
@@ -380,10 +407,10 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
         led_ptr[i * 4 + 3] = 0;
     }
 
+    // Рендерим цвета в led_ptr с временным bri_byte=0xFF (bri_level игнорируется пока).
+    // ABL считается ПО РЕЗУЛЬТАТУ рендера — те же данные что и RMS, одна шкала.
     for (int ray = 0; ray < num_arms; ray++) {
-        // Передняя сторона луча: сектора идут в порядке вращения
         int sector_front = (current_sector + ray * step_deg) % 360;
-        // Задняя сторона луча: зеркало + сдвиг на 180°
         int sector_back  = (540 - sector_front) % 360;
 
         const uint8_t* src_f = frameBuffer + anim_offset + sector_front * 38 * 3;
@@ -404,10 +431,12 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
                 b = (uint8_t)constrain(b2, 0, 255);
             }
             int idx_a = (ray * 76 + i) * 4;
-            led_ptr[idx_a + 0] = bri_byte; led_ptr[idx_a + 1] = b;
-            led_ptr[idx_a + 2] = g;        led_ptr[idx_a + 3] = r;
+            led_ptr[idx_a + 0] = 0xFF; // bri_byte пропишем позже
+            led_ptr[idx_a + 1] = b;
+            led_ptr[idx_a + 2] = g;
+            led_ptr[idx_a + 3] = r;
 
-            // --- Задняя половина луча (LEDs 38–75, зеркальный сектор + 180°) ---
+            // --- Задняя половина луча (LEDs 38–75) ---
             uint8_t rb = lut_r[src_b[i * 3]];
             uint8_t gb = lut_g[src_b[i * 3 + 1]];
             uint8_t bb = lut_b[src_b[i * 3 + 2]];
@@ -421,9 +450,50 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
                 bb = (uint8_t)constrain(b2, 0, 255);
             }
             int idx_b = (ray * 76 + 75 - i) * 4;
-            led_ptr[idx_b + 0] = bri_byte; led_ptr[idx_b + 1] = bb;
-            led_ptr[idx_b + 2] = gb;        led_ptr[idx_b + 3] = rb;
+            led_ptr[idx_b + 0] = 0xFF; // bri_byte пропишем позже
+            led_ptr[idx_b + 1] = bb;
+            led_ptr[idx_b + 2] = gb;
+            led_ptr[idx_b + 3] = rb;
         }
+    }
+
+    // --- ABL: считаем pixel_sum из уже отрендеренного led_ptr (после LUT+насыщенности).
+    // Та же база что и у RMS — оба показателя гарантированно в одной шкале.
+    if (abl < 100.0f) {
+        uint32_t pixel_sum = 0;
+        for (int i = 0; i < leds_total; i++) {
+            pixel_sum += led_ptr[i * 4 + 1]; // B
+            pixel_sum += led_ptr[i * 4 + 2]; // G
+            pixel_sum += led_ptr[i * 4 + 3]; // R
+        }
+        uint32_t max_sum   = (uint32_t)leds_total * 3 * 255;
+        uint32_t limit_sum = (uint32_t)(max_sum * abl * 0.01f);
+        if (pixel_sum > limit_sum && pixel_sum > 0) {
+            bri_level = (uint8_t)((uint32_t)bri_level * limit_sum / pixel_sum);
+        }
+    }
+    uint8_t bri_byte = 0xE0 | bri_level;
+    global_effective_brightness = bri_level; // для отображения NOW в UI
+
+    // Проставляем финальный bri_byte во все активные слоты.
+    for (int i = 0; i < leds_total; i++) {
+        led_ptr[i * 4 + 0] = bri_byte;
+    }
+
+    // --- RMS: та же сумма RGB что считал ABL, умноженная на итоговый bri_level/31.
+    // 100% = все активные лучи белые при bri=31.
+    {
+        uint32_t sector_sum = 0;
+        for (int i = 0; i < leds_total; i++) {
+            sector_sum += led_ptr[i * 4 + 1]; // B
+            sector_sum += led_ptr[i * 4 + 2]; // G
+            sector_sum += led_ptr[i * 4 + 3]; // R
+        }
+        uint32_t max_sector = (uint32_t)leds_total * 3 * 255;
+        float sector_load = (max_sector > 0)
+            ? (float)sector_sum / (float)max_sector * (float)bri_level / 31.0f
+            : 0.0f;
+        rms_accum += sector_load;
     }
 }
 
@@ -445,10 +515,10 @@ void renderingTask(void* pvParameters) {
     esp_task_wdt_add(xTaskGetCurrentTaskHandle());
 
     while (true) {
-        // Таймаут 500мс: если холл молчит дольше 500мс — скорость точно <125RPM.
+        // Таймаут 1100мс: если холл молчит дольше 1100мс — скорость точно <60RPM.
         // При portMAX_DELAY задача зависала в ожидании и не успевала погасить
         // светодиоды при резкой остановке — loop() выключал питание только через 3с.
-        xSemaphoreTake(hallSemaphore, pdMS_TO_TICKS(500));
+        xSemaphoreTake(hallSemaphore, pdMS_TO_TICKS(1100));
         esp_task_wdt_reset(); // Сбрасываем WDT после каждого ожидания (в т.ч. при pause/stop)
 
         if (force_stop_display || !peripherals_active || !newFrameReady) continue;
@@ -494,6 +564,9 @@ void renderingTask(void* pvParameters) {
                 (int)min_brightness,
                 (int)max_brightness
             );
+            // effective синхронизируем с brightness всегда — fillSectorIntoBuffer
+            // перезапишет его финальным значением после ABL в ходе рендеринга.
+            global_effective_brightness = global_brightness;
         }
 
         noInterrupts();
@@ -501,22 +574,24 @@ void renderingTask(void* pvParameters) {
         uint32_t period = rotation_period;
         interrupts();
 
-        // Пропускаем рендеринг ниже 125 RPM (period > 480 мс).
+        // Пропускаем рендеринг ниже 60 RPM (period > 1000 мс).
         // Критично: при первом обороте после долгой остановки
         // rotation_period = micros() - last_hall_time = десятки миллионов мкс.
         // Без этой проверки renderingTask уходит в busy-wait на минуты,
         // вытесняя WiFi/loop, WDT срабатывает через 5 с → краш → перезагрузка.
         //
-        // Дополнительно: если с момента последнего сигнала холла прошло >480мс —
-        // обороты точно <125RPM независимо от сохранённого rotation_period.
+        // Дополнительно: если с момента последнего сигнала холла прошло >1000мс —
+        // обороты точно <60RPM независимо от сохранённого rotation_period.
         uint32_t now_us = micros();
         uint32_t age_us = (now_us >= t0) ? (now_us - t0) : (0xFFFFFFFFUL - t0 + now_us + 1);
-        if (period == 0 || period > 480000 || age_us > 480000) {
+        if (period == 0 || period > 1000000 || age_us > 1000000) {
             if (rendering_active) {
                 rendering_active = false;
-                webLog("[PWR] RPM <125, rendering paused");
-                FastLED.clear();
-                sendLEDs_DMA();
+                webLog("[PWR] RPM <60, rendering paused");
+                blankAllLEDs_DMA();
+                global_abl_rms              = 0.0f;
+                rms_accum                   = 0.0f;
+                global_effective_brightness = global_brightness; // нет рендера → ABL не действует
             }
             continue;
         }
@@ -524,11 +599,12 @@ void renderingTask(void* pvParameters) {
             rendering_active = true;
             // Питание уже включено hall_event'ом в loop() — здесь только логируем
             // факт достижения порога рендеринга.
-            webLog("[PWR] RPM >=125, rendering started");
+            webLog("[PWR] RPM >=60, rendering started");
         }
 
-        int last_sector = -1;
-        tx_pending      = false;
+        int last_sector   = -1;
+        int sectors_drawn = 0;  // счётчик реально отрендеренных секторов за оборот
+        tx_pending        = false;
 
         while (true) {
             // Прерываем оборот если буфер освобождается во время рендеринга:
@@ -552,6 +628,7 @@ void renderingTask(void* pvParameters) {
                 // Это гарантирует что физически подключённые лучи 5–8 получают команду
                 // выключения на каждом кадре, а не держат старое состояние.
                 fillSectorIntoBuffer(dma_buf[idle], sector);
+                sectors_drawn++;
 
                 // Ждём завершения предыдущей передачи.
                 // spi_device_get_trans_result не держит критическую секцию —
@@ -576,6 +653,11 @@ void renderingTask(void* pvParameters) {
             spi_device_get_trans_result(sk9822_spi, &done, portMAX_DELAY);
             tx_pending = false;
         }
+
+        // Публикуем RMS: среднее по секторам → значение 0.0–1.0
+        if (sectors_drawn > 0)
+            global_abl_rms = rms_accum / (float)sectors_drawn;
+        rms_accum = 0.0f;
     }
 }
 
@@ -627,9 +709,18 @@ void setup() {
     // Возвращаем пин 21 в обычное состояние для активной работы
     gpio_pullup_dis((gpio_num_t)21);
 
+    // Записываем LOW в защёлку ДО переключения в OUTPUT — иначе при смене режима
+    // пин на долю мкс оказывается в HIGH (или неопределён), DCDC включается и
+    // светодиоды видят случайный сигнал. gpio_set_level не меняет direction — безопасно.
+    gpio_set_level((gpio_num_t)PIN_EN_DCDC,        0);
+    gpio_set_level((gpio_num_t)PIN_EN_LEVEL_SHIFT, 0);
     pinMode(PIN_EN_DCDC, OUTPUT); pinMode(PIN_EN_LEVEL_SHIFT, OUTPUT);
+    // Явно подтверждаем LOW после смены direction
+    digitalWrite(PIN_EN_DCDC, LOW); digitalWrite(PIN_EN_LEVEL_SHIFT, LOW);
     pinMode(PIN_WAKEUP, INPUT_PULLUP); pinMode(PIN_BUTTON, INPUT_PULLUP); pinMode(PIN_COLOR_INT, INPUT_PULLUP);
     
+    digitalWrite(PIN_EN_DCDC, LOW);
+    digitalWrite(PIN_EN_LEVEL_SHIFT, LOW); 
     // Настраиваем прерывание BQ25798 на GPIO 21
     pinMode(21, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(21), bqInterruptHandler, FALLING);
@@ -720,17 +811,19 @@ void setup() {
     // Данные обновляются из loop() раз в секунду на Core 1.
     // Wire из Core 0 (AsyncWebServer) вызывался параллельно с loop() → гонка → WDT.
     server.on("/battery", HTTP_GET, [](AsyncWebServerRequest *request){
-        // Фоновый поллинг — не сбрасывает таймер активности
-        String json = "{";
-        json += "\"vbat\":"     + String(bat_cache.vbat)    + ",";
-        json += "\"ibat\":"     + String(bat_cache.ibat)    + ",";
-        json += "\"vbus\":"     + String(bat_cache.vbus)    + ",";
-        json += "\"ibus\":"     + String(bat_cache.ibus)    + ",";
-        json += "\"chg_stat\":" + String(bat_cache.chg_stat) + ",";
-        json += "\"vbus_ok\":"  + String(bat_cache.vbus_ok  ? "true" : "false") + ",";
-        json += "\"connected\":" + String(bat_cache.vbus_ok ? "true" : "false");
-        json += "}";
-        request->send(200, "application/json", json);
+        // Фоновый поллинг — не сбрасывает таймер активности.
+        // snprintf в стековый буфер — ноль heap-аллокаций.
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+            "{\"vbat\":%d,\"ibat\":%d,\"vbus\":%d,\"ibus\":%d"
+            ",\"chg_stat\":%u,\"vbus_ok\":%s,\"connected\":%s}",
+            (int)bat_cache.vbat, (int)bat_cache.ibat,
+            (int)bat_cache.vbus, (int)bat_cache.ibus,
+            (unsigned)bat_cache.chg_stat,
+            bat_cache.vbus_ok ? "true" : "false",
+            bat_cache.vbus_ok ? "true" : "false"
+        );
+        request->send(200, "application/json", buf);
     });
 
     updateFileList();
@@ -739,7 +832,7 @@ void setup() {
     // пины DATA и CLK переходят под контроль SPI-драйвера (LOW в idle),
     // и светодиоды не видят мусорный сигнал в момент подачи питания.
     initSK9822_DMA();
-    sendLEDs_DMA(); // явно гасим все диоды сразу после инициализации шины
+    blankAllLEDs_DMA(); // гасим все 608 диодов — leds[] ещё не инициализирован
 
     String last_file = prefs.getString("last_file", "");
     if (last_file != "" && LittleFS.exists("/" + last_file)) {
@@ -747,6 +840,7 @@ void setup() {
         webLog("[PWR] Autoplay: LEDs power on");
         digitalWrite(PIN_EN_DCDC, HIGH);
         digitalWrite(PIN_EN_LEVEL_SHIFT, HIGH);
+        blankAllLEDs_DMA(); // гасим все 608 диодов до начала рендеринга
         peripherals_active = true;
         last_dcdc_on_time = millis();
         loadFrameFromFile("/" + last_file);
@@ -796,6 +890,7 @@ void loop() {
             webLogf("[PWR] Play \"%s\": LEDs power on", pendingFilePath.c_str());
             digitalWrite(PIN_EN_DCDC, HIGH);
             digitalWrite(PIN_EN_LEVEL_SHIFT, HIGH);
+            blankAllLEDs_DMA(); // гасим все 608 диодов до начала рендеринга
             peripherals_active = true;
             last_dcdc_on_time = millis();
         }
@@ -829,12 +924,13 @@ void loop() {
         // Без файла DCDC остаётся выключенным до нажатия Play.
         if (!force_stop_display && !peripherals_active && newFrameReady) {
             // Включаем питание немедленно по первому hall-сигналу.
-            // Лог о начале рендеринга выводит renderingTask когда period подтвердит >=100 RPM.
+            // Лог о начале рендеринга выводит renderingTask когда period подтвердит >=60 RPM.
             digitalWrite(PIN_EN_DCDC, HIGH);
             digitalWrite(PIN_EN_LEVEL_SHIFT, HIGH);
+            blankAllLEDs_DMA(); // гасим все 608 диодов до начала рендеринга
             peripherals_active = true;
             last_dcdc_on_time = millis();
-            webLog("[PWR] Hall: LEDs power on (waiting for >=125 RPM)");
+            webLog("[PWR] Hall: LEDs power on (waiting for >=60 RPM)");
         }
         // Рендеринг управляется renderingTask через hallSemaphore
     }
@@ -865,6 +961,7 @@ void loop() {
             webLog("[PWR] IO5: LEDs power on");
             digitalWrite(PIN_EN_DCDC, HIGH);
             digitalWrite(PIN_EN_LEVEL_SHIFT, HIGH);
+            blankAllLEDs_DMA(); // гасим все 608 диодов до начала рендеринга
             peripherals_active = true;
             last_dcdc_on_time = millis();
             // last_hall_time НЕ трогаем: IO4 обновит его сам после стабилизации DCDC
@@ -1049,8 +1146,9 @@ void loop() {
     // Завершение восстановления: 5 секунд прошло — включаем питание обратно
     if (bms_recovery_in_progress && (now_ms - bms_recovery_off_time >= 5000)) {
         bms_recovery_in_progress = false;
-        digitalWrite(PIN_EN_DCDC, HIGH);
-        digitalWrite(PIN_EN_LEVEL_SHIFT, HIGH);
+        digitalWrite(PIN_EN_DCDC, LOW);
+        digitalWrite(PIN_EN_LEVEL_SHIFT, LOW);
+        blankAllLEDs_DMA(); // гасим все 608 диодов до начала рендеринга
         peripherals_active = true;
         last_dcdc_on_time = millis();
         Wire.beginTransmission(BQ25792_ADDR);

@@ -343,6 +343,10 @@ void setupNetwork() {
             int av = request->getParam("arms")->value().toInt();
             if (av >= 1 && av <= 8) global_num_arms = (uint8_t)av;
         }
+        if (request->hasParam("abl")) {
+            float v = request->getParam("abl")->value().toFloat();
+            if (v >= 0.0f && v <= 100.0f) global_abl_limit = v;
+        }
         if (request->hasParam("rg")) {
             float v = request->getParam("rg")->value().toFloat();
             if (v >= 0.0f && v <= 200.0f) global_r_gain = v;
@@ -362,28 +366,33 @@ void setupNetwork() {
             (int)min_brightness,
             (int)max_brightness
         );
+        // Пока рендеринг не активен — effective совпадает с brightness (ABL не применяется)
+        if (!peripherals_active) global_effective_brightness = global_brightness;
         state_version++;
         request->send(200, "text/plain", "OK");
     });
 
     server.on("/get_settings", HTTP_GET, [](AsyncWebServerRequest *request){
-        // Фоновый поллинг — не сбрасывает таймер активности
-        String json = "{";
-        json += "\"bmin\":" + String(min_brightness) + ",";
-        json += "\"bmax\":" + String(max_brightness) + ",";
-        json += "\"angle\":" + String(global_angle_offset) + ",";
-        json += "\"brightness\":" + String(global_brightness) + ",";
-        json += "\"gamma\":" + String(global_gamma, 1) + ",";
-        json += "\"saturation\":" + String(global_saturation, 1) + ",";
-        json += "\"contrast\":" + String(global_contrast, 1) + ",";
-        json += "\"circ\":" + String(wheel_circumference) + ",";
-        json += "\"arms\":" + String(global_num_arms) + ",";
-        json += "\"rg\":" + String(global_r_gain, 1) + ",";
-        json += "\"gg\":" + String(global_g_gain, 1) + ",";
-        json += "\"bg\":" + String(global_b_gain, 1) + ",";
-        json += "\"ver\":" + String(state_version);
-        json += "}";
-        request->send(200, "application/json", json);
+        // Фоновый поллинг — не сбрасывает таймер активности.
+        // snprintf в стековый буфер — ноль heap-аллокаций, не фрагментирует SRAM.
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+            "{\"bmin\":%u,\"bmax\":%u,\"angle\":%d,\"brightness\":%u,\"eff_bri\":%u"
+            ",\"gamma\":%.1f,\"saturation\":%.1f,\"contrast\":%.1f"
+            ",\"circ\":%u,\"arms\":%u"
+            ",\"abl\":%.1f,\"abl_rms\":%.1f"
+            ",\"rg\":%.1f,\"gg\":%.1f,\"bg\":%.1f"
+            ",\"ver\":%lu}",
+            (unsigned)min_brightness, (unsigned)max_brightness,
+            (int)global_angle_offset, (unsigned)global_brightness,
+            (unsigned)global_effective_brightness,
+            (float)global_gamma, (float)global_saturation, (float)global_contrast,
+            (unsigned)wheel_circumference, (unsigned)global_num_arms,
+            (float)global_abl_limit, (float)(global_abl_rms * 100.0f),
+            (float)global_r_gain, (float)global_g_gain, (float)global_b_gain,
+            (unsigned long)state_version
+        );
+        request->send(200, "application/json", buf);
     });
 
     server.on("/list", HTTP_GET, [](AsyncWebServerRequest *request){
@@ -406,16 +415,27 @@ void setupNetwork() {
             }
         }
 
-        // Второй проход: строим JSON списка файлов
+        // Второй проход: строим JSON списка файлов.
+        // Используем malloc вместо String — один блок вместо многих маленьких аллокаций.
+        // Каждый файл: {"name":"filename.bin","size":999999,"frames":999} — ~60 символов.
+        // Резервируем 64 файла × 80 байт + скобки = ~5 кБ.
+        const size_t LIST_CAP = 64 * 80 + 8;
+        char* jsonBuf = (char*)malloc(LIST_CAP);
+        if (!jsonBuf) {
+            request->send(500, "text/plain", "OOM");
+            return;
+        }
+        size_t pos = 0;
+        jsonBuf[pos++] = '[';
+
         File root = LittleFS.open("/");
-        String json = "[";
         File file = root.openNextFile();
         bool first = true;
-        while(file) {
-            String fn = String(file.name());
-            if(fn.endsWith(".bin")) {
-                if(!first) json += ",";
-                // Читаем заголовок: если файл начинается с "ANIM" — это GIF, берём кол-во кадров
+        while (file) {
+            const char* fn = file.name();
+            size_t fnlen = strlen(fn);
+            if (fnlen >= 4 && strcmp(fn + fnlen - 4, ".bin") == 0) {
+                // Читаем заголовок: ANIM-файл → берём кол-во кадров
                 uint16_t frames = 0;
                 if (file.size() > 6) {
                     uint8_t hdr[6];
@@ -424,22 +444,33 @@ void setupNetwork() {
                         frames = hdr[4] | (hdr[5] << 8);
                     }
                 }
-                json += "{\"name\":\"" + fn + "\",\"size\":" + String(file.size());
-                if (frames > 0) json += ",\"frames\":" + String(frames);
-                json += "}";
+                if (!first && pos < LIST_CAP - 1) jsonBuf[pos++] = ',';
                 first = false;
+                if (frames > 0) {
+                    pos += snprintf(jsonBuf + pos, LIST_CAP - pos,
+                        "{\"name\":\"%s\",\"size\":%u,\"frames\":%u}",
+                        fn, (unsigned)file.size(), (unsigned)frames);
+                } else {
+                    pos += snprintf(jsonBuf + pos, LIST_CAP - pos,
+                        "{\"name\":\"%s\",\"size\":%u}",
+                        fn, (unsigned)file.size());
+                }
             }
             file = root.openNextFile();
         }
-        json += "]";
-        request->send(200, "application/json", json);
+        if (pos < LIST_CAP - 1) jsonBuf[pos++] = ']';
+        jsonBuf[pos] = '\0';
+        request->send(200, "application/json", jsonBuf);
+        free(jsonBuf);
     });
 
     server.on("/fs_info", HTTP_GET, [](AsyncWebServerRequest *request){
         size_t total = LittleFS.totalBytes();
         size_t used  = LittleFS.usedBytes();
-        String json = "{\"total\":" + String(total) + ",\"used\":" + String(used) + ",\"free\":" + String(total - used) + "}";
-        request->send(200, "application/json", json);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "{\"total\":%u,\"used\":%u,\"free\":%u}",
+                 (unsigned)total, (unsigned)used, (unsigned)(total - used));
+        request->send(200, "application/json", buf);
     });
 
     server.on("/play", HTTP_GET, [](AsyncWebServerRequest *request){
@@ -552,8 +583,9 @@ void setupNetwork() {
         if (period > 0 && elapsed < 2000000UL) {
             rpm = 60000000.0f / (float)period;
         }
-        String json = "{\"rpm\":" + String(rpm, 1) + "}";
-        request->send(200, "application/json", json);
+        char buf[32];
+        snprintf(buf, sizeof(buf), "{\"rpm\":%.1f}", rpm);
+        request->send(200, "application/json", buf);
     });
 
     // POST /settime?t=<unix>&tz=<секунды> — синхронизирует время и часовой пояс.
@@ -583,33 +615,48 @@ void setupNetwork() {
 
         portENTER_CRITICAL(&_log_mux);
         uint32_t total = _log_total;
-        uint32_t head  = _log_head;
         portEXIT_CRITICAL(&_log_mux);
 
         // Определяем диапазон записей для отдачи: [since, total)
         uint32_t from = since;
-        if (from > total) from = 0;                            // Устройство перезагрузилось — отдаём с начала
-        if (total - from > WEB_LOG_COUNT) from = total - WEB_LOG_COUNT; // Буфер уже перезаписан
+        if (from > total) from = 0;
+        if (total - from > WEB_LOG_COUNT) from = total - WEB_LOG_COUNT;
 
-        String json = "{\"total\":" + String(total) +
-                      ",\"now\":" + String(_currentEpoch()) +
-                      ",\"lines\":[";
+        // Максимальный размер ответа: заголовок ~40 + N строк × (2 + WEB_LOG_LINE + 2 escape)
+        // WEB_LOG_COUNT=64, WEB_LOG_LINE=96 → 64 × (96*2+4) = ~12 кБ — вмещается в один буфер.
+        // Выделяем из heap (не стек — слишком велик для задачи AsyncWebServer ~4кБ стека).
+        const size_t BUF_CAP = 40 + WEB_LOG_COUNT * (WEB_LOG_LINE * 2 + 4) + 4;
+        char* buf = (char*)malloc(BUF_CAP);
+        if (!buf) {
+            request->send(500, "text/plain", "OOM");
+            return;
+        }
+
+        size_t pos = 0;
+        // Заголовок
+        pos += snprintf(buf + pos, BUF_CAP - pos,
+            "{\"total\":%lu,\"now\":%lu,\"lines\":[",
+            (unsigned long)total, (unsigned long)_currentEpoch());
+
         bool first = true;
         for (uint32_t i = from; i < total; i++) {
             uint32_t idx = i % WEB_LOG_COUNT;
-            if (!first) json += ',';
+            if (!first && pos < BUF_CAP - 1) buf[pos++] = ',';
             first = false;
+            if (pos < BUF_CAP - 1) buf[pos++] = '"';
             // Экранируем кавычки и обратные слэши для корректного JSON
-            json += '"';
             const char* p = _log_buf[idx];
-            while (*p) {
-                if (*p == '"' || *p == '\\') json += '\\';
-                json += *p++;
+            while (*p && pos < BUF_CAP - 3) {
+                if (*p == '"' || *p == '\\') buf[pos++] = '\\';
+                buf[pos++] = *p++;
             }
-            json += '"';
+            if (pos < BUF_CAP - 1) buf[pos++] = '"';
         }
-        json += "]}";
-        request->send(200, "application/json", json);
+        if (pos < BUF_CAP - 2) { buf[pos++] = ']'; buf[pos++] = '}'; }
+        buf[pos] = '\0';
+
+        request->send(200, "application/json", buf);
+        free(buf);
     });
 
     ElegantOTA.begin(&server);

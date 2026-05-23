@@ -303,6 +303,24 @@ canvas {
                oninput="document.getElementById('armsVal').textContent=this.value; syncSettings()">
     </div>
 
+    <!-- ABL -->
+    <div class="slider-row">
+        <label>FORWARD CURRENT <span id="ablVal">100%</span>
+            <span id="ablRmsLabel" style="color:#ffcc00;font-size:0.85em;margin-left:8px;">RMS --</span>
+        </label>
+        <div style="position:relative;">
+            <input class="angle-slide" type="range" id="ablSlide" min="0" max="100" value="100"
+                   oninput="document.getElementById('ablVal').textContent=this.value+'%'; syncSettings()">
+            <!-- Желтая отметка RMS: абсолютно позиционирована над треком -->
+            <div id="ablRmsMark" style="
+                position:absolute; top:50%; width:3px; height:14px;
+                background:#ffcc00; box-shadow:0 0 6px #ffcc00;
+                transform:translate(-50%,-50%); pointer-events:none;
+                left:50%; transition:left 0.5s;
+            "></div>
+        </div>
+    </div>
+
     <!-- RGB gain -->
     <div class="slider-row">
         <label>RED <span id="rgVal" style="color:#ff4466;">100%</span></label>
@@ -796,6 +814,17 @@ function playFile(name)   { fetch(`/play?file=${encodeURIComponent(name)}`); }
 function stopDisplay()    { fetch('/stop'); }
 function deleteFile(name) { fetch(`/delete?file=${encodeURIComponent(name)}`).then(() => { loadFiles(); loadFSInfo(); }); }
 
+// ===================== ABL RMS MARKER =====================
+function _updateAblRms(rms) {
+    const mark  = document.getElementById('ablRmsMark');
+    const label = document.getElementById('ablRmsLabel');
+    if (!mark || !label) return;
+    const thumbR = 7; // половина ширины thumb (14px / 2) для angle-slide
+    const p = rms / 100; // 0..1
+    mark.style.left = `calc(${thumbR}px + ${p} * (100% - ${2 * thumbR}px))`;
+    label.textContent = `RMS ${rms.toFixed(0)}%`;
+}
+
 // ===================== DUAL-RANGE BRIGHTNESS SLIDER =====================
 function pct(v) { return v / 31 * 100; }
 
@@ -820,18 +849,14 @@ function updateDualRange() {
 
 function updateBriCursor(val) {
     currentBrightness = val;
-    const minV = +document.getElementById('bMinSlide').value;
-    const maxV = +document.getElementById('bMaxSlide').value;
-    // NOW всегда внутри диапазона [min, max] — ни визуально, ни реально не выходит за границы
-    const displayVal = Math.min(Math.max(val, minV), maxV);
-    // Браузер рендерит thumb с отступом thumbR от краёв трека.
-    // Компенсируем: реальная позиция = thumbR + pct * (trackWidth - 2*thumbR)
-    // Выражаем через calc(), чтобы не зависеть от пиксельной ширины контейнера.
-    const thumbR = 8; // половина ширины thumb (16px / 2)
-    const p = pct(displayVal) / 100; // 0..1
+    // Курсор NOW движется по всему треку 0–31, не зажат в [min,max].
+    // ABL может опустить яркость ниже MIN — это важно показать.
+    const clamped = Math.min(Math.max(val, 0), 31);
+    const thumbR = 8;
+    const p = pct(clamped) / 100;
     document.getElementById('drCursor').style.left =
         `calc(${thumbR}px + ${p} * (100% - ${2 * thumbR}px))`;
-    document.getElementById('briVal').textContent = displayVal;
+    document.getElementById('briVal').textContent = clamped;
 }
 
 // Дебаунс: синхронизируем не чаще 1 раза в 50 мс при перетаскивании ползунка
@@ -847,18 +872,18 @@ function syncSettings() {
         const co   = document.getElementById('coSlide').value;
         const circ = document.getElementById('wheelCirc').value || wheelCircMm;
         const arms = document.getElementById('armsSlide').value;
+        const abl  = document.getElementById('ablSlide').value;
         const rg   = document.getElementById('rgSlide').value;
         const gg   = document.getElementById('ggSlide').value;
         const bg   = document.getElementById('bgSlide').value;
-        fetch(`/settings?bmin=${bmin}&bmax=${bmax}&a=${a}&g=${g}&s=${s}&co=${co}&circ=${circ}&arms=${arms}&rg=${rg}&gg=${gg}&bg=${bg}`);
+        fetch(`/settings?bmin=${bmin}&bmax=${bmax}&a=${a}&g=${g}&s=${s}&co=${co}&circ=${circ}&arms=${arms}&abl=${abl}&rg=${rg}&gg=${gg}&bg=${bg}`);
         _syncTimer = null;
     }, 50);
 }
 
 document.getElementById('bMinSlide').addEventListener('input', function() {
     const maxSlide = document.getElementById('bMaxSlide');
-    if (+this.value > +maxSlide.value) this.value = maxSlide.value;
-    // Поднимаем min поверх: пользователь активно его двигает
+    if (+this.value > +maxSlide.value) maxSlide.value = this.value;
     this.style.zIndex = 5;
     maxSlide.style.zIndex = '';
     updateDualRange();
@@ -867,13 +892,40 @@ document.getElementById('bMinSlide').addEventListener('input', function() {
 
 document.getElementById('bMaxSlide').addEventListener('input', function() {
     const minSlide = document.getElementById('bMinSlide');
-    if (+this.value < +minSlide.value) this.value = minSlide.value;
-    // Поднимаем max поверх: пользователь активно его двигает
+    if (+this.value < +minSlide.value) minSlide.value = this.value;
     this.style.zIndex = 5;
     minSlide.style.zIndex = '';
     updateDualRange();
     syncSettings();
 });
+
+// При mousedown/touchstart определяем какой ползунок активировать по позиции клика.
+// Это решает застревание когда оба на одном значении: тянем влево → активируем MIN,
+// тянем вправо → активируем MAX.
+(function() {
+    const minSlide = document.getElementById('bMinSlide');
+    const maxSlide = document.getElementById('bMaxSlide');
+    function pickActive(e) {
+        const rect  = maxSlide.getBoundingClientRect();
+        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+        const ratio = (clientX - rect.left) / rect.width;
+        const clickVal = Math.round(ratio * 31);
+        const minV = +minSlide.value;
+        const maxV = +maxSlide.value;
+        // Если значения совпадают — выбираем по стороне относительно середины
+        if (minV === maxV) {
+            if (clickVal <= minV) {
+                minSlide.style.zIndex = 5; maxSlide.style.zIndex = '';
+            } else {
+                maxSlide.style.zIndex = 5; minSlide.style.zIndex = '';
+            }
+        }
+    }
+    minSlide.addEventListener('mousedown',  pickActive);
+    maxSlide.addEventListener('mousedown',  pickActive);
+    minSlide.addEventListener('touchstart', pickActive, {passive: true});
+    maxSlide.addEventListener('touchstart', pickActive, {passive: true});
+})();
 
 
 // ===================== SETTINGS =====================
@@ -905,6 +957,14 @@ function _applySettings(d) {
         document.getElementById('armsSlide').value = a;
         document.getElementById('armsVal').textContent = a;
     }
+    if (d.abl !== undefined) {
+        const v = Math.round(d.abl);
+        document.getElementById('ablSlide').value = v;
+        document.getElementById('ablVal').textContent = v + '%';
+    }
+    if (d.abl_rms !== undefined) {
+        _updateAblRms(d.abl_rms);
+    }
     if (d.rg !== undefined) {
         const v = Math.round(d.rg);
         document.getElementById('rgSlide').value = v;
@@ -926,7 +986,7 @@ function _applySettings(d) {
 function loadSettings() {
     return fetch('/get_settings').then(r => r.json()).then(d => {
         _applySettings(d);
-        updateBriCursor(d.brightness);
+        updateBriCursor(d.eff_bri !== undefined ? d.eff_bri : d.brightness);
     }).catch(() => {});
 }
 
@@ -1164,7 +1224,16 @@ async function _pollSettings() {
         const r = await _fetchTimeout('/get_settings', {}, 3000);
         if (!r.ok) throw new Error();
         const d = await r.json();
-        updateBriCursor(d.brightness);
+        updateBriCursor(d.eff_bri !== undefined ? d.eff_bri : d.brightness);
+        if (d.abl_rms !== undefined) _updateAblRms(d.abl_rms);
+        // Детектируем ребут: ver вернулся в 0 при ненулевой сохранённой версии.
+        // В этом случае делаем полную ресинхронизацию — polling остановится сам
+        // и будет перезапущен из _pingLoop после _initialSync.
+        if (_stateVersion !== null && d.ver === 0 && _stateVersion > 0) {
+            _stateVersion = null;
+            _conn.pollActive = false;  // сигнал _pingLoop запустить _initialSync
+            return;
+        }
         if (_stateVersion !== null && d.ver !== _stateVersion) {
             _applySettings(d);
             loadFiles();
@@ -1230,12 +1299,14 @@ async function _pingLoop() {
         if (!r.ok) throw new Error();
         _conn.failCount = 0;
         if (!_conn.online) {
-            // Переход офлайн → онлайн: синхронизируем и запускаем polling параллельно с ping.
+            // Переход офлайн → онлайн: полная ресинхронизация с нуля.
             _setOnline(true);
             _initialSync().then(() => _startPolling());
         } else if (!_conn.pollActive) {
-            // Polling упал по ошибке пока мы были онлайн — перезапускаем.
-            _startPolling();
+            // Polling упал пока были онлайн — устройство могло ребутнуться и вернуться
+            // быстрее чем failCount достиг 2. Делаем полную ресинхронизацию, не просто
+            // _startPolling(), — иначе stateVersion не сбросится и данные не обновятся.
+            _initialSync().then(() => _startPolling());
         }
     } catch(e) {
         _conn.failCount++;
