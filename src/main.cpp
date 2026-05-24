@@ -790,6 +790,9 @@ void setup() {
         webLog("[PWR] Autoplay: LEDs power on");
         digitalWrite(PIN_EN_DCDC, HIGH);
         digitalWrite(PIN_EN_LEVEL_SHIFT, HIGH);
+        // SK9822 при подаче питания стартует с неопределённым содержимым регистров.
+        // Ждём стабилизации питания (~5мс) перед отправкой команды гашения.
+        delay(5);
         blankAllLEDs_DMA(); // гасим все 608 диодов до начала рендеринга
         peripherals_active = true;
         last_dcdc_on_time = millis();
@@ -850,6 +853,7 @@ void loop() {
             webLogf("[PWR] Play \"%s\": LEDs power on", pendingFilePath.c_str());
             digitalWrite(PIN_EN_DCDC, HIGH);
             digitalWrite(PIN_EN_LEVEL_SHIFT, HIGH);
+            delay(5); // ждём стабилизации питания SK9822
             blankAllLEDs_DMA(); // гасим все 608 диодов до начала рендеринга
             peripherals_active = true;
             last_dcdc_on_time = millis();
@@ -887,6 +891,7 @@ void loop() {
             // Лог о начале рендеринга выводит renderingTask когда period подтвердит >=60 RPM.
             digitalWrite(PIN_EN_DCDC, HIGH);
             digitalWrite(PIN_EN_LEVEL_SHIFT, HIGH);
+            delay(5); // ждём стабилизации питания SK9822
             blankAllLEDs_DMA(); // гасим все 608 диодов до начала рендеринга
             peripherals_active = true;
             last_dcdc_on_time = millis();
@@ -921,6 +926,7 @@ void loop() {
             webLog("[PWR] IO5: LEDs power on");
             digitalWrite(PIN_EN_DCDC, HIGH);
             digitalWrite(PIN_EN_LEVEL_SHIFT, HIGH);
+            delay(5); // ждём стабилизации питания SK9822
             blankAllLEDs_DMA(); // гасим все 608 диодов до начала рендеринга
             peripherals_active = true;
             last_dcdc_on_time = millis();
@@ -1125,16 +1131,16 @@ void loop() {
     // Завершение восстановления: 5 секунд прошло — включаем питание обратно
     if (bms_recovery_in_progress && (now_ms - bms_recovery_off_time >= 5000)) {
         bms_recovery_in_progress = false;
-        digitalWrite(PIN_EN_DCDC, LOW);
-        digitalWrite(PIN_EN_LEVEL_SHIFT, LOW);
-        blankAllLEDs_DMA(); // гасим все 608 диодов до начала рендеринга
-        peripherals_active = true;
-        last_dcdc_on_time = millis();
         Wire.beginTransmission(BQ25792_ADDR);
         Wire.write(0x0F);
         Wire.write(0xA2); // Re-enable charging
         Wire.endTransmission();
-        FastLED.clear(); sendLEDs_DMA();
+        digitalWrite(PIN_EN_DCDC, HIGH);
+        digitalWrite(PIN_EN_LEVEL_SHIFT, HIGH);
+        delay(5); // ждём стабилизации питания SK9822
+        blankAllLEDs_DMA(); // гасим все 608 диодов до начала рендеринга
+        peripherals_active = true;
+        last_dcdc_on_time = millis();
         last_bms_recovery_time = now_ms;
         webLog("[BMS] Recovery complete");
     }
