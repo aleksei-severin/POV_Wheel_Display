@@ -10,6 +10,8 @@
 #include <HTTPClient.h>
 #include <stdarg.h>
 #include <vector>
+#include <memory>
+#include <algorithm>
 
 AsyncWebServer server(80);
 Preferences prefs;
@@ -657,6 +659,61 @@ void setupNetwork() {
 
         request->send(200, "application/json", buf);
         free(buf);
+    });
+
+    // GET /preview?file=X — возвращает первый фрейм (FRAME_SIZE байт) для рендеринга превью в браузере.
+    // Для ANIM-файла пропускает 8-байтовый заголовок и возвращает первый фрейм.
+    // Для статичного изображения возвращает данные с начала файла.
+    server.on("/preview", HTTP_GET, [](AsyncWebServerRequest *request){
+        if (!request->hasParam("file")) {
+            request->send(400, "text/plain", "Missing file");
+            return;
+        }
+        String path = "/" + request->getParam("file")->value();
+        File f = LittleFS.open(path, "r");
+        if (!f || f.size() < 8) {
+            if (f) f.close();
+            request->send(404, "text/plain", "Not found");
+            return;
+        }
+
+        // Определяем смещение первого фрейма
+        uint8_t hdr[8];
+        f.read(hdr, 8);
+        size_t offset = 0;
+        if (hdr[0]=='A' && hdr[1]=='N' && hdr[2]=='I' && hdr[3]=='M') {
+            offset = 8;  // ANIM: пропускаем magic + frame_count + frame_delay
+        } else {
+            offset = 0;  // Статичное изображение — данные с начала
+        }
+
+        size_t toRead = FRAME_SIZE;
+        if (f.size() < offset + toRead) toRead = f.size() - offset;
+
+        // Читаем в heap-буфер; ownership передаётся лямбде через shared_ptr —
+        // память освобождается автоматически когда AsyncWebServer завершит отправку.
+        auto frameBuf = std::shared_ptr<uint8_t>((uint8_t*)malloc(toRead), free);
+        if (!frameBuf) {
+            f.close();
+            request->send(500, "text/plain", "OOM");
+            return;
+        }
+        f.seek(offset);
+        f.read(frameBuf.get(), toRead);
+        f.close();
+
+        size_t capturedSize = toRead;
+        AsyncWebServerResponse* resp = request->beginChunkedResponse(
+            "application/octet-stream",
+            [frameBuf, capturedSize](uint8_t* buf, size_t maxLen, size_t index) -> size_t {
+                if (index >= capturedSize) return 0;
+                size_t chunk = std::min(maxLen, capturedSize - index);
+                memcpy(buf, frameBuf.get() + index, chunk);
+                return chunk;
+            }
+        );
+        resp->addHeader("Cache-Control", "max-age=300");
+        request->send(resp);
     });
 
     ElegantOTA.begin(&server);

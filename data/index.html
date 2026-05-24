@@ -498,6 +498,25 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
 /* ---- Preview canvas (hidden, functional) ---- */
 #preview { display: none; width: 0; height: 0; }
 
+/* ---- Миниатюра колеса в списке файлов ---- */
+.file-thumb {
+  width: 48px; height: 48px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--bg-deep);
+  border: 1px solid var(--border-dim);
+  overflow: hidden;
+}
+.file-thumb canvas {
+  width: 48px; height: 48px;
+  display: block;
+}
+.file-thumb .thumb-spinner {
+  width: 100%; height: 100%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 18px; opacity: 0.3;
+}
+
 /* ---- Dot pulse ---- */
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
 .dot-pulse {
@@ -1126,6 +1145,65 @@ async function processAndUpload() {
     document.getElementById('uploadQueue').style.display = 'none';
 }
 
+// ===================== ПРЕВЬЮ КОЛЕСА =====================
+// Рисует один фрейм (360×38×3 байт, полярный буфер) на canvas как кольцо колеса.
+// Каждый пиксель canvas обратно проецируется: угол → сектор, радиус → LED.
+function drawWheelPreview(buf, canvas) {
+    const SIZE = canvas.width;  // квадратный canvas
+    const ctx  = canvas.getContext('2d');
+    const img  = ctx.createImageData(SIZE, SIZE);
+    const cx = SIZE / 2, cy = SIZE / 2;
+    const minR = SIZE * 0.10;   // внутренний радиус отсечки (совпадает с toPolarBuffer)
+    const maxR = SIZE * 0.495;
+
+    for (let y = 0; y < SIZE; y++) {
+        for (let x = 0; x < SIZE; x++) {
+            const dx = x - cx, dy = y - cy;
+            const r  = Math.sqrt(dx * dx + dy * dy);
+            if (r < minR || r > maxR) continue;
+
+            // Угол в [0, 360) — sector
+            let ang = Math.atan2(dy, dx) * 180 / Math.PI;
+            if (ang < 0) ang += 360;
+            const sector = Math.round(ang) % 360;
+
+            // Нормализованный радиус → индекс LED [0..37]
+            const ledF = (r - minR) / (maxR - minR) * 37;
+            const led  = Math.min(37, Math.max(0, Math.round(ledF)));
+
+            const off = (sector * 38 + led) * 3;
+            const pi  = (y * SIZE + x) * 4;
+            img.data[pi]     = buf[off];
+            img.data[pi + 1] = buf[off + 1];
+            img.data[pi + 2] = buf[off + 2];
+            img.data[pi + 3] = 255;
+        }
+    }
+    ctx.putImageData(img, 0, 0);
+}
+
+// Загружает превью для одного файла. Возвращает Promise.
+// Использует кэш _thumbCache чтобы не перезагружать при повторном вызове loadFiles().
+const _thumbCache = {};  // fname → ImageData (80×80)
+
+async function _loadThumb(fname, canvas) {
+    if (_thumbCache[fname]) {
+        const ctx = canvas.getContext('2d');
+        ctx.putImageData(_thumbCache[fname], 0, 0);
+        return;
+    }
+    try {
+        const resp = await _fetchTimeout(`/preview?file=${encodeURIComponent(fname)}`, {}, 8000);
+        if (!resp.ok) return;
+        const ab  = await resp.arrayBuffer();
+        const buf = new Uint8Array(ab);
+        if (buf.length < 360 * 38 * 3) return;
+        drawWheelPreview(buf, canvas);
+        // Кэшируем ImageData для быстрого повторного рендеринга
+        _thumbCache[fname] = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height);
+    } catch(e) { /* молча игнорируем — превью необязательно */ }
+}
+
 // ===================== FILE MANAGER =====================
 function loadFiles() {
     return fetch('/list').then(r => r.json()).then(files => {
@@ -1135,7 +1213,10 @@ function loadFiles() {
             return;
         }
         list.innerHTML = files.map(f =>
-            `<div class="file-item">
+            `<div class="file-item" id="fi-${CSS.escape(f.name)}">
+                <div class="file-thumb">
+                    <canvas width="80" height="80" id="thumb-${CSS.escape(f.name)}"></canvas>
+                </div>
                 <span class="fname">${f.name}${f.frames ? `<span style="color:var(--text-hint);font-size:0.85em;margin-left:6px;">${f.frames}&nbsp;fr</span>` : ''}</span>
                 <span class="fsize">${(f.size/1024).toFixed(1)}&nbsp;kB</span>
                 <div class="acts">
@@ -1144,6 +1225,14 @@ function loadFiles() {
                 </div>
              </div>`
         ).join('');
+
+        // Загружаем превью последовательно чтобы не перегружать ESP32
+        (async () => {
+            for (const f of files) {
+                const canvas = document.getElementById(`thumb-${CSS.escape(f.name)}`);
+                if (canvas) await _loadThumb(f.name, canvas);
+            }
+        })();
     });
 }
 
@@ -1159,7 +1248,13 @@ function loadFSInfo() {
 
 function playFile(name)   { fetch(`/play?file=${encodeURIComponent(name)}`); }
 function stopDisplay()    { fetch('/stop'); }
-function deleteFile(name) { fetch(`/delete?file=${encodeURIComponent(name)}`).then(() => { loadFiles(); loadFSInfo(); }); }
+function deleteFile(name) {
+    fetch(`/delete?file=${encodeURIComponent(name)}`).then(() => {
+        delete _thumbCache[name];
+        loadFiles();
+        loadFSInfo();
+    });
+}
 
 // ===================== ABL RMS MARKER =====================
 function _updateAblRms(rms) {
