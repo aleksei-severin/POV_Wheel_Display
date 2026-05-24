@@ -25,7 +25,7 @@ volatile uint8_t global_brightness = 8; // единицы SK9822 (0–31)
 
 RTC_DATA_ATTR uint8_t min_brightness = 2;  // единицы SK9822 (0–31)
 RTC_DATA_ATTR uint8_t max_brightness = 16; // единицы SK9822 (0–31)
-RTC_DATA_ATTR volatile int global_angle_offset = 86;
+RTC_DATA_ATTR volatile int global_angle_offset = 91;
 
 uint8_t* frameBuffer = nullptr; 
 

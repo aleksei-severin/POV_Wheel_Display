@@ -607,9 +607,9 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
     <div class="slider-row">
       <div class="slider-label">
         <span>Angle offset</span>
-        <span class="val"><span id="aVal">0</span>&deg;</span>
+        <span class="val"><span id="aVal">91</span>&deg;</span>
       </div>
-      <input type="range" id="aSlide" min="0" max="360" value="0"
+      <input type="range" id="aSlide" min="0" max="360" value="91"
              oninput="document.getElementById('aVal').textContent=this.value; syncSettings()">
     </div>
 
@@ -698,30 +698,27 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
   <div class="card">
     <p class="card-title">Live metrics</p>
 
-    <!-- Speed -->
-    <div class="speed-block">
-      <div>
-        <span class="speed-value" id="infoSpeed">--</span>
-        <span class="speed-unit">km/h</span>
+    <!-- Speed + RPM — клик открывает ввод Wheel mm -->
+    <div class="speed-block" id="speedBlock" onclick="toggleWheelCircEdit()" style="cursor:pointer;" title="Click to set wheel circumference">
+      <div style="display:flex;align-items:baseline;justify-content:center;gap:14px;">
+        <div>
+          <span class="speed-value" id="infoSpeed">--</span>
+          <span class="speed-unit">km/h</span>
+        </div>
+        <div>
+          <span class="speed-value" id="infoRpm" style="font-size:32px;">--</span>
+          <span class="speed-unit">rpm</span>
+        </div>
       </div>
     </div>
 
-    <div class="metrics-row" style="margin-bottom:16px">
-      <div class="mini-metric">
-        <span class="mini-val" id="infoRpm">--</span>
-        <span class="mini-label">RPM</span>
-      </div>
-      <div class="mini-metric" title="Click to edit wheel circumference">
-        <input class="wheel-circ-input mini-val" type="text" id="wheelCirc"
-               value="2355" maxlength="4">
-        <span class="mini-label">Wheel mm</span>
-      </div>
-      <div class="mini-metric">
-        <div style="display:flex;align-items:center;justify-content:center;gap:6px;">
-          <span class="mini-val" id="batV">--</span>
-          <span style="font-size:11px;color:var(--text-hint)">V</span>
-        </div>
-        <span class="mini-label">Battery</span>
+    <!-- Скрытый ввод окружности колеса — появляется по клику на speed-block -->
+    <div id="wheelCircWrap" style="display:none;margin-bottom:14px;">
+      <div style="background:var(--bg-input);border-radius:var(--r-elem);padding:10px 12px;display:flex;align-items:center;gap:8px;">
+        <span style="font-size:12px;color:var(--text-muted);flex:1;">Wheel circumference</span>
+        <input class="wheel-circ-input" type="text" id="wheelCirc" value="2355" maxlength="4"
+               style="font-family:var(--font-mono);font-size:14px;font-weight:700;color:var(--text);background:transparent;border:none;outline:none;width:48px;text-align:right;">
+        <span style="font-size:11px;color:var(--text-hint);">mm</span>
       </div>
     </div>
 
@@ -740,6 +737,10 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
     </div>
 
     <!-- Power rows -->
+    <div class="power-row">
+      <span class="power-label">Battery voltage</span>
+      <div><span class="power-val" id="batV">--</span><span class="power-unit">V</span></div>
+    </div>
     <div class="power-row">
       <span class="power-label">Charge current</span>
       <div><span class="power-val" id="batI">--</span><span class="power-unit">A</span></div>
@@ -1421,6 +1422,13 @@ function loadSettings() {
 
 // ===================== INFO (RPM + SPEED) =====================
 let wheelCircMm = 2355;
+
+function toggleWheelCircEdit() {
+    const wrap = document.getElementById('wheelCircWrap');
+    const visible = wrap.style.display !== 'none';
+    wrap.style.display = visible ? 'none' : 'block';
+    if (!visible) document.getElementById('wheelCirc').focus();
+}
 
 document.getElementById('wheelCirc').addEventListener('change', function() {
     let v = parseInt(this.value);
