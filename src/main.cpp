@@ -350,6 +350,37 @@ void rebuildGammaLUT() {
 
 // Заполняет DMA-буфер данными сектора без отправки по SPI.
 // Вызывается из renderingTask пока предыдущий буфер ещё передаётся — CPU и DMA работают параллельно.
+// Кеш параметров LUT — обновляются в начале каждого оборота в renderingTask,
+// вне горячего цикла секторов, чтобы не задерживать рендеринг на вызов powf().
+static float   lut_last_gamma    = -1.0f;
+static float   lut_last_contrast = -999.0f;
+static float   lut_last_r        = -1.0f;
+static float   lut_last_g        = -1.0f;
+static float   lut_last_b        = -1.0f;
+static float   lut_last_sat      = -1.0f;
+static int16_t lut_sat_fxp       = 256;
+
+// Проверяет изменение параметров и пересчитывает LUT если нужно.
+// Вызывается один раз в начале оборота — не внутри fillSectorIntoBuffer.
+static void updateLUTIfNeeded() {
+    if (global_gamma    != lut_last_gamma    ||
+        global_contrast != lut_last_contrast ||
+        global_r_gain   != lut_last_r        ||
+        global_g_gain   != lut_last_g        ||
+        global_b_gain   != lut_last_b) {
+        rebuildGammaLUT();
+        lut_last_gamma    = global_gamma;
+        lut_last_contrast = global_contrast;
+        lut_last_r        = global_r_gain;
+        lut_last_g        = global_g_gain;
+        lut_last_b        = global_b_gain;
+    }
+    if (global_saturation != lut_last_sat) {
+        lut_sat_fxp  = (int16_t)(global_saturation * 256.0f);
+        lut_last_sat = global_saturation;
+    }
+}
+
 static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
     if (frameBuffer == nullptr) {
         // Буфер ещё не загружен или уже освобождён — гасим все диоды,
@@ -363,30 +394,8 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
         }
         return;
     }
-    static float   last_built_gamma    = -1.0f;
-    static float   last_built_contrast = -999.0f;
-    static float   last_built_r        = -1.0f;
-    static float   last_built_g        = -1.0f;
-    static float   last_built_b        = -1.0f;
-    static float   last_built_sat      = -1.0f;
-    static int16_t sat_fxp             = 256;
-
-    if (global_gamma    != last_built_gamma    ||
-        global_contrast != last_built_contrast ||
-        global_r_gain   != last_built_r        ||
-        global_g_gain   != last_built_g        ||
-        global_b_gain   != last_built_b) {
-        rebuildGammaLUT();
-        last_built_gamma    = global_gamma;
-        last_built_contrast = global_contrast;
-        last_built_r        = global_r_gain;
-        last_built_g        = global_g_gain;
-        last_built_b        = global_b_gain;
-    }
-    if (global_saturation != last_built_sat) {
-        sat_fxp = (int16_t)(global_saturation * 256.0f);
-        last_built_sat = global_saturation;
-    }
+    // LUT и sat_fxp обновляются снаружи (updateLUTIfNeeded) — здесь читаем напрямую.
+    int16_t sat_fxp = lut_sat_fxp;
 
     // Кадр анимации вычисляется по абсолютному времени — не раз в оборот, а при каждом секторе.
     // lastFrameSwitchTime сбрасывается при загрузке файла; elapsed растёт непрерывно,
@@ -562,6 +571,11 @@ void renderingTask(void* pvParameters) {
             // факт достижения порога рендеринга.
             webLog("[PWR] RPM >=60, rendering started");
         }
+
+        // Пересчёт LUT выполняется один раз в начале оборота — не внутри fillSectorIntoBuffer.
+        // rebuildGammaLUT() содержит ~768 вызовов powf() (~1–3 мс), что пропустило бы
+        // несколько секторов если бы вызывалось в горячем цикле при первом изменении параметра.
+        updateLUTIfNeeded();
 
         int last_sector   = -1;
         int sectors_drawn = 0;  // счётчик реально отрендеренных секторов за оборот

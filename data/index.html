@@ -1206,7 +1206,7 @@ function updateBriCursor(val) {
     document.getElementById('briVal').textContent = clamped;
 }
 
-// Дебаунс: синхронизируем не чаще 1 раза в 50 мс при перетаскивании ползунка
+// Дебаунс: синхронизируем не чаще 1 раза в 150 мс при перетаскивании ползунка
 let _syncTimer = null;
 function syncSettings() {
     if (_syncTimer) clearTimeout(_syncTimer);
