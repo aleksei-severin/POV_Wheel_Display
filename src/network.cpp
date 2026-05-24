@@ -356,15 +356,15 @@ void setupNetwork() {
         }
         if (request->hasParam("rg")) {
             float v = request->getParam("rg")->value().toFloat();
-            if (v >= 0.0f && v <= 200.0f) global_r_gain = v;
+            if (v >= 0.0f && v <= 100.0f) global_r_gain = v;
         }
         if (request->hasParam("gg")) {
             float v = request->getParam("gg")->value().toFloat();
-            if (v >= 0.0f && v <= 200.0f) global_g_gain = v;
+            if (v >= 0.0f && v <= 100.0f) global_g_gain = v;
         }
         if (request->hasParam("bg")) {
             float v = request->getParam("bg")->value().toFloat();
-            if (v >= 0.0f && v <= 200.0f) global_b_gain = v;
+            if (v >= 0.0f && v <= 100.0f) global_b_gain = v;
         }
         // Мгновенный пересчёт яркости — не ждём следующего тика датчика (50 мс)
         float ratio = constrain(last_lux_value / 1000.0f, 0.0f, 1.0f);

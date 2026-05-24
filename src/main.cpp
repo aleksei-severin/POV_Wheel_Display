@@ -84,8 +84,9 @@ static BatteryCache bat_cache;
 #define SK9822_END_FRAMES (SK9822_MAX_LEDS / 2)                // 304 end-frame бита (по спецификации N/2)
 #define SK9822_BUF_SIZE   (4 + SK9822_MAX_LEDS * 4 + SK9822_END_FRAMES) // максимальный размер буфера
 
-// Накопитель RMS за текущий оборот: заполняется в fillSectorIntoBuffer,
-// публикуется в global_abl_rms в конце оборота renderingTask.
+// RMS за текущий оборот: среднее нормированное потребление тока (0.0–1.0).
+// Считается от нередуцированного bri_level — показывает реальную нагрузку.
+// Публикуется в global_abl_rms в конце оборота.
 static float rms_accum = 0.0f;
 
 static spi_device_handle_t sk9822_spi   = nullptr;
@@ -103,12 +104,12 @@ volatile bool request_play_flag = false;
 RTC_DATA_ATTR volatile float global_gamma         = 2.5f;
 RTC_DATA_ATTR volatile float global_saturation    = 1.5f;
 RTC_DATA_ATTR volatile float global_contrast      = 5.0f;
-RTC_DATA_ATTR volatile float global_r_gain        = 60.0f;  // 0..200 %, 100 = без изменений
-RTC_DATA_ATTR volatile float global_g_gain        = 100.0f;
+RTC_DATA_ATTR volatile float global_r_gain        = 100.0f; // 0..100 %, 100 = без изменений
+RTC_DATA_ATTR volatile float global_g_gain        = 70.0f;
 RTC_DATA_ATTR volatile float global_b_gain        = 100.0f;
 RTC_DATA_ATTR volatile uint16_t wheel_circumference = 2355;
 RTC_DATA_ATTR volatile uint8_t  global_num_arms     = 7;
-RTC_DATA_ATTR volatile float    global_abl_limit    = 15.0f;  // ABL: 0–100 %, 100 = без ограничения
+RTC_DATA_ATTR volatile float    global_abl_limit    = 10.0f;  // ABL: 0–100 %, 100 = без ограничения
 volatile float                  global_abl_rms      = 0.0f;  // RMS загрузка тока 0.0–1.0, не сохраняем в RTC
 volatile uint8_t                global_effective_brightness = 8; // bri_level после ABL; совпадает с global_brightness пока нет рендеринга
 uint8_t lut_r[256];
@@ -476,43 +477,37 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
         }
     }
 
-    // --- ABL: считаем pixel_sum из уже отрендеренного led_ptr (после LUT+насыщенности).
-    // Та же база что и у RMS — оба показателя гарантированно в одной шкале.
-    if (abl < 100.0f) {
-        uint32_t pixel_sum = 0;
-        for (int i = 0; i < leds_total; i++) {
-            pixel_sum += led_ptr[i * 4 + 1]; // B
-            pixel_sum += led_ptr[i * 4 + 2]; // G
-            pixel_sum += led_ptr[i * 4 + 3]; // R
-        }
-        uint32_t max_sum   = (uint32_t)leds_total * 3 * 255;
+    // --- Считаем pixel_sum один раз — используется и для RMS, и для ABL.
+    uint32_t pixel_sum  = 0;
+    uint32_t max_sum    = (uint32_t)leds_total * 3 * 255;
+    for (int i = 0; i < leds_total; i++) {
+        pixel_sum += led_ptr[i * 4 + 1]; // B
+        pixel_sum += led_ptr[i * 4 + 2]; // G
+        pixel_sum += led_ptr[i * 4 + 3]; // R
+    }
+
+    // --- RMS: нагрузка тока ДО ABL — для отображения в UI.
+    // 100% = все лучи белые при bri=31.
+    rms_accum += (max_sum > 0)
+        ? (float)pixel_sum / (float)max_sum * (float)bri_level / 31.0f
+        : 0.0f;
+
+    // --- ABL: мгновенное ограничение per-sector по pixel_sum текущего сектора.
+    // Реагирует без задержки — не ждёт конца оборота.
+    // Это гарантирует, что ни один сектор не превысит лимит тока даже при
+    // резком изменении Brightness.
+    if (abl < 100.0f && pixel_sum > 0) {
         uint32_t limit_sum = (uint32_t)(max_sum * abl * 0.01f);
-        if (pixel_sum > limit_sum && pixel_sum > 0) {
+        if (pixel_sum > limit_sum) {
             bri_level = (uint8_t)((uint32_t)bri_level * limit_sum / pixel_sum);
         }
     }
-    uint8_t bri_byte = 0xE0 | bri_level;
-    global_effective_brightness = bri_level; // для отображения NOW в UI
+    uint8_t bri_byte = 0xE0 | (bri_level & 0x1F);
+    global_effective_brightness = bri_level;
 
     // Проставляем финальный bri_byte во все активные слоты.
     for (int i = 0; i < leds_total; i++) {
         led_ptr[i * 4 + 0] = bri_byte;
-    }
-
-    // --- RMS: та же сумма RGB что считал ABL, умноженная на итоговый bri_level/31.
-    // 100% = все активные лучи белые при bri=31.
-    {
-        uint32_t sector_sum = 0;
-        for (int i = 0; i < leds_total; i++) {
-            sector_sum += led_ptr[i * 4 + 1]; // B
-            sector_sum += led_ptr[i * 4 + 2]; // G
-            sector_sum += led_ptr[i * 4 + 3]; // R
-        }
-        uint32_t max_sector = (uint32_t)leds_total * 3 * 255;
-        float sector_load = (max_sector > 0)
-            ? (float)sector_sum / (float)max_sector * (float)bri_level / 31.0f
-            : 0.0f;
-        rms_accum += sector_load;
     }
 }
 
@@ -1128,10 +1123,8 @@ void loop() {
             last_lux_value = sum / lux_count;
         }
         float ratio = constrain(last_lux_value / 1000.0f, 0.0f, 1.0f);
-        global_brightness = (uint8_t)constrain(
-            (int)(ratio * (float)max_brightness),
-            (int)min_brightness,
-            (int)max_brightness
+        global_brightness = (uint8_t)(
+            min_brightness + ratio * (float)(max_brightness - min_brightness) + 0.5f
         );
         global_effective_brightness = global_brightness;
     }

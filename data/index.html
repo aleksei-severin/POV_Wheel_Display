@@ -746,12 +746,12 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
       <div class="slider-label">
         <span>LED Power</span>
         <span class="val">
-          <span id="ablVal">15%</span>
+          <span id="ablVal">10%</span>
           <span id="ablRmsLabel" style="color:var(--yellow);font-size:10px;margin-left:6px;">RMS --</span>
         </span>
       </div>
       <div class="abl-wrap">
-        <input type="range" id="ablSlide" min="0" max="100" value="15"
+        <input type="range" id="ablSlide" min="0" max="100" value="10"
                oninput="document.getElementById('ablVal').textContent=this.value+'%'; syncSettings()">
         <div id="ablRmsMark"></div>
       </div>
@@ -762,21 +762,21 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
 
     <div class="rgb-grid">
       <div class="rgb-block rgb-r">
-        <div class="rgb-val" id="rgVal">60%</div>
+        <div class="rgb-val" id="rgVal">100%</div>
         <div class="rgb-name">Red</div>
-        <input type="range" class="r-slider" id="rgSlide" min="0" max="200" step="10" value="60"
+        <input type="range" class="r-slider" id="rgSlide" min="0" max="100" step="5" value="100"
                oninput="document.getElementById('rgVal').textContent=this.value+'%'; syncSettings()">
       </div>
       <div class="rgb-block rgb-g">
-        <div class="rgb-val" id="ggVal">100%</div>
+        <div class="rgb-val" id="ggVal">70%</div>
         <div class="rgb-name">Green</div>
-        <input type="range" class="g-slider" id="ggSlide" min="0" max="200" step="10" value="100"
+        <input type="range" class="g-slider" id="ggSlide" min="0" max="100" step="5" value="70"
                oninput="document.getElementById('ggVal').textContent=this.value+'%'; syncSettings()">
       </div>
       <div class="rgb-block rgb-b">
         <div class="rgb-val" id="bgVal">100%</div>
         <div class="rgb-name">Blue</div>
-        <input type="range" class="b-slider" id="bgSlide" min="0" max="200" step="10" value="100"
+        <input type="range" class="b-slider" id="bgSlide" min="0" max="100" step="5" value="100"
                oninput="document.getElementById('bgVal').textContent=this.value+'%'; syncSettings()">
       </div>
     </div>
