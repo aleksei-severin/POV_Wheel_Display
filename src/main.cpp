@@ -497,29 +497,26 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
     }
 }
 
-// Задача рендеринга: Core 1, высокий приоритет.
-// Ping-pong DMA: пока dma_buf[active] идёт по SPI (polling — без планировщика),
-// CPU заполняет dma_buf[idle] следующим сектором.
-// spi_device_polling_start/end — детерминированный busy-wait, исключает джиттер
-// от задержки пробуждения FreeRTOS (источник дрожания изображения 3–5°).
+// Задача рендеринга: Core 1, приоритет 2.
+// Ping-pong DMA: spi_device_queue_trans ставит передачу в очередь,
+// spi_device_get_trans_result ждёт завершения не держа spinlock —
+// WiFi ISR (prio >10) прерывает задачу когда нужно обработать пакеты.
 void renderingTask(void* pvParameters) {
     static bool     rendering_active = false; // Флаг: были ли обороты >125 RPM (для лога при снижении)
     uint8_t active     = 0;
     bool    tx_pending = false;
 
     // Отписываем IDLE-задачу Core 1 от Task WDT: renderingTask (приоритет 18)
-    // занимает Core 1 почти непрерывно через spi_device_polling busy-wait,
-    // IDLE не получает тиков → WDT срабатывает через 5с.
-    // renderingTask сам сбрасывает WDT в конце каждого оборота.
+    // занимает Core 1 почти непрерывно и IDLE не получает тиков.
     esp_task_wdt_delete(xTaskGetIdleTaskHandleForCPU(1));
-    esp_task_wdt_add(xTaskGetCurrentTaskHandle());
+    // renderingTask НЕ подписываем на WDT: taskYIELD() и vTaskDelay внутри цикла
+    // могут передать CPU системным задачам с prio>18, и WDT сработает раньше сброса.
 
     while (true) {
         // Таймаут 1100мс: если холл молчит дольше 1100мс — скорость точно <60RPM.
         // При portMAX_DELAY задача зависала в ожидании и не успевала погасить
         // светодиоды при резкой остановке — loop() выключал питание только через 3с.
         xSemaphoreTake(hallSemaphore, pdMS_TO_TICKS(1100));
-        esp_task_wdt_reset(); // Сбрасываем WDT после каждого ожидания (в т.ч. при pause/stop)
 
         if (force_stop_display || !peripherals_active || !newFrameReady) continue;
 
@@ -538,35 +535,6 @@ void renderingTask(void* pvParameters) {
                 lastFrameSwitchTime += steps * frameDelay;
                 currentFrameIndex = (currentFrameIndex + steps) % totalFrames;
             }
-        }
-
-        // Авто-яркость: HIGH_RES_MODE (~120 мс/замер), среднее по 10 замерам
-        // measurementReady() гарантирует что датчик завершил текущий цикл перед чтением
-        if (lightMeter.measurementReady()) {
-            float lux = lightMeter.readLightLevel();
-            if (lux >= 0) {
-                // Кольцевой буфер 10 замеров
-                static float   lux_buf[10] = {};
-                static uint8_t lux_idx     = 0;
-                static uint8_t lux_count   = 0;
-
-                lux_buf[lux_idx] = lux;
-                lux_idx = (lux_idx + 1) % 10;
-                if (lux_count < 10) lux_count++;
-
-                float sum = 0;
-                for (uint8_t i = 0; i < lux_count; i++) sum += lux_buf[i];
-                last_lux_value = sum / lux_count;
-            }
-            float ratio = constrain(last_lux_value / 1000.0f, 0.0f, 1.0f);
-            global_brightness = (uint8_t)constrain(
-                (int)(ratio * (float)max_brightness),
-                (int)min_brightness,
-                (int)max_brightness
-            );
-            // effective синхронизируем с brightness всегда — fillSectorIntoBuffer
-            // перезапишет его финальным значением после ABL в ходе рендеринга.
-            global_effective_brightness = global_brightness;
         }
 
         noInterrupts();
@@ -622,25 +590,14 @@ void renderingTask(void* pvParameters) {
 
             if (sector != last_sector) {
                 uint8_t idle = 1 - active;
-
-                // Заполняем свободный буфер ПОКА предыдущая DMA-передача ещё идёт.
-                // Всегда заполняем SK9822_MAX_LEDS диодов — неиспользуемые гасятся внутри.
-                // Это гарантирует что физически подключённые лучи 5–8 получают команду
-                // выключения на каждом кадре, а не держат старое состояние.
                 fillSectorIntoBuffer(dma_buf[idle], sector);
                 sectors_drawn++;
 
-                // Ждём завершения предыдущей передачи.
-                // spi_device_get_trans_result не держит критическую секцию —
-                // прерывания разрешены, lwIP/WiFi обрабатывают пакеты во время ожидания.
                 if (tx_pending) {
                     spi_transaction_t* done;
                     spi_device_get_trans_result(sk9822_spi, &done, portMAX_DELAY);
                 }
-
-                // length фиксирован в initSK9822_DMA — не меняем, просто ставим в очередь.
                 spi_device_queue_trans(sk9822_spi, &spi_trans[idle], portMAX_DELAY);
-
                 active      = idle;
                 tx_pending  = true;
                 last_sector = sector;
@@ -858,9 +815,19 @@ void setup() {
     // рендеринга, loopNetwork() не вызывается → WDT на loopTask.
     xTaskCreatePinnedToCore(networkTask, "network", 4096, NULL, 3, NULL, 0);
 
-    // Приоритет 18: выше WiFi/lwIP (1–3), выше loop() (1), ниже системных задач ESP-IDF (22+).
-    // Высокий приоритет минимизирует вытеснение во время рендеринга.
-    xTaskCreatePinnedToCore(renderingTask, "render", 4096, NULL, 18, NULL, 1);
+    // Core 1, приоритет 2: выше loop()/BQ25792 (prio 1), ниже WiFi ISR и системных задач.
+    // Приоритет 18 вызывал непрерывный busy-wait без уступок WiFi-прерываниям →
+    // SPI spinlock блокировал beacon-обработку → WiFi рвал ассоциацию → ребут.
+    // При prio 2 WiFi ISR (prio >10 в IDF) всегда прерывает рендеринг когда нужно.
+    // Джиттер <5мкс на сектор при 14мкс/сектор (200 RPM) — визуально незаметен.
+    xTaskCreatePinnedToCore(renderingTask, "render", 4096, NULL, 2, NULL, 1);
+
+    // loopTask (Arduino loop) работает на Core 1 с приоритетом 1.
+    // renderingTask (приоритет 18) полностью вытесняет его во время вращения —
+    // loop() не вызывается сотни миллисекунд. Task WDT убивает устройство через 5с.
+    // Решение: отписываем loopTask от WDT. Всё критичное (network, BQ25792, sleep)
+    // уже вынесено в отдельные задачи с собственными WDT или без них.
+    esp_task_wdt_delete(xTaskGetCurrentTaskHandle());
 
     // Подключаем прерывания
     attachInterrupt(digitalPinToInterrupt(PIN_COLOR_INT), magnetInterruptHandler, FALLING);
@@ -1133,9 +1100,28 @@ void loop() {
     }
 
     // --- 5. Авто-яркость ---
-    // Чтение BH1750 и обновление global_brightness выполняется в renderingTask (Core 1)
-    // каждые 100 мс — дублировать здесь нельзя, так как Wire не потокобезопасен
-    // при одновременном вызове с двух ядер.
+    // Wire вызывается только из loop() — исключает гонку с renderingTask.
+    if (lightMeter.measurementReady()) {
+        float lux = lightMeter.readLightLevel();
+        if (lux >= 0) {
+            static float   lux_buf[10] = {};
+            static uint8_t lux_idx     = 0;
+            static uint8_t lux_count   = 0;
+            lux_buf[lux_idx] = lux;
+            lux_idx = (lux_idx + 1) % 10;
+            if (lux_count < 10) lux_count++;
+            float sum = 0;
+            for (uint8_t i = 0; i < lux_count; i++) sum += lux_buf[i];
+            last_lux_value = sum / lux_count;
+        }
+        float ratio = constrain(last_lux_value / 1000.0f, 0.0f, 1.0f);
+        global_brightness = (uint8_t)constrain(
+            (int)(ratio * (float)max_brightness),
+            (int)min_brightness,
+            (int)max_brightness
+        );
+        global_effective_brightness = global_brightness;
+    }
 
     // --- 6. Мониторинг BMS (Непрерывный мониторинг, даже при остановленном рендере) ---
     static uint32_t last_bms_check_time = 0;

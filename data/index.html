@@ -3,423 +3,771 @@
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>POV WHEEL CONTROL</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
-:root {
-    --c: #00d4ff; --c2: #0055ff; --acc: #ff8800;
-    --bg: #050510; --card: #08101e; --border: #00d4ff33;
-    --text: #a0d8ef; --dim: #3a5a6a; --danger: #ff2244;
-    --ok: #00ff88; --glow: rgba(0,212,255,0.15);
-}
-* { box-sizing: border-box; margin: 0; padding: 0; }
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 html { overflow-x: hidden; }
-body {
-    font-family: 'Courier New', Consolas, monospace;
-    background: var(--bg); color: var(--text);
-    padding: 16px; min-height: 100vh;
-    width: 100%; max-width: 100%;
-    overflow-x: hidden;
-    -webkit-text-size-adjust: 100%;
-    text-size-adjust: 100%;
-    background-image:
-        linear-gradient(rgba(0,212,255,0.025) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(0,212,255,0.025) 1px, transparent 1px);
-    background-size: 40px 40px;
-}
-header {
-    text-align: center; margin-bottom: 20px; padding: 14px 0;
-    border-bottom: 1px solid var(--border);
-    width: 100%; max-width: 100%; overflow: hidden;
-}
-header h1 {
-    font-size: 1.4em; letter-spacing: 0.12em; color: var(--c);
-    text-shadow: 0 0 18px var(--c);
-    overflow: hidden; text-overflow: ellipsis; overflow-wrap: anywhere;
-}
-header .sub {
-    font-size: 0.68em; color: var(--dim); letter-spacing: 0.15em; margin-top: 5px;
-    overflow: hidden; text-overflow: ellipsis; overflow-wrap: anywhere;
-    min-height: 1.2em; /* резервируем место до появления текста — предотвращает reflow */
-}
-.grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 16px; max-width: 860px; margin: 0 auto;
-    width: 100%; overflow-x: hidden;
-}
-.full { grid-column: 1 / -1; }
-.panel {
-    background: var(--card); border: 1px solid var(--border);
-    padding: 16px; position: relative;
-    box-shadow: 0 0 18px var(--glow), inset 0 0 18px rgba(0,212,255,0.03);
-    min-width: 0; overflow-x: hidden;
-}
-.panel::before {
-    content: ''; position: absolute; top: 0; left: 0;
-    width: 7px; height: 7px; border-top: 2px solid var(--c); border-left: 2px solid var(--c);
-}
-.panel::after {
-    content: ''; position: absolute; bottom: 0; right: 0;
-    width: 7px; height: 7px; border-bottom: 2px solid var(--c); border-right: 2px solid var(--c);
-}
-.panel-title {
-    font-size: 0.62em; letter-spacing: 0.2em; color: var(--c);
-    text-transform: uppercase; margin-bottom: 13px;
-    padding-bottom: 7px; border-bottom: 1px solid var(--border);
-}
-button {
-    background: transparent; border: 1px solid var(--c); color: var(--c);
-    padding: 7px 14px; cursor: pointer; font-family: inherit;
-    font-size: 0.72em; letter-spacing: 0.1em; text-transform: uppercase;
-    transition: all 0.15s;
-    clip-path: polygon(6px 0%, 100% 0%, calc(100% - 6px) 100%, 0% 100%);
-}
-button:hover { background: var(--c); color: var(--bg); box-shadow: 0 0 12px var(--c); }
-button.danger { border-color: var(--danger); color: var(--danger); clip-path: none; }
-button.danger:hover { background: var(--danger); color: #fff; box-shadow: 0 0 10px var(--danger); }
-button.full-w { width: 100%; clip-path: none; margin-top: 8px; }
-input[type="text"], input[type="file"] {
-    background: #0a1628; color: var(--text); border: 1px solid var(--border);
-    padding: 8px 10px; width: 100%; margin-bottom: 10px;
-    font-family: inherit; font-size: 0.78em; outline: none;
-}
-input[type="text"]:focus { border-color: var(--c); box-shadow: 0 0 8px rgba(0,212,255,0.25); }
-input[type="file"] { cursor: pointer; color: var(--dim); }
 
-/* ---- Dual-range brightness slider ---- */
-.bri-wrap { position: relative; height: 32px; margin: 8px 0 4px; user-select: none; }
+:root {
+  --bg-base:    #0a0f1a;
+  --bg-card:    #0f172a;
+  --bg-deep:    #060b14;
+  --bg-input:   #070d1a;
+  --border:     #1e3a5f;
+  --border-dim: #132847;
+  --accent:     #38bdf8;
+  --accent-dim: #1d4ed8;
+  --text:       #e2e8f0;
+  --text-muted: #64748b;
+  --text-hint:  #475569;
+  --green:      #34d399;
+  --yellow:     #fbbf24;
+  --red:        #f87171;
+  --orange:     #fb923c;
+  --purple:     #818cf8;
+  --font-ui:    'DM Sans', sans-serif;
+  --font-mono:  'Space Mono', monospace;
+  --r-card:     14px;
+  --r-elem:     10px;
+}
+
+body {
+  font-family: var(--font-ui);
+  background: var(--bg-base);
+  color: var(--text);
+  min-height: 100vh;
+  padding-bottom: 32px;
+}
+
+/* ---- Topbar ---- */
+.topbar {
+  background: var(--bg-deep);
+  border-bottom: 1px solid var(--border);
+  padding: 14px 28px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.topbar-left { display: flex; flex-direction: column; gap: 3px; }
+.topbar-title {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  color: var(--accent);
+  letter-spacing: 2px;
+  text-transform: uppercase;
+}
+.topbar-ip {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-hint);
+}
+.topbar-right { display: flex; align-items: center; gap: 20px; }
+.status-pill {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 500;
+}
+.log-dot {
+  width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+}
+.log-dot.online  { background: var(--green);  box-shadow: 0 0 6px var(--green); }
+.log-dot.offline { background: var(--red);    box-shadow: 0 0 6px var(--red); }
+#logStatusText { color: var(--red); }
+.ota-btn {
+  font-size: 11px;
+  padding: 5px 14px;
+  border-radius: 7px;
+  border: 1px solid #ff660044;
+  background: transparent;
+  color: #ff6600;
+  font-family: var(--font-ui);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.ota-btn:hover { background: #ff6600; color: #fff; }
+
+/* ---- Grid layouts ---- */
+.main-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 16px;
+  padding: 20px 24px 0;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+.bottom-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  padding: 16px 24px 0;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+/* ---- Card ---- */
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  padding: 20px;
+}
+.card-title {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--text-hint);
+  margin-bottom: 16px;
+}
+.card-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+.card-title-row .card-title { margin-bottom: 0; }
+
+/* ---- Live Metrics card ---- */
+.wheel-vis {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 14px;
+}
+svg.wheel { filter: drop-shadow(0 0 14px #1d4ed855); }
+.speed-block { text-align: center; margin-bottom: 14px; }
+.speed-value {
+  font-family: var(--font-mono);
+  font-size: 44px;
+  font-weight: 700;
+  color: var(--text);
+  line-height: 1;
+}
+.speed-unit {
+  font-size: 14px;
+  color: var(--text-muted);
+  margin-left: 4px;
+}
+.speed-label {
+  font-size: 11px;
+  color: var(--text-hint);
+  margin-top: 5px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+.metrics-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 10px;
+}
+.mini-metric {
+  background: var(--bg-input);
+  border-radius: var(--r-elem);
+  padding: 11px 10px;
+  text-align: center;
+}
+.mini-val {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text);
+}
+.mini-val.accent { color: var(--accent); }
+.mini-label {
+  display: block;
+  font-size: 9px;
+  color: var(--text-hint);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-top: 3px;
+}
+.wheel-circ-input {
+  background: transparent;
+  border: none;
+  outline: none;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+  text-align: center;
+  width: 60px;
+  cursor: text;
+  padding: 0;
+}
+
+/* ---- Power Status card ---- */
+.power-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--border-dim);
+  font-size: 13px;
+}
+.power-row:last-child { border-bottom: none; }
+.power-label { color: var(--text-muted); font-size: 12px; }
+.power-val { font-family: var(--font-mono); font-size: 13px; }
+.power-unit { font-size: 11px; color: var(--text-hint); margin-left: 2px; }
+.badge {
+  font-size: 10px; padding: 3px 9px; border-radius: 20px;
+  font-weight: 600; letter-spacing: 0.5px;
+}
+.badge-green { background: #052e16; color: var(--green); border: 1px solid #166534; }
+.badge-blue  { background: #0c2340; color: var(--accent); border: 1px solid #164e73; }
+.badge-dim   { background: #111827; color: var(--text-muted); border: 1px solid var(--border); }
+.battery-bar-wrap {
+  background: var(--bg-input);
+  border-radius: var(--r-elem);
+  padding: 12px;
+  margin-top: 14px;
+}
+.battery-bar-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.battery-bar-label { font-size: 11px; color: var(--text-muted); }
+.battery-bar-pct   { font-family: var(--font-mono); font-size: 13px; color: var(--green); }
+.battery-bar-track {
+  height: 5px; background: var(--border); border-radius: 3px; overflow: hidden;
+}
+.battery-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #065f46, var(--green));
+  border-radius: 3px;
+  width: 0%;
+  transition: width 0.5s;
+}
+
+/* ---- Storage & Upload card ---- */
+.upload-zone {
+  border: 1.5px dashed var(--border);
+  border-radius: 12px;
+  padding: 20px;
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.2s;
+  position: relative;
+}
+.upload-zone:hover { border-color: var(--accent); background: #060b14; }
+.upload-zone input[type="file"] {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  opacity: 0; cursor: pointer;
+}
+.upload-icon { font-size: 26px; color: var(--border); margin-bottom: 6px; transition: color 0.2s; }
+.upload-zone:hover .upload-icon { color: var(--accent); }
+.upload-text { font-size: 12px; color: var(--text-hint); line-height: 1.5; }
+.upload-text span { color: var(--accent); font-weight: 500; }
+
+.status-bar {
+  font-size: 11px;
+  color: var(--text-muted);
+  padding: 7px 10px;
+  background: var(--bg-input);
+  border-radius: 8px;
+  border-left: 2px solid var(--border);
+  margin-top: 10px;
+  min-height: 30px;
+  font-family: var(--font-mono);
+}
+.status-bar.ok  { border-color: var(--green); color: var(--green); }
+.status-bar.err { border-color: var(--red);   color: var(--red); }
+
+.progress-wrap { margin-top: 6px; display: none; }
+.progress-track { height: 3px; background: var(--border); border-radius: 2px; overflow: hidden; }
+.progress-fill  { height: 100%; background: linear-gradient(90deg, var(--accent-dim), var(--accent)); border-radius: 2px; width: 0%; transition: width 0.15s; }
+
+.upload-queue-label {
+  font-size: 11px; color: var(--text-hint); margin-top: 7px;
+  font-family: var(--font-mono); display: none;
+}
+
+.fs-header {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 6px;
+}
+.fs-label { font-size: 11px; color: var(--text-muted); }
+.fs-pct   { font-family: var(--font-mono); font-size: 11px; color: var(--accent); }
+.fs-track { height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; margin-bottom: 14px; }
+.fs-fill  { height: 100%; background: linear-gradient(90deg, var(--accent-dim), var(--accent)); border-radius: 2px; transition: width 0.4s; width: 0%; }
+
+.file-item {
+  display: flex; align-items: center;
+  background: var(--bg-input);
+  border-radius: var(--r-elem);
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  gap: 10px;
+}
+.file-item .fname {
+  flex: 1; font-family: var(--font-mono); font-size: 11px;
+  color: #cbd5e1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.file-item .fsize { font-size: 11px; color: var(--text-hint); white-space: nowrap; }
+.file-item .acts  { display: flex; gap: 6px; }
+
+.btn-icon {
+  width: 30px; height: 30px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-family: var(--font-ui);
+  transition: all 0.15s;
+  padding: 0;
+}
+.btn-icon:hover { background: var(--border); color: var(--text); }
+.btn-icon.play  { color: var(--green); border-color: #166534; }
+.btn-icon.play:hover { background: #052e16; }
+.btn-icon.del   { color: var(--red);   border-color: #7f1d1d; }
+.btn-icon.del:hover  { background: #1a0505; }
+
+/* ---- Buttons ---- */
+.btn-primary {
+  display: block; width: 100%;
+  padding: 11px;
+  border: none; border-radius: var(--r-elem);
+  background: var(--accent-dim);
+  color: #fff;
+  font-family: var(--font-ui); font-size: 13px; font-weight: 600;
+  cursor: pointer; letter-spacing: 0.3px;
+  transition: background 0.15s;
+  margin-top: 10px;
+}
+.btn-primary:hover { background: #2563eb; }
+.btn-stop {
+  display: block; width: 100%;
+  padding: 10px;
+  border: 1px solid #7f1d1d; border-radius: var(--r-elem);
+  background: #1a0505;
+  color: var(--red);
+  font-family: var(--font-ui); font-size: 13px; font-weight: 600;
+  cursor: pointer; margin-top: 10px;
+  transition: background 0.15s;
+}
+.btn-stop:hover { background: #2d0808; }
+
+/* ---- Settings card ---- */
+.slider-row { margin-bottom: 14px; }
+.slider-label {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 12px; color: var(--text-muted); margin-bottom: 7px;
+}
+.slider-label .val { font-family: var(--font-mono); color: var(--accent); font-size: 12px; }
+
+/* custom range */
+input[type="range"] {
+  -webkit-appearance: none; appearance: none;
+  width: 100%; height: 4px;
+  background: var(--border); border-radius: 2px;
+  outline: none; cursor: pointer; display: block;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 14px; height: 14px; border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--bg-base);
+  cursor: pointer;
+}
+input[type="range"]::-moz-range-thumb {
+  width: 14px; height: 14px; border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--bg-base);
+  cursor: pointer;
+}
+
+/* Цветные RGB thumb'ы */
+input[type="range"].r-slider::-webkit-slider-thumb { background: var(--red); }
+input[type="range"].r-slider::-moz-range-thumb     { background: var(--red); }
+input[type="range"].g-slider::-webkit-slider-thumb { background: var(--green); }
+input[type="range"].g-slider::-moz-range-thumb     { background: var(--green); }
+input[type="range"].b-slider::-webkit-slider-thumb { background: var(--purple); }
+input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); }
+
+/* Dual-range brightness */
+.bri-wrap { position: relative; height: 28px; margin-bottom: 4px; user-select: none; }
 .bri-track {
-    position: absolute; top: 50%; left: 0; right: 0;
-    height: 4px; background: #0a2040; transform: translateY(-50%);
+  position: absolute; top: 50%; left: 0; right: 0;
+  height: 4px; background: var(--border); border-radius: 2px;
+  transform: translateY(-50%);
 }
 .bri-fill {
-    position: absolute; top: 50%; height: 4px;
-    background: linear-gradient(90deg, #0055ff, #00d4ff);
-    transform: translateY(-50%); pointer-events: none;
+  position: absolute; top: 50%; height: 4px;
+  background: linear-gradient(90deg, var(--accent-dim), var(--accent));
+  border-radius: 2px; transform: translateY(-50%); pointer-events: none;
 }
 .bri-cursor {
-    position: absolute; top: 50%; transform: translate(-50%, -50%);
-    width: 10px; height: 10px; background: var(--acc);
-    clip-path: polygon(50% 0%,100% 50%,50% 100%,0% 50%);
-    pointer-events: none; z-index: 10;
-    box-shadow: 0 0 8px var(--acc);
-    transition: left 0.3s;
+  position: absolute; top: 50%; transform: translate(-50%, -50%);
+  width: 8px; height: 8px;
+  background: var(--yellow);
+  border-radius: 50%;
+  pointer-events: none; z-index: 10;
+  box-shadow: 0 0 6px var(--yellow);
+  transition: left 0.3s;
 }
 .bri-wrap input[type="range"] {
-    position: absolute; width: 100%; height: 32px; top: 0; left: 0; margin: 0; padding: 0;
-    -webkit-appearance: none; appearance: none;
-    background: transparent; outline: none; pointer-events: none;
+  position: absolute; width: 100%; height: 28px; top: 0; left: 0;
+  margin: 0; padding: 0; background: transparent; pointer-events: none;
+  touch-action: none;
 }
-.bri-wrap input[type="range"]::-webkit-slider-thumb {
-    -webkit-appearance: none; appearance: none;
-    width: 16px; height: 16px; background: var(--c);
-    clip-path: polygon(50% 0%,100% 50%,50% 100%,0% 50%);
-    cursor: pointer; pointer-events: all;
-    box-shadow: 0 0 8px var(--c);
-}
-.bri-wrap input[type="range"]::-moz-range-thumb {
-    width: 16px; height: 16px; background: var(--c);
-    border: none; cursor: pointer; pointer-events: all; border-radius: 0;
-}
+.bri-wrap input[type="range"]::-webkit-slider-thumb { pointer-events: all; }
+.bri-wrap input[type="range"]::-moz-range-thumb     { pointer-events: all; }
 .bri-labels {
-    display: flex; justify-content: space-between; align-items: center;
-    font-size: 0.63em; color: var(--dim); margin-bottom: 10px;
+  display: flex; justify-content: space-between;
+  font-size: 11px; color: var(--text-hint); margin-bottom: 12px;
+  font-family: var(--font-mono);
 }
-.bri-labels .now { color: var(--acc); font-size: 1.05em; }
-.bri-labels b { color: var(--c); }
-.bri-labels .now b { color: var(--acc); }
+.bri-labels .v  { color: var(--accent); }
+.bri-labels .now { color: var(--yellow); }
 
-/* ---- Angle slider ---- */
-.slider-row { margin-bottom: 12px; }
-.slider-row label { display: flex; justify-content: space-between; font-size: 0.68em; letter-spacing: 0.07em; margin-bottom: 5px; }
-.slider-row label span { color: var(--c); }
-input.angle-slide {
-    -webkit-appearance: none; appearance: none; width: 100%; height: 3px;
-    background: #0a2040; outline: none; pointer-events: none;
-}
-input.angle-slide::-webkit-slider-thumb {
-    -webkit-appearance: none; appearance: none;
-    width: 14px; height: 14px; background: var(--c);
-    clip-path: polygon(50% 0%,100% 50%,50% 100%,0% 50%);
-    cursor: pointer; pointer-events: all; box-shadow: 0 0 8px var(--c);
-}
-input.angle-slide::-moz-range-thumb {
-    width: 14px; height: 14px; background: var(--c);
-    border: none; cursor: pointer; pointer-events: all; border-radius: 0;
-}
-/* Цветные thumb'ы для RGB-ползунков */
-input.angle-slide[style*="--thumb-color:#ff4466"]::-webkit-slider-thumb { background: #ff4466; box-shadow: 0 0 8px #ff4466; }
-input.angle-slide[style*="--thumb-color:#ff4466"]::-moz-range-thumb     { background: #ff4466; }
-input.angle-slide[style*="--thumb-color:#00ff88"]::-webkit-slider-thumb { background: #00ff88; box-shadow: 0 0 8px #00ff88; }
-input.angle-slide[style*="--thumb-color:#00ff88"]::-moz-range-thumb     { background: #00ff88; }
-input.angle-slide[style*="--thumb-color:#00aaff"]::-webkit-slider-thumb { background: #00aaff; box-shadow: 0 0 8px #00aaff; }
-input.angle-slide[style*="--thumb-color:#00aaff"]::-moz-range-thumb     { background: #00aaff; }
-
-/* ---- File list ---- */
-.file-item {
-    display: flex; align-items: center;
-    border: 1px solid var(--border); padding: 7px 10px;
-    margin-bottom: 5px; background: #060f1c; gap: 8px;
-}
-.file-item .fname { flex: 1; font-size: 0.72em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.file-item .fsize { font-size: 0.62em; color: var(--dim); white-space: nowrap; }
-.file-item .acts { display: flex; gap: 4px; }
-.file-item button { padding: 3px 10px; font-size: 0.65em; clip-path: none; }
-
-/* ---- Stats ---- */
-.stat-row { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; font-size: 0.75em; }
-.stat-row .lbl { color: var(--dim); letter-spacing: 0.06em; }
-.stat-row .val { color: var(--c); }
-.fs-bar { height: 4px; background: #0a2040; margin: 6px 0 3px; }
-.fs-bar-fill { height: 100%; background: linear-gradient(90deg, var(--c2), var(--c)); transition: width 0.4s; }
-.fs-label { font-size: 0.62em; color: var(--dim); text-align: right; margin-bottom: 10px; }
-.status-bar {
-    font-size: 0.68em; color: var(--dim); margin-top: 8px;
-    padding: 5px 8px; border-left: 2px solid var(--c);
-    background: #060f1c; min-height: 26px;
-}
-.status-bar.ok { border-color: var(--ok); color: var(--ok); }
-.status-bar.err { border-color: var(--danger); color: var(--danger); }
-
-/* ---- Canvas ---- */
-canvas {
-    display: block; border-radius: 50%;
-    border: 1px solid var(--border); background: #000;
-    margin: 10px auto; box-shadow: 0 0 10px var(--glow);
-    width: 160px; height: 160px; /* display size */
+/* ABL RMS marker */
+.abl-wrap { position: relative; }
+#ablRmsMark {
+  position: absolute; top: 50%; width: 3px; height: 12px;
+  background: var(--yellow); box-shadow: 0 0 5px var(--yellow);
+  transform: translate(-50%, -50%); pointer-events: none;
+  border-radius: 1px;
+  transition: left 0.5s;
 }
 
-/* ---- OTA footer ---- */
-.ota-footer {
-    max-width: 860px; margin: 16px auto 0; text-align: center;
+/* RGB blocks */
+.rgb-grid {
+  display: grid; grid-template-columns: 1fr 1fr 1fr;
+  gap: 8px; margin-top: 14px;
 }
-.ota-footer button {
-    border-color: #ff660044; color: #ff6600; clip-path: none;
-    font-size: 0.7em; padding: 6px 20px;
+.rgb-block { border-radius: 8px; padding: 10px; text-align: center; }
+.rgb-r { background: #1a0505; border: 1px solid #7f1d1d; }
+.rgb-g { background: #051a0a; border: 1px solid #065f46; }
+.rgb-b { background: #05081a; border: 1px solid #1e1b4b; }
+.rgb-val { font-family: var(--font-mono); font-size: 15px; font-weight: 700; }
+.rgb-r .rgb-val { color: var(--red); }
+.rgb-g .rgb-val { color: var(--green); }
+.rgb-b .rgb-val { color: var(--purple); }
+.rgb-name {
+  font-size: 9px; color: var(--text-hint);
+  letter-spacing: 1px; text-transform: uppercase; margin-top: 3px;
 }
-.ota-footer button:hover { background: #ff6600; color: #fff; box-shadow: 0 0 10px #ff6600; }
+.rgb-block input[type="range"] { margin-top: 8px; height: 3px; background: var(--border); }
 
-/* ---- Log panel ---- */
+/* ---- Log card ---- */
 .log-box {
-    /* 100 строк: line-height 1.55 × font-size 0.68em ≈ 15.4px/строка */
-    height: 1540px; overflow-y: auto; background: #020810;
-    border: 1px solid var(--border); padding: 6px 8px;
-    font-size: 0.68em; line-height: 1.55;
+  background: var(--bg-deep);
+  border-radius: var(--r-elem);
+  padding: 12px 14px;
+  height: 280px;
+  overflow-y: auto;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.9;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
 }
-.log-box .log-line { color: var(--text); white-space: pre-wrap; word-break: break-all; }
-.log-controls { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
-.log-controls button { padding: 3px 10px; font-size: 0.65em; clip-path: none; }
-.log-status { display: flex; align-items: center; gap: 6px; font-size: 0.68em; }
-.log-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
-.log-dot.online  { background: var(--ok);     box-shadow: 0 0 6px var(--ok); }
-.log-dot.offline { background: var(--danger); box-shadow: 0 0 6px var(--danger); }
-.log-badge { font-size: 0.62em; color: var(--dim); }
+.log-box::-webkit-scrollbar { width: 4px; }
+.log-box::-webkit-scrollbar-track { background: transparent; }
+.log-box::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+.log-line { white-space: pre-wrap; word-break: break-all; }
+.log-controls {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-top: 8px;
+}
+.log-badge { font-size: 10px; color: var(--text-hint); font-family: var(--font-mono); }
+.log-clear-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 11px;
+  padding: 4px 12px;
+  border-radius: 7px;
+  cursor: pointer;
+  font-family: var(--font-ui);
+  transition: background 0.15s;
+}
+.log-clear-btn:hover { background: var(--border); color: var(--text); }
 
-@media (max-width: 700px) { .grid { grid-template-columns: 1fr; } }
+/* ---- Divider ---- */
+.divider { height: 1px; background: var(--border-dim); margin: 16px 0; }
+
+/* ---- Preview canvas (hidden, functional) ---- */
+#preview { display: none; width: 0; height: 0; }
+
+/* ---- Dot pulse ---- */
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+.dot-pulse {
+  display: inline-block; width: 7px; height: 7px;
+  border-radius: 50%; background: var(--green);
+  animation: pulse 2s ease-in-out infinite;
+}
+
+@media (max-width: 900px) {
+  .main-grid  { grid-template-columns: 1fr 1fr; }
+  .bottom-grid{ grid-template-columns: 1fr; }
+}
+@media (max-width: 600px) {
+  .main-grid  { grid-template-columns: 1fr; padding: 12px 12px 0; }
+  .bottom-grid{ padding: 12px 12px 0; }
+  .topbar { padding: 12px 16px; }
+}
 </style>
 </head>
 <body>
 
-<header>
-    <h1>Pixels Of Velocity</h1>
-    <div class="sub" id="deviceName">CONNECTING...</div>
+<!-- ---- Topbar ---- -->
+<header class="topbar">
+  <div class="topbar-left">
+    <span class="topbar-title">Pixels of Velocity</span>
+    <span class="topbar-ip" id="deviceName">CONNECTING...</span>
+  </div>
+  <div class="topbar-right">
+    <div class="status-pill">
+      <span class="log-dot offline" id="logDot"></span>
+      <span id="logStatusText">OFFLINE</span>
+    </div>
+    <button class="ota-btn" onclick="fetch('/ping').then(()=>window.location.href='/update')">&#8679; OTA Update</button>
+  </div>
 </header>
 
-<div class="grid">
+<!-- ---- Main 3-column grid ---- -->
+<div class="main-grid">
 
-<!-- UPLOAD -->
-<div class="panel full">
-    <div class="panel-title">// Upload Animation</div>
-    <input type="file" id="fileInput" accept="image/*" multiple>
-    <!-- Canvas buffer 200×200, displayed at 160×160 -->
-    <canvas id="preview" width="200" height="200" style="display:none;"></canvas>
-    <div id="uploadQueue" style="display:none; margin:6px 0; font-size:0.68em; color:var(--dim);"></div>
-    <button class="full-w" onclick="processAndUpload()">&#9654; Convert &amp; Upload</button>
-    <div class="status-bar" id="uploadStatus">Waiting for file...</div>
-    <div id="uploadProgressWrap" style="display:none; margin-top:5px;">
-        <div class="fs-bar"><div class="fs-bar-fill" id="uploadProgressBar" style="width:0%; transition:width 0.15s;"></div></div>
+  <!-- Card 1: Live Metrics + Power Status -->
+  <div class="card">
+    <p class="card-title">Live metrics &amp; power</p>
+
+    <!-- Speed -->
+    <div class="speed-block">
+      <div>
+        <span class="speed-value" id="infoSpeed">--</span>
+        <span class="speed-unit">km/h</span>
+      </div>
     </div>
-</div>
 
-<!-- STORAGE -->
-<div class="panel full">
-    <div class="panel-title">// Storage — Device Memory</div>
-    <div class="fs-bar"><div class="fs-bar-fill" id="fsFill" style="width:0%"></div></div>
-    <div class="fs-label" id="fsLabel">Loading...</div>
+    <div class="metrics-row" style="margin-bottom:16px">
+      <div class="mini-metric">
+        <span class="mini-val" id="infoRpm">--</span>
+        <span class="mini-label">RPM</span>
+      </div>
+      <div class="mini-metric" title="Click to edit wheel circumference">
+        <input class="wheel-circ-input mini-val" type="text" id="wheelCirc"
+               value="2355" maxlength="4">
+        <span class="mini-label">Wheel mm</span>
+      </div>
+      <div class="mini-metric">
+        <div style="display:flex;align-items:center;justify-content:center;gap:6px;">
+          <span class="mini-val" id="batV">--</span>
+          <span style="font-size:11px;color:var(--text-hint)">V</span>
+        </div>
+        <span class="mini-label">Battery</span>
+      </div>
+    </div>
+
+    <!-- Battery bar -->
+    <div class="battery-bar-wrap" style="margin-top:0;margin-bottom:14px;">
+      <div class="battery-bar-header">
+        <span class="battery-bar-label">Battery level</span>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span class="badge badge-dim" id="chgStat">--</span>
+          <span class="battery-bar-pct" id="batPct">--%</span>
+        </div>
+      </div>
+      <div class="battery-bar-track">
+        <div class="battery-bar-fill" id="batBar"></div>
+      </div>
+    </div>
+
+    <!-- Power rows -->
+    <div class="power-row">
+      <span class="power-label">Charge current</span>
+      <div><span class="power-val" id="batI">--</span><span class="power-unit">A</span></div>
+    </div>
+    <div class="power-row">
+      <span class="power-label">Input voltage</span>
+      <div><span class="power-val" id="busV">--</span><span class="power-unit">V</span></div>
+    </div>
+    <div class="power-row">
+      <span class="power-label">Input current</span>
+      <div><span class="power-val" id="busI">--</span><span class="power-unit">A</span></div>
+    </div>
+  </div>
+
+  <!-- Card 2: Storage & Upload -->
+  <div class="card">
+    <p class="card-title">Upload animation</p>
+
+    <div class="upload-zone" onclick="document.getElementById('fileInput').click()">
+      <input type="file" id="fileInput" accept="image/*" multiple style="display:none">
+      <div class="upload-icon">&#8679;</div>
+      <div class="upload-text">Drop <span>.gif</span> or image here<br>or click to browse</div>
+    </div>
+    <div class="upload-queue-label" id="uploadQueue"></div>
+    <div class="status-bar" id="uploadStatus">Waiting for file...</div>
+    <div class="progress-wrap" id="uploadProgressWrap">
+      <div class="progress-track">
+        <div class="progress-fill" id="uploadProgressBar"></div>
+      </div>
+    </div>
+    <button class="btn-primary" onclick="processAndUpload()">&#9654; Convert &amp; Upload</button>
+
+    <div class="divider"></div>
+
+    <p class="card-title">Storage</p>
+    <div class="fs-header">
+      <span class="fs-label" id="fsLabel">Loading...</span>
+      <span class="fs-pct" id="fsPct"></span>
+    </div>
+    <div class="fs-track"><div class="fs-fill" id="fsFill"></div></div>
+
     <div id="fileList"></div>
-    <button class="full-w danger" onclick="stopDisplay()">&#9632; Stop Display</button>
-</div>
 
-<!-- SETTINGS -->
-<div class="panel">
-    <div class="panel-title">// Display Settings</div>
+    <button class="btn-stop" onclick="stopDisplay()">&#9632; Stop Display</button>
+  </div>
 
-    <!-- Dual-range brightness -->
-    <div style="font-size:0.68em;letter-spacing:0.07em;margin-bottom:5px;">BRIGHTNESS RANGE</div>
-    <div class="bri-wrap">
+
+</div><!-- /main-grid -->
+
+<!-- hidden preview canvas — used for GIF/image conversion -->
+<canvas id="preview" width="200" height="200"></canvas>
+
+<!-- ---- Bottom 2-column grid ---- -->
+<div class="bottom-grid">
+
+  <!-- Card 4: Display Settings -->
+  <div class="card">
+    <p class="card-title">Display settings</p>
+
+    <!-- Brightness dual-range -->
+    <div class="slider-row">
+      <div class="slider-label">
+        <span>Brightness range</span>
+        <span class="val">
+          <span id="bMinVal">2</span>&nbsp;–&nbsp;<span id="bMaxVal">16</span>
+          &nbsp;<span style="color:var(--text-hint);font-size:10px">/ 31</span>
+          &nbsp;<span class="now" style="color:var(--yellow)">now&nbsp;<span id="briVal">--</span></span>
+        </span>
+      </div>
+      <div class="bri-wrap">
         <div class="bri-track"></div>
         <div class="bri-fill" id="drFill"></div>
         <div class="bri-cursor" id="drCursor"></div>
         <input type="range" id="bMinSlide" min="0" max="31" value="2">
         <input type="range" id="bMaxSlide" min="0" max="31" value="16">
-    </div>
-    <div class="bri-labels">
-        <span>MIN&nbsp;<b id="bMinVal">2</b>/31</span>
-        <span class="now">NOW&nbsp;<b id="briVal">--</b>/31</span>
-        <span>MAX&nbsp;<b id="bMaxVal">16</b>/31</span>
+      </div>
     </div>
 
     <!-- Angle -->
     <div class="slider-row">
-        <label>ANGLE OFFSET <span><span id="aVal">0</span>&deg;</span></label>
-        <input class="angle-slide" type="range" id="aSlide" min="0" max="360" value="0"
-               oninput="document.getElementById('aVal').textContent=this.value; syncSettings()">
+      <div class="slider-label">
+        <span>Angle offset</span>
+        <span class="val"><span id="aVal">0</span>&deg;</span>
+      </div>
+      <input type="range" id="aSlide" min="0" max="360" value="0"
+             oninput="document.getElementById('aVal').textContent=this.value; syncSettings()">
     </div>
 
-    <!-- Gamma correction -->
+    <!-- Gamma -->
     <div class="slider-row">
-        <label>GAMMA CORRECTION <span id="gVal">4.0</span></label>
-        <input class="angle-slide" type="range" id="gSlide" min="10" max="50" value="40"
-               oninput="document.getElementById('gVal').textContent=(this.value/10).toFixed(1); syncSettings()">
+      <div class="slider-label">
+        <span>Gamma correction</span>
+        <span class="val" id="gVal">4.0</span>
+      </div>
+      <input type="range" id="gSlide" min="10" max="50" value="40"
+             oninput="document.getElementById('gVal').textContent=(this.value/10).toFixed(1); syncSettings()">
     </div>
 
     <!-- Saturation -->
     <div class="slider-row">
-        <label>SATURATION <span id="sVal">1.0</span></label>
-        <input class="angle-slide" type="range" id="sSlide" min="10" max="30" value="10"
-               oninput="document.getElementById('sVal').textContent=(this.value/10).toFixed(1); syncSettings()">
+      <div class="slider-label">
+        <span>Saturation</span>
+        <span class="val" id="sVal">1.0</span>
+      </div>
+      <input type="range" id="sSlide" min="10" max="30" value="10"
+             oninput="document.getElementById('sVal').textContent=(this.value/10).toFixed(1); syncSettings()">
     </div>
 
     <!-- Contrast -->
     <div class="slider-row">
-        <label>CONTRAST <span id="coVal">0%</span></label>
-        <input class="angle-slide" type="range" id="coSlide" min="0" max="100" value="0"
-               oninput="document.getElementById('coVal').textContent=this.value+'%'; syncSettings()">
+      <div class="slider-label">
+        <span>Contrast</span>
+        <span class="val" id="coVal">0%</span>
+      </div>
+      <input type="range" id="coSlide" min="0" max="100" value="0"
+             oninput="document.getElementById('coVal').textContent=this.value+'%'; syncSettings()">
     </div>
 
     <!-- Arms -->
     <div class="slider-row">
-        <label>ARMS <span id="armsVal">4</span></label>
-        <input class="angle-slide" type="range" id="armsSlide" min="1" max="8" value="7" step="1"
-               oninput="document.getElementById('armsVal').textContent=this.value; syncSettings()">
+      <div class="slider-label">
+        <span>Arms count</span>
+        <span class="val" id="armsVal">4</span>
+      </div>
+      <input type="range" id="armsSlide" min="1" max="8" value="4" step="1"
+             oninput="document.getElementById('armsVal').textContent=this.value; syncSettings()">
     </div>
 
     <!-- ABL -->
     <div class="slider-row">
-        <label>FORWARD CURRENT <span id="ablVal">100%</span>
-            <span id="ablRmsLabel" style="color:#ffcc00;font-size:0.85em;margin-left:8px;">RMS --</span>
-        </label>
-        <div style="position:relative;">
-            <input class="angle-slide" type="range" id="ablSlide" min="0" max="100" value="100"
-                   oninput="document.getElementById('ablVal').textContent=this.value+'%'; syncSettings()">
-            <!-- Желтая отметка RMS: абсолютно позиционирована над треком -->
-            <div id="ablRmsMark" style="
-                position:absolute; top:50%; width:3px; height:14px;
-                background:#ffcc00; box-shadow:0 0 6px #ffcc00;
-                transform:translate(-50%,-50%); pointer-events:none;
-                left:50%; transition:left 0.5s;
-            "></div>
-        </div>
+      <div class="slider-label">
+        <span>Forward current</span>
+        <span class="val">
+          <span id="ablVal">100%</span>
+          <span id="ablRmsLabel" style="color:var(--yellow);font-size:10px;margin-left:6px;">RMS --</span>
+        </span>
+      </div>
+      <div class="abl-wrap">
+        <input type="range" id="ablSlide" min="0" max="100" value="100"
+               oninput="document.getElementById('ablVal').textContent=this.value+'%'; syncSettings()">
+        <div id="ablRmsMark"></div>
+      </div>
     </div>
 
-    <!-- RGB gain -->
-    <div class="slider-row">
-        <label>RED <span id="rgVal" style="color:#ff4466;">100%</span></label>
-        <input class="angle-slide" type="range" id="rgSlide" min="0" max="200" value="100"
-               oninput="document.getElementById('rgVal').textContent=this.value+'%'; syncSettings()"
-               style="--thumb-color:#ff4466;">
-    </div>
-    <div class="slider-row">
-        <label>GREEN <span id="ggVal" style="color:#00ff88;">100%</span></label>
-        <input class="angle-slide" type="range" id="ggSlide" min="0" max="200" value="100"
-               oninput="document.getElementById('ggVal').textContent=this.value+'%'; syncSettings()"
-               style="--thumb-color:#00ff88;">
-    </div>
-    <div class="slider-row">
-        <label>BLUE <span id="bgVal" style="color:#00aaff;">100%</span></label>
-        <input class="angle-slide" type="range" id="bgSlide" min="0" max="200" value="100"
-               oninput="document.getElementById('bgVal').textContent=this.value+'%'; syncSettings()"
-               style="--thumb-color:#00aaff;">
-    </div>
-</div>
+    <div class="divider"></div>
+    <p class="card-title">Color correction</p>
 
-<!-- POWER + INFO -->
-<div class="panel">
-    <div class="panel-title">// Power Status</div>
-    <div class="stat-row">
-        <span class="lbl">BATTERY VOLTAGE</span>
-        <span style="display:flex;align-items:baseline;gap:3px;">
-            <span class="val" id="batV">--</span><span style="color:var(--dim);font-size:0.85em;">V</span>
-        </span>
+    <div class="rgb-grid">
+      <div class="rgb-block rgb-r">
+        <div class="rgb-val" id="rgVal">100%</div>
+        <div class="rgb-name">Red</div>
+        <input type="range" class="r-slider" id="rgSlide" min="0" max="200" step="10" value="100"
+               oninput="document.getElementById('rgVal').textContent=this.value+'%'; syncSettings()">
+      </div>
+      <div class="rgb-block rgb-g">
+        <div class="rgb-val" id="ggVal">100%</div>
+        <div class="rgb-name">Green</div>
+        <input type="range" class="g-slider" id="ggSlide" min="0" max="200" step="10" value="100"
+               oninput="document.getElementById('ggVal').textContent=this.value+'%'; syncSettings()">
+      </div>
+      <div class="rgb-block rgb-b">
+        <div class="rgb-val" id="bgVal">100%</div>
+        <div class="rgb-name">Blue</div>
+        <input type="range" class="b-slider" id="bgSlide" min="0" max="200" step="10" value="100"
+               oninput="document.getElementById('bgVal').textContent=this.value+'%'; syncSettings()">
+      </div>
     </div>
-    <div class="stat-row">
-        <span class="lbl">CHARGE CURRENT</span>
-        <span style="display:flex;align-items:baseline;gap:3px;">
-            <span class="val" id="batI">--</span><span style="color:var(--dim);font-size:0.85em;">A</span>
-        </span>
-    </div>
-    <div class="stat-row">
-        <span class="lbl">INPUT VOLTAGE</span>
-        <span style="display:flex;align-items:baseline;gap:3px;">
-            <span class="val" id="busV">--</span><span style="color:var(--dim);font-size:0.85em;">V</span>
-        </span>
-    </div>
-    <div class="stat-row">
-        <span class="lbl">INPUT CURRENT</span>
-        <span style="display:flex;align-items:baseline;gap:3px;">
-            <span class="val" id="busI">--</span><span style="color:var(--dim);font-size:0.85em;">A</span>
-        </span>
-    </div>
-    <div class="stat-row" style="margin-top:6px;">
-        <span class="lbl">CHARGING STATUS</span>
-        <span class="val" id="chgStat" style="font-size:0.72em;text-align:right;max-width:55%;">--</span>
-    </div>
+  </div>
 
-    <div style="height:1px;background:var(--border);margin:13px 0 11px;"></div>
-
-    <div class="panel-title" style="margin-bottom:11px;">// Info</div>
-    <div class="stat-row"><span class="lbl">RPM</span><span class="val" id="infoRpm">--</span></div>
-    <div class="stat-row">
-        <span class="lbl">SPEED</span>
-        <span style="display:flex;align-items:baseline;gap:4px;">
-            <span class="val" id="infoSpeed">--</span>
-            <span style="color:var(--dim);font-size:0.85em;">km/h</span>
-        </span>
-    </div>
-    <div class="stat-row" style="align-items:center;margin-top:2px;">
-        <span class="lbl">WHEEL CIRCUMFERENCE</span>
-        <span style="display:flex;align-items:center;gap:5px;">
-            <input type="text" id="wheelCirc" value="2355"
-                   style="width:58px;margin:0;padding:3px 6px;font-size:0.78em;text-align:right;
-                          background:#0a1628;border:1px solid var(--border);color:var(--c);
-                          font-family:inherit;outline:none;">
-            <span style="font-size:0.72em;color:var(--dim);">mm</span>
-        </span>
-    </div>
-</div>
-
-</div><!-- /grid -->
-
-<!-- LOG PANEL -->
-<div class="panel full" style="max-width:860px;margin:16px auto 0;">
-    <div class="log-controls">
-        <div style="display:flex;align-items:center;gap:10px;">
-            <div class="panel-title" style="margin:0;">// Device Log</div>
-            <div class="log-status">
-                <span class="log-dot offline" id="logDot"></span>
-                <span id="logStatusText" style="color:var(--danger);">OFFLINE</span>
-            </div>
-        </div>
-        <div style="display:flex;align-items:center;gap:8px;">
-            <span class="log-badge" id="logBadge"></span>
-            <button onclick="clearLogView()">&#10005; Clear</button>
-        </div>
+  <!-- Card 5: Device Log -->
+  <div class="card">
+    <div class="card-title-row">
+      <p class="card-title">Device log</p>
+      <div class="status-pill" style="font-size:11px;color:var(--green)">
+        <span class="dot-pulse"></span> Live
+      </div>
     </div>
     <div class="log-box" id="logBox"></div>
-</div>
+    <div class="log-controls">
+      <span class="log-badge" id="logBadge"></span>
+      <button class="log-clear-btn" onclick="clearLogView()">&#10005; Clear</button>
+    </div>
+  </div>
 
-<div class="ota-footer">
-    <button onclick="fetch('/ping').then(()=>window.location.href='/update')">&#8679; OTA Firmware Update</button>
-</div>
+</div><!-- /bottom-grid -->
 
 <script>
 // ===================== GIF PARSER =====================
@@ -557,7 +905,7 @@ function renderGIFFrames(gif) {
 // Обновляется сервером при изменении настроек, файлов или воспроизведения.
 let _stateVersion = null;  // null = ещё не получено (первый запрос)
 
-const previewCanvas = document.getElementById('preview'); // 200×200 buffer, 160×160 display
+const previewCanvas = document.getElementById('preview'); // 200×200 buffer
 const previewCtx = previewCanvas.getContext('2d', {willReadFrequently: true});
 
 // ===================== FILE INPUT =====================
@@ -575,7 +923,6 @@ document.getElementById('fileInput').addEventListener('change', function(e) {
 
     // Превью только первого файла
     const first = files[0];
-    previewCanvas.style.display = 'inline-block';
     setStatus('uploadStatus', `${files.length} file(s) ready. Press Upload.`, 'ok');
 
     const r2 = new FileReader();
@@ -777,7 +1124,6 @@ async function processAndUpload() {
     // Сбрасываем input чтобы можно было выбрать те же файлы снова
     fileEl.value = '';
     document.getElementById('uploadQueue').style.display = 'none';
-    previewCanvas.style.display = 'none';
 }
 
 // ===================== FILE MANAGER =====================
@@ -785,16 +1131,16 @@ function loadFiles() {
     return fetch('/list').then(r => r.json()).then(files => {
         const list = document.getElementById('fileList');
         if (!files.length) {
-            list.innerHTML = '<div style="color:var(--dim);font-size:0.72em;padding:8px;">No files stored.</div>';
+            list.innerHTML = '<div style="color:var(--text-hint);font-size:12px;padding:8px 0;">No files stored.</div>';
             return;
         }
         list.innerHTML = files.map(f =>
             `<div class="file-item">
-                <span class="fname">${f.name}${f.frames ? `<span style="color:var(--dim);font-size:0.85em;margin-left:6px;">${f.frames}&nbsp;fr</span>` : ''}</span>
+                <span class="fname">${f.name}${f.frames ? `<span style="color:var(--text-hint);font-size:0.85em;margin-left:6px;">${f.frames}&nbsp;fr</span>` : ''}</span>
                 <span class="fsize">${(f.size/1024).toFixed(1)}&nbsp;kB</span>
                 <div class="acts">
-                    <button onclick="playFile('${f.name}')">&#9654;</button>
-                    <button class="danger" onclick="deleteFile('${f.name}')">&#10005;</button>
+                    <button class="btn-icon play" onclick="playFile('${f.name}')" title="Play">&#9654;</button>
+                    <button class="btn-icon del" onclick="deleteFile('${f.name}')" title="Delete">&#10005;</button>
                 </div>
              </div>`
         ).join('');
@@ -807,6 +1153,7 @@ function loadFSInfo() {
         document.getElementById('fsFill').style.width = pct.toFixed(1) + '%';
         document.getElementById('fsLabel').textContent =
             `${(d.free/1024).toFixed(0)} kB free of ${(d.total/1024).toFixed(0)} kB`;
+        document.getElementById('fsPct').textContent = pct.toFixed(0) + '%';
     });
 }
 
@@ -819,7 +1166,7 @@ function _updateAblRms(rms) {
     const mark  = document.getElementById('ablRmsMark');
     const label = document.getElementById('ablRmsLabel');
     if (!mark || !label) return;
-    const thumbR = 7; // половина ширины thumb (14px / 2) для angle-slide
+    const thumbR = 7; // половина ширины thumb (14px / 2)
     const p = rms / 100; // 0..1
     mark.style.left = `calc(${thumbR}px + ${p} * (100% - ${2 * thumbR}px))`;
     label.textContent = `RMS ${rms.toFixed(0)}%`;
@@ -835,7 +1182,7 @@ function updateDualRange() {
     const minV = +document.getElementById('bMinSlide').value;
     const maxV = +document.getElementById('bMaxSlide').value;
     const fill = document.getElementById('drFill');
-    const thumbR = 8; // половина ширины thumb (16px / 2)
+    const thumbR = 7; // половина ширины thumb (14px / 2)
     const pMin = pct(minV) / 100;
     const pMax = pct(maxV) / 100;
     // Заливка точно совпадает с реальным диапазоном движения thumb'ов
@@ -852,7 +1199,7 @@ function updateBriCursor(val) {
     // Курсор NOW движется по всему треку 0–31, не зажат в [min,max].
     // ABL может опустить яркость ниже MIN — это важно показать.
     const clamped = Math.min(Math.max(val, 0), 31);
-    const thumbR = 8;
+    const thumbR = 7;
     const p = pct(clamped) / 100;
     document.getElementById('drCursor').style.left =
         `calc(${thumbR}px + ${p} * (100% - ${2 * thumbR}px))`;
@@ -1015,27 +1362,40 @@ function updateInfo() {
 }
 
 // ===================== BATTERY =====================
+// Порог напряжения заряда: 3.0V = 0%, 4.2V = 100%
+function _voltToPct(mv) {
+    const v = mv / 1000;
+    const pct = Math.max(0, Math.min(100, (v - 3.0) / (4.2 - 3.0) * 100));
+    return pct;
+}
+
 function updateBatteryStatus() {
     return fetch('/battery').then(r => r.json()).then(d => {
         document.getElementById('batV').textContent = (d.vbat/1000).toFixed(2);
         document.getElementById('batI').textContent = (d.ibat/1000).toFixed(2);
         document.getElementById('busV').textContent = (d.vbus/1000).toFixed(2);
         document.getElementById('busI').textContent = (d.ibus/1000).toFixed(2);
+
+        // Обновляем полоску батареи
+        const pct = _voltToPct(d.vbat);
+        document.getElementById('batBar').style.width = pct.toFixed(0) + '%';
+        document.getElementById('batPct').textContent = pct.toFixed(0) + '%';
+
         if (d.chg_stat !== undefined) {
             const el = document.getElementById('chgStat');
             const chgMap = [
-                ['Not Charging',      'var(--dim)'],
-                ['Trickle Charge',    'var(--acc)'],
-                ['Pre-charge',        'var(--acc)'],
-                ['Fast Charge (CC)',  'var(--acc)'],
-                ['Taper Charge (CV)', 'var(--acc)'],
-                ['Top-off Charging',  'var(--acc)'],
-                ['Charge Done',       'var(--ok)'],
-                ['Charge Done',       'var(--ok)'],
+                ['Not Charging',      'badge-dim'],
+                ['Trickle Charge',    'badge-blue'],
+                ['Pre-charge',        'badge-blue'],
+                ['Fast Charge (CC)',  'badge-green'],
+                ['Taper Charge (CV)', 'badge-green'],
+                ['Top-off Charging',  'badge-green'],
+                ['Charge Done',       'badge-green'],
+                ['Charge Done',       'badge-green'],
             ];
             const entry = chgMap[d.chg_stat];
-            el.textContent   = entry ? entry[0] : '--';
-            el.style.color   = entry ? entry[1] : 'var(--dim)';
+            el.textContent = entry ? entry[0] : '--';
+            el.className   = 'badge ' + (entry ? entry[1] : 'badge-dim');
         }
     });
     // Нет .catch() — ошибка пробрасывается в _pollBattery для остановки цепочки
@@ -1056,20 +1416,20 @@ let _logLines      = [];     // Вся накопленная история в 
 let _logAutoScroll = true;
 
 function _logColor(msg) {
-    if (msg.includes('[NET]'))  return '#00d4ff';
-    if (msg.includes('[PWR]'))  return '#ff8800';
-    if (msg.includes('[BMS]'))  return '#ffcc00';
-    if (msg.includes('[DISP]')) return '#00ff88';
-    if (msg.includes('[ERR]'))  return '#ff2244';
-    if (msg.includes('[SYS]'))  return '#c8e0f4';
-    return '#a0d8ef';
+    if (msg.includes('[NET]'))  return '#38bdf8';
+    if (msg.includes('[PWR]'))  return '#fb923c';
+    if (msg.includes('[BMS]'))  return '#fbbf24';
+    if (msg.includes('[DISP]')) return '#34d399';
+    if (msg.includes('[ERR]'))  return '#f87171';
+    if (msg.includes('[SYS]'))  return '#cbd5e1';
+    return '#64748b';
 }
 
 function _logRender() {
     const box = document.getElementById('logBox');
     box.innerHTML = _logLines.map(l => {
         if (l.special === 'restart') {
-            return `<div class="log-line" style="color:#ff8800;text-align:center;border-top:1px solid #ff880044;border-bottom:1px solid #ff880044;padding:2px 0;margin:2px 0;">${_escHtml(l.msg)}</div>`;
+            return `<div class="log-line" style="color:#fb923c;text-align:center;border-top:1px solid #fb923c44;border-bottom:1px solid #fb923c44;padding:2px 0;margin:2px 0;">${_escHtml(l.msg)}</div>`;
         }
         return `<div class="log-line" style="color:${_logColor(l.msg)}">${_escHtml(l.msg)}</div>`;
     }).join('');
@@ -1182,17 +1542,16 @@ const _conn = {
 function _setOnline(online) {
     if (_conn.online === online) return;
     _conn.online = online;
-    // Обновляем тот же индикатор что использовал _logPoll
     const dot  = document.getElementById('logDot');
     const text = document.getElementById('logStatusText');
     if (online) {
         dot.className    = 'log-dot online';
-        text.textContent = 'ONLINE';
-        text.style.color = 'var(--ok)';
+        text.textContent = 'Online';
+        text.style.color = 'var(--green)';
     } else {
         dot.className    = 'log-dot offline';
-        text.textContent = 'OFFLINE';
-        text.style.color = 'var(--danger)';
+        text.textContent = 'Offline';
+        text.style.color = 'var(--red)';
     }
 }
 
@@ -1221,17 +1580,14 @@ async function _initialSync() {
 async function _pollSettings() {
     if (!_conn.online) return;
     try {
-        const r = await _fetchTimeout('/get_settings', {}, 3000);
+        const r = await _fetchTimeout('/get_settings', {}, 5000);
         if (!r.ok) throw new Error();
         const d = await r.json();
         updateBriCursor(d.eff_bri !== undefined ? d.eff_bri : d.brightness);
         if (d.abl_rms !== undefined) _updateAblRms(d.abl_rms);
-        // Детектируем ребут: ver вернулся в 0 при ненулевой сохранённой версии.
-        // В этом случае делаем полную ресинхронизацию — polling остановится сам
-        // и будет перезапущен из _pingLoop после _initialSync.
         if (_stateVersion !== null && d.ver === 0 && _stateVersion > 0) {
             _stateVersion = null;
-            _conn.pollActive = false;  // сигнал _pingLoop запустить _initialSync
+            _conn.pollActive = false;
             return;
         }
         if (_stateVersion !== null && d.ver !== _stateVersion) {
@@ -1240,9 +1596,9 @@ async function _pollSettings() {
             loadFSInfo();
         }
         _stateVersion = d.ver;
-        setTimeout(_pollSettings, 500);   // следующий цикл только при успехе
+        setTimeout(_pollSettings, 2000);
     } catch(e) {
-        _conn.pollActive = false;          // сигнал ping-циклу что цепочка упала
+        _conn.pollActive = false;
     }
 }
 
@@ -1250,7 +1606,7 @@ async function _pollInfo() {
     if (!_conn.online) return;
     try {
         await updateInfo();
-        setTimeout(_pollInfo, 500);
+        setTimeout(_pollInfo, 1000);
     } catch(e) {
         _conn.pollActive = false;
     }
@@ -1292,32 +1648,102 @@ function _stopPolling() {
 }
 
 // Главный ping-цикл: единственная функция которая определяет онлайн/офлайн.
-// Интервал: 1с. Синхронизация и polling запускаются асинхронно — ping не блокируется.
+// Интервал: 2с. Таймаут 5с — ESP32 во время рендеринга может отвечать медленно.
+// failCount >= 4 (8с без ответа) → офлайн, чтобы не мигать при кратких задержках.
 async function _pingLoop() {
     try {
-        const r = await _fetchTimeout('/ping', {}, 2000);
+        const r = await _fetchTimeout('/ping', {}, 5000);
         if (!r.ok) throw new Error();
         _conn.failCount = 0;
         if (!_conn.online) {
-            // Переход офлайн → онлайн: полная ресинхронизация с нуля.
             _setOnline(true);
             _initialSync().then(() => _startPolling());
         } else if (!_conn.pollActive) {
-            // Polling упал пока были онлайн — устройство могло ребутнуться и вернуться
-            // быстрее чем failCount достиг 2. Делаем полную ресинхронизацию, не просто
-            // _startPolling(), — иначе stateVersion не сбросится и данные не обновятся.
             _initialSync().then(() => _startPolling());
         }
     } catch(e) {
         _conn.failCount++;
-        // 2 неудачи подряд → офлайн
-        if (_conn.failCount >= 2 && _conn.online) {
+        if (_conn.failCount >= 4 && _conn.online) {
             _setOnline(false);
             _stopPolling();
         }
     }
-    _conn.pingTimer = setTimeout(_pingLoop, 1000);
+    _conn.pingTimer = setTimeout(_pingLoop, 2000);
 }
+
+// ===================== TOUCH SCROLL GUARD =====================
+// Проблема: браузер на мобильном при touchstart на input[range] сразу прыгает
+// ползунком к позиции пальца, даже если пользователь хотел прокрутить страницу.
+// Решение: перехватываем touchstart с preventDefault() чтобы отменить нативное
+// поведение слайдера, затем сами управляем value через touchmove.
+// Скролл восстанавливается когда определяем вертикальное направление.
+(function() {
+    // Исключаем dual-range brightness — у него своя логика pointer-events
+    const EXCLUDED = ['bMinSlide', 'bMaxSlide'];
+
+    document.addEventListener('touchstart', function(e) {
+        const el = e.target;
+        if (el.tagName !== 'INPUT' || el.type !== 'range') return;
+        if (EXCLUDED.includes(el.id)) return;
+
+        // Запоминаем начальное значение слайдера и позицию пальца
+        const startX   = e.touches[0].clientX;
+        const startY   = e.touches[0].clientY;
+        const startVal = +el.value;
+        const rect     = el.getBoundingClientRect();
+        let decided    = false;
+        let activated  = false;
+
+        // Блокируем нативный прыжок ползунка к пальцу
+        e.preventDefault();
+
+        function onMove(ev) {
+            const dx = ev.touches[0].clientX - startX;
+            const dy = ev.touches[0].clientY - startY;
+            const adx = Math.abs(dx), ady = Math.abs(dy);
+
+            if (!decided) {
+                if (ady > adx && ady > 6) {
+                    // Вертикальный свайп — отдаём скроллу, прекращаем отслеживание
+                    decided = true;
+                    cleanup();
+                    return;
+                }
+                if (adx > 6) {
+                    decided  = true;
+                    activated = true;
+                }
+            }
+
+            if (!activated) return;
+
+            // Управляем value вручную пропорционально смещению пальца
+            ev.preventDefault();
+            const range  = +el.max - +el.min;
+            const ratio  = dx / rect.width;
+            const step   = +el.step || 1;
+            const raw    = startVal + ratio * range;
+            const snapped = Math.round(raw / step) * step;
+            const clamped = Math.min(+el.max, Math.max(+el.min, snapped));
+            if (el.value !== String(clamped)) {
+                el.value = clamped;
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+        }
+
+        function onEnd() {
+            cleanup();
+        }
+
+        function cleanup() {
+            el.removeEventListener('touchmove', onMove);
+            el.removeEventListener('touchend',  onEnd);
+        }
+
+        el.addEventListener('touchmove', onMove, { passive: false });
+        el.addEventListener('touchend',  onEnd);
+    }, { passive: false });
+})();
 
 window.onload = () => {
     // Запускаем только ping-цикл. Он сам определит когда устройство онлайн
