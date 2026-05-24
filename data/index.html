@@ -464,24 +464,50 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
   transition: left 0.5s;
 }
 
-/* RGB blocks */
-.rgb-grid {
-  display: grid; grid-template-columns: 1fr 1fr 1fr;
-  gap: 8px; margin-top: 14px;
+/* IMAGE CORRECTION block */
+.img-correction-title {
+  font-size: 9px; letter-spacing: 1px; text-transform: uppercase;
+  color: var(--text-hint); text-align: center; margin: 14px 0 10px;
 }
-.rgb-block { border-radius: 8px; padding: 10px; text-align: center; }
-.rgb-r { background: #1a0505; border: 1px solid #7f1d1d; }
-.rgb-g { background: #051a0a; border: 1px solid #065f46; }
-.rgb-b { background: #05081a; border: 1px solid #1e1b4b; }
-.rgb-val { font-family: var(--font-mono); font-size: 15px; font-weight: 700; }
-.rgb-r .rgb-val { color: var(--red); }
-.rgb-g .rgb-val { color: var(--green); }
-.rgb-b .rgb-val { color: var(--purple); }
-.rgb-name {
-  font-size: 9px; color: var(--text-hint);
-  letter-spacing: 1px; text-transform: uppercase; margin-top: 3px;
+/* IMAGE + COLOR two-column grid */
+.img-color-grid {
+  display: grid; grid-template-columns: 1fr 1fr;
+  gap: 0 16px;
 }
-.rgb-block input[type="range"] { margin-top: 8px; height: 3px; background: var(--border); }
+.img-restore-btn {
+  display: block; width: 100%; margin-top: 12px;
+  padding: 6px 0; border-radius: var(--r-elem);
+  background: transparent; border: 1px solid var(--border);
+  color: var(--text-muted); font-size: 11px; letter-spacing: 0.5px;
+  cursor: pointer; transition: border-color 0.2s, color 0.2s;
+}
+.img-restore-btn:hover { border-color: var(--accent); color: var(--accent); }
+/* Каждая колонка — единая сетка: все строки делят одни треки.
+   Обе колонки идентичны → слайдеры одинаковой ширины. */
+.img-color-col {
+  display: grid;
+  grid-template-columns: 14px 1fr 30px;
+  grid-template-rows: auto auto auto auto;
+  align-items: center;
+  column-gap: 7px;
+  row-gap: 9px;
+}
+.mini-label {
+  font-size: 11px; color: var(--text-muted); white-space: nowrap;
+}
+.mini-val {
+  font-family: var(--font-mono); font-size: 11px;
+  color: var(--accent); text-align: right; white-space: nowrap;
+}
+.img-color-col input[type="range"] {
+  height: 3px; margin: 0; width: 100%;
+}
+.img-color-col input[type="range"].r-slider::-webkit-slider-thumb { background: var(--red); }
+.img-color-col input[type="range"].r-slider::-moz-range-thumb     { background: var(--red); }
+.img-color-col input[type="range"].g-slider::-webkit-slider-thumb { background: var(--green); }
+.img-color-col input[type="range"].g-slider::-moz-range-thumb     { background: var(--green); }
+.img-color-col input[type="range"].b-slider::-webkit-slider-thumb { background: var(--purple); }
+.img-color-col input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); }
 
 /* ---- Log card ---- */
 .card-log {
@@ -678,8 +704,7 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
         <span>Brightness</span>
         <span class="val">
           <span id="bMinVal">1</span>&nbsp;–&nbsp;<span id="bMaxVal">30</span>
-          &nbsp;<span style="color:var(--text-hint);font-size:10px">/ 30</span>
-          &nbsp;<span class="now" style="color:var(--yellow)">now&nbsp;<span id="briVal">--</span></span>
+          &nbsp;<span class="now" style="color:var(--yellow)">NOW&nbsp;<span id="briVal">--</span></span>
         </span>
       </div>
       <div class="bri-wrap">
@@ -691,57 +716,7 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
       </div>
     </div>
 
-    <!-- Angle -->
-    <div class="slider-row">
-      <div class="slider-label">
-        <span>Angle offset</span>
-        <span class="val"><span id="aVal">91</span>&deg;</span>
-      </div>
-      <input type="range" id="aSlide" min="0" max="360" value="91"
-             oninput="document.getElementById('aVal').textContent=this.value; syncSettings()">
-    </div>
-
-    <!-- Gamma -->
-    <div class="slider-row">
-      <div class="slider-label">
-        <span>Gamma</span>
-        <span class="val" id="gVal">2.5</span>
-      </div>
-      <input type="range" id="gSlide" min="10" max="50" value="25"
-             oninput="document.getElementById('gVal').textContent=(this.value/10).toFixed(1); syncSettings()">
-    </div>
-
-    <!-- Saturation -->
-    <div class="slider-row">
-      <div class="slider-label">
-        <span>Saturation</span>
-        <span class="val" id="sVal">1.5</span>
-      </div>
-      <input type="range" id="sSlide" min="10" max="30" value="15"
-             oninput="document.getElementById('sVal').textContent=(this.value/10).toFixed(1); syncSettings()">
-    </div>
-
-    <!-- Contrast -->
-    <div class="slider-row">
-      <div class="slider-label">
-        <span>Contrast</span>
-        <span class="val" id="coVal">5%</span>
-      </div>
-      <input type="range" id="coSlide" min="0" max="100" value="5"
-             oninput="document.getElementById('coVal').textContent=this.value+'%'; syncSettings()">
-    </div>
-
-    <!-- Arms -->
-    <div class="slider-row">
-      <div class="slider-label">
-        <span>Arms count</span>
-        <span class="val" id="armsVal">4</span>
-      </div>
-      <input type="range" id="armsSlide" min="1" max="8" value="4" step="1"
-             oninput="document.getElementById('armsVal').textContent=this.value; syncSettings()">
-    </div>
-
-    <!-- ABL -->
+    <!-- LED Power -->
     <div class="slider-row">
       <div class="slider-label">
         <span>LED Power</span>
@@ -757,29 +732,61 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
       </div>
     </div>
 
-    <div class="divider"></div>
-    <p class="card-title" style="font-size:13px;margin-bottom:10px;">Color correction</p>
+    <!-- LED Arms -->
+    <div class="slider-row">
+      <div class="slider-label">
+        <span>LED Arms</span>
+        <span class="val" id="armsVal">4</span>
+      </div>
+      <input type="range" id="armsSlide" min="1" max="8" value="4" step="1"
+             oninput="document.getElementById('armsVal').textContent=this.value; syncSettings()">
+    </div>
 
-    <div class="rgb-grid">
-      <div class="rgb-block rgb-r">
-        <div class="rgb-val" id="rgVal">100%</div>
-        <div class="rgb-name">Red</div>
+    <!-- Angle -->
+    <div class="slider-row">
+      <div class="slider-label">
+        <span>Angle offset</span>
+        <span class="val"><span id="aVal">91</span>&deg;</span>
+      </div>
+      <input type="range" id="aSlide" min="0" max="360" value="91"
+             oninput="document.getElementById('aVal').textContent=this.value; syncSettings()">
+    </div>
+
+    <!-- IMAGE + COLOR two-column grid -->
+    <p class="img-correction-title">Image Correction</p>
+
+    <div class="img-color-grid">
+      <div class="img-color-col">
+        <span class="mini-label" title="Gamma">γ</span>
+        <input type="range" id="gSlide" min="10" max="50" value="25"
+               oninput="document.getElementById('gVal').textContent=(this.value/10).toFixed(1); syncSettings()">
+        <span class="mini-val" id="gVal">2.5</span>
+        <span class="mini-label" title="Saturation">S</span>
+        <input type="range" id="sSlide" min="10" max="30" value="15"
+               oninput="document.getElementById('sVal').textContent=(this.value/10).toFixed(1); syncSettings()">
+        <span class="mini-val" id="sVal">1.5</span>
+        <span class="mini-label" title="Contrast">C</span>
+        <input type="range" id="coSlide" min="0" max="100" value="5"
+               oninput="document.getElementById('coVal').textContent=this.value+'%'; syncSettings()">
+        <span class="mini-val" id="coVal">5%</span>
+      </div>
+      <div class="img-color-col">
+        <span class="mini-label" style="color:var(--red)">R</span>
         <input type="range" class="r-slider" id="rgSlide" min="0" max="100" step="5" value="100"
                oninput="document.getElementById('rgVal').textContent=this.value+'%'; syncSettings()">
-      </div>
-      <div class="rgb-block rgb-g">
-        <div class="rgb-val" id="ggVal">70%</div>
-        <div class="rgb-name">Green</div>
+        <span class="mini-val" id="rgVal" style="color:var(--red)">100%</span>
+        <span class="mini-label" style="color:var(--green)">G</span>
         <input type="range" class="g-slider" id="ggSlide" min="0" max="100" step="5" value="70"
                oninput="document.getElementById('ggVal').textContent=this.value+'%'; syncSettings()">
-      </div>
-      <div class="rgb-block rgb-b">
-        <div class="rgb-val" id="bgVal">100%</div>
-        <div class="rgb-name">Blue</div>
+        <span class="mini-val" id="ggVal" style="color:var(--green)">70%</span>
+        <span class="mini-label" style="color:var(--purple)">B</span>
         <input type="range" class="b-slider" id="bgSlide" min="0" max="100" step="5" value="100"
                oninput="document.getElementById('bgVal').textContent=this.value+'%'; syncSettings()">
+        <span class="mini-val" id="bgVal" style="color:var(--purple)">100%</span>
       </div>
     </div>
+
+    <button class="img-restore-btn" onclick="restoreImgDefaults()">Restore Defaults</button>
   </div>
 
   <!-- Card 5: Device Log -->
@@ -1353,6 +1360,20 @@ function updateBriCursor(val) {
     document.getElementById('drCursor').style.left =
         `calc(${thumbR}px + ${p} * (100% - ${2 * thumbR}px))`;
     document.getElementById('briVal').textContent = clamped;
+}
+
+function restoreImgDefaults() {
+    const set = (id, val, display) => {
+        document.getElementById(id).value = val;
+        document.getElementById(display[0]).textContent = display[1];
+    };
+    set('gSlide',  25, ['gVal',  '2.5']);
+    set('sSlide',  15, ['sVal',  '1.5']);
+    set('coSlide',  5, ['coVal', '5%']);
+    set('rgSlide', 100, ['rgVal', '100%']);
+    set('ggSlide',  70, ['ggVal', '70%']);
+    set('bgSlide', 100, ['bgVal', '100%']);
+    syncSettings();
 }
 
 // Дебаунс: синхронизируем не чаще 1 раза в 150 мс при перетаскивании ползунка
