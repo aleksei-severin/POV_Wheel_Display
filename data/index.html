@@ -90,22 +90,20 @@ body {
 }
 .ota-btn:hover { background: #ff6600; color: #fff; }
 
-/* ---- Grid layouts ---- */
+/* ---- Grid layout ---- */
 .main-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
+  grid-template-columns: repeat(4, 1fr);
   gap: 16px;
-  padding: 20px 24px 0;
-  max-width: 1200px;
-  margin: 0 auto;
+  padding: 20px 16px 0;
+  align-items: start;
 }
-.bottom-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 16px;
-  padding: 16px 24px 0;
-  max-width: 1200px;
-  margin: 0 auto;
+
+@media (max-width: 1100px) {
+  .main-grid { grid-template-columns: repeat(2, 1fr); }
+}
+@media (max-width: 600px) {
+  .main-grid { grid-template-columns: 1fr; padding: 12px 12px 0; }
 }
 
 /* ---- Card ---- */
@@ -525,13 +523,7 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
   animation: pulse 2s ease-in-out infinite;
 }
 
-@media (max-width: 900px) {
-  .main-grid  { grid-template-columns: 1fr 1fr; }
-  .bottom-grid{ grid-template-columns: 1fr; }
-}
 @media (max-width: 600px) {
-  .main-grid  { grid-template-columns: 1fr; padding: 12px 12px 0; }
-  .bottom-grid{ padding: 12px 12px 0; }
   .topbar { padding: 12px 16px; }
 }
 </style>
@@ -553,68 +545,8 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
   </div>
 </header>
 
-<!-- ---- Main 3-column grid ---- -->
+<!-- ---- Main 4-column grid ---- -->
 <div class="main-grid">
-
-  <!-- Card 1: Live Metrics + Power Status -->
-  <div class="card">
-    <p class="card-title">Live metrics &amp; power</p>
-
-    <!-- Speed -->
-    <div class="speed-block">
-      <div>
-        <span class="speed-value" id="infoSpeed">--</span>
-        <span class="speed-unit">km/h</span>
-      </div>
-    </div>
-
-    <div class="metrics-row" style="margin-bottom:16px">
-      <div class="mini-metric">
-        <span class="mini-val" id="infoRpm">--</span>
-        <span class="mini-label">RPM</span>
-      </div>
-      <div class="mini-metric" title="Click to edit wheel circumference">
-        <input class="wheel-circ-input mini-val" type="text" id="wheelCirc"
-               value="2355" maxlength="4">
-        <span class="mini-label">Wheel mm</span>
-      </div>
-      <div class="mini-metric">
-        <div style="display:flex;align-items:center;justify-content:center;gap:6px;">
-          <span class="mini-val" id="batV">--</span>
-          <span style="font-size:11px;color:var(--text-hint)">V</span>
-        </div>
-        <span class="mini-label">Battery</span>
-      </div>
-    </div>
-
-    <!-- Battery bar -->
-    <div class="battery-bar-wrap" style="margin-top:0;margin-bottom:14px;">
-      <div class="battery-bar-header">
-        <span class="battery-bar-label">Battery level</span>
-        <div style="display:flex;align-items:center;gap:8px;">
-          <span class="badge badge-dim" id="chgStat">--</span>
-          <span class="battery-bar-pct" id="batPct">--%</span>
-        </div>
-      </div>
-      <div class="battery-bar-track">
-        <div class="battery-bar-fill" id="batBar"></div>
-      </div>
-    </div>
-
-    <!-- Power rows -->
-    <div class="power-row">
-      <span class="power-label">Charge current</span>
-      <div><span class="power-val" id="batI">--</span><span class="power-unit">A</span></div>
-    </div>
-    <div class="power-row">
-      <span class="power-label">Input voltage</span>
-      <div><span class="power-val" id="busV">--</span><span class="power-unit">V</span></div>
-    </div>
-    <div class="power-row">
-      <span class="power-label">Input current</span>
-      <div><span class="power-val" id="busI">--</span><span class="power-unit">A</span></div>
-    </div>
-  </div>
 
   <!-- Card 2: Storage & Upload -->
   <div class="card">
@@ -647,15 +579,6 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
 
     <button class="btn-stop" onclick="stopDisplay()">&#9632; Stop Display</button>
   </div>
-
-
-</div><!-- /main-grid -->
-
-<!-- hidden preview canvas — used for GIF/image conversion -->
-<canvas id="preview" width="200" height="200"></canvas>
-
-<!-- ---- Bottom 2-column grid ---- -->
-<div class="bottom-grid">
 
   <!-- Card 4: Display Settings -->
   <div class="card">
@@ -771,6 +694,66 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
     </div>
   </div>
 
+  <!-- Card 1: Live Metrics -->
+  <div class="card">
+    <p class="card-title">Live metrics</p>
+
+    <!-- Speed -->
+    <div class="speed-block">
+      <div>
+        <span class="speed-value" id="infoSpeed">--</span>
+        <span class="speed-unit">km/h</span>
+      </div>
+    </div>
+
+    <div class="metrics-row" style="margin-bottom:16px">
+      <div class="mini-metric">
+        <span class="mini-val" id="infoRpm">--</span>
+        <span class="mini-label">RPM</span>
+      </div>
+      <div class="mini-metric" title="Click to edit wheel circumference">
+        <input class="wheel-circ-input mini-val" type="text" id="wheelCirc"
+               value="2355" maxlength="4">
+        <span class="mini-label">Wheel mm</span>
+      </div>
+      <div class="mini-metric">
+        <div style="display:flex;align-items:center;justify-content:center;gap:6px;">
+          <span class="mini-val" id="batV">--</span>
+          <span style="font-size:11px;color:var(--text-hint)">V</span>
+        </div>
+        <span class="mini-label">Battery</span>
+      </div>
+    </div>
+
+    <!-- Battery bar -->
+    <div class="battery-bar-wrap" style="margin-top:0;margin-bottom:14px;">
+      <div class="battery-bar-header">
+        <span class="battery-bar-label">Battery level</span>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span class="badge badge-dim" id="chgStat">--</span>
+          <span class="battery-bar-pct" id="batPct">--%</span>
+        </div>
+      </div>
+      <div class="battery-bar-track">
+        <div class="battery-bar-fill" id="batBar"></div>
+      </div>
+    </div>
+
+    <!-- Power rows -->
+    <div class="power-row">
+      <span class="power-label">Charge current</span>
+      <div><span class="power-val" id="batI">--</span><span class="power-unit">A</span></div>
+    </div>
+    <div class="power-row">
+      <span class="power-label">Input voltage</span>
+      <div><span class="power-val" id="busV">--</span><span class="power-unit">V</span></div>
+    </div>
+    <div class="power-row">
+      <span class="power-label">Input current</span>
+      <div><span class="power-val" id="busI">--</span><span class="power-unit">A</span></div>
+    </div>
+  </div>
+
   <!-- Card 5: Device Log -->
   <div class="card">
     <div class="card-title-row">
@@ -786,7 +769,10 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
     </div>
   </div>
 
-</div><!-- /bottom-grid -->
+</div><!-- /main-grid -->
+
+<!-- hidden preview canvas — used for GIF/image conversion -->
+<canvas id="preview" width="200" height="200"></canvas>
 
 <script>
 // ===================== GIF PARSER =====================
@@ -923,6 +909,7 @@ function renderGIFFrames(gif) {
 // Версия состояния устройства: синхронизирует несколько браузерных вкладок.
 // Обновляется сервером при изменении настроек, файлов или воспроизведения.
 let _stateVersion = null;  // null = ещё не получено (первый запрос)
+let _fileVersion  = null;  // отдельная версия списка файлов (upload/delete/play)
 
 const previewCanvas = document.getElementById('preview'); // 200×200 buffer
 const previewCtx = previewCanvas.getContext('2d', {willReadFrequently: true});
@@ -1217,7 +1204,7 @@ function loadFiles() {
                 <div class="file-thumb">
                     <canvas width="80" height="80" id="thumb-${CSS.escape(f.name)}"></canvas>
                 </div>
-                <span class="fname">${f.name}${f.frames ? `<span style="color:var(--text-hint);font-size:0.85em;margin-left:6px;">${f.frames}&nbsp;fr</span>` : ''}</span>
+                <span class="fname">${f.name.replace(/\.bin$/i,'')}${f.frames ? `<span style="color:var(--text-hint);font-size:0.85em;margin-left:6px;">${f.frames}&nbsp;fr</span>` : ''}</span>
                 <span class="fsize">${(f.size/1024).toFixed(1)}&nbsp;kB</span>
                 <div class="acts">
                     <button class="btn-icon play" onclick="playFile('${f.name}')" title="Play">&#9654;</button>
@@ -1655,8 +1642,9 @@ function _setOnline(online) {
 // _logPoll идёт последним т.к. он делает POST /settime и зависит от готовности сервера.
 async function _initialSync() {
     document.getElementById('deviceName').textContent = window.location.hostname || 'pov-wheel';
-    // Сбрасываем stateVersion — иначе polling не применит изменения после ребута.
+    // Сбрасываем версии — иначе polling не применит изменения после ребута.
     _stateVersion = null;
+    _fileVersion  = null;
     _logNextIdx   = 0;
 
     await Promise.allSettled([
@@ -1687,10 +1675,14 @@ async function _pollSettings() {
         }
         if (_stateVersion !== null && d.ver !== _stateVersion) {
             _applySettings(d);
+        }
+        _stateVersion = d.ver;
+        // loadFiles и превью — только при реальном изменении списка файлов
+        if (_fileVersion !== null && d.fver !== undefined && d.fver !== _fileVersion) {
             loadFiles();
             loadFSInfo();
         }
-        _stateVersion = d.ver;
+        if (d.fver !== undefined) _fileVersion = d.fver;
         setTimeout(_pollSettings, 2000);
     } catch(e) {
         _conn.pollActive = false;

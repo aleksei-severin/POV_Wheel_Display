@@ -25,6 +25,11 @@ String currentDisplayFile = "";   // Имя файла, загруженного
 // и обновляют UI при расхождении — синхронизация нескольких браузеров.
 static uint32_t state_version = 0;
 
+// Отдельный счётчик версии списка файлов: инкрементируется только при
+// upload/delete/play — НЕ при изменении настроек. Браузер обновляет список
+// (и запускает загрузку превью) только когда этот счётчик меняется.
+static uint32_t file_version = 0;
+
 // ===================== WEB LOG BUFFER =====================
 // Кольцевой буфер в RTC SLOW RAM — переживает deep sleep.
 // ESP32-S3 RTC SLOW RAM = 8192 байт, из них ~1 кБ занимает ESP-IDF.
@@ -384,7 +389,7 @@ void setupNetwork() {
             ",\"circ\":%u,\"arms\":%u"
             ",\"abl\":%.1f,\"abl_rms\":%.1f"
             ",\"rg\":%.1f,\"gg\":%.1f,\"bg\":%.1f"
-            ",\"ver\":%lu}",
+            ",\"ver\":%lu,\"fver\":%lu}",
             (unsigned)min_brightness, (unsigned)max_brightness,
             (int)global_angle_offset, (unsigned)global_brightness,
             (unsigned)global_effective_brightness,
@@ -392,7 +397,7 @@ void setupNetwork() {
             (unsigned)wheel_circumference, (unsigned)global_num_arms,
             (float)global_abl_limit, (float)(global_abl_rms * 100.0f),
             (float)global_r_gain, (float)global_g_gain, (float)global_b_gain,
-            (unsigned long)state_version
+            (unsigned long)state_version, (unsigned long)file_version
         );
         request->send(200, "application/json", buf);
     });
@@ -490,6 +495,7 @@ void setupNetwork() {
             request_play_flag = true;
             xSemaphoreGive(fileLoaderSemaphore);
             state_version++;
+            file_version++;
             webLogf("[DISP] Play: %s", fname.c_str());
             request->send(200, "text/plain", "Playing");
         }
@@ -515,6 +521,7 @@ void setupNetwork() {
             }
             LittleFS.remove(path);
             state_version++;
+            file_version++;
             request->send(200, "text/plain", "Deleted");
         }
     });
@@ -564,6 +571,7 @@ void setupNetwork() {
         if (uploadFile) uploadFile.write(data, len);
         if (index + len == total && uploadFile) {
             uploadFile.close();  // после close() объект становится false — сигнал onRequest об успехе
+            file_version++;
         }
     });
 
