@@ -23,8 +23,8 @@ extern AsyncWebServer server;
 // --- ИНИЦИАЛИЗАЦИЯ ГЛОБАЛЬНЫХ ПЕРЕМЕННЫХ ---
 volatile uint8_t global_brightness = 8; // единицы SK9822 (0–31)
 
-RTC_DATA_ATTR uint8_t min_brightness = 2;  // единицы SK9822 (0–31)
-RTC_DATA_ATTR uint8_t max_brightness = 16; // единицы SK9822 (0–31)
+RTC_DATA_ATTR uint8_t min_brightness = 1;  // единицы SK9822 (1–30)
+RTC_DATA_ATTR uint8_t max_brightness = 30; // единицы SK9822 (1–30)
 RTC_DATA_ATTR volatile int global_angle_offset = 91;
 
 uint8_t* frameBuffer = nullptr; 
@@ -100,15 +100,15 @@ String                     pendingFilePath;
 volatile bool wakeup_event = false;
 volatile bool request_play_flag = false;
 
-RTC_DATA_ATTR volatile float global_gamma         = 3.5f;
-RTC_DATA_ATTR volatile float global_saturation    = 1.0f;
-RTC_DATA_ATTR volatile float global_contrast      = 10.0f;
-RTC_DATA_ATTR volatile float global_r_gain        = 100.0f; // 0..200 %, 100 = без изменений
+RTC_DATA_ATTR volatile float global_gamma         = 2.5f;
+RTC_DATA_ATTR volatile float global_saturation    = 1.5f;
+RTC_DATA_ATTR volatile float global_contrast      = 5.0f;
+RTC_DATA_ATTR volatile float global_r_gain        = 60.0f;  // 0..200 %, 100 = без изменений
 RTC_DATA_ATTR volatile float global_g_gain        = 100.0f;
 RTC_DATA_ATTR volatile float global_b_gain        = 100.0f;
 RTC_DATA_ATTR volatile uint16_t wheel_circumference = 2355;
 RTC_DATA_ATTR volatile uint8_t  global_num_arms     = 7;
-RTC_DATA_ATTR volatile float    global_abl_limit    = 100.0f; // ABL: 0–100 %, 100 = без ограничения
+RTC_DATA_ATTR volatile float    global_abl_limit    = 15.0f;  // ABL: 0–100 %, 100 = без ограничения
 volatile float                  global_abl_rms      = 0.0f;  // RMS загрузка тока 0.0–1.0, не сохраняем в RTC
 volatile uint8_t                global_effective_brightness = 8; // bri_level после ABL; совпадает с global_brightness пока нет рендеринга
 uint8_t lut_r[256];

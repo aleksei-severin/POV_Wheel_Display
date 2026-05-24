@@ -433,11 +433,10 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
 }
 .bri-cursor {
   position: absolute; top: 50%; transform: translate(-50%, -50%);
-  width: 8px; height: 8px;
+  width: 3px; height: 12px;
   background: var(--yellow);
-  border-radius: 50%;
   pointer-events: none; z-index: 10;
-  box-shadow: 0 0 6px var(--yellow);
+  box-shadow: 0 0 5px var(--yellow);
   transition: left 0.3s;
 }
 .bri-wrap input[type="range"] {
@@ -676,10 +675,10 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
     <!-- Brightness dual-range -->
     <div class="slider-row">
       <div class="slider-label">
-        <span>Brightness range</span>
+        <span>Brightness</span>
         <span class="val">
-          <span id="bMinVal">2</span>&nbsp;–&nbsp;<span id="bMaxVal">16</span>
-          &nbsp;<span style="color:var(--text-hint);font-size:10px">/ 31</span>
+          <span id="bMinVal">1</span>&nbsp;–&nbsp;<span id="bMaxVal">30</span>
+          &nbsp;<span style="color:var(--text-hint);font-size:10px">/ 30</span>
           &nbsp;<span class="now" style="color:var(--yellow)">now&nbsp;<span id="briVal">--</span></span>
         </span>
       </div>
@@ -687,8 +686,8 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
         <div class="bri-track"></div>
         <div class="bri-fill" id="drFill"></div>
         <div class="bri-cursor" id="drCursor"></div>
-        <input type="range" id="bMinSlide" min="0" max="31" value="2">
-        <input type="range" id="bMaxSlide" min="0" max="31" value="16">
+        <input type="range" id="bMinSlide" min="1" max="30" value="1">
+        <input type="range" id="bMaxSlide" min="1" max="30" value="30">
       </div>
     </div>
 
@@ -705,10 +704,10 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
     <!-- Gamma -->
     <div class="slider-row">
       <div class="slider-label">
-        <span>Gamma correction</span>
-        <span class="val" id="gVal">4.0</span>
+        <span>Gamma</span>
+        <span class="val" id="gVal">2.5</span>
       </div>
-      <input type="range" id="gSlide" min="10" max="50" value="40"
+      <input type="range" id="gSlide" min="10" max="50" value="25"
              oninput="document.getElementById('gVal').textContent=(this.value/10).toFixed(1); syncSettings()">
     </div>
 
@@ -716,9 +715,9 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
     <div class="slider-row">
       <div class="slider-label">
         <span>Saturation</span>
-        <span class="val" id="sVal">1.0</span>
+        <span class="val" id="sVal">1.5</span>
       </div>
-      <input type="range" id="sSlide" min="10" max="30" value="10"
+      <input type="range" id="sSlide" min="10" max="30" value="15"
              oninput="document.getElementById('sVal').textContent=(this.value/10).toFixed(1); syncSettings()">
     </div>
 
@@ -726,9 +725,9 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
     <div class="slider-row">
       <div class="slider-label">
         <span>Contrast</span>
-        <span class="val" id="coVal">0%</span>
+        <span class="val" id="coVal">5%</span>
       </div>
-      <input type="range" id="coSlide" min="0" max="100" value="0"
+      <input type="range" id="coSlide" min="0" max="100" value="5"
              oninput="document.getElementById('coVal').textContent=this.value+'%'; syncSettings()">
     </div>
 
@@ -745,14 +744,14 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
     <!-- ABL -->
     <div class="slider-row">
       <div class="slider-label">
-        <span>Forward current</span>
+        <span>LED Power</span>
         <span class="val">
-          <span id="ablVal">100%</span>
+          <span id="ablVal">15%</span>
           <span id="ablRmsLabel" style="color:var(--yellow);font-size:10px;margin-left:6px;">RMS --</span>
         </span>
       </div>
       <div class="abl-wrap">
-        <input type="range" id="ablSlide" min="0" max="100" value="100"
+        <input type="range" id="ablSlide" min="0" max="100" value="15"
                oninput="document.getElementById('ablVal').textContent=this.value+'%'; syncSettings()">
         <div id="ablRmsMark"></div>
       </div>
@@ -763,9 +762,9 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
 
     <div class="rgb-grid">
       <div class="rgb-block rgb-r">
-        <div class="rgb-val" id="rgVal">100%</div>
+        <div class="rgb-val" id="rgVal">60%</div>
         <div class="rgb-name">Red</div>
-        <input type="range" class="r-slider" id="rgSlide" min="0" max="200" step="10" value="100"
+        <input type="range" class="r-slider" id="rgSlide" min="0" max="200" step="10" value="60"
                oninput="document.getElementById('rgVal').textContent=this.value+'%'; syncSettings()">
       </div>
       <div class="rgb-block rgb-g">
@@ -1324,7 +1323,9 @@ function _updateAblRms(rms) {
 }
 
 // ===================== DUAL-RANGE BRIGHTNESS SLIDER =====================
-function pct(v) { return v / 31 * 100; }
+const BRI_MIN = 1, BRI_MAX = 30;
+// Нормировка: (v - min) / (max - min) — совпадает с реальной позицией thumb браузера
+function pct(v) { return (v - BRI_MIN) / (BRI_MAX - BRI_MIN) * 100; }
 
 // Хранит последнее известное значение NOW для пересчёта при движении ползунков
 let currentBrightness = 0;
@@ -1336,20 +1337,17 @@ function updateDualRange() {
     const thumbR = 7; // половина ширины thumb (14px / 2)
     const pMin = pct(minV) / 100;
     const pMax = pct(maxV) / 100;
-    // Заливка точно совпадает с реальным диапазоном движения thumb'ов
     fill.style.left  = `calc(${thumbR}px + ${pMin} * (100% - ${2 * thumbR}px))`;
     fill.style.width = `calc(${(pMax - pMin)} * (100% - ${2 * thumbR}px))`;
     document.getElementById('bMinVal').textContent = minV;
     document.getElementById('bMaxVal').textContent = maxV;
-    // Немедленно пересчитать позицию NOW в новых границах
     updateBriCursor(currentBrightness);
 }
 
 function updateBriCursor(val) {
     currentBrightness = val;
-    // Курсор NOW движется по всему треку 0–31, не зажат в [min,max].
-    // ABL может опустить яркость ниже MIN — это важно показать.
-    const clamped = Math.min(Math.max(val, 0), 31);
+    // Курсор NOW движется по всему треку, ABL может опустить ниже MIN
+    const clamped = Math.min(Math.max(val, BRI_MIN), BRI_MAX);
     const thumbR = 7;
     const p = pct(clamped) / 100;
     document.getElementById('drCursor').style.left =
@@ -1847,16 +1845,14 @@ async function _pingLoop() {
         if (el.tagName !== 'INPUT' || el.type !== 'range') return;
         if (EXCLUDED.includes(el.id)) return;
 
-        // Запоминаем начальное значение слайдера и позицию пальца
+        // Запоминаем начальное значение слайдера и позицию пальца.
+        // НЕ вызываем preventDefault здесь — иначе вертикальный скролл по слайдеру невозможен.
         const startX   = e.touches[0].clientX;
         const startY   = e.touches[0].clientY;
         const startVal = +el.value;
         const rect     = el.getBoundingClientRect();
         let decided    = false;
         let activated  = false;
-
-        // Блокируем нативный прыжок ползунка к пальцу
-        e.preventDefault();
 
         function onMove(ev) {
             const dx = ev.touches[0].clientX - startX;
@@ -1865,14 +1861,16 @@ async function _pingLoop() {
 
             if (!decided) {
                 if (ady > adx && ady > 6) {
-                    // Вертикальный свайп — отдаём скроллу, прекращаем отслеживание
+                    // Вертикальный свайп — отдаём скроллу
                     decided = true;
                     cleanup();
                     return;
                 }
                 if (adx > 6) {
-                    decided  = true;
+                    decided   = true;
                     activated = true;
+                    // Только теперь блокируем нативный скролл/прыжок ползунка
+                    ev.preventDefault();
                 }
             }
 
@@ -1880,10 +1878,10 @@ async function _pingLoop() {
 
             // Управляем value вручную пропорционально смещению пальца
             ev.preventDefault();
-            const range  = +el.max - +el.min;
-            const ratio  = dx / rect.width;
-            const step   = +el.step || 1;
-            const raw    = startVal + ratio * range;
+            const range   = +el.max - +el.min;
+            const ratio   = dx / rect.width;
+            const step    = +el.step || 1;
+            const raw     = startVal + ratio * range;
             const snapped = Math.round(raw / step) * step;
             const clamped = Math.min(+el.max, Math.max(+el.min, snapped));
             if (el.value !== String(clamped)) {
@@ -1897,13 +1895,14 @@ async function _pingLoop() {
         }
 
         function cleanup() {
-            el.removeEventListener('touchmove', onMove);
+            document.removeEventListener('touchmove', onMove);
             el.removeEventListener('touchend',  onEnd);
         }
 
-        el.addEventListener('touchmove', onMove, { passive: false });
+        // Слушаем на document с passive:false чтобы иметь возможность вызвать preventDefault
+        document.addEventListener('touchmove', onMove, { passive: false });
         el.addEventListener('touchend',  onEnd);
-    }, { passive: false });
+    }, { passive: true });
 })();
 
 window.onload = () => {
