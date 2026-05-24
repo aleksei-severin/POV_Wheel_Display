@@ -478,28 +478,31 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
     }
 
     // --- Считаем pixel_sum один раз — используется и для RMS, и для ABL.
-    uint32_t pixel_sum  = 0;
-    uint32_t max_sum    = (uint32_t)leds_total * 3 * 255;
+    // pixel_sum / max_sum — доля заполнения RGB (0..1), не зависит от яркости.
+    uint32_t pixel_sum = 0;
+    uint32_t max_sum   = (uint32_t)leds_total * 3 * 255;
     for (int i = 0; i < leds_total; i++) {
         pixel_sum += led_ptr[i * 4 + 1]; // B
         pixel_sum += led_ptr[i * 4 + 2]; // G
         pixel_sum += led_ptr[i * 4 + 3]; // R
     }
 
-    // --- RMS: нагрузка тока ДО ABL — для отображения в UI.
-    // 100% = все лучи белые при bri=31.
+    // --- RMS: реальная нагрузка тока = pixel_fill × bri / 31.
+    // 100% = все лучи белые при bri=31. Считается ДО ABL — показывает
+    // фактическое потребление без ограничений.
     rms_accum += (max_sum > 0)
         ? (float)pixel_sum / (float)max_sum * (float)bri_level / 31.0f
         : 0.0f;
 
-    // --- ABL: мгновенное ограничение per-sector по pixel_sum текущего сектора.
-    // Реагирует без задержки — не ждёт конца оборота.
-    // Это гарантирует, что ни один сектор не превысит лимит тока даже при
-    // резком изменении Brightness.
+    // --- ABL: лимитирует общий ток (pixel_fill × bri / 31 ≤ abl/100).
+    // Снижает bri_level только если реальное потребление превышает лимит.
+    // При малой яркости или тёмном контенте не вмешивается совсем.
     if (abl < 100.0f && pixel_sum > 0) {
-        uint32_t limit_sum = (uint32_t)(max_sum * abl * 0.01f);
-        if (pixel_sum > limit_sum) {
-            bri_level = (uint8_t)((uint32_t)bri_level * limit_sum / pixel_sum);
+        // Максимальный допустимый bri_level при данном pixel_sum:
+        // bri_max = limit * 31 * max_sum / pixel_sum
+        float bri_max = abl * 0.01f * 31.0f * (float)max_sum / (float)pixel_sum;
+        if ((float)bri_level > bri_max) {
+            bri_level = (uint8_t)bri_max; // floor — не превышаем лимит
         }
     }
     uint8_t bri_byte = 0xE0 | (bri_level & 0x1F);
