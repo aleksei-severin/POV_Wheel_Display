@@ -382,6 +382,21 @@ svg.wheel { filter: drop-shadow(0 0 14px #1d4ed855); }
 }
 .btn-stop:hover { background: #2d0808; }
 
+.btn-album {
+  flex: 1;
+  padding: 10px;
+  border: 1px solid #166534; border-radius: var(--r-elem);
+  background: #052e16;
+  color: var(--green);
+  font-family: var(--font-ui); font-size: 13px; font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+  white-space: nowrap;
+}
+.btn-album:hover       { background: #065f46; }
+.btn-album.active      { background: var(--green); color: #000; border-color: var(--green); }
+.btn-album.active:hover{ background: #6ee7b7; }
+
 /* ---- Settings card ---- */
 .slider-row { margin-bottom: 14px; }
 .slider-label {
@@ -641,7 +656,16 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
 
     <div id="fileList"></div>
 
-    <button class="btn-stop" onclick="stopDisplay()">&#9632; Stop Display</button>
+    <!-- Кнопки управления воспроизведением -->
+    <div style="display:flex;gap:8px;margin-top:10px;align-items:center;">
+      <button class="btn-album" id="albumBtn" onclick="toggleAlbum()">&#9654;&#9654; Start Slideshow</button>
+      <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;">
+        <input type="number" id="albumSecs" min="1" max="99" value="10"
+          style="width:44px;background:var(--bg-deep);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--font-mono);font-size:14px;padding:6px 4px;text-align:center;">
+        <span style="font-size:11px;color:var(--text-hint);">sec</span>
+      </div>
+      <button class="btn-stop" style="margin-top:0;flex:1;" onclick="stopDisplay()">&#9632; Stop Display</button>
+    </div>
   </div>
 
   <!-- Card: POV Display — метрики + настройки -->
@@ -732,10 +756,10 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
       </div>
     </div>
 
-    <!-- LED Arms -->
+    <!-- LED Beams -->
     <div class="slider-row">
       <div class="slider-label">
-        <span>LED Arms</span>
+        <span>LED Beams</span>
         <span class="val" id="armsVal">4</span>
       </div>
       <input type="range" id="armsSlide" min="1" max="8" value="4" step="1"
@@ -1309,7 +1333,52 @@ function loadFSInfo() {
 }
 
 function playFile(name)   { fetch(`/play?file=${encodeURIComponent(name)}`); }
-function stopDisplay()    { fetch('/stop'); }
+
+function stopDisplay() {
+    fetch('/stop');
+    _albumSetActive(false);
+}
+
+// ===================== ALBUM / SLIDESHOW =====================
+let _albumRunning = false;
+
+function _albumSetActive(active) {
+    _albumRunning = active;
+    const btn = document.getElementById('albumBtn');
+    if (!btn) return;
+    if (active) {
+        btn.classList.add('active');
+        btn.innerHTML = '&#9724; Stop Slideshow';
+    } else {
+        btn.classList.remove('active');
+        btn.innerHTML = '&#9654;&#9654; Start Slideshow';
+    }
+}
+
+function _albumDelayMs() {
+    let s = parseInt(document.getElementById('albumSecs').value) || 10;
+    s = Math.min(99, Math.max(1, s));
+    document.getElementById('albumSecs').value = s;
+    return s * 1000;
+}
+
+function toggleAlbum() {
+    if (_albumRunning) {
+        fetch('/album?action=stop');
+        _albumSetActive(false);
+        return;
+    }
+    fetch(`/album?action=start&delay=${_albumDelayMs()}`).then(r => {
+        if (r.ok) _albumSetActive(true);
+    });
+}
+
+// Живое обновление интервала: если слайдшоу уже идёт — применяем без перезапуска
+document.getElementById('albumSecs').addEventListener('change', function() {
+    if (!_albumRunning) return;
+    fetch(`/album?action=start&delay=${_albumDelayMs()}`);
+});
+
 function deleteFile(name) {
     fetch(`/delete?file=${encodeURIComponent(name)}`).then(() => {
         delete _thumbCache[name];

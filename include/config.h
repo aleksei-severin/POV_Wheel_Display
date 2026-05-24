@@ -55,9 +55,16 @@ extern volatile uint32_t last_web_activity_time;
 extern volatile uint32_t last_hall_time;
 extern volatile uint32_t rotation_period;
 
-// Настройки альбома
-extern bool slideshowActive;
-extern uint16_t slideInterval;
+// Слайдшоу
+extern bool     slideshowActive;
+extern uint32_t slideInterval;      // мс между сменами файлов
+extern int      slideCurrentIndex;  // текущий индекс в savedFiles (-1 = не запущен)
+extern uint32_t slideLastSwitch;    // millis() последней смены файла
+
+// Список файлов на LittleFS (обновляется updateFileList)
+#include <vector>
+extern std::vector<String> savedFiles;
+extern void updateFileList();
 
 extern Preferences prefs;
 

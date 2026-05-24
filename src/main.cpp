@@ -101,6 +101,12 @@ String                     pendingFilePath;
 volatile bool wakeup_event = false;
 volatile bool request_play_flag = false;
 
+// Слайдшоу: переключение файлов по таймеру
+bool     slideshowActive    = false;
+uint32_t slideInterval      = 10000; // мс между сменами (по умолчанию 10 с)
+uint32_t slideLastSwitch    = 0;
+int      slideCurrentIndex  = -1;    // индекс текущего файла в savedFiles (-1 = не запущен)
+
 RTC_DATA_ATTR volatile float global_gamma         = 2.5f;
 RTC_DATA_ATTR volatile float global_saturation    = 1.5f;
 RTC_DATA_ATTR volatile float global_contrast      = 5.0f;
@@ -875,6 +881,22 @@ void loop() {
         // вместо ~333мс, и renderingTask выйдет из цикла после 1 сектора.
         // Запоминаем момент запроса — секция 2 даст 2с на загрузку файла.
         last_play_ms = millis();
+    }
+
+    // --- Слайдшоу: автоматическая смена файлов по таймеру ---
+    if (slideshowActive && savedFiles.size() > 0 &&
+        (now_ms - slideLastSwitch >= slideInterval || slideCurrentIndex < 0)) {
+        slideLastSwitch = now_ms;
+        slideCurrentIndex = (slideCurrentIndex + 1) % (int)savedFiles.size();
+        String nextFile = savedFiles[slideCurrentIndex];
+        pendingFilePath = "/" + nextFile;
+        prefs.putString("last_file", nextFile);
+        force_stop_display = false;
+        request_play_flag = true;
+        xSemaphoreGive(fileLoaderSemaphore);
+        last_web_activity_time = now_ms; // предотвращаем засыпание во время слайдшоу
+        webLogf("[DISP] Slideshow: %s (%d/%d)", nextFile.c_str(),
+                slideCurrentIndex + 1, (int)savedFiles.size());
     }
 
     // safe_rotation_period используется в /info endpoint через глобальную переменную rotation_period.

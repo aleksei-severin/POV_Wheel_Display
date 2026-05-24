@@ -503,10 +503,57 @@ void setupNetwork() {
 
     server.on("/stop", HTTP_GET, [](AsyncWebServerRequest *request){
         last_web_activity_time = millis();
+        slideshowActive = false;
         force_stop_display = true;
         state_version++;
         webLog("[DISP] Stop");
         request->send(200, "text/plain", "Stopped");
+    });
+
+    // GET /album?action=start|stop&delay=<мс> — управление слайдшоу
+    server.on("/album", HTTP_GET, [](AsyncWebServerRequest *request){
+        last_web_activity_time = millis();
+        if (request->hasParam("action")) {
+            String action = request->getParam("action")->value();
+            if (action == "start") {
+                if (request->hasParam("delay")) {
+                    uint32_t ms = (uint32_t)request->getParam("delay")->value().toInt();
+                    if (ms >= 1000 && ms <= 300000) slideInterval = ms;
+                }
+                if (slideshowActive) {
+                    // Слайдшоу уже идёт — только обновляем интервал, не сбрасываем индекс
+                    webLogf("[DISP] Slideshow interval -> %lus", (unsigned long)(slideInterval / 1000));
+                    request->send(200, "text/plain", "OK");
+                    return;
+                }
+                updateFileList(); // Обновляем список файлов перед стартом
+                if (savedFiles.size() == 0) {
+                    request->send(400, "text/plain", "No files");
+                    return;
+                }
+                force_stop_display = false;
+                slideshowActive = true;
+                slideCurrentIndex = -1;  // loop() немедленно запустит первый файл
+                slideLastSwitch   = 0;
+                state_version++;
+                webLogf("[DISP] Slideshow start, interval %lus", (unsigned long)(slideInterval / 1000));
+                request->send(200, "text/plain", "OK");
+            } else if (action == "stop") {
+                slideshowActive = false;
+                state_version++;
+                webLog("[DISP] Slideshow stop");
+                request->send(200, "text/plain", "OK");
+            } else {
+                request->send(400, "text/plain", "Unknown action");
+            }
+        } else {
+            // GET без параметров — возвращает текущее состояние
+            char buf[64];
+            snprintf(buf, sizeof(buf), "{\"active\":%s,\"delay\":%lu}",
+                     slideshowActive ? "true" : "false",
+                     (unsigned long)slideInterval);
+            request->send(200, "application/json", buf);
+        }
     });
 
     server.on("/delete", HTTP_GET, [](AsyncWebServerRequest *request){
