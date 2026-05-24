@@ -8,7 +8,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-html { overflow-x: hidden; }
+html, body { overflow-x: hidden; max-width: 100%; }
 
 :root {
   --bg-base:    #0a0f1a;
@@ -49,6 +49,8 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  min-width: 0;
+  width: 100%;
 }
 .topbar-left { display: flex; flex-direction: column; gap: 3px; }
 .topbar-title {
@@ -93,17 +95,26 @@ body {
 /* ---- Grid layout ---- */
 .main-grid {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(3, 1fr);
   gap: 16px;
   padding: 20px 16px 0;
-  align-items: start;
+  align-items: stretch;
+  /* min-width: 0 на grid-container предотвращает распирание дочерних элементов */
+  min-width: 0;
+}
+.main-grid > .card {
+  height: 100%;
+  min-width: 0;   /* grid item не уходит за границу трека */
+  overflow: hidden;
 }
 
-@media (max-width: 1100px) {
-  .main-grid { grid-template-columns: repeat(2, 1fr); }
-}
-@media (max-width: 600px) {
-  .main-grid { grid-template-columns: 1fr; padding: 12px 12px 0; }
+@media (max-width: 900px) {
+  .main-grid {
+    grid-template-columns: 1fr;
+    align-items: start;
+    padding: 12px 12px 0;
+  }
+  .main-grid > .card { height: auto; }
 }
 
 /* ---- Card ---- */
@@ -114,12 +125,13 @@ body {
   padding: 20px;
 }
 .card-title {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  letter-spacing: 2px;
-  text-transform: uppercase;
-  color: var(--text-hint);
+  font-family: var(--font-ui);
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  color: var(--text);
   margin-bottom: 16px;
+  text-align: center;
 }
 .card-title-row {
   display: flex;
@@ -127,7 +139,7 @@ body {
   justify-content: space-between;
   margin-bottom: 16px;
 }
-.card-title-row .card-title { margin-bottom: 0; }
+.card-title-row .card-title { margin-bottom: 0; text-align: left; font-size: 14px; }
 
 /* ---- Live Metrics card ---- */
 .wheel-vis {
@@ -140,7 +152,7 @@ svg.wheel { filter: drop-shadow(0 0 14px #1d4ed855); }
 .speed-block { text-align: center; margin-bottom: 14px; }
 .speed-value {
   font-family: var(--font-mono);
-  font-size: 44px;
+  font-size: clamp(28px, 5vw, 44px);
   font-weight: 700;
   color: var(--text);
   line-height: 1;
@@ -262,6 +274,23 @@ svg.wheel { filter: drop-shadow(0 0 14px #1d4ed855); }
 .upload-zone:hover .upload-icon { color: var(--accent); }
 .upload-text { font-size: 12px; color: var(--text-hint); line-height: 1.5; }
 .upload-text span { color: var(--accent); font-weight: 500; }
+
+/* Круглая миниатюра в зоне дропа */
+.drop-thumb {
+  width: 96px; height: 96px;
+  border-radius: 50%;
+  overflow: hidden;
+  margin: 0 auto 8px;
+  border: 2px solid var(--border);
+  display: none;
+}
+.drop-thumb canvas {
+  width: 96px; height: 96px;
+  display: block;
+}
+.upload-zone.has-preview .upload-icon { display: none; }
+.upload-zone.has-preview .drop-thumb  { display: block; }
+.upload-zone.has-preview { border-color: var(--accent); }
 
 .status-bar {
   font-size: 11px;
@@ -456,11 +485,20 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
 .rgb-block input[type="range"] { margin-top: 8px; height: 3px; background: var(--border); }
 
 /* ---- Log card ---- */
+.card-log {
+  display: flex;
+  flex-direction: column;
+}
+.card-log .log-box {
+  flex: 1;
+  min-height: 0;
+}
 .log-box {
   background: var(--bg-deep);
   border-radius: var(--r-elem);
   padding: 12px 14px;
   height: 280px;
+  overflow-x: hidden;
   overflow-y: auto;
   font-family: var(--font-mono);
   font-size: 10px;
@@ -552,8 +590,9 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
   <div class="card">
     <p class="card-title">Upload animation</p>
 
-    <div class="upload-zone" onclick="document.getElementById('fileInput').click()">
+    <div class="upload-zone" id="uploadZone" onclick="document.getElementById('fileInput').click()">
       <input type="file" id="fileInput" accept="image/*" multiple style="display:none">
+      <div class="drop-thumb"><canvas id="dropThumbCanvas" width="192" height="192"></canvas></div>
       <div class="upload-icon">&#8679;</div>
       <div class="upload-text">Drop <span>.gif</span> or image here<br>or click to browse</div>
     </div>
@@ -580,9 +619,59 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
     <button class="btn-stop" onclick="stopDisplay()">&#9632; Stop Display</button>
   </div>
 
-  <!-- Card 4: Display Settings -->
+  <!-- Card: POV Display — метрики + настройки -->
   <div class="card">
-    <p class="card-title">Display settings</p>
+    <p class="card-title">POV Display</p>
+
+    <!-- Speed + RPM -->
+    <div class="speed-block" id="speedBlock" onclick="toggleWheelCircEdit()" style="cursor:pointer;" title="Click to set wheel circumference">
+      <div style="display:flex;align-items:baseline;justify-content:center;gap:14px;">
+        <div>
+          <span class="speed-value" id="infoSpeed">--</span>
+          <span class="speed-unit">km/h</span>
+        </div>
+        <div>
+          <span class="speed-value" id="infoRpm" style="font-size:32px;">--</span>
+          <span class="speed-unit">rpm</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Скрытый ввод окружности колеса -->
+    <div id="wheelCircWrap" style="display:none;margin-bottom:14px;">
+      <div style="background:var(--bg-input);border-radius:var(--r-elem);padding:10px 12px;display:flex;align-items:center;gap:8px;">
+        <span style="font-size:12px;color:var(--text-muted);flex:1;">Wheel circumference</span>
+        <input class="wheel-circ-input" type="text" id="wheelCirc" value="2355" maxlength="4"
+               style="font-family:var(--font-mono);font-size:14px;font-weight:700;color:var(--text);background:transparent;border:none;outline:none;width:48px;text-align:right;">
+        <span style="font-size:11px;color:var(--text-hint);">mm</span>
+      </div>
+    </div>
+
+    <!-- Battery bar -->
+    <div class="battery-bar-wrap" style="margin-top:0;margin-bottom:14px;">
+      <div class="battery-bar-header">
+        <span class="battery-bar-label">Battery level</span>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span class="badge badge-dim" id="chgStat">--</span>
+          <span class="battery-bar-pct" id="batPct">--%</span>
+        </div>
+      </div>
+      <div class="battery-bar-track">
+        <div class="battery-bar-fill" id="batBar"></div>
+      </div>
+    </div>
+
+    <!-- Power rows -->
+    <div class="power-row">
+      <span class="power-label">Battery voltage</span>
+      <div><span class="power-val" id="batV">--</span><span class="power-unit">V</span></div>
+    </div>
+    <div class="power-row">
+      <span class="power-label">Charge current</span>
+      <div><span class="power-val" id="batI">--</span><span class="power-unit">A</span></div>
+    </div>
+
+    <div class="divider"></div>
 
     <!-- Brightness dual-range -->
     <div class="slider-row">
@@ -670,7 +759,7 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
     </div>
 
     <div class="divider"></div>
-    <p class="card-title">Color correction</p>
+    <p class="card-title" style="font-size:13px;margin-bottom:10px;">Color correction</p>
 
     <div class="rgb-grid">
       <div class="rgb-block rgb-r">
@@ -694,75 +783,9 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
     </div>
   </div>
 
-  <!-- Card 1: Live Metrics -->
-  <div class="card">
-    <p class="card-title">Live metrics</p>
-
-    <!-- Speed + RPM — клик открывает ввод Wheel mm -->
-    <div class="speed-block" id="speedBlock" onclick="toggleWheelCircEdit()" style="cursor:pointer;" title="Click to set wheel circumference">
-      <div style="display:flex;align-items:baseline;justify-content:center;gap:14px;">
-        <div>
-          <span class="speed-value" id="infoSpeed">--</span>
-          <span class="speed-unit">km/h</span>
-        </div>
-        <div>
-          <span class="speed-value" id="infoRpm" style="font-size:32px;">--</span>
-          <span class="speed-unit">rpm</span>
-        </div>
-      </div>
-    </div>
-
-    <!-- Скрытый ввод окружности колеса — появляется по клику на speed-block -->
-    <div id="wheelCircWrap" style="display:none;margin-bottom:14px;">
-      <div style="background:var(--bg-input);border-radius:var(--r-elem);padding:10px 12px;display:flex;align-items:center;gap:8px;">
-        <span style="font-size:12px;color:var(--text-muted);flex:1;">Wheel circumference</span>
-        <input class="wheel-circ-input" type="text" id="wheelCirc" value="2355" maxlength="4"
-               style="font-family:var(--font-mono);font-size:14px;font-weight:700;color:var(--text);background:transparent;border:none;outline:none;width:48px;text-align:right;">
-        <span style="font-size:11px;color:var(--text-hint);">mm</span>
-      </div>
-    </div>
-
-    <!-- Battery bar -->
-    <div class="battery-bar-wrap" style="margin-top:0;margin-bottom:14px;">
-      <div class="battery-bar-header">
-        <span class="battery-bar-label">Battery level</span>
-        <div style="display:flex;align-items:center;gap:8px;">
-          <span class="badge badge-dim" id="chgStat">--</span>
-          <span class="battery-bar-pct" id="batPct">--%</span>
-        </div>
-      </div>
-      <div class="battery-bar-track">
-        <div class="battery-bar-fill" id="batBar"></div>
-      </div>
-    </div>
-
-    <!-- Power rows -->
-    <div class="power-row">
-      <span class="power-label">Battery voltage</span>
-      <div><span class="power-val" id="batV">--</span><span class="power-unit">V</span></div>
-    </div>
-    <div class="power-row">
-      <span class="power-label">Charge current</span>
-      <div><span class="power-val" id="batI">--</span><span class="power-unit">A</span></div>
-    </div>
-    <div class="power-row">
-      <span class="power-label">Input voltage</span>
-      <div><span class="power-val" id="busV">--</span><span class="power-unit">V</span></div>
-    </div>
-    <div class="power-row">
-      <span class="power-label">Input current</span>
-      <div><span class="power-val" id="busI">--</span><span class="power-unit">A</span></div>
-    </div>
-  </div>
-
   <!-- Card 5: Device Log -->
-  <div class="card">
-    <div class="card-title-row">
-      <p class="card-title">Device log</p>
-      <div class="status-pill" style="font-size:11px;color:var(--green)">
-        <span class="dot-pulse"></span> Live
-      </div>
-    </div>
+  <div class="card card-log">
+    <p class="card-title">Device log</p>
     <div class="log-box" id="logBox"></div>
     <div class="log-controls">
       <span class="log-badge" id="logBadge"></span>
@@ -916,6 +939,49 @@ const previewCanvas = document.getElementById('preview'); // 200×200 buffer
 const previewCtx = previewCanvas.getContext('2d', {willReadFrequently: true});
 
 // ===================== FILE INPUT =====================
+// Показывает круглую миниатюру в зоне дропа из File объекта
+function _showDropThumb(file) {
+    const zone   = document.getElementById('uploadZone');
+    const canvas = document.getElementById('dropThumbCanvas');
+    const ctx    = canvas.getContext('2d', {willReadFrequently: true});
+    const r = new FileReader();
+    r.onload = ev => {
+        const img = new Image();
+        img.onload = () => {
+            drawCenteredSquare(img, ctx, 192);
+            zone.classList.add('has-preview');
+        };
+        img.src = ev.target.result;
+    };
+    r.readAsDataURL(file);
+}
+
+function _clearDropThumb() {
+    const zone   = document.getElementById('uploadZone');
+    const canvas = document.getElementById('dropThumbCanvas');
+    canvas.getContext('2d').clearRect(0, 0, 192, 192);
+    zone.classList.remove('has-preview');
+}
+
+// Drag-and-drop на зону загрузки
+(function() {
+    const zone = document.getElementById('uploadZone');
+    zone.addEventListener('dragover', e => { e.preventDefault(); zone.style.borderColor = 'var(--accent)'; });
+    zone.addEventListener('dragleave', ()  => { zone.style.borderColor = ''; });
+    zone.addEventListener('drop', e => {
+        e.preventDefault();
+        zone.style.borderColor = '';
+        const files = Array.from(e.dataTransfer.files).filter(f =>
+            f.type.startsWith('image/') || f.name.toLowerCase().endsWith('.gif'));
+        if (!files.length) return;
+        // Подставляем файлы в input через DataTransfer
+        const dt = new DataTransfer();
+        files.forEach(f => dt.items.add(f));
+        document.getElementById('fileInput').files = dt.files;
+        document.getElementById('fileInput').dispatchEvent(new Event('change'));
+    });
+})();
+
 document.getElementById('fileInput').addEventListener('change', function(e) {
     const files = Array.from(e.target.files);
     if (!files.length) return;
@@ -931,6 +997,7 @@ document.getElementById('fileInput').addEventListener('change', function(e) {
     // Превью только первого файла
     const first = files[0];
     setStatus('uploadStatus', `${files.length} file(s) ready. Press Upload.`, 'ok');
+    _showDropThumb(first);
 
     const r2 = new FileReader();
     r2.onload = ev => {
@@ -1128,8 +1195,9 @@ async function processAndUpload() {
             setStatus('uploadStatus', `Done: ${ok} uploaded, ${fail} failed.`, '');
         }
     }
-    // Сбрасываем input чтобы можно было выбрать те же файлы снова
+    // Сбрасываем input и превью чтобы можно было выбрать те же файлы снова
     fileEl.value = '';
+    _clearDropThumb();
     document.getElementById('uploadQueue').style.display = 'none';
 }
 
@@ -1463,8 +1531,6 @@ function updateBatteryStatus() {
     return fetch('/battery').then(r => r.json()).then(d => {
         document.getElementById('batV').textContent = (d.vbat/1000).toFixed(2);
         document.getElementById('batI').textContent = (d.ibat/1000).toFixed(2);
-        document.getElementById('busV').textContent = (d.vbus/1000).toFixed(2);
-        document.getElementById('busI').textContent = (d.ibus/1000).toFixed(2);
 
         // Обновляем полоску батареи
         const pct = _voltToPct(d.vbat);
