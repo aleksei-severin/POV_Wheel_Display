@@ -388,7 +388,17 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
         last_built_sat = global_saturation;
     }
 
-    uint32_t anim_offset = currentFrameIndex * FRAME_SIZE;
+    // Кадр анимации вычисляется по абсолютному времени — не раз в оборот, а при каждом секторе.
+    // lastFrameSwitchTime сбрасывается при загрузке файла; elapsed растёт непрерывно,
+    // поэтому кадр может смениться прямо посередине оборота при высоком fps.
+    uint32_t frame_idx;
+    if (totalFrames > 1 && frameDelay > 0) {
+        uint32_t elapsed_ms = millis() - lastFrameSwitchTime;
+        frame_idx = (elapsed_ms / frameDelay) % totalFrames;
+    } else {
+        frame_idx = 0;
+    }
+    uint32_t anim_offset = frame_idx * FRAME_SIZE;
     uint8_t* led_ptr     = buf + 4;
 
     // Количество лучей читаем один раз — не меняется в середине кадра
@@ -519,23 +529,6 @@ void renderingTask(void* pvParameters) {
         xSemaphoreTake(hallSemaphore, pdMS_TO_TICKS(1100));
 
         if (force_stop_display || !peripherals_active || !newFrameReady) continue;
-
-        // --- Переключение кадров анимации (GIF таймер) ---
-        // Выполняется здесь, а не в loop(): renderingTask (приоритет 18) делает
-        // занятое ожидание весь оборот колеса и полностью вытесняет loop()
-        // (приоритет 1) на том же Core 1 — тот не успевает выполниться.
-        // Важно: за один оборот может пройти несколько frameDelay — вычисляем,
-        // сколько кадров реально истекло, и прыгаем сразу на нужный, иначе
-        // при period >> frameDelay анимация играет в period/frameDelay раз медленнее.
-        if (totalFrames > 1 && frameBuffer != nullptr) {
-            uint32_t now_anim = millis();
-            uint32_t elapsed  = now_anim - lastFrameSwitchTime;
-            if (elapsed >= frameDelay) {
-                uint32_t steps = elapsed / frameDelay;
-                lastFrameSwitchTime += steps * frameDelay;
-                currentFrameIndex = (currentFrameIndex + steps) % totalFrames;
-            }
-        }
 
         noInterrupts();
         uint32_t t0     = last_hall_time;
