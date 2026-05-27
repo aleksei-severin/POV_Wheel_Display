@@ -102,8 +102,9 @@ volatile bool wakeup_event = false;
 volatile bool request_play_flag = false;
 
 // Слайдшоу: переключение файлов по таймеру
-bool     slideshowActive    = false;
-uint32_t slideInterval      = 10000; // мс между сменами (по умолчанию 10 с)
+// Флаг и интервал живут в RTC — восстанавливаются после deep sleep
+RTC_DATA_ATTR bool     slideshowActive    = false;
+RTC_DATA_ATTR uint32_t slideInterval      = 10000; // мс между сменами (по умолчанию 10 с)
 uint32_t slideLastSwitch    = 0;
 int      slideCurrentIndex  = -1;    // индекс текущего файла в savedFiles (-1 = не запущен)
 
@@ -829,7 +830,13 @@ void setup() {
 
     String last_file = prefs.getString("last_file", "");
     if (last_file != "" && LittleFS.exists("/" + last_file)) {
-        webLogf("[DISP] Autoplay: %s", last_file.c_str());
+        if (slideshowActive) {
+            // Слайдшоу было активно до ухода в сон — загружаем последний файл как заглушку,
+            // loop() тут же начнёт слайдшоу с следующего файла (slideCurrentIndex == -1).
+            webLogf("[DISP] Autoplay (slideshow resume): %s", last_file.c_str());
+        } else {
+            webLogf("[DISP] Autoplay: %s", last_file.c_str());
+        }
         webLog("[PWR] Autoplay: LEDs power on");
         digitalWrite(PIN_EN_DCDC, HIGH);
         digitalWrite(PIN_EN_LEVEL_SHIFT, HIGH);
@@ -840,6 +847,10 @@ void setup() {
         peripherals_active = true;
         last_dcdc_on_time = millis();
         loadFrameFromFile("/" + last_file);
+    } else if (slideshowActive) {
+        // Слайдшоу активно, но last_file не найден — загрузим первый доступный файл
+        // при первом запуске slideshow-цикла в loop() (slideCurrentIndex == -1).
+        webLog("[DISP] Slideshow resume: waiting for first file load");
     }
 
     hallSemaphore = xSemaphoreCreateBinary();
@@ -886,6 +897,22 @@ void loop() {
     uint32_t now_ms = millis();
     uint32_t now_us = micros();
 
+    // Вычисляем время с последнего прохода магнита в начале loop() —
+    // используется и для паузы слайдшоу, и для логики выключения/засыпания.
+    // Читаем last_hall_time атомарно (ISR обновляет его из другого контекста).
+    noInterrupts();
+    uint32_t fresh_hall_time = last_hall_time;
+    interrupts();
+    uint32_t fresh_now_us = micros();
+    // Если колесо ни разу не крутилось — используем UINT32_MAX,
+    // чтобы условие засыпания по hall не блокировало переход в deep sleep.
+    uint32_t time_since_magnet_us = UINT32_MAX;
+    if (fresh_hall_time > 0) {
+        time_since_magnet_us = (fresh_now_us >= fresh_hall_time)
+            ? (fresh_now_us - fresh_hall_time)
+            : (0xFFFFFFFFUL - fresh_hall_time + fresh_now_us + 1);
+    }
+
 
     // --- Обработка запроса Play из Web UI ---
     if (request_play_flag) {
@@ -909,8 +936,13 @@ void loop() {
     }
 
     // --- Слайдшоу: автоматическая смена файлов по таймеру ---
+    // Пауза слайдшоу при отсутствии вращения: не переключаем файлы и не обновляем
+    // last_web_activity_time — это позволяет устройству уйти в sleep если нет активности.
+    // При первом запуске (slideCurrentIndex < 0) загружаем файл немедленно независимо от вращения.
+    bool rotation_present = (time_since_magnet_us < 3000000UL);
     if (slideshowActive && savedFiles.size() > 0 &&
-        (now_ms - slideLastSwitch >= slideInterval || slideCurrentIndex < 0)) {
+        (slideCurrentIndex < 0 ||
+         (rotation_present && (now_ms - slideLastSwitch >= slideInterval)))) {
         slideLastSwitch = now_ms;
         slideCurrentIndex = (slideCurrentIndex + 1) % (int)savedFiles.size();
         String nextFile = savedFiles[slideCurrentIndex];
@@ -919,14 +951,12 @@ void loop() {
         force_stop_display = false;
         request_play_flag = true;
         xSemaphoreGive(fileLoaderSemaphore);
-        last_web_activity_time = now_ms; // предотвращаем засыпание во время слайдшоу
+        last_web_activity_time = now_ms; // предотвращаем засыпание во время активного слайдшоу
         webLogf("[DISP] Slideshow: %s (%d/%d)", nextFile.c_str(),
                 slideCurrentIndex + 1, (int)savedFiles.size());
     }
 
     // safe_rotation_period используется в /info endpoint через глобальную переменную rotation_period.
-    // Здесь дополнительное чтение не нужно — time_since_magnet_us вычисляется свежим micros()
-    // непосредственно перед проверкой таймаута (см. секцию 2).
 
     // --- Обработка прерывания зарядного устройства BQ25798 ---
    if (bq_interrupt_flag) {
@@ -991,25 +1021,6 @@ void loop() {
             last_dcdc_on_time = millis();
             // last_hall_time НЕ трогаем: IO4 обновит его сам после стабилизации DCDC
         }
-    }
-
-    // Вычисляем реальное время с последнего прохода магнита.
-    // ВАЖНО: используем свежий micros() и читаем last_hall_time заново —
-    // renderingTask (приоритет 18, Core 1) вытесняет loop() на целые обороты,
-    // и safe_last_hall_time, прочитанный в начале loop(), может быть устаревшим.
-    // Прямое чтение ISR-переменной с запретом прерываний — единственный надёжный способ.
-    noInterrupts();
-    uint32_t fresh_hall_time = last_hall_time;
-    interrupts();
-    uint32_t fresh_now_us = micros();
-    // Если колесо ни разу не крутилось (last_hall_time == 0) — считаем что магнита
-    // не было "с начала времён": используем UINT32_MAX чтобы условие засыпания
-    // по hall не блокировало переход в deep sleep.
-    uint32_t time_since_magnet_us = UINT32_MAX;
-    if (fresh_hall_time > 0) {
-        time_since_magnet_us = (fresh_now_us >= fresh_hall_time)
-            ? (fresh_now_us - fresh_hall_time)
-            : (0xFFFFFFFFUL - fresh_hall_time + fresh_now_us + 1);
     }
 
     // --- 2. Логика остановки (Таймаут 3 секунды) ---

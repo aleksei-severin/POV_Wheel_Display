@@ -55,11 +55,11 @@ extern volatile uint32_t last_web_activity_time;
 extern volatile uint32_t last_hall_time;
 extern volatile uint32_t rotation_period;
 
-// Слайдшоу
-extern bool     slideshowActive;
-extern uint32_t slideInterval;      // мс между сменами файлов
-extern int      slideCurrentIndex;  // текущий индекс в savedFiles (-1 = не запущен)
-extern uint32_t slideLastSwitch;    // millis() последней смены файла
+// Слайдшоу (slideshowActive и slideInterval живут в RTC — сохраняются через deep sleep)
+extern RTC_DATA_ATTR bool     slideshowActive;
+extern RTC_DATA_ATTR uint32_t slideInterval;    // мс между сменами файлов
+extern int      slideCurrentIndex;              // текущий индекс в savedFiles (-1 = не запущен)
+extern uint32_t slideLastSwitch;                // millis() последней смены файла
 
 // Список файлов на LittleFS (обновляется updateFileList)
 #include <vector>

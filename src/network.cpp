@@ -386,13 +386,14 @@ void setupNetwork() {
     server.on("/get_settings", HTTP_GET, [](AsyncWebServerRequest *request){
         // Фоновый поллинг — не сбрасывает таймер активности.
         // snprintf в стековый буфер — ноль heap-аллокаций, не фрагментирует SRAM.
-        char buf[288];
+        char buf[320];
         snprintf(buf, sizeof(buf),
             "{\"bmin\":%u,\"bmax\":%u,\"angle\":%d,\"brightness\":%u,\"eff_bri\":%u"
             ",\"gamma\":%.1f,\"saturation\":%.1f,\"contrast\":%.1f"
             ",\"circ\":%u,\"arms\":%u,\"spoke\":%d"
             ",\"abl\":%.1f,\"abl_rms\":%.1f"
             ",\"rg\":%.1f,\"gg\":%.1f,\"bg\":%.1f"
+            ",\"slideshow\":%s"
             ",\"ver\":%lu,\"fver\":%lu}",
             (unsigned)min_brightness, (unsigned)max_brightness,
             (int)global_angle_offset, (unsigned)global_brightness,
@@ -401,6 +402,7 @@ void setupNetwork() {
             (unsigned)wheel_circumference, (unsigned)global_num_arms, (int)global_spoke_offset,
             (float)global_abl_limit, (float)(global_abl_rms * 100.0f),
             (float)global_r_gain, (float)global_g_gain, (float)global_b_gain,
+            slideshowActive ? "true" : "false",
             (unsigned long)state_version, (unsigned long)file_version
         );
         request->send(200, "application/json", buf);
@@ -491,6 +493,7 @@ void setupNetwork() {
             // Сохраняем файл ДО загрузки: если загрузка упадёт с крашем,
             // после перезагрузки устройство восстановит правильный файл.
             prefs.putString("last_file", fname);
+            slideshowActive = false;
             force_stop_display = false;
             // Передаём загрузку в fileLoaderTask (Core 0, приоритет 2).
             // Это освобождает WiFi-задачу немедленно — браузер получает ответ
