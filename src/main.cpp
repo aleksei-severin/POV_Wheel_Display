@@ -368,6 +368,23 @@ static float   lut_last_b        = -1.0f;
 static float   lut_last_sat      = -1.0f;
 static int16_t lut_sat_fxp       = 256;
 
+// Угловые поправки (в секторах) для каждого из 38 LED на луче.
+// Пересчитываются при изменении global_spoke_offset — не внутри горячего цикла.
+static int8_t  spoke_corr[38]    = {};
+static int16_t spoke_last        = -999;
+
+static void updateSpokeCorrIfNeeded() {
+    int16_t off = global_spoke_offset;
+    if (off == spoke_last) return;
+    spoke_last = off;
+    for (int i = 0; i < 38; i++) {
+        float r_mm = 45.0f + i * (250.0f / 37.0f);
+        spoke_corr[i] = (off != 0)
+            ? (int8_t)(atan2f((float)off, r_mm) * (360.0f / (2.0f * 3.14159265f)) + 0.5f)
+            : 0;
+    }
+}
+
 // Проверяет изменение параметров и пересчитывает LUT если нужно.
 // Вызывается один раз в начале оборота — не внутри fillSectorIntoBuffer.
 static void updateLUTIfNeeded() {
@@ -436,27 +453,13 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
 
     // Рендерим цвета в led_ptr с временным bri_byte=0xFF (bri_level игнорируется пока).
     // ABL считается ПО РЕЗУЛЬТАТУ рендера — те же данные что и RMS, одна шкала.
-    // Смещение спицы от оси (мм). При ненулевом значении каждый LED
-    // находится не на прямом радиусе, а смещён поперёк луча на spoke_offset мм —
-    // как спица велосипеда, крепящаяся к фланцу втулки.
-    // Для LED i реальный радиус от оси: r_mm = R_INNER_MM + i * LED_STEP_MM.
-    // Угловая поправка: atan2(spoke_offset, r_mm) — LED сдвинут по углу относительно
-    // базового направления луча. Для задней половины поправка имеет обратный знак.
-    float spoke_f = (float)global_spoke_offset; // мм, ±100
-
+    // spoke_corr[i] предвычислен в updateSpokeCorrIfNeeded() — atan2 вне горячего цикла.
     for (int ray = 0; ray < num_arms; ray++) {
         int base_front = (current_sector + ray * step_deg) % 360;
         int base_back  = (540 - base_front) % 360;
 
         for (int i = 0; i < 38; i++) {
-            // Расстояние от оси до LED i (мм): R_inner=45, R_outer=295, шаг (295-45)/37
-            float r_mm = 45.0f + i * (250.0f / 37.0f);
-
-            // Угловая поправка в секторах (360 = полный круг)
-            // atan2f возвращает радианы; делим на 2π и умножаем на 360
-            int ang_corr = (spoke_f != 0.0f)
-                ? (int)(atan2f(spoke_f, r_mm) * (360.0f / (2.0f * 3.14159265f)) + 0.5f)
-                : 0;
+            int ang_corr = spoke_corr[i];
 
             // --- Передняя половина луча (LEDs 0–37): поправка прибавляется ---
             int sector_f = ((base_front + ang_corr) % 360 + 360) % 360;
@@ -601,6 +604,7 @@ void renderingTask(void* pvParameters) {
         // rebuildGammaLUT() содержит ~768 вызовов powf() (~1–3 мс), что пропустило бы
         // несколько секторов если бы вызывалось в горячем цикле при первом изменении параметра.
         updateLUTIfNeeded();
+        updateSpokeCorrIfNeeded();
 
         int last_sector   = -1;
         int sectors_drawn = 0;  // счётчик реально отрендеренных секторов за оборот
@@ -1019,7 +1023,7 @@ void loop() {
     if (peripherals_active && time_since_magnet_us > 3000000 && !force_stop_display &&
         (now_ms - last_play_ms) > 5000 && (now_ms - last_dcdc_on_time) > 2000) {
         webLog("[PWR] No rotation >3s, LEDs power off");
-        FastLED.clear(); sendLEDs_DMA();
+        blankAllLEDs_DMA();
         digitalWrite(PIN_EN_LEVEL_SHIFT, LOW);
         digitalWrite(PIN_EN_DCDC, LOW);
         last_dcdc_off_time = millis();
@@ -1029,7 +1033,7 @@ void loop() {
     // --- 3. Принудительная остановка из Web UI (Stop Display) ---
     if (force_stop_display && peripherals_active) {
         webLog("[PWR] Force stop, LEDs power off");
-        FastLED.clear(); sendLEDs_DMA();
+        blankAllLEDs_DMA();
         digitalWrite(PIN_EN_LEVEL_SHIFT, LOW);
         digitalWrite(PIN_EN_DCDC, LOW);
         last_dcdc_off_time = millis();
@@ -1230,8 +1234,7 @@ void loop() {
                 Wire.write(0x82);
                 Wire.endTransmission();
 
-                FastLED.clear();
-                if (peripherals_active) sendLEDs_DMA();
+                if (peripherals_active) blankAllLEDs_DMA();
                 digitalWrite(PIN_EN_DCDC, LOW);
                 digitalWrite(PIN_EN_LEVEL_SHIFT, LOW);
                 peripherals_active = false;
