@@ -528,6 +528,8 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
 .card-log {
   display: flex;
   flex-direction: column;
+  align-self: start;
+  overflow: hidden;
 }
 .card-log .log-box {
   flex: 1;
@@ -537,7 +539,6 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
   background: var(--bg-deep);
   border-radius: var(--r-elem);
   padding: 12px 14px;
-  height: 280px;
   overflow-x: hidden;
   overflow-y: auto;
   font-family: var(--font-mono);
@@ -627,7 +628,7 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
 <div class="main-grid">
 
   <!-- Card 2: Storage & Upload -->
-  <div class="card">
+  <div class="card" id="uploadCard">
     <p class="card-title">Upload animation</p>
 
     <div class="upload-zone" id="uploadZone" onclick="document.getElementById('fileInput').click()">
@@ -654,8 +655,6 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
     </div>
     <div class="fs-track"><div class="fs-fill" id="fsFill"></div></div>
 
-    <div id="fileList"></div>
-
     <!-- Кнопки управления воспроизведением -->
     <div style="display:flex;gap:8px;margin-top:10px;align-items:center;">
       <button class="btn-album" id="albumBtn" onclick="toggleAlbum()">&#9654;&#9654; Start Slideshow</button>
@@ -666,6 +665,8 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
       </div>
       <button class="btn-stop" style="margin-top:0;flex:1;" onclick="stopDisplay()">&#9632; Stop Display</button>
     </div>
+
+    <div id="fileList" style="margin-top:8px;"></div>
   </div>
 
   <!-- Card: POV Display — метрики + настройки -->
@@ -1024,9 +1025,7 @@ document.getElementById('fileInput').addEventListener('change', function(e) {
         queueEl.style.display = 'none';
     }
 
-    // Превью только первого файла
     const first = files[0];
-    setStatus('uploadStatus', `${files.length} file(s) ready. Press Upload.`, 'ok');
     _showDropThumb(first);
 
     const r2 = new FileReader();
@@ -1036,6 +1035,19 @@ document.getElementById('fileInput').addEventListener('change', function(e) {
         img.src = ev.target.result;
     };
     r2.readAsDataURL(first);
+
+    if (files.length === 1) {
+        setStatus('uploadStatus', `${first.name} — converting...`, '');
+        _convertFile(first).then(({ buf, frameCount }) => {
+            const sizeKb = (buf.length / 1024).toFixed(1);
+            const info = frameCount ? ` · ${frameCount} frames` : '';
+            setStatus('uploadStatus', `${first.name} — ${sizeKb} kB${info}. Press Upload.`, 'ok');
+        }).catch(err => {
+            setStatus('uploadStatus', `${first.name} — convert error: ${err.message}`, 'err');
+        });
+    } else {
+        setStatus('uploadStatus', `${files.length} file(s) ready. Press Upload.`, 'ok');
+    }
 });
 
 // Draw image centered and square-cropped into a ctx of given size
@@ -1101,7 +1113,7 @@ async function _convertFile(file) {
         buf[6]=dd&0xFF; buf[7]=(dd>>8)&0xFF;
         let off = 8;
         for (const f of frames) { buf.set(f.data, off); off += f.data.length; }
-        return { buf, fileName };
+        return { buf, fileName, frameCount: frames.length };
     } else {
         const dataUrl = await new Promise((res, rej) => {
             const r = new FileReader();
@@ -1171,13 +1183,20 @@ async function processAndUpload() {
         const label = total > 1 ? `[${i+1}/${total}] ${file.name}` : file.name;
 
         setStatus('uploadStatus', `${label} — converting...`, '');
-        let buf, fileName;
+        let buf, fileName, frameCount;
         try {
-            ({ buf, fileName } = await _convertFile(file));
+            ({ buf, fileName, frameCount } = await _convertFile(file));
         } catch(err) {
             setStatus('uploadStatus', `${label} — convert error: ${err.message}`, 'err');
             fail++;
             continue;
+        }
+
+        if (total > 1) {
+            const sizeKb = (buf.length / 1024).toFixed(1);
+            const info = frameCount ? ` · ${frameCount} frames` : '';
+            setStatus('uploadStatus', `${label} — ${sizeKb} kB${info}`, '');
+            await new Promise(r => setTimeout(r, 400));
         }
 
         if (buf.length > fsFree) {
@@ -1996,7 +2015,17 @@ async function _pingLoop() {
     }, { passive: true });
 })();
 
+function _syncLogHeight() {
+    const ref = document.getElementById('uploadCard');
+    const log = document.querySelector('.card-log');
+    if (!ref || !log) return;
+    log.style.maxHeight = ref.offsetHeight + 'px';
+}
+
 window.onload = () => {
+    _syncLogHeight();
+    window.addEventListener('resize', _syncLogHeight);
+    new ResizeObserver(_syncLogHeight).observe(document.getElementById('uploadCard'));
     // Запускаем только ping-цикл. Он сам определит когда устройство онлайн
     // и запустит синхронизацию + polling. Это работает корректно и при первой
     // загрузке страницы, и при переподключении после ребута устройства.
