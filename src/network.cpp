@@ -174,8 +174,22 @@ static bool     initial_connect_done   = false;
 static uint32_t last_reconnect_attempt = 0;
 
 void safeOTAShutdown() {
-    FastLED.clear();
-    sendLEDs_DMA();
+    // 1. Выставляем флаг — renderingTask прерывает текущий оборот после следующего сектора.
+    //    force_stop_display блокирует повторное включение DCDC из hall_event/wakeup_event.
+    ota_in_progress    = true;
+    force_stop_display = true;
+    peripherals_active = false;
+
+    // 2. Ждём до 200 мс пока renderingTask завершит текущую DMA-транзакцию.
+    //    При 60 RPM один оборот = 1000 мс, но транзакция на один сектор ≈ 1–2 мс.
+    //    dmaMutex свободен → можно безопасно вызвать blankAllLEDs_DMA без deadlock.
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    // 3. Гасим светодиоды и снимаем питание.
+    blankAllLEDs_DMA();
+    digitalWrite(PIN_EN_LEVEL_SHIFT, LOW);
+    digitalWrite(PIN_EN_DCDC, LOW);
+    webLog("[OTA] Display off, starting update...");
 }
 
 void loadFrameFromFile(String path) {

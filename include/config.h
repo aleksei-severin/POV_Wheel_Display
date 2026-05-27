@@ -115,6 +115,9 @@ extern volatile uint8_t global_effective_brightness;
 
 // DMA-замена FastLED.show() — определена в main.cpp, используется также в network.cpp
 extern void sendLEDs_DMA();
+extern void blankAllLEDs_DMA();
+extern bool peripherals_active;
+extern volatile bool ota_in_progress;
 
 // Web-логирование: дублирует Serial и хранит 100 последних строк в RTC RAM
 // (переживает deep sleep). Безопасно вызывать из любого контекста.

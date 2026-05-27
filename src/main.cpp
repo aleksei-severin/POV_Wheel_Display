@@ -36,6 +36,7 @@ uint16_t frameDelay = 100;
 uint32_t lastFrameSwitchTime = 0;
 
 volatile bool newFrameReady = false;
+volatile bool ota_in_progress = false; // блокирует рендеринг на время OTA-обновления
 CRGB leds[NUM_LEDS];
 
 std::vector<String> savedFiles;
@@ -116,7 +117,7 @@ RTC_DATA_ATTR volatile float global_g_gain        = 70.0f;
 RTC_DATA_ATTR volatile float global_b_gain        = 100.0f;
 RTC_DATA_ATTR volatile uint16_t wheel_circumference = 2355;
 RTC_DATA_ATTR volatile uint8_t  global_num_arms     = 7;
-RTC_DATA_ATTR volatile int16_t  global_spoke_offset = 25;  // мм, 0 = лучи из центра
+RTC_DATA_ATTR volatile int16_t  global_spoke_offset = 21;  // мм, 0 = лучи из центра
 RTC_DATA_ATTR volatile float    global_abl_limit    = 10.0f;  // ABL: 0–100 %, 100 = без ограничения
 volatile float                  global_abl_rms      = 0.0f;  // RMS загрузка тока 0.0–1.0, не сохраняем в RTC
 volatile uint8_t                global_effective_brightness = 8; // bri_level после ABL; совпадает с global_brightness пока нет рендеринга
@@ -297,7 +298,7 @@ void initSK9822_DMA() {
 // Гасит все SK9822_MAX_LEDS (608) диодов — ток=0, цвет=0.
 // Используется при включении DCDC и при остановке рендеринга.
 // НЕ читает leds[] — не зависит от содержимого FastLED-массива.
-static void blankAllLEDs_DMA() {
+void blankAllLEDs_DMA() {
     if (!dma_tx_buffer || !sk9822_spi || !dmaMutex) return;
     xSemaphoreTake(dmaMutex, portMAX_DELAY);
     uint8_t* led_ptr = dma_tx_buffer + 4;
@@ -566,7 +567,7 @@ void renderingTask(void* pvParameters) {
         // светодиоды при резкой остановке — loop() выключал питание только через 3с.
         xSemaphoreTake(hallSemaphore, pdMS_TO_TICKS(1100));
 
-        if (force_stop_display || !peripherals_active || !newFrameReady) continue;
+        if (force_stop_display || !peripherals_active || !newFrameReady || ota_in_progress) continue;
 
         noInterrupts();
         uint32_t t0     = last_hall_time;
@@ -615,7 +616,7 @@ void renderingTask(void* pvParameters) {
             // Прерываем оборот если буфер освобождается во время рендеринга:
             // loadFrameFromFile (Core 0) ставит newFrameReady=false ДО free(frameBuffer),
             // поэтому эта проверка надёжно защищает от use-after-free.
-            if (force_stop_display || !peripherals_active || !newFrameReady) break;
+            if (force_stop_display || !peripherals_active || !newFrameReady || ota_in_progress) break;
 
             uint32_t elapsed = micros() - t0;
             if (elapsed >= period) break;
