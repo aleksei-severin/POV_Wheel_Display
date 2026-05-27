@@ -767,6 +767,16 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
              oninput="document.getElementById('armsVal').textContent=this.value; syncSettings()">
     </div>
 
+    <!-- Spoke Offset -->
+    <div class="slider-row">
+      <div class="slider-label">
+        <span>Spoke Offset</span>
+        <span class="val"><span id="spokeVal">20</span> mm</span>
+      </div>
+      <input type="range" id="spokeSlide" min="-50" max="50" value="20" step="1"
+             oninput="document.getElementById('spokeVal').textContent=this.value; syncSettings()">
+    </div>
+
     <!-- Angle -->
     <div class="slider-row">
       <div class="slider-label">
@@ -1477,12 +1487,13 @@ function syncSettings() {
         const s    = (document.getElementById('sSlide').value / 10).toFixed(1);
         const co   = document.getElementById('coSlide').value;
         const circ = document.getElementById('wheelCirc').value || wheelCircMm;
-        const arms = document.getElementById('armsSlide').value;
-        const abl  = document.getElementById('ablSlide').value;
-        const rg   = document.getElementById('rgSlide').value;
-        const gg   = document.getElementById('ggSlide').value;
-        const bg   = document.getElementById('bgSlide').value;
-        fetch(`/settings?bmin=${bmin}&bmax=${bmax}&a=${a}&g=${g}&s=${s}&co=${co}&circ=${circ}&arms=${arms}&abl=${abl}&rg=${rg}&gg=${gg}&bg=${bg}`);
+        const arms  = document.getElementById('armsSlide').value;
+        const spoke = document.getElementById('spokeSlide').value;
+        const abl   = document.getElementById('ablSlide').value;
+        const rg    = document.getElementById('rgSlide').value;
+        const gg    = document.getElementById('ggSlide').value;
+        const bg    = document.getElementById('bgSlide').value;
+        fetch(`/settings?bmin=${bmin}&bmax=${bmax}&a=${a}&g=${g}&s=${s}&co=${co}&circ=${circ}&arms=${arms}&spoke=${spoke}&abl=${abl}&rg=${rg}&gg=${gg}&bg=${bg}`);
         _syncTimer = null;
     }, 50);
 }
@@ -1562,6 +1573,11 @@ function _applySettings(d) {
         const a = Math.max(1, Math.min(8, d.arms));
         document.getElementById('armsSlide').value = a;
         document.getElementById('armsVal').textContent = a;
+    }
+    if (d.spoke !== undefined) {
+        const v = Math.max(-50, Math.min(50, d.spoke));
+        document.getElementById('spokeSlide').value = v;
+        document.getElementById('spokeVal').textContent = v;
     }
     if (d.abl !== undefined) {
         const v = Math.round(d.abl);

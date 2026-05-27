@@ -99,6 +99,10 @@ extern volatile uint16_t wheel_circumference;
 // Количество лучей (1–8), по умолчанию 4
 extern volatile uint8_t global_num_arms;
 
+// Смещение начала спицы от оси (мм): 0 = лучи из центра, ±100 = касательная к фланцу 100 мм.
+// Положительное значение — смещение в правую сторону (по ходу вращения), отрицательное — в левую.
+extern volatile int16_t global_spoke_offset;
+
 // ABL: лимит суммарного тока 0–100 %, 100 = без ограничения
 extern volatile float global_abl_limit;
 

@@ -350,6 +350,10 @@ void setupNetwork() {
             int av = request->getParam("arms")->value().toInt();
             if (av >= 1 && av <= 8) global_num_arms = (uint8_t)av;
         }
+        if (request->hasParam("spoke")) {
+            int sv = request->getParam("spoke")->value().toInt();
+            if (sv >= -50 && sv <= 50) global_spoke_offset = (int16_t)sv;
+        }
         if (request->hasParam("abl")) {
             float v = request->getParam("abl")->value().toFloat();
             if (v >= 0.0f && v <= 100.0f) global_abl_limit = v;
@@ -382,11 +386,11 @@ void setupNetwork() {
     server.on("/get_settings", HTTP_GET, [](AsyncWebServerRequest *request){
         // Фоновый поллинг — не сбрасывает таймер активности.
         // snprintf в стековый буфер — ноль heap-аллокаций, не фрагментирует SRAM.
-        char buf[256];
+        char buf[288];
         snprintf(buf, sizeof(buf),
             "{\"bmin\":%u,\"bmax\":%u,\"angle\":%d,\"brightness\":%u,\"eff_bri\":%u"
             ",\"gamma\":%.1f,\"saturation\":%.1f,\"contrast\":%.1f"
-            ",\"circ\":%u,\"arms\":%u"
+            ",\"circ\":%u,\"arms\":%u,\"spoke\":%d"
             ",\"abl\":%.1f,\"abl_rms\":%.1f"
             ",\"rg\":%.1f,\"gg\":%.1f,\"bg\":%.1f"
             ",\"ver\":%lu,\"fver\":%lu}",
@@ -394,7 +398,7 @@ void setupNetwork() {
             (int)global_angle_offset, (unsigned)global_brightness,
             (unsigned)global_effective_brightness,
             (float)global_gamma, (float)global_saturation, (float)global_contrast,
-            (unsigned)wheel_circumference, (unsigned)global_num_arms,
+            (unsigned)wheel_circumference, (unsigned)global_num_arms, (int)global_spoke_offset,
             (float)global_abl_limit, (float)(global_abl_rms * 100.0f),
             (float)global_r_gain, (float)global_g_gain, (float)global_b_gain,
             (unsigned long)state_version, (unsigned long)file_version

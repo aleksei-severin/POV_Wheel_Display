@@ -115,6 +115,7 @@ RTC_DATA_ATTR volatile float global_g_gain        = 70.0f;
 RTC_DATA_ATTR volatile float global_b_gain        = 100.0f;
 RTC_DATA_ATTR volatile uint16_t wheel_circumference = 2355;
 RTC_DATA_ATTR volatile uint8_t  global_num_arms     = 7;
+RTC_DATA_ATTR volatile int16_t  global_spoke_offset = 20;  // мм, 0 = лучи из центра
 RTC_DATA_ATTR volatile float    global_abl_limit    = 10.0f;  // ABL: 0–100 %, 100 = без ограничения
 volatile float                  global_abl_rms      = 0.0f;  // RMS загрузка тока 0.0–1.0, не сохраняем в RTC
 volatile uint8_t                global_effective_brightness = 8; // bri_level после ABL; совпадает с global_brightness пока нет рендеринга
@@ -435,15 +436,32 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
 
     // Рендерим цвета в led_ptr с временным bri_byte=0xFF (bri_level игнорируется пока).
     // ABL считается ПО РЕЗУЛЬТАТУ рендера — те же данные что и RMS, одна шкала.
-    for (int ray = 0; ray < num_arms; ray++) {
-        int sector_front = (current_sector + ray * step_deg) % 360;
-        int sector_back  = (540 - sector_front) % 360;
+    // Смещение спицы от оси (мм). При ненулевом значении каждый LED
+    // находится не на прямом радиусе, а смещён поперёк луча на spoke_offset мм —
+    // как спица велосипеда, крепящаяся к фланцу втулки.
+    // Для LED i реальный радиус от оси: r_mm = R_INNER_MM + i * LED_STEP_MM.
+    // Угловая поправка: atan2(spoke_offset, r_mm) — LED сдвинут по углу относительно
+    // базового направления луча. Для задней половины поправка имеет обратный знак.
+    float spoke_f = (float)global_spoke_offset; // мм, ±100
 
-        const uint8_t* src_f = frameBuffer + anim_offset + sector_front * 38 * 3;
-        const uint8_t* src_b = frameBuffer + anim_offset + sector_back  * 38 * 3;
+    for (int ray = 0; ray < num_arms; ray++) {
+        int base_front = (current_sector + ray * step_deg) % 360;
+        int base_back  = (540 - base_front) % 360;
 
         for (int i = 0; i < 38; i++) {
-            // --- Передняя половина луча (LEDs 0–37) ---
+            // Расстояние от оси до LED i (мм): R_inner=45, R_outer=295, шаг (295-45)/37
+            float r_mm = 45.0f + i * (250.0f / 37.0f);
+
+            // Угловая поправка в секторах (360 = полный круг)
+            // atan2f возвращает радианы; делим на 2π и умножаем на 360
+            int ang_corr = (spoke_f != 0.0f)
+                ? (int)(atan2f(spoke_f, r_mm) * (360.0f / (2.0f * 3.14159265f)) + 0.5f)
+                : 0;
+
+            // --- Передняя половина луча (LEDs 0–37): поправка прибавляется ---
+            int sector_f = ((base_front + ang_corr) % 360 + 360) % 360;
+            const uint8_t* src_f = frameBuffer + anim_offset + sector_f * 38 * 3;
+
             uint8_t r = lut_r[src_f[i * 3]];
             uint8_t g = lut_g[src_f[i * 3 + 1]];
             uint8_t b = lut_b[src_f[i * 3 + 2]];
@@ -457,12 +475,15 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
                 b = (uint8_t)constrain(b2, 0, 255);
             }
             int idx_a = (ray * 76 + i) * 4;
-            led_ptr[idx_a + 0] = 0xFF; // bri_byte пропишем позже
+            led_ptr[idx_a + 0] = 0xFF;
             led_ptr[idx_a + 1] = b;
             led_ptr[idx_a + 2] = g;
             led_ptr[idx_a + 3] = r;
 
-            // --- Задняя половина луча (LEDs 38–75) ---
+            // --- Задняя половина луча (LEDs 38–75): поправка вычитается (зеркальный луч) ---
+            int sector_b = ((base_back - ang_corr) % 360 + 360) % 360;
+            const uint8_t* src_b = frameBuffer + anim_offset + sector_b * 38 * 3;
+
             uint8_t rb = lut_r[src_b[i * 3]];
             uint8_t gb = lut_g[src_b[i * 3 + 1]];
             uint8_t bb = lut_b[src_b[i * 3 + 2]];
@@ -476,7 +497,7 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
                 bb = (uint8_t)constrain(b2, 0, 255);
             }
             int idx_b = (ray * 76 + 75 - i) * 4;
-            led_ptr[idx_b + 0] = 0xFF; // bri_byte пропишем позже
+            led_ptr[idx_b + 0] = 0xFF;
             led_ptr[idx_b + 1] = bb;
             led_ptr[idx_b + 2] = gb;
             led_ptr[idx_b + 3] = rb;
