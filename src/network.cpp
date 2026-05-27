@@ -174,22 +174,26 @@ static bool     initial_connect_done   = false;
 static uint32_t last_reconnect_attempt = 0;
 
 void safeOTAShutdown() {
-    // 1. Выставляем флаг — renderingTask прерывает текущий оборот после следующего сектора.
-    //    force_stop_display блокирует повторное включение DCDC из hall_event/wakeup_event.
+    // 1. Выставляем флаги — renderingTask прерывает текущий оборот,
+    //    loop() не включает DCDC повторно через hall_event/wakeup_event.
     ota_in_progress    = true;
     force_stop_display = true;
     peripherals_active = false;
 
-    // 2. Ждём до 200 мс пока renderingTask завершит текущую DMA-транзакцию.
-    //    При 60 RPM один оборот = 1000 мс, но транзакция на один сектор ≈ 1–2 мс.
-    //    dmaMutex свободен → можно безопасно вызвать blankAllLEDs_DMA без deadlock.
+    // 2. Ждём 200 мс — гарантируем завершение текущей DMA-транзакции renderingTask,
+    //    чтобы dmaMutex был свободен и blankAllLEDs_DMA не вызвал deadlock.
     vTaskDelay(pdMS_TO_TICKS(200));
 
     // 3. Гасим светодиоды и снимаем питание.
     blankAllLEDs_DMA();
     digitalWrite(PIN_EN_LEVEL_SHIFT, LOW);
     digitalWrite(PIN_EN_DCDC, LOW);
-    webLog("[OTA] Display off, starting update...");
+
+    // 4. Размонтируем LittleFS — ElegantOTA для ESP32 не делает это автоматически,
+    //    запись поверх смонтированной FS приводит к её повреждению и краш/статус 0.
+    LittleFS.end();
+
+    webLog("[OTA] Display off, FS unmounted, starting update...");
 }
 
 void loadFrameFromFile(String path) {
