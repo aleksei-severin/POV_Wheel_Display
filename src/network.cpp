@@ -630,7 +630,7 @@ void setupNetwork() {
     });
 
     server.on("/ping", HTTP_GET, [](AsyncWebServerRequest *request){
-        last_web_activity_time = millis();
+        // Фоновый heartbeat — не сбрасывает таймер активности.
         request->send(200, "text/plain", "OK");
     });
 

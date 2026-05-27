@@ -770,20 +770,20 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
     <!-- Spoke Offset -->
     <div class="slider-row">
       <div class="slider-label">
-        <span>Spoke Offset</span>
-        <span class="val"><span id="spokeVal">20</span> mm</span>
+        <span>Hub Offset</span>
+        <span class="val"><span id="spokeVal">25</span> mm</span>
       </div>
-      <input type="range" id="spokeSlide" min="-50" max="50" value="20" step="1"
+      <input type="range" id="spokeSlide" min="-50" max="50" value="25" step="1"
              oninput="document.getElementById('spokeVal').textContent=this.value; syncSettings()">
     </div>
 
     <!-- Angle -->
     <div class="slider-row">
       <div class="slider-label">
-        <span>Angle offset</span>
-        <span class="val"><span id="aVal">91</span>&deg;</span>
+        <span>Angle Offset</span>
+        <span class="val"><span id="aVal">86</span>&deg;</span>
       </div>
-      <input type="range" id="aSlide" min="0" max="360" value="91"
+      <input type="range" id="aSlide" min="0" max="360" value="86"
              oninput="document.getElementById('aVal').textContent=this.value; syncSettings()">
     </div>
 

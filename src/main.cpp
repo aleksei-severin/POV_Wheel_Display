@@ -25,7 +25,7 @@ volatile uint8_t global_brightness = 8; // единицы SK9822 (0–31)
 
 RTC_DATA_ATTR uint8_t min_brightness = 1;  // единицы SK9822 (1–30)
 RTC_DATA_ATTR uint8_t max_brightness = 30; // единицы SK9822 (1–30)
-RTC_DATA_ATTR volatile int global_angle_offset = 91;
+RTC_DATA_ATTR volatile int global_angle_offset = 86;
 
 uint8_t* frameBuffer = nullptr; 
 
@@ -116,7 +116,7 @@ RTC_DATA_ATTR volatile float global_g_gain        = 70.0f;
 RTC_DATA_ATTR volatile float global_b_gain        = 100.0f;
 RTC_DATA_ATTR volatile uint16_t wheel_circumference = 2355;
 RTC_DATA_ATTR volatile uint8_t  global_num_arms     = 7;
-RTC_DATA_ATTR volatile int16_t  global_spoke_offset = 20;  // мм, 0 = лучи из центра
+RTC_DATA_ATTR volatile int16_t  global_spoke_offset = 25;  // мм, 0 = лучи из центра
 RTC_DATA_ATTR volatile float    global_abl_limit    = 10.0f;  // ABL: 0–100 %, 100 = без ограничения
 volatile float                  global_abl_rms      = 0.0f;  // RMS загрузка тока 0.0–1.0, не сохраняем в RTC
 volatile uint8_t                global_effective_brightness = 8; // bri_level после ABL; совпадает с global_brightness пока нет рендеринга
@@ -921,18 +921,18 @@ void loop() {
             // Явно включаем питание LED: датчик Холла может быть обесточен,
             // поэтому нельзя ждать hall_event — включаем сами.
             webLogf("[PWR] Play \"%s\": LEDs power on", pendingFilePath.c_str());
+            last_dcdc_on_time = now_ms; // до delay(5) — иначе now_ms < last_dcdc_on_time → underflow
             digitalWrite(PIN_EN_DCDC, HIGH);
             digitalWrite(PIN_EN_LEVEL_SHIFT, HIGH);
             delay(5); // ждём стабилизации питания SK9822
             blankAllLEDs_DMA(); // гасим все 608 диодов до начала рендеринга
             peripherals_active = true;
-            last_dcdc_on_time = millis();
         }
         // Не сбрасываем last_hall_time — это портит rotation_period в ISR:
         // если Холл сработает вскоре после сброса, rotation_period = несколько мс
         // вместо ~333мс, и renderingTask выйдет из цикла после 1 сектора.
-        // Запоминаем момент запроса — секция 2 даст 2с на загрузку файла.
-        last_play_ms = millis();
+        // Запоминаем момент запроса — секция 2 даст 10с на стабилизацию/загрузку файла.
+        last_play_ms = now_ms;
     }
 
     // --- Слайдшоу: автоматическая смена файлов по таймеру ---
@@ -978,12 +978,12 @@ void loop() {
         if (!force_stop_display && !peripherals_active && newFrameReady) {
             // Включаем питание немедленно по первому hall-сигналу.
             // Лог о начале рендеринга выводит renderingTask когда period подтвердит >=60 RPM.
+            last_dcdc_on_time = now_ms; // до delay(5) — иначе now_ms < last_dcdc_on_time → underflow
             digitalWrite(PIN_EN_DCDC, HIGH);
             digitalWrite(PIN_EN_LEVEL_SHIFT, HIGH);
             delay(5); // ждём стабилизации питания SK9822
             blankAllLEDs_DMA(); // гасим все 608 диодов до начала рендеринга
             peripherals_active = true;
-            last_dcdc_on_time = millis();
             webLog("[PWR] Hall: LEDs power on (waiting for >=60 RPM)");
         }
         // Рендеринг управляется renderingTask через hallSemaphore
@@ -1013,12 +1013,16 @@ void loop() {
         // Без файла для показа DCDC не включаем — ждём нажатия Play.
         if (!peripherals_active && !force_stop_display && newFrameReady && io4_age_us > 3000000UL) {
             webLog("[PWR] IO5: LEDs power on");
+            // last_play_ms и last_dcdc_on_time устанавливаем ДО delay(5),
+            // чтобы now_ms (снапшот начала loop) не оказался меньше их значений
+            // и не вызвал uint32_t underflow в секции 2.
+            last_dcdc_on_time = now_ms;
+            last_play_ms      = now_ms;
             digitalWrite(PIN_EN_DCDC, HIGH);
             digitalWrite(PIN_EN_LEVEL_SHIFT, HIGH);
             delay(5); // ждём стабилизации питания SK9822
             blankAllLEDs_DMA(); // гасим все 608 диодов до начала рендеринга
             peripherals_active = true;
-            last_dcdc_on_time = millis();
             // last_hall_time НЕ трогаем: IO4 обновит его сам после стабилизации DCDC
         }
     }
@@ -1030,10 +1034,13 @@ void loop() {
     // DCDC успевает выключиться до следующей итерации loop().
     // 3с — достаточно для любых реалистичных пауз планировщика, но быстро
     // реагирует на реальную остановку колеса.
-    // 5-секундная защита после /play и 2с после включения DCDC остаются.
+    // 10-секундная защита после /play и 2с после включения DCDC остаются.
+    // newFrameReady: не выключаем DCDC пока файл ещё грузится — это особенно важно
+    // при первом запуске после прошивки, когда нет autoplay и загрузка идёт с нуля.
     if (peripherals_active && time_since_magnet_us > 3000000 && !force_stop_display &&
-        (now_ms - last_play_ms) > 5000 && (now_ms - last_dcdc_on_time) > 2000) {
-        webLog("[PWR] No rotation >3s, LEDs power off");
+        newFrameReady && (now_ms - last_play_ms) > 10000 && (now_ms - last_dcdc_on_time) > 2000) {
+        webLogf("[PWR] No rotation >3s, LEDs power off (play:%lums dcdc:%lums)",
+                (unsigned long)(now_ms - last_play_ms), (unsigned long)(now_ms - last_dcdc_on_time));
         blankAllLEDs_DMA();
         digitalWrite(PIN_EN_LEVEL_SHIFT, LOW);
         digitalWrite(PIN_EN_DCDC, LOW);
