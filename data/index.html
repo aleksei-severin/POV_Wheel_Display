@@ -1326,8 +1326,9 @@ function loadFSInfo() {
     return fetch('/fs_info').then(r => r.json()).then(d => {
         const pct = d.total ? (d.used / d.total * 100) : 0;
         document.getElementById('fsFill').style.width = pct.toFixed(1) + '%';
+        const fmt = v => Math.round(v/1024).toLocaleString('ru-RU').replace(/ /g, ' ');
         document.getElementById('fsLabel').textContent =
-            `${(d.free/1024).toFixed(0)} kB free of ${(d.total/1024).toFixed(0)} kB`;
+            `${fmt(d.free)} kB free of ${fmt(d.total)} kB`;
         document.getElementById('fsPct').textContent = pct.toFixed(0) + '%';
     });
 }

@@ -1,9 +1,9 @@
 # POV Wheel Display - custom partition table (16MB flash)
-# app0/app1: 3MB each (3x current firmware size of ~947KB)
-# littlefs:  10000KB for animations storage
+# app0/app1: 2MB each (~2x current firmware size of ~935KB)
+# littlefs:  12000KB for animations storage
 # Name,     Type, SubType,  Offset,   Size
 nvs,        data, nvs,      0x9000,   0x5000,
 otadata,    data, ota,      0xe000,   0x2000,
-app0,       app,  ota_0,    0x10000,  0x300000,
-app1,       app,  ota_1,    0x310000, 0x300000,
-spiffs,     data, spiffs,   0x610000, 0x9C4000,
+app0,       app,  ota_0,    0x10000,  0x200000,
+app1,       app,  ota_1,    0x210000, 0x200000,
+spiffs,     data, spiffs,   0x410000, 0xBB8000,
