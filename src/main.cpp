@@ -50,7 +50,10 @@ ICM456xx imu(SPI, PIN_CS);
 BH1750 lightMeter;
 
 // --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ (Замените старые переменные времени этими) ---
-volatile bool hall_event = false;
+// hall_event    — флаг для renderingTask: читает и сбрасывает сама задача
+// hall_event_loop — флаг для loop(): включение питания по вращению
+volatile bool hall_event      = false;
+volatile bool hall_event_loop = false;
 volatile uint32_t last_hall_time = 0;
 volatile uint32_t rotation_period = 0;
 RTC_DATA_ATTR bool force_stop_display = false;
@@ -166,7 +169,8 @@ void IRAM_ATTR magnetInterruptHandler() {
     if (now - last_hall_time > 50000) {
         rotation_period = now - last_hall_time;
         last_hall_time = now;
-        hall_event = true;
+        hall_event      = true;  // для renderingTask
+        hall_event_loop = true;  // для loop() (включение питания)
 
         // Будим renderingTask для нового оборота
         if (hallSemaphore) {
@@ -550,38 +554,75 @@ static void fillSectorIntoBuffer(uint8_t* buf, int current_sector) {
 // Ping-pong DMA: spi_device_queue_trans ставит передачу в очередь,
 // spi_device_get_trans_result ждёт завершения не держа spinlock —
 // WiFi ISR (prio >10) прерывает задачу когда нужно обработать пакеты.
+//
+// Ключевое решение стабильности: сектор вычисляется непрерывно из micros() и
+// last_hall_time — без привязки к моменту пробуждения задачи. Семафор используется
+// ТОЛЬКО для выхода из блокировки при новом hall-событии; сам рендеринг не ждёт
+// семафора — он стартует немедленно при наличии валидного period. Это устраняет
+// джиттер планировщика (50–500 мкс), который раньше сдвигал начальный сектор
+// и вызывал угловое дрожание изображения от оборота к обороту.
 void renderingTask(void* pvParameters) {
-    static bool     rendering_active = false; // Флаг: были ли обороты >125 RPM (для лога при снижении)
+    static bool rendering_active = false;
     uint8_t active     = 0;
     bool    tx_pending = false;
 
-    // Отписываем IDLE-задачу Core 1 от Task WDT: renderingTask (приоритет 18)
-    // занимает Core 1 почти непрерывно и IDLE не получает тиков.
+    // Отписываем IDLE-задачу Core 1 от Task WDT: renderingTask занимает Core 1
+    // почти непрерывно и IDLE не получает тиков.
     esp_task_wdt_delete(xTaskGetIdleTaskHandleForCPU(1));
-    // renderingTask НЕ подписываем на WDT: taskYIELD() и vTaskDelay внутри цикла
-    // могут передать CPU системным задачам с prio>18, и WDT сработает раньше сброса.
+
+    // Локальные снапшоты hall-данных — обновляются при каждом новом hall-событии.
+    uint32_t t0     = 0;
+    uint32_t period = 0;
+    // hall_seq: счётчик событий, инкрементируется ISR через hall_event.
+    // renderingTask читает его чтобы понять — было ли новое hall-событие с прошлой итерации.
+    uint32_t last_seen_hall_seq = 0;
+
+    // Переменные для однократного вызова updateLUT/updateSpokeCorr при смене оборота
+    uint32_t last_lut_update_seq = 0xFFFFFFFFUL;
+
+    // Счётчики RMS для текущего оборота
+    int sectors_drawn = 0;
 
     while (true) {
-        // Таймаут 1100мс: если холл молчит дольше 1100мс — скорость точно <60RPM.
-        // При portMAX_DELAY задача зависала в ожидании и не успевала погасить
-        // светодиоды при резкой остановке — loop() выключал питание только через 3с.
+        // Ждём нового hall-события максимум 1100мс.
+        // Если холл молчит дольше — скорость <60RPM, уходим на проверку остановки.
         xSemaphoreTake(hallSemaphore, pdMS_TO_TICKS(1100));
 
-        if (force_stop_display || !peripherals_active || !newFrameReady || ota_in_progress) continue;
-
+        // Обновляем локальный снапшот hall-данных при каждом новом событии.
+        // hall_event используется как флаг нового события — сбрасываем его атомарно.
         noInterrupts();
-        uint32_t t0     = last_hall_time;
-        uint32_t period = rotation_period;
+        uint32_t snap_t0     = last_hall_time;
+        uint32_t snap_period = rotation_period;
+        bool     new_event   = hall_event;
+        if (new_event) hall_event = false;
         interrupts();
 
-        // Пропускаем рендеринг ниже 60 RPM (period > 1000 мс).
-        // Критично: при первом обороте после долгой остановки
-        // rotation_period = micros() - last_hall_time = десятки миллионов мкс.
-        // Без этой проверки renderingTask уходит в busy-wait на минуты,
-        // вытесняя WiFi/loop, WDT срабатывает через 5 с → краш → перезагрузка.
-        //
-        // Дополнительно: если с момента последнего сигнала холла прошло >1000мс —
-        // обороты точно <60RPM независимо от сохранённого rotation_period.
+        if (new_event) {
+            // Новый оборот: публикуем RMS предыдущего оборота
+            if (sectors_drawn > 0)
+                global_abl_rms = rms_accum / (float)sectors_drawn;
+            rms_accum     = 0.0f;
+            sectors_drawn = 0;
+
+            t0     = snap_t0;
+            period = snap_period;
+            last_seen_hall_seq++;
+        }
+
+        if (force_stop_display || !peripherals_active || !newFrameReady || ota_in_progress) {
+            if (rendering_active) {
+                rendering_active = false;
+                webLog("[PWR] Rendering stopped");
+                blankAllLEDs_DMA();
+                global_abl_rms              = 0.0f;
+                rms_accum                   = 0.0f;
+                sectors_drawn               = 0;
+                global_effective_brightness = global_brightness;
+            }
+            continue;
+        }
+
+        // Проверка валидности: период > 1с → <60 RPM, или hall устарел >1с
         uint32_t now_us = micros();
         uint32_t age_us = (now_us >= t0) ? (now_us - t0) : (0xFFFFFFFFUL - t0 + now_us + 1);
         if (period == 0 || period > 1000000 || age_us > 1000000) {
@@ -591,38 +632,50 @@ void renderingTask(void* pvParameters) {
                 blankAllLEDs_DMA();
                 global_abl_rms              = 0.0f;
                 rms_accum                   = 0.0f;
-                global_effective_brightness = global_brightness; // нет рендера → ABL не действует
+                sectors_drawn               = 0;
+                global_effective_brightness = global_brightness;
             }
             continue;
         }
         if (!rendering_active) {
             rendering_active = true;
-            // Питание уже включено hall_event'ом в loop() — здесь только логируем
-            // факт достижения порога рендеринга.
             webLog("[PWR] RPM >=60, rendering started");
         }
 
-        // Пересчёт LUT выполняется один раз в начале оборота — не внутри fillSectorIntoBuffer.
-        // rebuildGammaLUT() содержит ~768 вызовов powf() (~1–3 мс), что пропустило бы
-        // несколько секторов если бы вызывалось в горячем цикле при первом изменении параметра.
-        updateLUTIfNeeded();
-        updateSpokeCorrIfNeeded();
+        // LUT и spoke_corr обновляем один раз за оборот — при новом hall-событии.
+        if (last_lut_update_seq != last_seen_hall_seq) {
+            updateLUTIfNeeded();
+            updateSpokeCorrIfNeeded();
+            last_lut_update_seq = last_seen_hall_seq;
+        }
 
-        int last_sector   = -1;
-        int sectors_drawn = 0;  // счётчик реально отрендеренных секторов за оборот
-        tx_pending        = false;
+        // Непрерывный рендеринг: вычисляем текущий сектор из реального времени.
+        // Не привязываемся к моменту пробуждения — используем micros() здесь и сейчас.
+        // Это устраняет джиттер планировщика: независимо от того, когда xSemaphoreTake
+        // вернул управление, сектор будет точно соответствовать угловому положению ротора.
+        int last_sector = -1;
 
         while (true) {
-            // Прерываем оборот если буфер освобождается во время рендеринга:
-            // loadFrameFromFile (Core 0) ставит newFrameReady=false ДО free(frameBuffer),
-            // поэтому эта проверка надёжно защищает от use-after-free.
             if (force_stop_display || !peripherals_active || !newFrameReady || ota_in_progress) break;
 
+            // Проверяем новое hall-событие: если пришло — прерываем цикл, чтобы
+            // обновить t0/period и начать следующий оборот с актуальными данными.
+            noInterrupts();
+            bool got_new = hall_event;
+            interrupts();
+            if (got_new) break;
+
             uint32_t elapsed = micros() - t0;
-            if (elapsed >= period) break;
+            if (elapsed >= period) {
+                // Оборот завершён по таймеру (следующий hall ещё не пришёл).
+                // Кратковременно уступаем CPU — не крутим busy-wait впустую,
+                // но реагируем на hall-событие быстрее чем через полный тик (1мс).
+                taskYIELD();
+                continue;
+            }
 
             int base = (int)((uint64_t)elapsed * 360 / period);
-            if (base >= 360) break;
+            if (base >= 360) { taskYIELD(); continue; }
 
             int sector = (base + (int)global_angle_offset + 360) % 360;
 
@@ -642,17 +695,12 @@ void renderingTask(void* pvParameters) {
             }
         }
 
-        // Забираем последнюю незавершённую транзакцию перед следующим оборотом
+        // Забираем незавершённую транзакцию
         if (tx_pending) {
             spi_transaction_t* done;
             spi_device_get_trans_result(sk9822_spi, &done, portMAX_DELAY);
             tx_pending = false;
         }
-
-        // Публикуем RMS: среднее по секторам → значение 0.0–1.0
-        if (sectors_drawn > 0)
-            global_abl_rms = rms_accum / (float)sectors_drawn;
-        rms_accum = 0.0f;
     }
 }
 
@@ -972,8 +1020,8 @@ void loop() {
     }
 
     // --- 1. Обработка прерывания Холла (Event Handler) ---
-    if (hall_event) {
-        hall_event = false;
+    if (hall_event_loop) {
+        hall_event_loop = false;
         // Включаем питание только если есть файл для показа.
         // Без файла DCDC остаётся выключенным до нажатия Play.
         if (!force_stop_display && !peripherals_active && newFrameReady) {
