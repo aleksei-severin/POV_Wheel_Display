@@ -887,9 +887,27 @@ class MinimalGIF {
                 let mcs=this.readByte(), id=[],l;
                 while((l=this.readByte())!==0){for(let i=0;i<l;i++) id.push(this.bytes[this.pos+i]); this.pos+=l;}
                 let pix=this.lzwDecode(mcs,new Uint8Array(id),w*h);
+                if(ip&0x40) pix=MinimalGIF.deinterlace(pix,w,h);   // бит 6 — чересстрочность
                 this.frames.push({x,y,w,h,pixels:pix,lct,delay,disposal,transIndex});
             }
         }
+    }
+
+    // Чересстрочный кадр хранится четырьмя проходами по строкам:
+    //   0, 8, 16…  затем 4, 12, 20…  затем 2, 6, 10…  затем 1, 3, 5…
+    // Без обратной перестановки каждый проход ложится сплошным блоком, и кадр
+    // выглядит как несколько сплющенных по вертикали копий картинки.
+    static deinterlace(src,w,h){
+        const dst=new Uint8Array(w*h);
+        const passes=[[0,8],[4,8],[2,4],[1,2]];
+        let row=0;
+        for(const [start,step] of passes){
+            for(let y=start;y<h;y+=step){
+                dst.set(src.subarray(row*w,row*w+w),y*w);
+                row++;
+            }
+        }
+        return dst;
     }
 
     lzwDecode(mcs,data,pc){
@@ -906,7 +924,10 @@ class MinimalGIF {
             let c=rc(); if(c===-1||c===eoi) break;
             if(c===cc){cs=mcs+1;ds=cc+2;dict.length=cc+2;oc=-1;continue;}
             let seq; if(c<ds) seq=dict[c]; else if(c===ds&&oc!==-1){seq=Array.from(dict[oc]);seq.push(dict[oc][0]);}else break;
-            out.set(seq,op); op+=seq.length;
+            // Битый поток может выдать больше пикселей, чем w×h: без обрезки
+            // TypedArray.set бросит исключение и уронит разбор всего файла.
+            let sl=seq.length; if(op+sl>pc) sl=pc-op;
+            out.set(sl===seq.length?seq:seq.slice(0,sl),op); op+=sl;
             if(oc!==-1&&ds<4096){let ne=Array.from(dict[oc]);ne.push(seq[0]);dict[ds++]=ne;if(ds===(1<<cs)&&cs<12)cs++;}
             oc=c;
         }
@@ -1012,7 +1033,11 @@ function renderGIFFrames(gif) {
 
     for (let i = 0; i < gif.frames.length; i++) {
         const f = gif.frames[i];
-        if (f.disposal === 2 && i > 0) {
+        // Метод утилизации относится к тому кадру, вместе с которым объявлен:
+        // очищать нужно область ПРЕДЫДУЩЕГО кадра, если очистку просил он.
+        // Раньше проверялся disposal текущего кадра — на GIF со смешанными
+        // методами это давало то лишнюю очистку, то шлейф от старого кадра.
+        if (i > 0 && gif.frames[i-1].disposal === 2) {
             const pf = gif.frames[i-1];
             ctx.clearRect(pf.x, pf.y, pf.w, pf.h);
         }

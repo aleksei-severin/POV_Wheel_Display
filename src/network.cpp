@@ -339,8 +339,17 @@ void setupNetwork() {
     // --- WEB SERVER ---
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
         last_web_activity_time = millis();
-        if (LittleFS.exists("/index.html")) request->send(LittleFS, "/index.html", "text/html");
-        else request->send(404, "text/plain", "Upload Filesystem Image!");
+        if (!LittleFS.exists("/index.html")) {
+            request->send(404, "text/plain", "Upload Filesystem Image!");
+            return;
+        }
+        // Запрещаем кеширование: конвертация картинок в полярный буфер живёт
+        // в этой же странице, и после uploadfs браузер обязан взять новую
+        // версию. Иначе он молча продолжает крутить старый JS, а загруженные
+        // файлы получаются по старым правилам — отладка такого стоит часов.
+        AsyncWebServerResponse* resp = request->beginResponse(LittleFS, "/index.html", "text/html");
+        resp->addHeader("Cache-Control", "no-cache, must-revalidate");
+        request->send(resp);
     });
 
     server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *request){
