@@ -759,6 +759,18 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
       </div>
     </div>
 
+    <!-- Radial Gain — компенсация падения яркости к периферии.
+         Диод на большом радиусе размазывает свет по большей длине дуги, поэтому
+         кажется тусклее. 0 % — выключено, 100 % — полная компенсация (яркость ∝ r). -->
+    <div class="slider-row">
+      <div class="slider-label">
+        <span>Radial Gain</span>
+        <span class="val"><span id="radVal">80%</span></span>
+      </div>
+      <input type="range" id="radSlide" min="0" max="100" value="80" step="5"
+             oninput="document.getElementById('radVal').textContent=this.value+'%'; syncSettings()">
+    </div>
+
     <!-- Arm order — лучей всегда 6, настраивается только их порядок в цепочке -->
     <div class="slider-row">
       <div class="slider-label">
@@ -815,13 +827,13 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
                oninput="document.getElementById('rgVal').textContent=this.value+'%'; syncSettings()">
         <span class="mini-val" id="rgVal" style="color:var(--red)">100%</span>
         <span class="mini-label" style="color:var(--green)">G</span>
-        <input type="range" class="g-slider" id="ggSlide" min="0" max="100" step="5" value="65"
+        <input type="range" class="g-slider" id="ggSlide" min="0" max="100" step="5" value="60"
                oninput="document.getElementById('ggVal').textContent=this.value+'%'; syncSettings()">
-        <span class="mini-val" id="ggVal" style="color:var(--green)">65%</span>
+        <span class="mini-val" id="ggVal" style="color:var(--green)">60%</span>
         <span class="mini-label" style="color:var(--purple)">B</span>
-        <input type="range" class="b-slider" id="bgSlide" min="0" max="100" step="5" value="75"
+        <input type="range" class="b-slider" id="bgSlide" min="0" max="100" step="5" value="80"
                oninput="document.getElementById('bgVal').textContent=this.value+'%'; syncSettings()">
-        <span class="mini-val" id="bgVal" style="color:var(--purple)">75%</span>
+        <span class="mini-val" id="bgVal" style="color:var(--purple)">80%</span>
       </div>
     </div>
 
@@ -910,30 +922,73 @@ const LEDS_PER_SIDE = 44;
 const R_OUTER_FRAC  = 0.495;              // outer LED (273 mm) -> image edge
 const R_INNER_FRAC  = 0.495 * 49 / 273;   // inner LED (49 mm)  -> 0.0889
 const FRAME_BYTES   = 360 * LEDS_PER_SIDE * 3;
+const SRC_SIZE_IMG  = 600;                // рабочий холст для статичной картинки
+const SRC_SIZE_GIF  = 400;                // для кадров GIF — их много, экономим время
 
-function toPolarBuffer(srcCanvas) {
+// Полярная выборка с усреднением по ячейке.
+// На периферии один сектор (1°) занимает несколько пикселей исходника, поэтому
+// выборка «ближайшего соседа» рвала границы линий ещё до отправки на устройство.
+// Усредняем ss×ss точек внутри ячейки «сектор 1° × кольцо в шаг диодов»,
+// каждую берём билинейно — граница попадает в промежуточный уровень, а не
+// прыгает на целый сектор.
+function toPolarBuffer(srcCanvas, ss) {
+    ss = ss || 3;
     const W = srcCanvas.width, H = srcCanvas.height;
     const ctx = srcCanvas.getContext('2d', {willReadFrequently: true});
     const sData = ctx.getImageData(0, 0, W, H).data;
     const buf = new Uint8Array(FRAME_BYTES);
-    let off = 0;
+    const cx = W / 2, cy = H / 2;
     const minR = W * R_INNER_FRAC;
     const maxR = W * R_OUTER_FRAC;
+    const dR   = (maxR - minR) / (LEDS_PER_SIDE - 1);
+    const DEG  = Math.PI / 180;
+
+    // Смещения подвыборок внутри ячейки: −0.5 … +0.5 её размера
+    const jit = new Float64Array(ss);
+    for (let k = 0; k < ss; k++) jit[k] = (k + 0.5) / ss - 0.5;
+
+    // cos/sin для всех углов подвыборки считаем один раз
+    const ca = new Float64Array(360 * ss), sa = new Float64Array(360 * ss);
+    for (let s = 0; s < 360; s++) {
+        for (let k = 0; k < ss; k++) {
+            const a = (s + jit[k]) * DEG;
+            ca[s * ss + k] = Math.cos(a);
+            sa[s * ss + k] = Math.sin(a);
+        }
+    }
+
+    const n = ss * ss;
+    let off = 0;
     for (let sector = 0; sector < 360; sector++) {
-        const angle = (sector / 360) * 2 * Math.PI;
-        const ca = Math.cos(angle), sa = Math.sin(angle);
         for (let r = 0; r < LEDS_PER_SIDE; r++) {
-            const rad = minR + (r / (LEDS_PER_SIDE - 1)) * (maxR - minR);
-            const px = Math.round(W / 2 + rad * ca);
-            const py = Math.round(H / 2 + rad * sa);
-            if (px >= 0 && px < W && py >= 0 && py < H) {
-                const idx = (py * W + px) * 4;
-                buf[off++] = sData[idx];     // R
-                buf[off++] = sData[idx + 1]; // G
-                buf[off++] = sData[idx + 2]; // B
-            } else {
-                buf[off++] = 0; buf[off++] = 0; buf[off++] = 0;
+            const rad0 = minR + r * dR;
+            let sr = 0, sg = 0, sb = 0;
+            for (let ia = 0; ia < ss; ia++) {
+                const c = ca[sector * ss + ia], s2 = sa[sector * ss + ia];
+                for (let ir = 0; ir < ss; ir++) {
+                    const rad = rad0 + jit[ir] * dR;
+                    const px = cx + rad * c, py = cy + rad * s2;
+                    let x0 = Math.floor(px), y0 = Math.floor(py);
+                    const fx = px - x0, fy = py - y0;
+                    let x1 = x0 + 1, y1 = y0 + 1;
+                    // Страховка по границам: при R_OUTER_FRAC = 0.495 выборка
+                    // всегда внутри холста, но пусть не зависит от константы.
+                    if (x0 < 0) x0 = 0; else if (x0 > W - 1) x0 = W - 1;
+                    if (x1 < 0) x1 = 0; else if (x1 > W - 1) x1 = W - 1;
+                    if (y0 < 0) y0 = 0; else if (y0 > H - 1) y0 = H - 1;
+                    if (y1 < 0) y1 = 0; else if (y1 > H - 1) y1 = H - 1;
+                    const i00 = (y0 * W + x0) * 4, i10 = (y0 * W + x1) * 4;
+                    const i01 = (y1 * W + x0) * 4, i11 = (y1 * W + x1) * 4;
+                    const w00 = (1 - fx) * (1 - fy), w10 = fx * (1 - fy);
+                    const w01 = (1 - fx) * fy,       w11 = fx * fy;
+                    sr += sData[i00]     * w00 + sData[i10]     * w10 + sData[i01]     * w01 + sData[i11]     * w11;
+                    sg += sData[i00 + 1] * w00 + sData[i10 + 1] * w10 + sData[i01 + 1] * w01 + sData[i11 + 1] * w11;
+                    sb += sData[i00 + 2] * w00 + sData[i10 + 2] * w10 + sData[i01 + 2] * w01 + sData[i11 + 2] * w11;
+                }
             }
+            buf[off++] = (sr / n + 0.5) | 0;
+            buf[off++] = (sg / n + 0.5) | 0;
+            buf[off++] = (sb / n + 0.5) | 0;
         }
     }
     return buf;
@@ -945,10 +1000,14 @@ function renderGIFFrames(gif) {
     canvas.width = gif.width; canvas.height = gif.height;
     const ctx = canvas.getContext('2d', {willReadFrequently: true});
     const sq = Math.min(gif.width, gif.height);
-    // Working canvas — square, centered crop, 200×200
+    // Working canvas — square, centered crop. Больше исходного разрешения, чем
+    // нужно ленте: полярная выборка усредняет по ячейке, ей есть что усреднять.
+    const S = SRC_SIZE_GIF;
     const work = document.createElement('canvas');
-    work.width = 200; work.height = 200;
+    work.width = S; work.height = S;
     const wCtx = work.getContext('2d', {willReadFrequently: true});
+    wCtx.imageSmoothingEnabled = true;
+    wCtx.imageSmoothingQuality = 'high';
     const frames = [];
 
     for (let i = 0; i < gif.frames.length; i++) {
@@ -972,10 +1031,12 @@ function renderGIFFrames(gif) {
         tmp.width = f.w; tmp.height = f.h;
         tmp.getContext('2d').putImageData(imgData, 0, 0);
         ctx.drawImage(tmp, f.x, f.y);
-        // Center-crop to square, scale to 200×200
-        wCtx.clearRect(0, 0, 200, 200);
-        wCtx.drawImage(canvas, (gif.width - sq)/2, (gif.height - sq)/2, sq, sq, 0, 0, 200, 200);
-        frames.push({ delay: f.delay, data: toPolarBuffer(work) });
+        // Center-crop to square, scale to S×S
+        wCtx.clearRect(0, 0, S, S);
+        wCtx.drawImage(canvas, (gif.width - sq)/2, (gif.height - sq)/2, sq, sq, 0, 0, S, S);
+        // Кадров в GIF много — берём 2×2 подвыборки вместо 3×3, иначе конвертация
+        // длинной анимации в браузере затягивается на десятки секунд.
+        frames.push({ delay: f.delay, data: toPolarBuffer(work, 2) });
     }
     return frames;
 }
@@ -1147,12 +1208,16 @@ async function _convertFile(file) {
             i.onerror = rej;
             i.src = dataUrl;
         });
-        // Рисуем в offscreen canvas 200×200 для полярного преобразования
+        // Рисуем в offscreen canvas для полярного преобразования. Холст заметно
+        // крупнее, чем нужно ленте: полярная выборка усредняет по ячейке, и на
+        // периферии, где сектор занимает несколько пикселей, это убирает рваные края.
         const oc = document.createElement('canvas');
-        oc.width = 200; oc.height = 200;
+        oc.width = SRC_SIZE_IMG; oc.height = SRC_SIZE_IMG;
         const ctx = oc.getContext('2d', {willReadFrequently: true});
-        drawCenteredSquare(img, ctx, 200);
-        return { buf: toPolarBuffer(oc), fileName };
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        drawCenteredSquare(img, ctx, SRC_SIZE_IMG);
+        return { buf: toPolarBuffer(oc, 3), fileName };
     }
 }
 
@@ -1480,8 +1545,8 @@ function restoreImgDefaults() {
     set('sSlide',  15, ['sVal',  '1.5']);
     set('coSlide',  5, ['coVal', '5%']);
     set('rgSlide', 100, ['rgVal', '100%']);
-    set('ggSlide',  65, ['ggVal', '65%']);
-    set('bgSlide',  75, ['bgVal', '75%']);
+    set('ggSlide',  60, ['ggVal', '60%']);
+    set('bgSlide',  80, ['bgVal', '80%']);
     syncSettings();
 }
 
@@ -1500,10 +1565,11 @@ function syncSettings() {
         const ao    = _armReverse ? 1 : 0;
         const spoke = document.getElementById('spokeSlide').value;
         const abl   = document.getElementById('ablSlide').value;
+        const rad   = document.getElementById('radSlide').value;
         const rg    = document.getElementById('rgSlide').value;
         const gg    = document.getElementById('ggSlide').value;
         const bg    = document.getElementById('bgSlide').value;
-        fetch(`/settings?bmin=${bmin}&bmax=${bmax}&a=${a}&g=${g}&s=${s}&co=${co}&circ=${circ}&ao=${ao}&spoke=${spoke}&abl=${abl}&rg=${rg}&gg=${gg}&bg=${bg}`);
+        fetch(`/settings?bmin=${bmin}&bmax=${bmax}&a=${a}&g=${g}&s=${s}&co=${co}&circ=${circ}&ao=${ao}&spoke=${spoke}&abl=${abl}&rad=${rad}&rg=${rg}&gg=${gg}&bg=${bg}`);
         _syncTimer = null;
     }, 50);
 }
@@ -1612,6 +1678,11 @@ function _applySettings(d) {
     }
     if (d.abl_rms !== undefined) {
         _updateAblRms(d.abl_rms);
+    }
+    if (d.rad !== undefined) {
+        const v = Math.round(d.rad);
+        document.getElementById('radSlide').value = v;
+        document.getElementById('radVal').textContent = v + '%';
     }
     if (d.rg !== undefined) {
         const v = Math.round(d.rg);

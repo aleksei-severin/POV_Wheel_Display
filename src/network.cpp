@@ -382,6 +382,11 @@ void setupNetwork() {
             float v = request->getParam("abl")->value().toFloat();
             if (v >= 0.0f && v <= 100.0f) global_abl_limit = v;
         }
+        // Радиальная компенсация яркости: 0 = выключена, 100 = полная (∝ r)
+        if (request->hasParam("rad")) {
+            float v = request->getParam("rad")->value().toFloat();
+            if (v >= 0.0f && v <= 100.0f) global_radial_gain = v;
+        }
         if (request->hasParam("rg")) {
             float v = request->getParam("rg")->value().toFloat();
             if (v >= 0.0f && v <= 100.0f) global_r_gain = v;
@@ -410,12 +415,12 @@ void setupNetwork() {
     server.on("/get_settings", HTTP_GET, [](AsyncWebServerRequest *request){
         // Фоновый поллинг — не сбрасывает таймер активности.
         // snprintf в стековый буфер — ноль heap-аллокаций, не фрагментирует SRAM.
-        char buf[384];
+        char buf[448];
         snprintf(buf, sizeof(buf),
             "{\"bmin\":%u,\"bmax\":%u,\"angle\":%d,\"brightness\":%u,\"eff_bri\":%u"
             ",\"gamma\":%.1f,\"saturation\":%.1f,\"contrast\":%.1f"
             ",\"circ\":%u,\"ao\":%u,\"spoke\":%d,\"lux\":%.0f"
-            ",\"abl\":%.1f,\"abl_rms\":%.1f"
+            ",\"abl\":%.1f,\"abl_rms\":%.1f,\"rad\":%.0f"
             ",\"rg\":%.1f,\"gg\":%.1f,\"bg\":%.1f"
             ",\"slideshow\":%s"
             ",\"ver\":%lu,\"fver\":%lu}",
@@ -426,6 +431,7 @@ void setupNetwork() {
             (unsigned)wheel_circumference, (unsigned)(global_arm_reverse ? 1 : 0),
             (int)global_spoke_offset, (float)last_lux_value,
             (float)global_abl_limit, (float)(global_abl_rms * 100.0f),
+            (float)global_radial_gain,
             (float)global_r_gain, (float)global_g_gain, (float)global_b_gain,
             slideshowActive ? "true" : "false",
             (unsigned long)state_version, (unsigned long)file_version
@@ -675,9 +681,14 @@ void setupNetwork() {
             uint32_t eff = (elapsed > period) ? elapsed : period;
             rpm = 60000000.0f / (float)eff;
         }
-        char buf[64];
-        snprintf(buf, sizeof(buf), "{\"rpm\":%.1f,\"dir\":%d,\"pwr\":%u}",
-                 rpm, (int)rotation_dir, (unsigned)power_state);
+        // step — угол, который луч проходит между обновлениями ленты; это и есть
+        // предел угловой чёткости. fill — время сборки кадра, для контроля запаса
+        // по CPU (должно оставаться заметно меньше времени передачи по SPI).
+        char buf[112];
+        snprintf(buf, sizeof(buf),
+                 "{\"rpm\":%.1f,\"dir\":%d,\"pwr\":%u,\"step\":%.2f,\"fill\":%u}",
+                 rpm, (int)rotation_dir, (unsigned)power_state,
+                 (float)global_render_span, (unsigned)global_render_fill_us);
         request->send(200, "application/json", buf);
     });
 

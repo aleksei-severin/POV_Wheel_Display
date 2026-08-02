@@ -104,9 +104,16 @@ static volatile float rotor_omega = 0.0f;  // град/мкс, знаковая
 static volatile float rotor_alpha = 0.0f;  // град/мкс², знаковая
 
 // --- ЕSP-IDF SPI DMA для SK9822 ---
-// 528 диодов: старт-фрейм 4 байта + 528×4 байта данных + end-frame N/2 бит.
-#define SK9822_END_FRAMES (NUM_LEDS / 2)
-#define SK9822_BUF_SIZE   (4 + NUM_LEDS * 4 + SK9822_END_FRAMES)
+// 528 диодов: старт-фрейм 4 байта + 528×4 байта данных + end-frame.
+// Протоколу нужно N/2 БИТ хвоста (528/2 = 264 бита = 33 байта), а раньше слалось
+// 264 БАЙТА — лишние 231 байт на каждом кадре, почти 10 % времени шины впустую.
+// Берём 33 байта + 4 байта запаса.
+#define SK9822_END_BYTES  (NUM_LEDS / 16 + 4)
+#define SK9822_BUF_SIZE   (4 + NUM_LEDS * 4 + SK9822_END_BYTES)
+
+// Время передачи одного кадра по SPI, мкс. Это и есть шаг дискретизации угла:
+// пока кадр идёт по шине, лента показывает предыдущие данные.
+#define SK9822_FRAME_US   ((float)(SK9822_BUF_SIZE * 8) * 1000000.0f / (float)SK9822_SPI_HZ)
 
 // RMS за текущий оборот: среднее нормированное потребление тока (0.0–1.0).
 // Считается от нередуцированного bri_level — показывает реальную нагрузку.
@@ -132,13 +139,16 @@ RTC_DATA_ATTR volatile float global_gamma         = 2.5f;
 RTC_DATA_ATTR volatile float global_saturation    = 1.5f;
 RTC_DATA_ATTR volatile float global_contrast      = 5.0f;
 RTC_DATA_ATTR volatile float global_r_gain        = 100.0f; // 0..100 %, 100 = без изменений
-RTC_DATA_ATTR volatile float global_g_gain        = 65.0f;
-RTC_DATA_ATTR volatile float global_b_gain        = 75.0f;
+RTC_DATA_ATTR volatile float global_g_gain        = 60.0f;
+RTC_DATA_ATTR volatile float global_b_gain        = 80.0f;
 RTC_DATA_ATTR volatile uint16_t wheel_circumference = 2355;
 RTC_DATA_ATTR volatile int16_t  global_spoke_offset = 0;   // мм, 0 = лучи из центра
 RTC_DATA_ATTR volatile bool     global_arm_reverse  = false; // порядок лучей в цепочке
+RTC_DATA_ATTR volatile float    global_radial_gain  = 80.0f; // радиальная компенсация яркости, 0–100 %
 RTC_DATA_ATTR volatile float    global_abl_limit    = 40.0f; // ABL: 0–100 %, 100 = без ограничения
 volatile float                  global_abl_rms      = 0.0f;  // RMS загрузка тока 0.0–1.0
+volatile float                  global_render_span    = 0.0f; // угол между обновлениями ленты, °
+volatile uint32_t               global_render_fill_us = 0;    // время сборки кадра, мкс
 volatile uint8_t                global_effective_brightness = 8;
 uint8_t lut_r[256];
 uint8_t lut_g[256];
@@ -280,8 +290,9 @@ void initSK9822_DMA() {
     buscfg.max_transfer_sz = SK9822_BUF_SIZE;
 
     spi_device_interface_config_t devcfg = {};
-    devcfg.clock_speed_hz = 23 * 1000 * 1000;  // 23 МГц
-    devcfg.mode           = 0;
+    devcfg.clock_speed_hz  = SK9822_SPI_HZ;
+    devcfg.duty_cycle_pos  = SK9822_DUTY_POS;
+    devcfg.mode            = 0;
     devcfg.spics_io_num   = -1;
     devcfg.queue_size     = 1;
     devcfg.flags          = SPI_DEVICE_NO_DUMMY;
@@ -293,14 +304,32 @@ void initSK9822_DMA() {
         dma_buf[b] = (uint8_t*)heap_caps_malloc(SK9822_BUF_SIZE, MALLOC_CAP_DMA);
         assert(dma_buf[b] != nullptr);
         memset(dma_buf[b], 0x00, SK9822_BUF_SIZE);                            // Старт-фрейм и данные в 0
-        memset(dma_buf[b] + 4 + NUM_LEDS * 4, 0xFF, SK9822_END_FRAMES);       // End-frame
+        memset(dma_buf[b] + 4 + NUM_LEDS * 4, 0xFF, SK9822_END_BYTES);        // End-frame
         spi_trans[b].tx_buffer = dma_buf[b];
         spi_trans[b].length    = SK9822_BUF_SIZE * 8;
     }
     dma_tx_buffer = dma_buf[0];
     dmaMutex = xSemaphoreCreateMutex();
-    webLog("[SYS] SK9822 DMA ready");
+
+    // Реальная частота может отличаться от запрошенной — драйвер умеет только 80 МГц/N.
+    // Она определяет максимальную частоту обновления, а с ней и угловую чёткость.
+    int actual_hz = spi_get_actual_clock(APB_CLK_FREQ, SK9822_SPI_HZ, SK9822_DUTY_POS);
+    // Длительности фаз клока — то, во что упирается длинная цепочка SK9822.
+    // Делитель n восстанавливаем из фактической частоты (верно при pre = 1,
+    // а это весь рабочий диапазон 13–40 МГц); такт APB = 12.5 нс.
+    int n = actual_hz ? (APB_CLK_FREQ + actual_hz / 2) / actual_hz : 1;
+    int h = (SK9822_DUTY_POS * n + 127) / 256;
+    if (h < 1) h = 1;
+    webLogf("[SYS] SK9822: %d kHz, duty %d/%d (%.1f/%.1f ns), %d B/frame, %.0f us",
+            actual_hz / 1000, h, n,
+            h * 12.5f, (n - h) * 12.5f,
+            (int)SK9822_BUF_SIZE,
+            (float)(SK9822_BUF_SIZE * 8) * 1000000.0f / (float)(actual_hz ? actual_hz : 1));
 }
+
+// Текущий байт яркости, лежащий в каждом из двух DMA-буферов.
+// Позволяет не переписывать 528 ячеек на каждом секторе — байт меняется редко.
+static uint8_t buf_bri_cache[2] = {0, 0};
 
 // Гасит все 528 диодов — ток=0, цвет=0.
 // Используется при включении питания и при остановке рендеринга.
@@ -317,7 +346,11 @@ void blankAllLEDs_DMA() {
     spi_transaction_t t = {};
     t.length    = SK9822_BUF_SIZE * 8;
     t.tx_buffer = dma_tx_buffer;
+    // Дважды: SK9822 защёлкивает данные в PWM-регистры по приходу следующего
+    // старт-фрейма, а после гашения других посылок может долго не быть.
     spi_device_transmit(sk9822_spi, &t);
+    spi_device_transmit(sk9822_spi, &t);
+    buf_bri_cache[0] = 0xE0;   // dma_tx_buffer == dma_buf[0]
     xSemaphoreGive(dmaMutex);
 }
 
@@ -348,21 +381,48 @@ static float   lut_last_b        = -1.0f;
 static float   lut_last_sat      = -1.0f;
 static int16_t lut_sat_fxp       = 256;
 
-// Угловые поправки (в секторах) для каждого из 44 LED на стороне луча.
+// Угловые поправки (в градусах) для каждого из 44 LED на стороне луча.
 // Пересчитываются при изменении global_spoke_offset — не внутри горячего цикла.
-static int8_t  spoke_corr[LEDS_PER_SIDE] = {};
+// Дробные: угол теперь считается в float, округлять до целого градуса незачем.
+static float   spoke_corr[LEDS_PER_SIDE] = {};
+static bool    spoke_active              = false;
 static int16_t spoke_last                = -999;
 
 static void updateSpokeCorrIfNeeded() {
     int16_t off = global_spoke_offset;
     if (off == spoke_last) return;
-    spoke_last = off;
+    spoke_last   = off;
+    spoke_active = (off != 0);
     const float step = (LED_R_OUTER_MM - LED_R_INNER_MM) / (float)(LEDS_PER_SIDE - 1);
     for (int i = 0; i < LEDS_PER_SIDE; i++) {
         float r_mm = LED_R_INNER_MM + i * step;
-        spoke_corr[i] = (off != 0)
-            ? (int8_t)(atan2f((float)off, r_mm) * (360.0f / (2.0f * 3.14159265f)) + 0.5f)
-            : 0;
+        spoke_corr[i] = spoke_active
+            ? atan2f((float)off, r_mm) * (360.0f / (2.0f * 3.14159265f))
+            : 0.0f;
+    }
+}
+
+// Радиальная компенсация яркости, 8.8 fixed point (256 = ×1.0).
+// За оборот диод на радиусе r засвечивает кольцо площадью 2πr·Δr, поэтому при
+// постоянном потоке яркость падает как 1/r: край в 49/273 = 0.18 раза тусклее
+// ступицы. Поднять край нельзя — он и так на максимуме, поэтому гасим центр.
+// Потерянную общую яркость возвращает ABL: суммарный ток падает, и лимит
+// разрешает поднять bri_level.
+static uint16_t radial_gain[LEDS_PER_SIDE];
+static bool     radial_active = false;
+static float    radial_last   = -1.0f;
+
+static void updateRadialGainIfNeeded() {
+    float k = global_radial_gain * 0.01f;   // 0 = выключено, 1 = полная компенсация
+    if (k == radial_last) return;
+    radial_last   = k;
+    radial_active = (k > 0.0f);
+    const float step = (LED_R_OUTER_MM - LED_R_INNER_MM) / (float)(LEDS_PER_SIDE - 1);
+    for (int i = 0; i < LEDS_PER_SIDE; i++) {
+        float r_mm = LED_R_INNER_MM + i * step;
+        float g    = radial_active ? powf(r_mm / LED_R_OUTER_MM, k) : 1.0f;
+        int   fxp  = (int)(g * 256.0f + 0.5f);
+        radial_gain[i] = (uint16_t)constrain(fxp, 1, 256);
     }
 }
 
@@ -385,14 +445,96 @@ static void updateLUTIfNeeded() {
     }
 }
 
+// --- Угловой предфильтр -------------------------------------------------
+// Лента обновляется целиком, поэтому каждое значение горит не «в точке», а на
+// всём угле, который луч успевает пройти до следующей посылки:
+//   span = 360 · (RPM/60) · t_кадра
+// При 20 МГц кадр идёт 861 мкс, то есть span = RPM · 0.0052° — на 200 об/мин это
+// уже целый градус, 4.9 мм дуги на радиусе 273 мм (у ступицы те же 1° — 0.9 мм,
+// потому там и чисто). Точечная выборка в середине этого интервала оставляет
+// алиасинг: частоты выше 1/(2·span) заворачиваются обратно и ровная линия
+// рассыпается на ступеньки. Убирает их только усреднение ПО ВСЕМУ span —
+// обязательный предфильтр, а не «размытие ради мягкости».
+//
+// Раскладывает интервал [c - span/2, c + span/2] на секторы кадра и их веса
+// (сумма ровно 256). Возвращает число задействованных секторов.
+#define ANG_TAPS_MAX 4
+
+static inline int boxWeights(float c, float span, const uint8_t* frame,
+                             const uint8_t** rows, int* w)
+{
+    float a = c - span * 0.5f;
+    float b = a + span;
+    int   i0 = (int)floorf(a);
+    int   n  = (int)floorf(b) - i0 + 1;
+    if (n < 1)            n = 1;
+    if (n > ANG_TAPS_MAX) n = ANG_TAPS_MAX;
+
+    const float inv = 256.0f / span;
+    int acc = 0, best = 0;
+    for (int j = 0; j < n; j++) {
+        float lo = (float)(i0 + j);       if (lo < a) lo = a;
+        float hi = (float)(i0 + j + 1);   if (hi > b) hi = b;
+        int   ww = (int)((hi - lo) * inv + 0.5f);
+        if (ww < 0) ww = 0;
+        w[j] = ww;
+        acc += ww;
+        if (ww > w[best]) best = j;
+        int s = (i0 + j) % 360;
+        if (s < 0) s += 360;
+        rows[j] = frame + s * (LEDS_PER_SIDE * 3);
+    }
+    // Остаток округления кладём в самый весомый отвод — так он не может увести
+    // маленький вес в минус, а суммарная яркость остаётся точной.
+    w[best] += 256 - acc;
+    return n;
+}
+
+// Считает цвет одного диода и пишет его в DMA-буфер. Возвращает r+g+b для ABL/RMS.
+// Байт яркости (dst[0]) заполняется отдельным проходом — он зависит от суммы по кадру.
+// Смешивание идёт ПОСЛЕ гамма-таблицы: усреднять надо световой поток, а не код,
+// иначе наполовину перекрытый край выйдет втрое темнее, чем должен.
+static inline uint32_t samplePix(const uint8_t** rows, const int* w, int n, int i3,
+                                 int sat, int rgain, uint8_t* dst)
+{
+    int r = 0, g = 0, b = 0;
+    for (int j = 0; j < n; j++) {
+        const uint8_t* p  = rows[j] + i3;
+        int            ww = w[j];
+        r += lut_r[p[0]] * ww;
+        g += lut_g[p[1]] * ww;
+        b += lut_b[p[2]] * ww;
+    }
+    r >>= 8;  g >>= 8;  b >>= 8;
+
+    if (sat != 256) {
+        int L = (77 * r + 150 * g + 29 * b) >> 8;
+        r = constrain(L + (((r - L) * sat) >> 8), 0, 255);
+        g = constrain(L + (((g - L) * sat) >> 8), 0, 255);
+        b = constrain(L + (((b - L) * sat) >> 8), 0, 255);
+    }
+    // Радиальная компенсация — после насыщенности: масштаб всех трёх каналов
+    // с ней коммутирует, но так не мешаем ограничению на верхней границе.
+    if (rgain != 256) {
+        r = (r * rgain + 128) >> 8;
+        g = (g * rgain + 128) >> 8;
+        b = (b * rgain + 128) >> 8;
+    }
+    dst[1] = (uint8_t)b;
+    dst[2] = (uint8_t)g;
+    dst[3] = (uint8_t)r;
+    return (uint32_t)(r + g + b);
+}
+
 // Заполняет DMA-буфер данными сектора без отправки по SPI.
 // Вызывается из renderingTask пока предыдущий буфер ещё передаётся —
 // CPU и DMA работают параллельно.
 //
-// sector0 — сектор, который в этот момент показывает ПЕРВЫЙ луч.
+// sector0 — ДРОБНЫЙ сектор, который в момент показа будет у ПЕРВОГО луча.
+// span    — угол, который луч пройдёт, пока горят эти данные (см. boxWeights).
 // Остальные лучи смещены на ±60°·N: знак задаётся global_arm_reverse и
 // зависит от того, в какую сторону пронумерованы лучи в цепочке SK9822.
-static void fillSectorIntoBuffer(uint8_t* buf, int sector0) {
+static void fillSectorIntoBuffer(uint8_t* buf, uint8_t buf_idx, float sector0, float span) {
     uint8_t* led_ptr = buf + 4;
 
     if (frameBuffer == nullptr) {
@@ -404,10 +546,11 @@ static void fillSectorIntoBuffer(uint8_t* buf, int sector0) {
             led_ptr[i * 4 + 2] = 0;
             led_ptr[i * 4 + 3] = 0;
         }
+        buf_bri_cache[buf_idx] = 0xE0;
         return;
     }
 
-    int16_t sat_fxp = lut_sat_fxp;
+    const int sat = lut_sat_fxp;
 
     // Кадр анимации вычисляется по абсолютному времени — не раз в оборот, а при каждом секторе.
     // lastFrameSwitchTime сбрасывается при загрузке файла; elapsed растёт непрерывно,
@@ -419,84 +562,65 @@ static void fillSectorIntoBuffer(uint8_t* buf, int sector0) {
     } else {
         frame_idx = 0;
     }
-    uint32_t anim_offset = frame_idx * FRAME_SIZE;
+    const uint8_t* frame = frameBuffer + frame_idx * FRAME_SIZE;
 
     uint8_t bri_level = global_brightness & 0x1F; // 0–31
     float   abl       = global_abl_limit;          // 0–100 %
-    int     arm_step  = global_arm_reverse ? -ARM_STEP_DEG : ARM_STEP_DEG;
+    float   arm_step  = global_arm_reverse ? -(float)ARM_STEP_DEG : (float)ARM_STEP_DEG;
 
-    // Рендерим цвета в led_ptr с временным bri_byte=0xFF (bri_level применяется ниже).
-    // ABL считается ПО РЕЗУЛЬТАТУ рендера — те же данные что и RMS, одна шкала.
-    // spoke_corr[i] предвычислен в updateSpokeCorrIfNeeded() — atan2 вне горячего цикла.
+    // pixel_sum копится прямо здесь: отдельный проход по 528 диодам ради суммы
+    // стоил столько же, сколько сам рендер, а значения и так уже в регистрах.
+    uint32_t pixel_sum = 0;
+
     for (int ray = 0; ray < NUM_ARMS; ray++) {
-        int base_front = ((sector0 + ray * arm_step) % 360 + 360) % 360;
-        // Обратная сторона луча видна с другой стороны колеса — зеркалим картинку
-        int base_back  = (540 - base_front) % 360;
+        float bf = fmodf(sector0 + (float)ray * arm_step, 360.0f);
+        if (bf < 0.0f) bf += 360.0f;
+        // Обратная сторона луча видна с другой стороны колеса — зеркалим картинку.
+        // bf ∈ [0,360) → bb ∈ (180,540], хватает одной проверки.
+        float bb = 540.0f - bf;
+        if (bb >= 360.0f) bb -= 360.0f;
 
-        for (int i = 0; i < LEDS_PER_SIDE; i++) {
-            int ang_corr = spoke_corr[i];
+        uint8_t* dst_f = led_ptr + (ray * LEDS_PER_ARM) * 4;                      // LED 0–43
+        uint8_t* dst_b = led_ptr + (ray * LEDS_PER_ARM + LEDS_PER_ARM - 1) * 4;   // LED 87–44
 
-            // --- Лицевая сторона луча (LED 0–43): поправка прибавляется ---
-            int sector_f = ((base_front + ang_corr) % 360 + 360) % 360;
-            const uint8_t* src_f = frameBuffer + anim_offset + sector_f * LEDS_PER_SIDE * 3;
+        const uint8_t* rows[ANG_TAPS_MAX];
+        int            wts[ANG_TAPS_MAX];
 
-            uint8_t r = lut_r[src_f[i * 3]];
-            uint8_t g = lut_g[src_f[i * 3 + 1]];
-            uint8_t b = lut_b[src_f[i * 3 + 2]];
-            if (sat_fxp != 256) {
-                int16_t L  = (int16_t)((77 * r + 150 * g + 29 * b) >> 8);
-                int16_t r2 = L + (((int16_t)r - L) * sat_fxp >> 8);
-                int16_t g2 = L + (((int16_t)g - L) * sat_fxp >> 8);
-                int16_t b2 = L + (((int16_t)b - L) * sat_fxp >> 8);
-                r = (uint8_t)constrain(r2, 0, 255);
-                g = (uint8_t)constrain(g2, 0, 255);
-                b = (uint8_t)constrain(b2, 0, 255);
+        if (!spoke_active) {
+            // Смещения спицы нет — набор секторов и весов общий для всех 44 диодов,
+            // так что разбор угла выносим из цикла по диодам.
+            const uint8_t* rows_b[ANG_TAPS_MAX];
+            int            wts_b[ANG_TAPS_MAX];
+            int nf = boxWeights(bf, span, frame, rows,   wts);
+            int nb = boxWeights(bb, span, frame, rows_b, wts_b);
+            for (int i = 0; i < LEDS_PER_SIDE; i++) {
+                int rg = radial_gain[i];
+                pixel_sum += samplePix(rows,   wts,   nf, i * 3, sat, rg, dst_f + i * 4);
+                pixel_sum += samplePix(rows_b, wts_b, nb, i * 3, sat, rg, dst_b - i * 4);
             }
-            int idx_a = (ray * LEDS_PER_ARM + i) * 4;
-            led_ptr[idx_a + 0] = 0xFF;
-            led_ptr[idx_a + 1] = b;
-            led_ptr[idx_a + 2] = g;
-            led_ptr[idx_a + 3] = r;
+        } else {
+            // Луч смещён от оси: у каждого диода свой угол (spoke_corr до ±46°).
+            for (int i = 0; i < LEDS_PER_SIDE; i++) {
+                int rg = radial_gain[i];
+                int n;
 
-            // --- Обратная сторона луча (LED 44–87): поправка вычитается (зеркало) ---
-            int sector_b = ((base_back - ang_corr) % 360 + 360) % 360;
-            const uint8_t* src_b = frameBuffer + anim_offset + sector_b * LEDS_PER_SIDE * 3;
+                n = boxWeights(bf + spoke_corr[i], span, frame, rows, wts);  // лицевая: прибавляется
+                pixel_sum += samplePix(rows, wts, n, i * 3, sat, rg, dst_f + i * 4);
 
-            uint8_t rb = lut_r[src_b[i * 3]];
-            uint8_t gb = lut_g[src_b[i * 3 + 1]];
-            uint8_t bb = lut_b[src_b[i * 3 + 2]];
-            if (sat_fxp != 256) {
-                int16_t L  = (int16_t)((77 * rb + 150 * gb + 29 * bb) >> 8);
-                int16_t r2 = L + (((int16_t)rb - L) * sat_fxp >> 8);
-                int16_t g2 = L + (((int16_t)gb - L) * sat_fxp >> 8);
-                int16_t b2 = L + (((int16_t)bb - L) * sat_fxp >> 8);
-                rb = (uint8_t)constrain(r2, 0, 255);
-                gb = (uint8_t)constrain(g2, 0, 255);
-                bb = (uint8_t)constrain(b2, 0, 255);
+                n = boxWeights(bb - spoke_corr[i], span, frame, rows, wts);  // обратная: вычитается
+                pixel_sum += samplePix(rows, wts, n, i * 3, sat, rg, dst_b - i * 4);
             }
-            int idx_b = (ray * LEDS_PER_ARM + (LEDS_PER_ARM - 1 - i)) * 4;
-            led_ptr[idx_b + 0] = 0xFF;
-            led_ptr[idx_b + 1] = bb;
-            led_ptr[idx_b + 2] = gb;
-            led_ptr[idx_b + 3] = rb;
         }
     }
 
-    // --- Считаем pixel_sum один раз — используется и для RMS, и для ABL.
-    uint32_t pixel_sum = 0;
-    uint32_t max_sum   = (uint32_t)NUM_LEDS * 3 * 255;
-    for (int i = 0; i < NUM_LEDS; i++) {
-        pixel_sum += led_ptr[i * 4 + 1]; // B
-        pixel_sum += led_ptr[i * 4 + 2]; // G
-        pixel_sum += led_ptr[i * 4 + 3]; // R
-    }
+    const uint32_t max_sum = (uint32_t)NUM_LEDS * 3 * 255;
 
     // --- RMS: реальная нагрузка тока = pixel_fill × bri / 31.
-    rms_accum += (max_sum > 0)
-        ? (float)pixel_sum / (float)max_sum * (float)bri_level / 31.0f
-        : 0.0f;
+    rms_accum += (float)pixel_sum / (float)max_sum * (float)bri_level / 31.0f;
 
     // --- ABL: лимитирует общий ток (pixel_fill × bri / 31 ≤ abl/100).
+    // Радиальная компенсация снижает pixel_sum примерно на 40 %, поэтому здесь
+    // ABL сам возвращает часть общей яркости — периферия становится даже ярче.
     if (abl < 100.0f && pixel_sum > 0) {
         float bri_max = abl * 0.01f * 31.0f * (float)max_sum / (float)pixel_sum;
         if ((float)bri_level > bri_max) {
@@ -506,8 +630,11 @@ static void fillSectorIntoBuffer(uint8_t* buf, int sector0) {
     uint8_t bri_byte = 0xE0 | (bri_level & 0x1F);
     global_effective_brightness = bri_level;
 
-    for (int i = 0; i < NUM_LEDS; i++) {
-        led_ptr[i * 4 + 0] = bri_byte;
+    // Байт яркости меняется редко (авто-яркость раз в 100 мс, ABL плавно), поэтому
+    // переписываем 528 ячеек только когда он реально изменился.
+    if (buf_bri_cache[buf_idx] != bri_byte) {
+        buf_bri_cache[buf_idx] = bri_byte;
+        for (int i = 0; i < NUM_LEDS; i++) led_ptr[i * 4] = bri_byte;
     }
 }
 
@@ -525,10 +652,20 @@ static void fillSectorIntoBuffer(uint8_t* buf, int sector0) {
 // картинку на месте при разгоне и торможении: одной только средней
 // скорости за прошлый оборот не хватает, ошибка ½·α·T² при резком
 // торможении достигает десятка градусов.
+//
+// Угол считается на МОМЕНТ ПОКАЗА, а не на момент расчёта: данные загорятся
+// только когда весь кадр уйдёт по SPI (SK9822_FRAME_US), и будут гореть до
+// следующего обновления. Без этой поправки картинка уезжала тем сильнее,
+// чем выше обороты, и «Angle Offset» приходилось бы крутить под скорость.
 void renderingTask(void* pvParameters) {
     static bool rendering_active = false;
     uint8_t active     = 0;
     bool    tx_pending = false;
+
+    const float dma_frame_us = SK9822_FRAME_US;   // время передачи кадра по SPI
+    uint32_t    tx_start_us  = 0;                 // когда ушла последняя транзакция
+    float       fill_us      = 200.0f;            // измеренное время заполнения буфера
+    float       show_us      = SK9822_FRAME_US;   // измеренный интервал между посылками
 
     // Отписываем IDLE-задачу Core 1 от Task WDT: renderingTask занимает Core 1
     // почти непрерывно и IDLE не получает тиков.
@@ -576,6 +713,18 @@ void renderingTask(void* pvParameters) {
 
         if (ev_seq != seen_seq) {
             seen_seq = ev_seq;
+
+            // Куда, по нашей модели, ротор пришёл к моменту события. Считаем ДО
+            // обновления ω/α — здесь нужны те значения, что действовали на интервале.
+            float pred    = 0.0f;
+            bool  pred_ok = false;
+            if (anchor_ok) {
+                float dtp = (float)(uint32_t)(ev_t - anchor_t);
+                if (dtp < 1.0e6f) {
+                    pred    = anchor_deg + rotor_omega * dtp + 0.5f * rotor_alpha * dtp * dtp;
+                    pred_ok = true;
+                }
+            }
 
             // Публикуем RMS раз в оборот — по опорному датчику
             if (ev_idx == 0 && sectors_drawn > 0) {
@@ -640,15 +789,38 @@ void renderingTask(void* pvParameters) {
                 }
             }
 
-            // --- Якорь фазы ---
+            // --- Якорь фазы (ФАПЧ) ---
             // Пока калибровка не набрана, привязываемся только к опорному датчику:
             // это в точности поведение старой прошивки с одним датчиком, без
             // риска добавить дрожание от разброса установки датчиков.
+            //
+            // Жёсткая привязка к каждому событию превращала остаточную погрешность
+            // калибровки датчика в скачок фазы: за оборот получалось шесть чуть
+            // повёрнутых копий изображения — у ступицы они сливаются, а на периферии
+            // расходятся веером. Поэтому корректируем фазу лишь на долю невязки:
+            // средняя фаза остаётся той же, а дрожание падает в 1/K раз.
             if (hall_cal_ready || ev_idx == 0) {
-                int sgn    = global_arm_reverse ? 1 : -1;
-                anchor_t   = ev_t;
-                anchor_deg = (float)sgn * (float)ev_idx * ARM_STEP_DEG + rtc_hall_cal[ev_idx];
-                anchor_ok  = true;
+                int   sgn  = global_arm_reverse ? 1 : -1;
+                float meas = (float)sgn * (float)ev_idx * ARM_STEP_DEG + rtc_hall_cal[ev_idx];
+
+                if (pred_ok) {
+                    float err = meas - pred;
+                    while (err >   180.0f) err -= 360.0f;
+                    while (err <= -180.0f) err += 360.0f;
+                    // Большая невязка — не разброс датчиков, а потеря синхронизации:
+                    // захватываем фазу жёстко, чтобы не ползти к ней целый оборот.
+                    anchor_deg = (fabsf(err) > 10.0f) ? meas : (pred + err * HALL_PLL_K);
+                } else {
+                    anchor_deg = meas;
+                }
+
+                // pred накапливается от оборота к обороту — держим в [0, 360),
+                // иначе за минуты вращения float потеряет точность в долях градуса.
+                anchor_deg = fmodf(anchor_deg, 360.0f);
+                if (anchor_deg < 0.0f) anchor_deg += 360.0f;
+
+                anchor_t  = ev_t;
+                anchor_ok = true;
             }
         }
 
@@ -662,6 +834,7 @@ void renderingTask(void* pvParameters) {
                 rms_accum                   = 0.0f;
                 sectors_drawn               = 0;
                 global_effective_brightness = global_brightness;
+                global_render_span          = 0.0f;
             }
             continue;
         }
@@ -673,7 +846,7 @@ void renderingTask(void* pvParameters) {
 
         // Порог оборотов проверяем здесь, а не только в loop(): во время
         // отрисовки renderingTask вытесняет loop(), и картинка «доживала» бы
-        // до момента, когда до автомата питания дойдут руки. Гистерезис 5 RPM:
+        // до момента, когда до автомата питания дойдут руки. Гистерезис 20 RPM:
         // старт на RPM_RENDER_ON, продолжение работы — до RPM_RENDER_OFF.
         float rpm_now = (rev > 0) ? 60000000.0f / (float)rev : 0.0f;
         float rpm_thr = rendering_active ? RPM_RENDER_OFF : RPM_RENDER_ON;
@@ -688,6 +861,7 @@ void renderingTask(void* pvParameters) {
                 rms_accum                   = 0.0f;
                 sectors_drawn               = 0;
                 global_effective_brightness = global_brightness;
+                global_render_span          = 0.0f;
             }
             // Оценки скорости устарели — начинаем набирать их заново,
             // иначе после остановки колеса alpha считалась бы по разрыву в секундах.
@@ -702,11 +876,14 @@ void renderingTask(void* pvParameters) {
             webLog("[PWR] Rendering started");
         }
 
-        // LUT и spoke_corr обновляем один раз за проход — вне горячего цикла.
+        // LUT, поправки спицы и радиальную компенсацию обновляем один раз
+        // за проход — powf/atan2f не место в горячем цикле.
         updateLUTIfNeeded();
         updateSpokeCorrIfNeeded();
+        updateRadialGainIfNeeded();
 
-        int last_sector = -1;
+        float last_psi  = 0.0f;   // угол ротора на момент последнего обновления ленты
+        bool  psi_valid = false;
 
         while (true) {
             if (force_stop_display || power_state != PWR_FULL || !newFrameReady || ota_in_progress) break;
@@ -717,36 +894,79 @@ void renderingTask(void* pvParameters) {
             interrupts();
             if (got_new) break;
 
-            uint32_t dt_u = (uint32_t)(micros() - anchor_t);
+            uint32_t now  = micros();
+            uint32_t dt_u = (uint32_t)(now - anchor_t);
             if (dt_u > age_limit) break;   // событие потерялось — наверх, на переоценку
 
-            float dt   = (float)dt_u;
-            float dpsi = rotor_omega * dt + 0.5f * rotor_alpha * dt * dt;
-            float base = anchor_deg + dpsi + (float)global_angle_offset;
+            float dt0   = (float)dt_u;
+            float psi   = anchor_deg + rotor_omega * dt0 + 0.5f * rotor_alpha * dt0 * dt0;
+            float w_abs = fabsf(rotor_omega);
 
-            int sector = (int)lroundf(base) % 360;
-            if (sector < 0) sector += 360;
-
-            if (sector != last_sector) {
-                uint8_t idle = 1 - active;
-                fillSectorIntoBuffer(dma_buf[idle], sector);
-                sectors_drawn++;
-
-                if (tx_pending) {
-                    spi_transaction_t* done;
-                    spi_device_get_trans_result(sk9822_spi, &done, portMAX_DELAY);
+            // --- Темп обновления ---
+            // Раньше строка перерисовывалась при смене ЦЕЛОГО сектора, то есть не
+            // чаще раза на градус. Теперь шаг мельче: угол дробный, и промежуточные
+            // положения дают ленте реальное преимущество. Оценка идёт по «сырому»
+            // углу ротора — он монотонен, в отличие от угла на момент показа.
+            if (psi_valid) {
+                float adv = fabsf(psi - last_psi);
+                if (adv < ANGLE_MIN_STEP) {
+                    // Ждать долго — уступаем такт планировщику, иначе loop()
+                    // (приоритет 1) не получит CPU: авто-яркость и телеметрия
+                    // замерли бы на всё время вращения.
+                    if (w_abs <= 0.0f || (ANGLE_MIN_STEP - adv) / w_abs > 1000.0f) vTaskDelay(1);
+                    continue;
                 }
-                spi_device_queue_trans(sk9822_spi, &spi_trans[idle], portMAX_DELAY);
-                active      = idle;
-                tx_pending  = true;
-                last_sector = sector;
-            } else if (rotor_omega != 0.0f && fabsf(1.0f / rotor_omega) > 2000.0f) {
-                // Сектор длится больше 2 мс (ниже ~80 об/мин) — DMA давно закончил
-                // и мы просто крутим пустой цикл. Уступаем такт планировщику,
-                // иначе loop() (приоритет 1) не получит CPU: авто-яркость и
-                // телеметрия замерли бы на всё время вращения.
-                vTaskDelay(1);
             }
+
+            // --- Момент, к которому считаем угол ---
+            // Кадр загорится, когда уйдёт по SPI, и будет гореть до следующего
+            // обновления. Целимся в середину этого интервала.
+            float bus_busy = 0.0f;
+            if (tx_pending) {
+                float since = (float)(uint32_t)(now - tx_start_us);
+                if (since < dma_frame_us) bus_busy = dma_frame_us - since;
+            }
+            float start_in = (fill_us > bus_busy) ? fill_us : bus_busy;  // когда уйдёт наш кадр
+            float dtf      = dt0 + start_in + dma_frame_us + show_us * 0.5f;
+
+            float base = anchor_deg + rotor_omega * dtf + 0.5f * rotor_alpha * dtf * dtf
+                       + (float)global_angle_offset;
+
+            // Угол, который луч пройдёт, пока горят эти данные. Меньше 1° брать
+            // незачем — это шаг самого кадра; больше ANG_TAPS_MAX-1 нельзя.
+            float span = w_abs * show_us;
+            if (span < 1.0f) span = 1.0f;
+            if (span > (float)(ANG_TAPS_MAX - 1)) span = (float)(ANG_TAPS_MAX - 1);
+
+            uint8_t  idle = 1 - active;
+            uint32_t t_fill0 = micros();
+            fillSectorIntoBuffer(dma_buf[idle], idle, base, span);
+            fill_us = (float)(uint32_t)(micros() - t_fill0);
+            sectors_drawn++;
+
+            global_render_span    = span;
+            global_render_fill_us = (uint32_t)fill_us;
+
+            if (tx_pending) {
+                spi_transaction_t* done;
+                spi_device_get_trans_result(sk9822_spi, &done, portMAX_DELAY);
+            }
+            spi_device_queue_trans(sk9822_spi, &spi_trans[idle], portMAX_DELAY);
+            uint32_t t_queued = micros();
+            // Интервал между посылками меряем, а не моделируем: он и есть время
+            // свечения кадра, а значит и ширина предфильтра. Модель промахнулась бы
+            // на любой задержке планировщика или промахе кеша PSRAM.
+            if (tx_pending) {
+                float iv = (float)(uint32_t)(t_queued - tx_start_us);
+                if (iv < dma_frame_us) iv = dma_frame_us;
+                if (iv > 20000.0f)     iv = 20000.0f;
+                show_us += (iv - show_us) * 0.25f;
+            }
+            tx_start_us = t_queued;
+            active      = idle;
+            tx_pending  = true;
+            last_psi    = psi;
+            psi_valid   = true;
         }
 
         // Забираем незавершённую транзакцию
@@ -1042,6 +1262,12 @@ void setup() {
 
     setupNetwork();                     // здесь же открывается prefs
     loadHallCalibration();
+
+    // Таблицы рендера — до первого кадра: пока они не построены,
+    // радиальные коэффициенты нулевые и картинка была бы чёрной.
+    rebuildGammaLUT();
+    updateSpokeCorrIfNeeded();
+    updateRadialGainIfNeeded();
     last_web_activity_time = millis();  // Считаем загрузку страницы активностью
 
     // Эндпоинт телеметрии питания — отдаёт кешированные данные без обращения к АЦП.
@@ -1175,7 +1401,7 @@ void loop() {
     // =================== АВТОМАТ ПИТАНИЯ ===================
     // PWR_OFF → PWR_SPINUP : вибрация или запрос Play (есть что показывать)
     // PWR_SPINUP → PWR_FULL: обороты достигли RPM_RENDER_ON
-    // PWR_FULL → PWR_SPINUP: обороты упали ниже RPM_RENDER_OFF (гистерезис 5 RPM)
+    // PWR_FULL → PWR_SPINUP: обороты упали ниже RPM_RENDER_OFF (гистерезис 20 RPM)
     // любое → PWR_OFF      : нет вращения дольше 3 с либо Stop из Web UI
     bool content_ready = newFrameReady && !force_stop_display && !ota_in_progress;
 
