@@ -827,13 +827,13 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
                oninput="document.getElementById('rgVal').textContent=this.value+'%'; syncSettings()">
         <span class="mini-val" id="rgVal" style="color:var(--red)">100%</span>
         <span class="mini-label" style="color:var(--green)">G</span>
-        <input type="range" class="g-slider" id="ggSlide" min="0" max="100" step="5" value="60"
+        <input type="range" class="g-slider" id="ggSlide" min="0" max="100" step="5" value="80"
                oninput="document.getElementById('ggVal').textContent=this.value+'%'; syncSettings()">
-        <span class="mini-val" id="ggVal" style="color:var(--green)">60%</span>
+        <span class="mini-val" id="ggVal" style="color:var(--green)">80%</span>
         <span class="mini-label" style="color:var(--purple)">B</span>
-        <input type="range" class="b-slider" id="bgSlide" min="0" max="100" step="5" value="80"
+        <input type="range" class="b-slider" id="bgSlide" min="0" max="100" step="5" value="100"
                oninput="document.getElementById('bgVal').textContent=this.value+'%'; syncSettings()">
-        <span class="mini-val" id="bgVal" style="color:var(--purple)">80%</span>
+        <span class="mini-val" id="bgVal" style="color:var(--purple)">100%</span>
       </div>
     </div>
 
@@ -1546,8 +1546,8 @@ function restoreImgDefaults() {
     set('sSlide',  15, ['sVal',  '1.5']);
     set('coSlide',  5, ['coVal', '5%']);
     set('rgSlide', 100, ['rgVal', '100%']);
-    set('ggSlide',  60, ['ggVal', '60%']);
-    set('bgSlide',  80, ['bgVal', '80%']);
+    set('ggSlide',  80, ['ggVal', '80%']);
+    set('bgSlide', 100, ['bgVal', '100%']);
     syncSettings();
 }
 

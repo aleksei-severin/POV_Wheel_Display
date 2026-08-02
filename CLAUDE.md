@@ -59,9 +59,23 @@ Three things keep it usable:
 
 `ANGLE_MIN_STEP` (0.5°) paces updates: finer than the frame grid, coarse enough not to spin the CPU at low RPM.
 
+### Colour Pipeline
+
+Order matters and is deliberate:
+
+```
+source → lut_tone[] (gamma + contrast) → saturation → per-LED gain → SK9822 brightness byte
+```
+
+`lut_tone` is **one** table for all three channels. The per-channel R/G/B gains are display white balance, not image processing, so they are applied *after* saturation — folded together with the radial compensation into `gain_r/g/b[44]` (8.8 fixed point) by `updateGainTablesIfNeeded()`. Keeping the gains inside the LUT (as earlier revisions did) made saturation operate on an already-unbalanced "white" and pull it further off neutral: with G=60 % and saturation 1.5, neutral grey came out at an effective G of 45 %, and the cast grew with the saturation slider. Folding the two gains costs nothing — the hot loop still does one multiply per channel.
+
+`global_effective_brightness` (the SK9822 5-bit current field) is global per frame; the per-LED shaping all happens in the 8-bit PWM values.
+
 ### Radial Brightness
 
-An LED at radius `r` spreads a constant flux over a ring of area `2πr·Δr`, so perceived brightness falls as `1/r` — the rim looks 49/273 = 0.18× as bright as the hub. The rim is already at full output, so the only fix is dimming the centre: `gain = (r / LED_R_OUTER_MM) ^ (global_radial_gain/100)`, applied in linear light after the gamma LUT. Little total brightness is actually lost — the lower current sum lets ABL raise `bri_level` back up. Exposed as **Radial Gain** in the web UI (0 = off, 100 = full physical compensation).
+An LED at radius `r` spreads a constant flux over a ring of area `2πr·Δr`, so perceived brightness falls as `1/r` — the rim looks 49/273 = 0.18× as bright as the hub. The rim is already at full output, so the only fix is dimming the centre: `gain = (r / LED_R_OUTER_MM) ^ (global_radial_gain/100)`, so the outermost LED is always ×1.000 and **the rim never gets dimmer** — only the hub does. Little total brightness is lost either: the lower current sum lets ABL raise `bri_level` back up. Exposed as **Radial Gain** in the web UI (0 = off, 100 = full physical compensation).
+
+This is why a white frame reports ~51 % RMS with stock settings: white balance ×0.81, radial mean ×0.65. RMS is normalised *current*, not brightness — 100 % would be all 528 LEDs at full white and current 31.
 
 ### Hall Sensor Calibration
 

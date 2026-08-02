@@ -154,9 +154,10 @@ extern String pendingFilePath;
 
 // Гамма-коррекция
 extern volatile float global_gamma;      // 1.0 = линейная, до 5.0 = максимум
-extern uint8_t lut_r[256];  // Гамма + контраст + R-gain
-extern uint8_t lut_g[256];  // Гамма + контраст + G-gain
-extern uint8_t lut_b[256];  // Гамма + контраст + B-gain
+// Тональная кривая: гамма + контраст, одна на все три канала.
+// Поканальные гейны сюда НЕ входят — они баланс белого дисплея и применяются
+// после насыщенности, иначе та растаскивала бы уже несбалансированный белый.
+extern uint8_t lut_tone[256];
 
 // Коррекция насыщенности
 extern volatile float global_saturation; // 1.0 = без изменений, до 3.0 = максимум
@@ -164,7 +165,8 @@ extern volatile float global_saturation; // 1.0 = без изменений, д�
 // Контраст: 0..100 %, 0 = без изменений (factor 1.0..3.0)
 extern volatile float global_contrast;
 
-// Коррекция каналов RGB: 0..200 %, 100 = без изменений
+// Баланс белого дисплея: 0..100 %, 100 = без изменений.
+// Применяется ПОСЛЕ насыщенности, вместе с радиальной компенсацией.
 extern volatile float global_r_gain;
 extern volatile float global_g_gain;
 extern volatile float global_b_gain;

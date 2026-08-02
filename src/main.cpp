@@ -139,8 +139,8 @@ RTC_DATA_ATTR volatile float global_gamma         = 2.5f;
 RTC_DATA_ATTR volatile float global_saturation    = 1.5f;
 RTC_DATA_ATTR volatile float global_contrast      = 5.0f;
 RTC_DATA_ATTR volatile float global_r_gain        = 100.0f; // 0..100 %, 100 = без изменений
-RTC_DATA_ATTR volatile float global_g_gain        = 60.0f;
-RTC_DATA_ATTR volatile float global_b_gain        = 80.0f;
+RTC_DATA_ATTR volatile float global_g_gain        = 80.0f;
+RTC_DATA_ATTR volatile float global_b_gain        = 100.0f;
 RTC_DATA_ATTR volatile uint16_t wheel_circumference = 2355;
 RTC_DATA_ATTR volatile int16_t  global_spoke_offset = 0;   // мм, 0 = лучи из центра
 RTC_DATA_ATTR volatile bool     global_arm_reverse  = false; // порядок лучей в цепочке
@@ -150,9 +150,7 @@ volatile float                  global_abl_rms      = 0.0f;  // RMS загруз
 volatile float                  global_render_span    = 0.0f; // угол между обновлениями ленты, °
 volatile uint32_t               global_render_fill_us = 0;    // время сборки кадра, мкс
 volatile uint8_t                global_effective_brightness = 8;
-uint8_t lut_r[256];
-uint8_t lut_g[256];
-uint8_t lut_b[256];
+uint8_t lut_tone[256];
 
 // --- КЕШ ТЕЛЕМЕТРИИ ПИТАНИЯ ---
 // Обновляется из loop() (Core 1), читается из /battery (Core 0).
@@ -354,20 +352,19 @@ void blankAllLEDs_DMA() {
     xSemaphoreGive(dmaMutex);
 }
 
-// Перестраивает три LUT (R, G, B): гамма + контраст + gain канала.
-// Все три преобразования объединены в одну таблицу — горячий цикл рендера не меняется.
+// Перестраивает тональную кривую: гамма + контраст. Одна таблица на все каналы.
+// Поканальные гейны отсюда убраны намеренно: это баланс белого дисплея, а не
+// обработка изображения. Пока они сидели в LUT, насыщенность применялась к уже
+// разбалансированному белому и растаскивала его дальше — нейтральный серый
+// уезжал в цвет тем сильнее, чем выше насыщенность. Теперь порядок такой:
+//   гамма+контраст → насыщенность → баланс белого × радиальная компенсация.
 void rebuildGammaLUT() {
-    float g        = global_gamma;
-    float factor   = 1.0f + global_contrast * 0.02f; // 0% → 1.0, 100% → 3.0
-    float gain[3]  = { global_r_gain * 0.01f, global_g_gain * 0.01f, global_b_gain * 0.01f };
-    uint8_t* luts[3] = { lut_r, lut_g, lut_b };
-    for (int ch = 0; ch < 3; ch++) {
-        for (int i = 0; i < 256; i++) {
-            float v = powf(i / 255.0f, g) * 255.0f;      // гамма
-            v = 128.0f + (v - 128.0f) * factor;           // контраст
-            v = v * gain[ch];                              // усиление канала
-            luts[ch][i] = (uint8_t)constrain((int)(v + 0.5f), 0, 255);
-        }
+    float g      = global_gamma;
+    float factor = 1.0f + global_contrast * 0.02f; // 0% → 1.0, 100% → 3.0
+    for (int i = 0; i < 256; i++) {
+        float v = powf(i / 255.0f, g) * 255.0f;    // гамма
+        v = 128.0f + (v - 128.0f) * factor;         // контраст
+        lut_tone[i] = (uint8_t)constrain((int)(v + 0.5f), 0, 255);
     }
 }
 
@@ -375,9 +372,6 @@ void rebuildGammaLUT() {
 // вне горячего цикла секторов, чтобы не задерживать рендеринг на вызов powf().
 static float   lut_last_gamma    = -1.0f;
 static float   lut_last_contrast = -999.0f;
-static float   lut_last_r        = -1.0f;
-static float   lut_last_g        = -1.0f;
-static float   lut_last_b        = -1.0f;
 static float   lut_last_sat      = -1.0f;
 static int16_t lut_sat_fxp       = 256;
 
@@ -402,42 +396,56 @@ static void updateSpokeCorrIfNeeded() {
     }
 }
 
-// Радиальная компенсация яркости, 8.8 fixed point (256 = ×1.0).
-// За оборот диод на радиусе r засвечивает кольцо площадью 2πr·Δr, поэтому при
-// постоянном потоке яркость падает как 1/r: край в 49/273 = 0.18 раза тусклее
-// ступицы. Поднять край нельзя — он и так на максимуме, поэтому гасим центр.
-// Потерянную общую яркость возвращает ABL: суммарный ток падает, и лимит
-// разрешает поднять bri_level.
-static uint16_t radial_gain[LEDS_PER_SIDE];
-static bool     radial_active = false;
-static float    radial_last   = -1.0f;
+// Поканальные коэффициенты для каждого из 44 диодов, 8.8 fixed point (256 = ×1.0).
+// Свёрнуты два независимых множителя, оба применяются после насыщенности:
+//
+//  • Баланс белого дисплея (R/G/B gain) — одинаков для всех диодов. Зелёный и
+//    синий кристаллы SK9822 ярче красного, без коррекции белый уходит в голубой.
+//
+//  • Радиальная компенсация. За оборот диод на радиусе r засвечивает кольцо
+//    площадью 2πr·Δr, поэтому при постоянном потоке яркость падает как 1/r:
+//    край в 49/273 = 0.18 раза тусклее ступицы. Поднять край нельзя — он и так
+//    на максимуме, поэтому гасим центр: gain = (r/R_outer)^k. Потерянный общий
+//    ток возвращает ABL — лимит разрешает поднять bri_level.
+//
+// Свёртка бесплатна: в горячем цикле как было одно умножение на канал, так и
+// осталось, просто коэффициент берётся из своей таблицы.
+static uint16_t gain_r[LEDS_PER_SIDE];
+static uint16_t gain_g[LEDS_PER_SIDE];
+static uint16_t gain_b[LEDS_PER_SIDE];
+static float    gain_last_rad = -1.0f;
+static float    gain_last_r   = -1.0f;
+static float    gain_last_g   = -1.0f;
+static float    gain_last_b   = -1.0f;
 
-static void updateRadialGainIfNeeded() {
-    float k = global_radial_gain * 0.01f;   // 0 = выключено, 1 = полная компенсация
-    if (k == radial_last) return;
-    radial_last   = k;
-    radial_active = (k > 0.0f);
+static void updateGainTablesIfNeeded() {
+    if (global_radial_gain == gain_last_rad && global_r_gain == gain_last_r &&
+        global_g_gain      == gain_last_g   && global_b_gain == gain_last_b) return;
+    gain_last_rad = global_radial_gain;
+    gain_last_r   = global_r_gain;
+    gain_last_g   = global_g_gain;
+    gain_last_b   = global_b_gain;
+
+    float k  = global_radial_gain * 0.01f;   // 0 = компенсация выключена, 1 = полная
+    float cr = global_r_gain * 0.01f;
+    float cg = global_g_gain * 0.01f;
+    float cb = global_b_gain * 0.01f;
     const float step = (LED_R_OUTER_MM - LED_R_INNER_MM) / (float)(LEDS_PER_SIDE - 1);
+
     for (int i = 0; i < LEDS_PER_SIDE; i++) {
         float r_mm = LED_R_INNER_MM + i * step;
-        float g    = radial_active ? powf(r_mm / LED_R_OUTER_MM, k) : 1.0f;
-        int   fxp  = (int)(g * 256.0f + 0.5f);
-        radial_gain[i] = (uint16_t)constrain(fxp, 1, 256);
+        float rad  = (k > 0.0f) ? powf(r_mm / LED_R_OUTER_MM, k) : 1.0f;
+        gain_r[i] = (uint16_t)constrain((int)(rad * cr * 256.0f + 0.5f), 0, 256);
+        gain_g[i] = (uint16_t)constrain((int)(rad * cg * 256.0f + 0.5f), 0, 256);
+        gain_b[i] = (uint16_t)constrain((int)(rad * cb * 256.0f + 0.5f), 0, 256);
     }
 }
 
 static void updateLUTIfNeeded() {
-    if (global_gamma    != lut_last_gamma    ||
-        global_contrast != lut_last_contrast ||
-        global_r_gain   != lut_last_r        ||
-        global_g_gain   != lut_last_g        ||
-        global_b_gain   != lut_last_b) {
+    if (global_gamma != lut_last_gamma || global_contrast != lut_last_contrast) {
         rebuildGammaLUT();
         lut_last_gamma    = global_gamma;
         lut_last_contrast = global_contrast;
-        lut_last_r        = global_r_gain;
-        lut_last_g        = global_g_gain;
-        lut_last_b        = global_b_gain;
     }
     if (global_saturation != lut_last_sat) {
         lut_sat_fxp  = (int16_t)(global_saturation * 256.0f);
@@ -495,31 +503,31 @@ static inline int boxWeights(float c, float span, const uint8_t* frame,
 // Смешивание идёт ПОСЛЕ гамма-таблицы: усреднять надо световой поток, а не код,
 // иначе наполовину перекрытый край выйдет втрое темнее, чем должен.
 static inline uint32_t samplePix(const uint8_t** rows, const int* w, int n, int i3,
-                                 int sat, int rgain, uint8_t* dst)
+                                 int sat, int kr, int kg, int kb, uint8_t* dst)
 {
     int r = 0, g = 0, b = 0;
     for (int j = 0; j < n; j++) {
         const uint8_t* p  = rows[j] + i3;
         int            ww = w[j];
-        r += lut_r[p[0]] * ww;
-        g += lut_g[p[1]] * ww;
-        b += lut_b[p[2]] * ww;
+        r += lut_tone[p[0]] * ww;
+        g += lut_tone[p[1]] * ww;
+        b += lut_tone[p[2]] * ww;
     }
     r >>= 8;  g >>= 8;  b >>= 8;
 
+    // Насыщенность — ДО баланса белого: нейтральный серый обязан остаться
+    // нейтральным независимо от того, как скорректированы каналы дисплея.
     if (sat != 256) {
         int L = (77 * r + 150 * g + 29 * b) >> 8;
         r = constrain(L + (((r - L) * sat) >> 8), 0, 255);
         g = constrain(L + (((g - L) * sat) >> 8), 0, 255);
         b = constrain(L + (((b - L) * sat) >> 8), 0, 255);
     }
-    // Радиальная компенсация — после насыщенности: масштаб всех трёх каналов
-    // с ней коммутирует, но так не мешаем ограничению на верхней границе.
-    if (rgain != 256) {
-        r = (r * rgain + 128) >> 8;
-        g = (g * rgain + 128) >> 8;
-        b = (b * rgain + 128) >> 8;
-    }
+    // Баланс белого × радиальная компенсация — одним умножением на канал.
+    r = (r * kr + 128) >> 8;
+    g = (g * kg + 128) >> 8;
+    b = (b * kb + 128) >> 8;
+
     dst[1] = (uint8_t)b;
     dst[2] = (uint8_t)g;
     dst[3] = (uint8_t)r;
@@ -594,21 +602,21 @@ static void fillSectorIntoBuffer(uint8_t* buf, uint8_t buf_idx, float sector0, f
             int nf = boxWeights(bf, span, frame, rows,   wts);
             int nb = boxWeights(bb, span, frame, rows_b, wts_b);
             for (int i = 0; i < LEDS_PER_SIDE; i++) {
-                int rg = radial_gain[i];
-                pixel_sum += samplePix(rows,   wts,   nf, i * 3, sat, rg, dst_f + i * 4);
-                pixel_sum += samplePix(rows_b, wts_b, nb, i * 3, sat, rg, dst_b - i * 4);
+                int kr = gain_r[i], kg = gain_g[i], kb = gain_b[i];
+                pixel_sum += samplePix(rows,   wts,   nf, i * 3, sat, kr, kg, kb, dst_f + i * 4);
+                pixel_sum += samplePix(rows_b, wts_b, nb, i * 3, sat, kr, kg, kb, dst_b - i * 4);
             }
         } else {
             // Луч смещён от оси: у каждого диода свой угол (spoke_corr до ±46°).
             for (int i = 0; i < LEDS_PER_SIDE; i++) {
-                int rg = radial_gain[i];
+                int kr = gain_r[i], kg = gain_g[i], kb = gain_b[i];
                 int n;
 
                 n = boxWeights(bf + spoke_corr[i], span, frame, rows, wts);  // лицевая: прибавляется
-                pixel_sum += samplePix(rows, wts, n, i * 3, sat, rg, dst_f + i * 4);
+                pixel_sum += samplePix(rows, wts, n, i * 3, sat, kr, kg, kb, dst_f + i * 4);
 
                 n = boxWeights(bb - spoke_corr[i], span, frame, rows, wts);  // обратная: вычитается
-                pixel_sum += samplePix(rows, wts, n, i * 3, sat, rg, dst_b - i * 4);
+                pixel_sum += samplePix(rows, wts, n, i * 3, sat, kr, kg, kb, dst_b - i * 4);
             }
         }
     }
@@ -880,7 +888,7 @@ void renderingTask(void* pvParameters) {
         // за проход — powf/atan2f не место в горячем цикле.
         updateLUTIfNeeded();
         updateSpokeCorrIfNeeded();
-        updateRadialGainIfNeeded();
+        updateGainTablesIfNeeded();
 
         float last_psi  = 0.0f;   // угол ротора на момент последнего обновления ленты
         bool  psi_valid = false;
@@ -1267,7 +1275,7 @@ void setup() {
     // радиальные коэффициенты нулевые и картинка была бы чёрной.
     rebuildGammaLUT();
     updateSpokeCorrIfNeeded();
-    updateRadialGainIfNeeded();
+    updateGainTablesIfNeeded();
     last_web_activity_time = millis();  // Считаем загрузку страницы активностью
 
     // Эндпоинт телеметрии питания — отдаёт кешированные данные без обращения к АЦП.
