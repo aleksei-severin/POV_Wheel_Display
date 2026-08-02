@@ -46,10 +46,6 @@ volatile uint32_t last_dcdc_on_time  = 0;      // Момент включени�
 // Отдельно от last_dcdc_on_time: вибродатчик срабатывает от любой тряски, и если
 // считать каждую попытку раскрутки активностью, устройство в рюкзаке не уснёт никогда.
 static uint32_t last_motion_ms = 0;
-// До этого момента вибрацию игнорируем — предыдущая попытка не дала вращения
-static uint32_t vibration_block_until = 0;
-static bool     spinup_from_vibration = false;
-#define VIBRATION_RETRY_MS  30000UL
 volatile uint32_t last_web_activity_time = 0;  // Отслеживание активности в Web UI
 volatile bool     wakeup_event       = false;  // Импульс с вибродатчика
 volatile bool     request_play_flag  = false;
@@ -157,7 +153,9 @@ uint8_t lut_tone[256];
 // Поля — примитивы ≤32 бит, запись атомарна на Xtensa, мьютекс не нужен.
 struct PowerCache {
     int16_t vbat_mv = 0;
-    int16_t vusb_mv = 0;
+    int16_t vusb_mv = 0;      // напряжение на клеммах, как есть
+    int16_t ocv_mv  = 0;      // восстановленная ЭДС (для калибровки/диагностики)
+    uint8_t soc     = 0;      // заряд, %
     uint8_t chg     = 0;      // 0 = разряд, 1 = идёт заряд, 2 = заряжено
     bool    usb     = false;
 };
@@ -996,6 +994,118 @@ static uint32_t readMilliVoltsAvg(uint8_t pin, uint8_t samples) {
     return acc / samples;
 }
 
+// =====================================================================
+//                        ЗАРЯД БАТАРЕИ
+// =====================================================================
+// Кривая разряда LiPo 1S: ЭДС (мВ) → заряд (%).
+// Середина крайне пологая — 3.73…3.87 В это весь диапазон 20…60 %, то есть
+// 20 мВ стоят 6 % заряда. Поэтому линейная шкала 3.0…4.2 В врала сама по себе,
+// а без компенсации просадки точность в этой зоне недостижима в принципе.
+static const uint16_t BATT_OCV_MV[] = {
+    3270, 3610, 3690, 3710, 3730, 3750, 3770, 3790, 3800, 3820, 3840,
+    3850, 3870, 3910, 3950, 3980, 4020, 4080, 4110, 4150, 4200
+};
+static const uint8_t BATT_OCV_PCT[] = {
+       0,    5,   10,   15,   20,   25,   30,   35,   40,   45,   50,
+      55,   60,   65,   70,   75,   80,   85,   90,   95,  100
+};
+
+static uint8_t battSocFromOcv(int32_t mv) {
+    const int n = sizeof(BATT_OCV_MV) / sizeof(BATT_OCV_MV[0]);
+    if (mv <= (int32_t)BATT_OCV_MV[0])     return 0;
+    if (mv >= (int32_t)BATT_OCV_MV[n - 1]) return 100;
+    for (int i = 1; i < n; i++) {
+        if (mv < (int32_t)BATT_OCV_MV[i]) {
+            int32_t v0 = BATT_OCV_MV[i - 1], v1 = BATT_OCV_MV[i];
+            int32_t p0 = BATT_OCV_PCT[i - 1], p1 = BATT_OCV_PCT[i];
+            return (uint8_t)(p0 + (mv - v0) * (p1 - p0) / (v1 - v0));
+        }
+    }
+    return 100;
+}
+
+static float    batt_sag_k     = (float)BATT_SAG_MV_AT_FULL; // мВ просадки при RMS = 1.0
+static uint16_t batt_chg_rise  = BATT_CHG_RISE_MV;           // мВ подъёма от тока заряда
+static uint16_t batt_rest_mv   = 0;      // последнее напряжение на холостом ходу
+static uint32_t batt_rest_ms   = 0;
+static uint16_t batt_prev_mv   = 0;      // напряжение на предыдущем такте (1 с назад)
+static bool     batt_prev_usb  = false;
+static float    batt_ocv_filt  = 0.0f;
+static bool     batt_soc_valid = false;
+
+// Восстанавливает ЭДС и переводит её в проценты. Вызывается раз в секунду.
+//
+// Ток нагрузки отдельно не меряется — он и не нужен: global_abl_rms по
+// построению и есть нормированная загрузка по току (заполнение кадра × bri/31).
+// Достаточно знать, сколько милливольт просадки приходится на единицу RMS,
+// а этот коэффициент прошивка определяет сама: в момент включения отрисовки
+// заряд физически измениться не успевает, поэтому вся разница напряжения
+// относительно холостого хода — это и есть просадка.
+static void updateBatterySoc(uint32_t vbat_mv, bool usb_ok, uint8_t chg) {
+    uint32_t now = millis();
+    float    rms = global_abl_rms;
+
+    if (power_state == PWR_OFF && !usb_ok) {
+        // Холостой ход: опорная точка для самокалибровки
+        batt_rest_mv = (uint16_t)vbat_mv;
+        batt_rest_ms = now;
+    } else if (power_state == PWR_FULL && !usb_ok && rms > 0.05f &&
+               batt_rest_mv != 0 && (now - batt_rest_ms) < 120000) {
+        // Опорная точка не старше двух минут — за это время заряд ещё не ушёл
+        float k = ((float)batt_rest_mv - (float)vbat_mv - (float)BATT_BASE_SAG_MV) / rms;
+        if (k > 100.0f && k < 4000.0f) batt_sag_k += (k - batt_sag_k) * 0.05f;
+    }
+
+    // Подъём от тока заряда меряем тем же приёмом, что и просадку: в секунду
+    // подключения зарядника заряд ещё не изменился, значит весь скачок
+    // напряжения — это I_зар × R_вн. Только на холостом ходу, иначе в скачок
+    // подмешается изменение нагрузки.
+    bool usb_edge = (usb_ok != batt_prev_usb);
+    if (usb_edge && usb_ok && power_state == PWR_OFF && batt_prev_mv != 0) {
+        int32_t d = (int32_t)vbat_mv - (int32_t)batt_prev_mv;
+        if (d > 0 && d < 400) batt_chg_rise = (uint16_t)d;
+    }
+    batt_prev_usb = usb_ok;
+    batt_prev_mv  = (uint16_t)vbat_mv;
+
+    int32_t ocv = (int32_t)vbat_mv;
+    if (power_state != PWR_OFF) ocv += BATT_BASE_SAG_MV;
+    ocv += (int32_t)(rms * batt_sag_k);
+    if (chg == 1) {
+        // Ток втекает в батарею — напряжение завышено. К концу заряда зарядник
+        // уходит в CV, ток спадает, и вместе с ним подъём: масштабируем по
+        // остатку до 4.2 В, иначе на финише заряда шкала занижала бы.
+        float taper = (4200.0f - (float)vbat_mv) / (float)BATT_CHG_TAPER_MV;
+        ocv -= (int32_t)((float)batt_chg_rise * constrain(taper, 0.0f, 1.0f));
+    }
+
+    // Смена режима питания меняет саму формулу — фильтр начинаем заново,
+    // иначе его инерция вылезет как ложный провал показаний.
+    if (!batt_soc_valid || usb_edge) batt_ocv_filt = (float)ocv;
+    else                             batt_ocv_filt += ((float)ocv - batt_ocv_filt) * 0.2f;
+
+    uint8_t target = battSocFromOcv((int32_t)batt_ocv_filt);
+    if (chg == 2) target = 100;              // зарядник отрапортовал окончание
+
+    // На зарядке без нагрузки шкала не имеет права падать: батарея набирает
+    // заряд, и любое снижение показаний — ошибка модели, а не физика. Оценка
+    // подъёма остаётся приблизительной (величину тока IP2312U не сообщает),
+    // поэтому просто не даём ей утащить показания вниз.
+    // При работающей отрисовке запрет не действует: там ток диодов может
+    // превышать зарядный, и батарея реально разряжается, несмотря на USB.
+    if (usb_ok && rms < 0.05f && batt_soc_valid && target < pwr_cache.soc) {
+        target = pwr_cache.soc;
+    }
+
+    // Ограничение скорости 1 %/с: остаточная ошибка модели выбирается плавно,
+    // а не прыжком. Первое значение ставим сразу, иначе шкала ползла бы от нуля.
+    if (!batt_soc_valid)             { pwr_cache.soc = target; batt_soc_valid = true; }
+    else if (target > pwr_cache.soc)   pwr_cache.soc++;
+    else if (target < pwr_cache.soc)   pwr_cache.soc--;
+
+    pwr_cache.ocv_mv = (int16_t)batt_ocv_filt;
+}
+
 // Обновляет кеш батареи/USB. Вызывается из loop() раз в секунду.
 static void updatePowerTelemetry() {
     uint32_t vbat = (uint32_t)(readMilliVoltsAvg(PIN_ADC_VBAT, 8) * ADC_DIVIDER_RATIO);
@@ -1011,6 +1121,8 @@ static void updatePowerTelemetry() {
     pwr_cache.vusb_mv = (int16_t)vusb;
     pwr_cache.usb     = usb_ok;
     pwr_cache.chg     = chg;
+
+    updateBatterySoc(vbat, usb_ok, chg);
 }
 
 // Авто-яркость по ALS-PT19. Датчик питается от DCDC №1, поэтому опрашиваем
@@ -1060,15 +1172,6 @@ static void applyPowerState(PowerState target) {
 
     switch (target) {
         case PWR_OFF:
-            // Попытка раскрутки после тряски не дала вращения — на время
-            // перестаём реагировать на вибродатчик, иначе тряска в транспорте
-            // будет держать устройство включённым бесконечно.
-            if (spinup_from_vibration) {
-                vibration_block_until = millis() + VIBRATION_RETRY_MS;
-                spinup_from_vibration = false;
-                webLogf("[PWR] No spin-up, vibration ignored for %lus",
-                        (unsigned long)(VIBRATION_RETRY_MS / 1000));
-            }
             // Сначала снимаем флаг — renderingTask прекращает трогать SPI,
             // затем гасим диоды, и только потом снимаем питание.
             power_state = PWR_OFF;
@@ -1106,9 +1209,8 @@ static void applyPowerState(PowerState target) {
 
         case PWR_FULL:
             // Колесо реально раскрутилось — это подтверждённая активность
-            last_dcdc_on_time     = millis();
-            last_motion_ms        = last_dcdc_on_time;
-            spinup_from_vibration = false;
+            last_dcdc_on_time = millis();
+            last_motion_ms    = last_dcdc_on_time;
             digitalWrite(PIN_EN_DCDC_REST, HIGH);
             peripherals_active = true;
             delay(5);                          // ждём стабилизации питания лучей 2–6
@@ -1281,13 +1383,19 @@ void setup() {
     // Эндпоинт телеметрии питания — отдаёт кешированные данные без обращения к АЦП.
     server.on("/battery", HTTP_GET, [](AsyncWebServerRequest *request){
         // Фоновый поллинг — не сбрасывает таймер активности.
-        char buf[160];
+        // soc — заряд по восстановленной ЭДС; остальное для калибровки:
+        // ocv не должен меняться при включении отрисовки и подключении зарядника,
+        // sag и rise показывают, к чему сошлись самокалибровки.
+        char buf[240];
         snprintf(buf, sizeof(buf),
-            "{\"vbat\":%d,\"vusb\":%d,\"chg\":%u,\"usb\":%s,\"connected\":%s}",
+            "{\"vbat\":%d,\"vusb\":%d,\"chg\":%u,\"usb\":%s,\"connected\":%s"
+            ",\"soc\":%u,\"ocv\":%d,\"sag\":%d,\"rise\":%u}",
             (int)pwr_cache.vbat_mv, (int)pwr_cache.vusb_mv,
             (unsigned)pwr_cache.chg,
             pwr_cache.usb ? "true" : "false",
-            pwr_cache.usb ? "true" : "false"
+            pwr_cache.usb ? "true" : "false",
+            (unsigned)pwr_cache.soc, (int)pwr_cache.ocv_mv,
+            (int)batt_sag_k, (unsigned)batt_chg_rise
         );
         request->send(200, "application/json", buf);
     });
@@ -1417,14 +1525,9 @@ void loop() {
         if (power_state != PWR_OFF) applyPowerState(PWR_OFF);
     } else {
         switch (power_state) {
-            case PWR_OFF: {
-                bool vib_allowed = vibration && (int32_t)(now_ms - vibration_block_until) >= 0;
-                if (vib_allowed || play_pending) {
-                    spinup_from_vibration = vib_allowed && !play_pending;
-                    applyPowerState(PWR_SPINUP);
-                }
+            case PWR_OFF:
+                if (vibration || play_pending) applyPowerState(PWR_SPINUP);
                 break;
-            }
 
             case PWR_SPINUP:
                 if (rpm >= RPM_RENDER_ON) {

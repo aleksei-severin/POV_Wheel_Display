@@ -109,6 +109,18 @@ Per-sensor mechanical/threshold spread would otherwise inject a phase jump 6× p
 
 `renderingTask` enforces the same RPM thresholds itself. It must — while rendering it preempts `loop()` (prio 1), so relying on `loop()` alone would leave the image running below threshold.
 
+### Battery State of Charge
+
+`updateBatterySoc()` reconstructs open-circuit voltage before reading the LiPo curve; percentage is computed on-device and served as `soc`, not derived from `vbat` in the browser. Two reasons the naive terminal-voltage reading was useless: a 1S LiPo curve is flat in the middle (3.73–3.87 V spans 20–60 % SoC, so 20 mV is 6 %), and terminal voltage moves with load — the display coming on dropped the reading 15–20 %, plugging in the charger raised it 10–15 %.
+
+```
+OCV = Vbat + BATT_BASE_SAG_MV (if DCDC on) + abl_rms · batt_sag_k − BATT_CHG_RISE_MV (if charging)
+```
+
+Load current is never measured: `global_abl_rms` is *by construction* the normalised current draw (frame fill × bri/31), so only mV-of-sag-per-unit-RMS is needed. That coefficient **self-calibrates** — SoC cannot change in the instant rendering starts, so the whole voltage step against the last idle reading is sag. The idle reference expires after 120 s, past which real discharge would contaminate it. Output is slew-limited to 1 %/s so residual model error is absorbed smoothly rather than as a jump. `chg == 2` (charger reports done) pins it to 100 %.
+
+`ocv` and `sag` are exposed in `/battery` for calibration: `ocv` should stay put when the display switches on, and `sag` shows where self-calibration settled.
+
 `setHallMask()` must be called on every power transition: it clears the timestamps of sensors that were unpowered, otherwise their first post-power-up event yields a bogus "revolution period".
 
 ### Module Breakdown
@@ -129,7 +141,7 @@ GET  /stop              # Stop rendering
 GET  /delete?file=X     # Delete file from LittleFS
 GET  /settings          # bmin,bmax,a,g,s,co,circ,ao,spoke,abl,rad,rg,gg,bg
 GET  /get_settings      # JSON of all settings + lux + state/file version counters
-GET  /battery           # JSON: {vbat,vusb,chg,usb}  (chg: 0=discharging 1=charging 2=done)
+GET  /battery           # JSON: {vbat,vusb,chg,usb,soc,ocv,sag}  (chg: 0=discharging 1=charging 2=done)
 GET  /info              # JSON: {rpm,dir,pwr,step,fill}  (step: °/LED update, fill: µs)
 GET  /preview?file=X    # First frame (FRAME_SIZE bytes) for browser-side thumbnail
 GET  /fs_info           # LittleFS total/used/free

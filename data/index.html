@@ -1746,7 +1746,10 @@ function updateInfo() {
 }
 
 // ===================== BATTERY =====================
-// Порог напряжения заряда: 3.0V = 0%, 4.2V = 100%
+// Запасной вариант на случай старой прошивки без поля soc. Линейная шкала
+// 3.0…4.2 В неточна сама по себе (кривая LiPo в середине пологая) и вдобавок
+// считается по напряжению под нагрузкой — устройство теперь отдаёт готовый
+// процент, посчитанный по восстановленной ЭДС.
 function _voltToPct(mv) {
     const v = mv / 1000;
     const pct = Math.max(0, Math.min(100, (v - 3.0) / (4.2 - 3.0) * 100));
@@ -1759,7 +1762,7 @@ function updateBatteryStatus() {
         document.getElementById('usbV').textContent = (d.vusb/1000).toFixed(2);
 
         // Обновляем полоску батареи
-        const pct = _voltToPct(d.vbat);
+        const pct = (d.soc !== undefined) ? d.soc : _voltToPct(d.vbat);
         document.getElementById('batBar').style.width = pct.toFixed(0) + '%';
         document.getElementById('batPct').textContent = pct.toFixed(0) + '%';
 
