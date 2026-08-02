@@ -206,8 +206,15 @@ void loadFrameFromFile(String path) {
         return;
     }
 
-    // Читаем новый файл в ВРЕМЕННЫЙ буфер, не трогая frameBuffer.
-    // Старая анимация продолжает рендериться на Core 1 всё время загрузки.
+    // Гасим ленту на время чтения. Дело не в скорости: ЛЮБАЯ операция с флешем
+    // отключает кеш инструкций и паркует второе ядро, поэтому renderingTask
+    // (он исполняется из флеша и читает кадр из PSRAM) всё равно замирает —
+    // но замирает не вовремя, и DMA продолжает светить кадром, снятым под
+    // другим углом. На ободе это блочный мусор. Чёрное честнее.
+    frame_loading = true;
+    for (int i = 0; i < 1000 && render_in_fill; i++) vTaskDelay(1);
+
+    uint32_t  t_load        = millis();
     uint8_t*  newBuf        = nullptr;
     uint32_t  newTotalFrames = 1;
     uint16_t  newFrameDelay  = 100;
@@ -225,7 +232,26 @@ void loadFrameFromFile(String path) {
             newBuf = (uint8_t*)ps_malloc(dataSize);
 
             if (newBuf) {
-                f.read(newBuf, dataSize);
+                // Отрисовка уже погашена, беречь шину не от кого — читаем
+                // крупными блоками, чтобы чёрная пауза вышла как можно короче.
+                // Уступаем такт раз в 32 КБ: сплошное чтение мегабайтами
+                // держало бы lwIP без CPU и роняло соединения.
+                size_t got = 0;
+                while (got < dataSize) {
+                    size_t want = dataSize - got;
+                    if (want > 32768) want = 32768;
+                    int n = f.read(newBuf + got, want);
+                    if (n <= 0) break;
+                    got += (size_t)n;
+                    vTaskDelay(1);
+                }
+                // Файл оказался короче заявленного числа кадров — хвост должен
+                // быть чёрным, а не мусором из PSRAM.
+                if (got < dataSize) {
+                    memset(newBuf + got, 0, dataSize - got);
+                    webLogf("[WARN] Short read: %u of %u bytes",
+                            (unsigned)got, (unsigned)dataSize);
+                }
             } else {
                 newTotalFrames = 0;
                 webLog("[ERR] PSRAM alloc failed");
@@ -249,12 +275,17 @@ void loadFrameFromFile(String path) {
     f.close();
 
     // Если выделить память не удалось — оставляем старую анимацию, не меняем ничего.
-    if (newBuf == nullptr) return;
+    if (newBuf == nullptr) {
+        frame_loading = false;
+        return;
+    }
 
-    // Новый буфер готов. Атомарно переключаем: останавливаем рендеринг только на
-    // одну итерацию loop renderingTask, чтобы безопасно заменить указатель.
-    newFrameReady = false;          // renderingTask сделает continue на следующем обороте
-
+    // Новый буфер готов. Переключаем целиком, а не по одному полю: рендер
+    // адресует кадр как frameBuffer + frame_idx·FRAME_SIZE, где frame_idx
+    // считается по totalFrames. Если новое число кадров окажется выставлено
+    // раньше нового буфера, рендер уедет далеко за пределы старого — на ободе
+    // это блочный мусор из PSRAM, тем заметнее, чем тяжелее новая анимация.
+    // Отрисовка уже стоит по frame_loading, так что гонки здесь нет.
     uint8_t* oldBuf = frameBuffer;  // Запоминаем старый указатель для free()
 
     // Устанавливаем новые параметры и буфер
@@ -270,11 +301,15 @@ void loadFrameFromFile(String path) {
     lastFrameSwitchTime = millis();
     newFrameReady = true;
     currentDisplayFile = path;
+    frame_loading = false;          // отрисовка возобновляется
 
+    // Длительность загрузки — это и есть длительность чёрной паузы.
+    uint32_t ms = millis() - t_load;
     if (newTotalFrames > 1) {
-        webLogf("[DISP] Loaded: %s  %lu frames @ %ums", path.c_str(), (unsigned long)newTotalFrames, (unsigned)newFrameDelay);
+        webLogf("[DISP] Loaded: %s  %lu frames @ %ums  (%lums)", path.c_str(),
+                (unsigned long)newTotalFrames, (unsigned)newFrameDelay, (unsigned long)ms);
     } else {
-        webLogf("[DISP] Loaded: %s", path.c_str());
+        webLogf("[DISP] Loaded: %s  (%lums)", path.c_str(), (unsigned long)ms);
     }
 }
 

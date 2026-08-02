@@ -32,6 +32,8 @@ uint16_t frameDelay = 100;
 uint32_t lastFrameSwitchTime = 0;
 
 volatile bool newFrameReady = false;
+volatile bool render_in_fill = false;   // renderingTask сейчас читает frameBuffer
+volatile bool frame_loading  = false;   // идёт чтение файла — отрисовка погашена
 volatile bool ota_in_progress = false; // блокирует рендеринг на время OTA-обновления
 
 std::vector<String> savedFiles;
@@ -831,10 +833,13 @@ void renderingTask(void* pvParameters) {
         }
 
         // --- Условия остановки отрисовки ---
-        if (force_stop_display || power_state != PWR_FULL || !newFrameReady || ota_in_progress) {
+        if (force_stop_display || power_state != PWR_FULL || !newFrameReady ||
+            ota_in_progress || frame_loading) {
             if (rendering_active) {
                 rendering_active = false;
-                webLog("[PWR] Rendering stopped");
+                // Пауза на загрузку файла — штатная и частая (слайдшоу),
+                // в лог её не пишем, иначе он забьётся.
+                if (!frame_loading) webLog("[PWR] Rendering stopped");
                 blankAllLEDs_DMA();
                 global_abl_rms              = 0.0f;
                 rms_accum                   = 0.0f;
@@ -892,7 +897,8 @@ void renderingTask(void* pvParameters) {
         bool  psi_valid = false;
 
         while (true) {
-            if (force_stop_display || power_state != PWR_FULL || !newFrameReady || ota_in_progress) break;
+            if (force_stop_display || power_state != PWR_FULL || !newFrameReady ||
+                ota_in_progress || frame_loading) break;
 
             // Пришло новое событие Холла — выходим, чтобы переставить якорь фазы
             noInterrupts();
@@ -944,10 +950,17 @@ void renderingTask(void* pvParameters) {
             if (span < 1.0f) span = 1.0f;
             if (span > (float)(ANG_TAPS_MAX - 1)) span = (float)(ANG_TAPS_MAX - 1);
 
+            // Захват буфера кадра. Флаг ставим ДО проверки newFrameReady, иначе
+            // загрузчик успел бы проскочить в зазор между проверкой и началом
+            // чтения и подменить буфер прямо под нами.
+            render_in_fill = true;
+            if (!newFrameReady) { render_in_fill = false; break; }
+
             uint8_t  idle = 1 - active;
             uint32_t t_fill0 = micros();
             fillSectorIntoBuffer(dma_buf[idle], idle, base, span);
             fill_us = (float)(uint32_t)(micros() - t_fill0);
+            render_in_fill = false;
             sectors_drawn++;
 
             global_render_span    = span;
@@ -1156,6 +1169,22 @@ static void updateAutoBrightness() {
 // Разрешает работу указанных датчиков Холла и сбрасывает накопленное состояние
 // для тех, что были обесточены: их метки времени устарели и дали бы неверный
 // период оборота при первом же срабатывании после подачи питания.
+// Имя последнего воспроизведённого файла — для автозапуска после перезагрузки.
+// Запись отложена: putString стирает страницу флеша, а на время записи кеш
+// инструкций отключается на ОБОИХ ядрах, и renderingTask, исполняемый из флеша,
+// замирает на десятки миллисекунд. В слайдшоу это происходило каждые 10 секунд
+// (заодно 8600 циклов записи в сутки — впустую жгло ресурс флеша).
+static String pending_last_file;
+
+// Сбрасывает отложенное имя в NVS. Вызывать только когда отрисовка остановлена.
+static void flushLastFile() {
+    if (pending_last_file.length() == 0) return;
+    if (prefs.getString("last_file", "") != pending_last_file) {
+        prefs.putString("last_file", pending_last_file);
+    }
+    pending_last_file = "";
+}
+
 static void setHallMask(uint8_t mask) {
     noInterrupts();
     hall_active_mask = mask;
@@ -1182,6 +1211,9 @@ static void applyPowerState(PowerState target) {
             digitalWrite(PIN_EN_DCDC_ARM1, LOW);
             peripherals_active = false;
             last_dcdc_off_time = millis();
+            // Отрисовка остановлена — самое время сбросить отложенную запись
+            // в NVS: помешать она уже никому не может.
+            flushLastFile();
             webLog("[PWR] Power off");
             break;
 
@@ -1223,6 +1255,7 @@ static void applyPowerState(PowerState target) {
 }
 
 static void enterDeepSleep() {
+    flushLastFile();
     // Снимаем питание и глушим прерывания
     digitalWrite(PIN_EN_DCDC_REST, LOW);
     digitalWrite(PIN_EN_DCDC_ARM1, LOW);
@@ -1498,7 +1531,9 @@ void loop() {
         slideCurrentIndex = (slideCurrentIndex + 1) % (int)savedFiles.size();
         String nextFile = savedFiles[slideCurrentIndex];
         pendingFilePath = "/" + nextFile;
-        prefs.putString("last_file", nextFile);
+        // Не пишем в NVS прямо здесь: запись во флеш заморозила бы рендер.
+        // Уйдёт на диск при остановке колеса или перед deep sleep.
+        pending_last_file = nextFile;
         force_stop_display = false;
         request_play_flag = true;
         xSemaphoreGive(fileLoaderSemaphore);

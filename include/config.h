@@ -127,6 +127,17 @@ extern uint8_t max_brightness;
 extern volatile int global_angle_offset;
 extern uint8_t* frameBuffer;
 extern volatile bool newFrameReady;
+// true пока renderingTask читает frameBuffer. Загрузчик обязан дождаться
+// снятия флага, прежде чем подменять буфер, счётчик кадров и освобождать старый:
+// иначе рендер адресует новым числом кадров старый буфер и читает чужую память.
+extern volatile bool render_in_fill;
+
+// true пока идёт чтение файла с LittleFS — отрисовка на это время гасится.
+// Держать картинку во время загрузки нельзя: операция с флешем отключает кеш
+// инструкций и паркует второе ядро, renderingTask замирает не вовремя, и на
+// ленте остаётся кадр, снятый под другим углом. Отдельный флаг, а не
+// newFrameReady: тот управляет автоматом питания и снял бы питание с лучей.
+extern volatile bool frame_loading;
 extern String hostName;
 extern bool force_stop_display;
 extern bool peripherals_active;          // true когда включён хотя бы DCDC №1
