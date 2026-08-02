@@ -21,7 +21,7 @@ volatile uint8_t global_brightness = 8; // единицы SK9822 (0–31)
 
 RTC_DATA_ATTR uint8_t min_brightness = 1;  // единицы SK9822 (1–30)
 RTC_DATA_ATTR uint8_t max_brightness = 30; // единицы SK9822 (1–30)
-RTC_DATA_ATTR volatile int global_angle_offset = 86;
+RTC_DATA_ATTR volatile int global_angle_offset = 90;
 
 uint8_t* frameBuffer = nullptr;
 
@@ -132,12 +132,12 @@ RTC_DATA_ATTR volatile float global_gamma         = 2.5f;
 RTC_DATA_ATTR volatile float global_saturation    = 1.5f;
 RTC_DATA_ATTR volatile float global_contrast      = 5.0f;
 RTC_DATA_ATTR volatile float global_r_gain        = 100.0f; // 0..100 %, 100 = без изменений
-RTC_DATA_ATTR volatile float global_g_gain        = 70.0f;
-RTC_DATA_ATTR volatile float global_b_gain        = 100.0f;
+RTC_DATA_ATTR volatile float global_g_gain        = 65.0f;
+RTC_DATA_ATTR volatile float global_b_gain        = 75.0f;
 RTC_DATA_ATTR volatile uint16_t wheel_circumference = 2355;
-RTC_DATA_ATTR volatile int16_t  global_spoke_offset = 21;  // мм, 0 = лучи из центра
+RTC_DATA_ATTR volatile int16_t  global_spoke_offset = 0;   // мм, 0 = лучи из центра
 RTC_DATA_ATTR volatile bool     global_arm_reverse  = false; // порядок лучей в цепочке
-RTC_DATA_ATTR volatile float    global_abl_limit    = 10.0f; // ABL: 0–100 %, 100 = без ограничения
+RTC_DATA_ATTR volatile float    global_abl_limit    = 40.0f; // ABL: 0–100 %, 100 = без ограничения
 volatile float                  global_abl_rms      = 0.0f;  // RMS загрузка тока 0.0–1.0
 volatile uint8_t                global_effective_brightness = 8;
 uint8_t lut_r[256];
