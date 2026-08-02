@@ -6,7 +6,6 @@
 #include <ElegantOTA.h>
 #include <LittleFS.h>
 #include <Preferences.h>
-#include <FastLED.h>
 #include <HTTPClient.h>
 #include <stdarg.h>
 #include <vector>
@@ -175,19 +174,20 @@ static uint32_t last_reconnect_attempt = 0;
 
 void safeOTAShutdown() {
     // 1. Выставляем флаги — renderingTask прерывает текущий оборот,
-    //    loop() не включает DCDC повторно через hall_event/wakeup_event.
+    //    loop() не включает питание повторно по вибрации или Холлу.
     ota_in_progress    = true;
     force_stop_display = true;
+    power_state        = PWR_OFF;
     peripherals_active = false;
 
     // 2. Ждём 200 мс — гарантируем завершение текущей DMA-транзакции renderingTask,
     //    чтобы dmaMutex был свободен и blankAllLEDs_DMA не вызвал deadlock.
     vTaskDelay(pdMS_TO_TICKS(200));
 
-    // 3. Гасим светодиоды и снимаем питание.
+    // 3. Гасим светодиоды и снимаем питание обоих DCDC.
     blankAllLEDs_DMA();
-    digitalWrite(PIN_EN_LEVEL_SHIFT, LOW);
-    digitalWrite(PIN_EN_DCDC, LOW);
+    digitalWrite(PIN_EN_DCDC_REST, LOW);
+    digitalWrite(PIN_EN_DCDC_ARM1, LOW);
 
     // 4. Размонтируем LittleFS — ElegantOTA для ESP32 не делает это автоматически,
     //    запись поверх смонтированной FS приводит к её повреждению и краш/статус 0.
@@ -233,11 +233,17 @@ void loadFrameFromFile(String path) {
         } else {
             f.seek(0);
             newBuf = (uint8_t*)ps_malloc(FRAME_SIZE);
-            if (newBuf) f.read(newBuf, FRAME_SIZE);
+            // Обнуляем перед чтением: файл может оказаться короче кадра
+            // (например, снятый со старой версии железа) — хвост должен быть
+            // чёрным, а не мусором из PSRAM.
+            if (newBuf) { memset(newBuf, 0, FRAME_SIZE); f.read(newBuf, FRAME_SIZE); }
         }
     } else {
         newBuf = (uint8_t*)ps_malloc(FRAME_SIZE);
-        if (newBuf) f.read(newBuf, FRAME_SIZE);
+        if (newBuf) {
+            memset(newBuf, 0, FRAME_SIZE);
+            f.read(newBuf, (fileSize < FRAME_SIZE) ? fileSize : FRAME_SIZE);
+        }
     }
 
     f.close();
@@ -364,9 +370,9 @@ void setupNetwork() {
             float cov = request->getParam("co")->value().toFloat();
             if (cov >= 0.0f && cov <= 100.0f) global_contrast = cov;
         }
-        if (request->hasParam("arms")) {
-            int av = request->getParam("arms")->value().toInt();
-            if (av >= 1 && av <= 8) global_num_arms = (uint8_t)av;
+        // Порядок лучей в цепочке относительно направления вращения (0/1)
+        if (request->hasParam("ao")) {
+            global_arm_reverse = request->getParam("ao")->value().toInt() != 0;
         }
         if (request->hasParam("spoke")) {
             int sv = request->getParam("spoke")->value().toInt();
@@ -404,11 +410,11 @@ void setupNetwork() {
     server.on("/get_settings", HTTP_GET, [](AsyncWebServerRequest *request){
         // Фоновый поллинг — не сбрасывает таймер активности.
         // snprintf в стековый буфер — ноль heap-аллокаций, не фрагментирует SRAM.
-        char buf[320];
+        char buf[384];
         snprintf(buf, sizeof(buf),
             "{\"bmin\":%u,\"bmax\":%u,\"angle\":%d,\"brightness\":%u,\"eff_bri\":%u"
             ",\"gamma\":%.1f,\"saturation\":%.1f,\"contrast\":%.1f"
-            ",\"circ\":%u,\"arms\":%u,\"spoke\":%d"
+            ",\"circ\":%u,\"ao\":%u,\"spoke\":%d,\"lux\":%.0f"
             ",\"abl\":%.1f,\"abl_rms\":%.1f"
             ",\"rg\":%.1f,\"gg\":%.1f,\"bg\":%.1f"
             ",\"slideshow\":%s"
@@ -417,7 +423,8 @@ void setupNetwork() {
             (int)global_angle_offset, (unsigned)global_brightness,
             (unsigned)global_effective_brightness,
             (float)global_gamma, (float)global_saturation, (float)global_contrast,
-            (unsigned)wheel_circumference, (unsigned)global_num_arms, (int)global_spoke_offset,
+            (unsigned)wheel_circumference, (unsigned)(global_arm_reverse ? 1 : 0),
+            (int)global_spoke_offset, (float)last_lux_value,
             (float)global_abl_limit, (float)(global_abl_rms * 100.0f),
             (float)global_r_gain, (float)global_g_gain, (float)global_b_gain,
             slideshowActive ? "true" : "false",
@@ -660,13 +667,17 @@ void setupNetwork() {
         // Защита от переполнения uint32_t при вычитании
         uint32_t elapsed = (now_us >= hall_t) ? (now_us - hall_t)
                                               : (0xFFFFFFFFUL - hall_t + now_us + 1);
-        // Если с последнего прохода магнита прошло > 2с — колесо остановлено
+        // period — время полного оборота, измеренное одним датчиком Холла.
+        // Если событий давно не было, реальный период не меньше времени молчания —
+        // берём максимум из двух, чтобы RPM спадал плавно, а не «залипал».
         float rpm = 0.0f;
-        if (period > 0 && elapsed < 2000000UL) {
-            rpm = 60000000.0f / (float)period;
+        if (period > 0 && elapsed < 3000000UL) {
+            uint32_t eff = (elapsed > period) ? elapsed : period;
+            rpm = 60000000.0f / (float)eff;
         }
-        char buf[32];
-        snprintf(buf, sizeof(buf), "{\"rpm\":%.1f}", rpm);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "{\"rpm\":%.1f,\"dir\":%d,\"pwr\":%u}",
+                 rpm, (int)rotation_dir, (unsigned)power_state);
         request->send(200, "application/json", buf);
     });
 
@@ -770,9 +781,10 @@ void setupNetwork() {
         size_t toRead = FRAME_SIZE;
         if (f.size() < offset + toRead) toRead = f.size() - offset;
 
-        // Читаем в heap-буфер; ownership передаётся лямбде через shared_ptr —
+        // Читаем в PSRAM; ownership передаётся лямбде через shared_ptr —
         // память освобождается автоматически когда AsyncWebServer завершит отправку.
-        auto frameBuf = std::shared_ptr<uint8_t>((uint8_t*)malloc(toRead), free);
+        // Кадр вырос до 47520 байт — держать его во внутреннем heap накладно.
+        auto frameBuf = std::shared_ptr<uint8_t>((uint8_t*)ps_malloc(toRead), free);
         if (!frameBuf) {
             f.close();
             request->send(500, "text/plain", "OOM");
@@ -801,7 +813,7 @@ void setupNetwork() {
     // server.begin() намеренно НЕ вызывается здесь.
     // AsyncTCP начинает принимать соединения сразу после begin(),
     // и браузер, открытый до загрузки устройства, немедленно шлёт запросы
-    // пока setup() ещё не завершился (initBQ25792, /battery endpoint и т.д.).
+    // пока setup() ещё не завершился (LittleFS, /battery endpoint и т.д.).
     // Задача AsyncTCP зависает ожидая lwIP → Task WDT через 5с → перезагрузка.
     // server.begin() вызывается из setup() после полной инициализации.
 

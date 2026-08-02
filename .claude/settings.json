@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pio device list)",
+      "Bash(pio system info)",
+      "Bash(pio project config *)",
+      "Bash(pio pkg list *)",
+      "Bash(git rev-list *)"
+    ]
+  }
+}

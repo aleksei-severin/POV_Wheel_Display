@@ -683,6 +683,7 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
         <div>
           <span class="speed-value" id="infoRpm" style="font-size:32px;">--</span>
           <span class="speed-unit">rpm</span>
+          <span class="speed-unit" id="infoDir" style="color:var(--yellow);"></span>
         </div>
       </div>
     </div>
@@ -717,8 +718,8 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
       <div><span class="power-val" id="batV">--</span><span class="power-unit">V</span></div>
     </div>
     <div class="power-row">
-      <span class="power-label">Charge current</span>
-      <div><span class="power-val" id="batI">--</span><span class="power-unit">A</span></div>
+      <span class="power-label">USB voltage</span>
+      <div><span class="power-val" id="usbV">--</span><span class="power-unit">V</span></div>
     </div>
 
     <div class="divider"></div>
@@ -730,6 +731,7 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
         <span class="val">
           <span id="bMinVal">1</span>&nbsp;–&nbsp;<span id="bMaxVal">30</span>
           &nbsp;<span class="now" style="color:var(--yellow)">NOW&nbsp;<span id="briVal">--</span></span>
+          &nbsp;<span style="color:var(--text-hint);font-size:10px;"><span id="luxVal">--</span>&nbsp;lx</span>
         </span>
       </div>
       <div class="bri-wrap">
@@ -757,14 +759,16 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
       </div>
     </div>
 
-    <!-- LED Beams -->
+    <!-- Arm order — лучей всегда 6, настраивается только их порядок в цепочке -->
     <div class="slider-row">
       <div class="slider-label">
-        <span>LED Beams</span>
-        <span class="val" id="armsVal">4</span>
+        <span>Arm Order</span>
+        <span class="val" id="armOrderVal">Normal</span>
       </div>
-      <input type="range" id="armsSlide" min="1" max="8" value="4" step="1"
-             oninput="document.getElementById('armsVal').textContent=this.value; syncSettings()">
+      <button id="armOrderBtn" onclick="toggleArmOrder()"
+              style="width:100%;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--r-elem);color:var(--text-muted);font-size:12px;padding:8px;cursor:pointer;">
+        Flip &mdash; use if the image splits into shuffled wedges
+      </button>
     </div>
 
     <!-- Spoke Offset -->
@@ -899,21 +903,27 @@ class MinimalGIF {
 }
 
 // ===================== POLAR MAPPING =====================
-// 360 sectors × 38 LEDs = 41040 bytes == FRAME_SIZE on device
-// Image is sampled as a centered square; inner cutout mirrors physical LED offset from hub
+// V5: 360 sectors × 44 LEDs × 3 = 47520 bytes == FRAME_SIZE on device.
+// Physical arm geometry: innermost LED at 49 mm, outermost at 273 mm.
+// Image is sampled as a centered square; inner cutout mirrors the LED offset from the hub.
+const LEDS_PER_SIDE = 44;
+const R_OUTER_FRAC  = 0.495;              // outer LED (273 mm) -> image edge
+const R_INNER_FRAC  = 0.495 * 49 / 273;   // inner LED (49 mm)  -> 0.0889
+const FRAME_BYTES   = 360 * LEDS_PER_SIDE * 3;
+
 function toPolarBuffer(srcCanvas) {
     const W = srcCanvas.width, H = srcCanvas.height;
     const ctx = srcCanvas.getContext('2d', {willReadFrequently: true});
     const sData = ctx.getImageData(0, 0, W, H).data;
-    const buf = new Uint8Array(360 * 38 * 3);
+    const buf = new Uint8Array(FRAME_BYTES);
     let off = 0;
-    const minR = W * 0.10;   // inner cutout  (~60mm physical)
-    const maxR = W * 0.495;  // outer edge    (~300mm physical)
+    const minR = W * R_INNER_FRAC;
+    const maxR = W * R_OUTER_FRAC;
     for (let sector = 0; sector < 360; sector++) {
         const angle = (sector / 360) * 2 * Math.PI;
         const ca = Math.cos(angle), sa = Math.sin(angle);
-        for (let r = 0; r < 38; r++) {
-            const rad = minR + (r / 37) * (maxR - minR);
+        for (let r = 0; r < LEDS_PER_SIDE; r++) {
+            const rad = minR + (r / (LEDS_PER_SIDE - 1)) * (maxR - minR);
             const px = Math.round(W / 2 + rad * ca);
             const py = Math.round(H / 2 + rad * sa);
             if (px >= 0 && px < W && py >= 0 && py < H) {
@@ -1114,7 +1124,7 @@ async function _convertFile(file) {
         const gif = new MinimalGIF(ab);
         gif.parse();
         const frames = renderGIFFrames(gif);
-        const frameBytes = 360 * 38 * 3;
+        const frameBytes = FRAME_BYTES;
         const totalSize = 8 + frames.length * frameBytes;
         const buf = new Uint8Array(totalSize);
         buf[0]=65;buf[1]=78;buf[2]=73;buf[3]=77; // "ANIM"
@@ -1261,15 +1271,15 @@ async function processAndUpload() {
 }
 
 // ===================== ПРЕВЬЮ КОЛЕСА =====================
-// Рисует один фрейм (360×38×3 байт, полярный буфер) на canvas как кольцо колеса.
+// Рисует один фрейм (360×44×3 байт, полярный буфер) на canvas как кольцо колеса.
 // Каждый пиксель canvas обратно проецируется: угол → сектор, радиус → LED.
 function drawWheelPreview(buf, canvas) {
     const SIZE = canvas.width;  // квадратный canvas
     const ctx  = canvas.getContext('2d');
     const img  = ctx.createImageData(SIZE, SIZE);
     const cx = SIZE / 2, cy = SIZE / 2;
-    const minR = SIZE * 0.10;   // внутренний радиус отсечки (совпадает с toPolarBuffer)
-    const maxR = SIZE * 0.495;
+    const minR = SIZE * R_INNER_FRAC;   // совпадает с toPolarBuffer
+    const maxR = SIZE * R_OUTER_FRAC;
 
     for (let y = 0; y < SIZE; y++) {
         for (let x = 0; x < SIZE; x++) {
@@ -1282,11 +1292,11 @@ function drawWheelPreview(buf, canvas) {
             if (ang < 0) ang += 360;
             const sector = Math.round(ang) % 360;
 
-            // Нормализованный радиус → индекс LED [0..37]
-            const ledF = (r - minR) / (maxR - minR) * 37;
-            const led  = Math.min(37, Math.max(0, Math.round(ledF)));
+            // Нормализованный радиус → индекс LED [0..43]
+            const ledF = (r - minR) / (maxR - minR) * (LEDS_PER_SIDE - 1);
+            const led  = Math.min(LEDS_PER_SIDE - 1, Math.max(0, Math.round(ledF)));
 
-            const off = (sector * 38 + led) * 3;
+            const off = (sector * LEDS_PER_SIDE + led) * 3;
             const pi  = (y * SIZE + x) * 4;
             img.data[pi]     = buf[off];
             img.data[pi + 1] = buf[off + 1];
@@ -1312,7 +1322,7 @@ async function _loadThumb(fname, canvas) {
         if (!resp.ok) return;
         const ab  = await resp.arrayBuffer();
         const buf = new Uint8Array(ab);
-        if (buf.length < 360 * 38 * 3) return;
+        if (buf.length < FRAME_BYTES) return;
         drawWheelPreview(buf, canvas);
         // Кэшируем ImageData для быстрого повторного рендеринга
         _thumbCache[fname] = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height);
@@ -1487,13 +1497,13 @@ function syncSettings() {
         const s    = (document.getElementById('sSlide').value / 10).toFixed(1);
         const co   = document.getElementById('coSlide').value;
         const circ = document.getElementById('wheelCirc').value || wheelCircMm;
-        const arms  = document.getElementById('armsSlide').value;
+        const ao    = _armReverse ? 1 : 0;
         const spoke = document.getElementById('spokeSlide').value;
         const abl   = document.getElementById('ablSlide').value;
         const rg    = document.getElementById('rgSlide').value;
         const gg    = document.getElementById('ggSlide').value;
         const bg    = document.getElementById('bgSlide').value;
-        fetch(`/settings?bmin=${bmin}&bmax=${bmax}&a=${a}&g=${g}&s=${s}&co=${co}&circ=${circ}&arms=${arms}&spoke=${spoke}&abl=${abl}&rg=${rg}&gg=${gg}&bg=${bg}`);
+        fetch(`/settings?bmin=${bmin}&bmax=${bmax}&a=${a}&g=${g}&s=${s}&co=${co}&circ=${circ}&ao=${ao}&spoke=${spoke}&abl=${abl}&rg=${rg}&gg=${gg}&bg=${bg}`);
         _syncTimer = null;
     }, 50);
 }
@@ -1546,6 +1556,20 @@ document.getElementById('bMaxSlide').addEventListener('input', function() {
 
 
 // ===================== SETTINGS =====================
+// Порядок лучей в цепочке SK9822 относительно направления вращения.
+// Если картинка распадается на переставленные секторы — жмём Flip.
+let _armReverse = false;
+
+function _applyArmOrder() {
+    document.getElementById('armOrderVal').textContent = _armReverse ? 'Reversed' : 'Normal';
+}
+
+function toggleArmOrder() {
+    _armReverse = !_armReverse;
+    _applyArmOrder();
+    syncSettings();
+}
+
 function _applySettings(d) {
     document.getElementById('bMinSlide').value = d.bmin;
     document.getElementById('bMaxSlide').value = d.bmax;
@@ -1569,10 +1593,12 @@ function _applySettings(d) {
         wheelCircMm = c;
         document.getElementById('wheelCirc').value = c;
     }
-    if (d.arms !== undefined) {
-        const a = Math.max(1, Math.min(8, d.arms));
-        document.getElementById('armsSlide').value = a;
-        document.getElementById('armsVal').textContent = a;
+    if (d.ao !== undefined) {
+        _armReverse = !!d.ao;
+        _applyArmOrder();
+    }
+    if (d.lux !== undefined) {
+        document.getElementById('luxVal').textContent = Math.round(d.lux);
     }
     if (d.spoke !== undefined) {
         const v = Math.max(-50, Math.min(50, d.spoke));
@@ -1637,6 +1663,9 @@ function updateInfo() {
     return fetch('/info').then(r => r.json()).then(d => {
         const rpm = d.rpm;
         document.getElementById('infoRpm').textContent = rpm.toFixed(0);
+        // Обратное вращение определяется по порядку срабатывания датчиков Холла
+        document.getElementById('infoDir').textContent =
+            (rpm > 0 && d.dir !== undefined && d.dir < 0) ? 'rev' : '';
         // speed (km/h) = circumference(mm) * rpm / 60 / 1000 * 3.6
         const kmh = wheelCircMm * rpm * 0.00006;
         document.getElementById('infoSpeed').textContent = kmh.toFixed(1);
@@ -1655,26 +1684,22 @@ function _voltToPct(mv) {
 function updateBatteryStatus() {
     return fetch('/battery').then(r => r.json()).then(d => {
         document.getElementById('batV').textContent = (d.vbat/1000).toFixed(2);
-        document.getElementById('batI').textContent = (d.ibat/1000).toFixed(2);
+        document.getElementById('usbV').textContent = (d.vusb/1000).toFixed(2);
 
         // Обновляем полоску батареи
         const pct = _voltToPct(d.vbat);
         document.getElementById('batBar').style.width = pct.toFixed(0) + '%';
         document.getElementById('batPct').textContent = pct.toFixed(0) + '%';
 
-        if (d.chg_stat !== undefined) {
+        // IP2312U: состояние заряда выводится из наличия USB и уровня на IO8
+        if (d.chg !== undefined) {
             const el = document.getElementById('chgStat');
             const chgMap = [
-                ['Not Charging',      'badge-dim'],
-                ['Trickle Charge',    'badge-blue'],
-                ['Pre-charge',        'badge-blue'],
-                ['Fast Charge (CC)',  'badge-green'],
-                ['Taper Charge (CV)', 'badge-green'],
-                ['Top-off Charging',  'badge-green'],
-                ['Charge Done',       'badge-green'],
-                ['Charge Done',       'badge-green'],
+                ['Discharging', 'badge-dim'],
+                ['Charging',    'badge-blue'],
+                ['Charge Done', 'badge-green'],
             ];
-            const entry = chgMap[d.chg_stat];
+            const entry = chgMap[d.chg];
             el.textContent = entry ? entry[0] : '--';
             el.className   = 'badge ' + (entry ? entry[1] : 'badge-dim');
         }
