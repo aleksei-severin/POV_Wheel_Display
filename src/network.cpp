@@ -347,11 +347,11 @@ void setupNetwork() {
         last_web_activity_time = millis();
         if (request->hasParam("bmin")) {
             int v = request->getParam("bmin")->value().toInt();
-            if (v >= 1 && v <= 30) min_brightness = (uint8_t)v;
+            if (v >= 1 && v <= 31) min_brightness = (uint8_t)v;
         }
         if (request->hasParam("bmax")) {
             int v = request->getParam("bmax")->value().toInt();
-            if (v >= 1 && v <= 30) max_brightness = (uint8_t)v;
+            if (v >= 1 && v <= 31) max_brightness = (uint8_t)v;
         }
         if (request->hasParam("a")) global_angle_offset = request->getParam("a")->value().toInt();
         if (request->hasParam("g")) {

@@ -729,7 +729,7 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
       <div class="slider-label">
         <span>Brightness</span>
         <span class="val">
-          <span id="bMinVal">1</span>&nbsp;–&nbsp;<span id="bMaxVal">30</span>
+          <span id="bMinVal">1</span>&nbsp;–&nbsp;<span id="bMaxVal">31</span>
           &nbsp;<span class="now" style="color:var(--yellow)">NOW&nbsp;<span id="briVal">--</span></span>
           &nbsp;<span style="color:var(--text-hint);font-size:10px;"><span id="luxVal">--</span>&nbsp;lx</span>
         </span>
@@ -738,8 +738,8 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
         <div class="bri-track"></div>
         <div class="bri-fill" id="drFill"></div>
         <div class="bri-cursor" id="drCursor"></div>
-        <input type="range" id="bMinSlide" min="1" max="30" value="1">
-        <input type="range" id="bMaxSlide" min="1" max="30" value="30">
+        <input type="range" id="bMinSlide" min="1" max="31" value="1">
+        <input type="range" id="bMaxSlide" min="1" max="31" value="31">
       </div>
     </div>
 
@@ -1504,7 +1504,8 @@ function _updateAblRms(rms) {
 }
 
 // ===================== DUAL-RANGE BRIGHTNESS SLIDER =====================
-const BRI_MIN = 1, BRI_MAX = 30;
+// SK9822: поле тока 5-битное, 31 — максимум. Раньше шкала обрезалась на 30.
+const BRI_MIN = 1, BRI_MAX = 31;
 // Нормировка: (v - min) / (max - min) — совпадает с реальной позицией thumb браузера
 function pct(v) { return (v - BRI_MIN) / (BRI_MAX - BRI_MIN) * 100; }
 
@@ -1602,7 +1603,7 @@ document.getElementById('bMaxSlide').addEventListener('input', function() {
         const rect  = maxSlide.getBoundingClientRect();
         const clientX = e.touches ? e.touches[0].clientX : e.clientX;
         const ratio = (clientX - rect.left) / rect.width;
-        const clickVal = Math.round(ratio * 31);
+        const clickVal = BRI_MIN + Math.round(ratio * (BRI_MAX - BRI_MIN));
         const minV = +minSlide.value;
         const maxV = +maxSlide.value;
         // Если значения совпадают — выбираем по стороне относительно середины

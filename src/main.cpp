@@ -19,8 +19,8 @@ extern AsyncWebServer server;
 // --- ИНИЦИАЛИЗАЦИЯ ГЛОБАЛЬНЫХ ПЕРЕМЕННЫХ ---
 volatile uint8_t global_brightness = 8; // единицы SK9822 (0–31)
 
-RTC_DATA_ATTR uint8_t min_brightness = 1;  // единицы SK9822 (1–30)
-RTC_DATA_ATTR uint8_t max_brightness = 30; // единицы SK9822 (1–30)
+RTC_DATA_ATTR uint8_t min_brightness = 1;  // единицы SK9822 (1–31)
+RTC_DATA_ATTR uint8_t max_brightness = 31; // единицы SK9822 (1–31), 31 = максимум тока
 RTC_DATA_ATTR volatile int global_angle_offset = 90;
 
 uint8_t* frameBuffer = nullptr;
