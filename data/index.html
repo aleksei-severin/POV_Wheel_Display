@@ -631,7 +631,7 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
   <div class="card" id="uploadCard">
     <p class="card-title">Upload animation</p>
 
-    <div class="upload-zone" id="uploadZone" onclick="document.getElementById('fileInput').click()">
+    <div class="upload-zone" id="uploadZone" onclick="pickUploadFiles()">
       <input type="file" id="fileInput" accept="image/*,video/*" multiple style="display:none">
       <div class="drop-thumb"><canvas id="dropThumbCanvas" width="192" height="192"></canvas></div>
       <div class="upload-icon">&#8679;</div>
@@ -679,7 +679,7 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
         <div class="progress-fill" id="uploadProgressBar"></div>
       </div>
     </div>
-    <button class="btn-primary" onclick="processAndUpload()">&#9654; Convert &amp; Upload</button>
+    <button class="btn-primary" id="btnUpload" onclick="processAndUpload()">&#9654; Convert &amp; Upload</button>
 
     <div class="divider"></div>
 
@@ -1357,6 +1357,29 @@ const previewCanvas = document.getElementById('preview'); // 200×200 buffer
 const previewCtx = previewCanvas.getContext('2d', {willReadFrequently: true});
 
 // ===================== FILE INPUT =====================
+// Идёт ли прямо сейчас цикл конвертации/загрузки. Повторный запуск запрещён:
+// два параллельных POST /upload пишутся на устройстве в один открытый файл,
+// и вместо анимации получается мусор. Заодно блокирует смену выбранных файлов
+// посреди цикла — список файлов читается по ходу, а не только в начале.
+let _uploadBusy = false;
+
+function pickUploadFiles() {
+    if (_uploadBusy) return;
+    document.getElementById('fileInput').click();
+}
+
+// Блокировка/разблокировка органов управления загрузкой на время цикла
+function _setUploadBusy(busy) {
+    _uploadBusy = busy;
+    const btn  = document.getElementById('btnUpload');
+    const zone = document.getElementById('uploadZone');
+    btn.disabled = busy;
+    btn.style.opacity = busy ? '0.5' : '';
+    btn.style.cursor  = busy ? 'not-allowed' : '';
+    zone.style.opacity = busy ? '0.5' : '';
+    zone.style.cursor  = busy ? 'not-allowed' : '';
+}
+
 // Показывает круглую миниатюру в зоне дропа из File объекта
 function _showDropThumb(file) {
     const zone   = document.getElementById('uploadZone');
@@ -1398,6 +1421,7 @@ function _clearDropThumb() {
     zone.addEventListener('drop', e => {
         e.preventDefault();
         zone.style.borderColor = '';
+        if (_uploadBusy) return;   // не подменяем файлы посреди загрузки
         const files = Array.from(e.dataTransfer.files).filter(f =>
             f.type.startsWith('image/') || f.name.toLowerCase().endsWith('.gif') || isVideoFile(f));
         if (!files.length) return;
@@ -1565,7 +1589,9 @@ async function _convertFile(file, label) {
     }
 }
 
-// Загружает готовый буфер на устройство. Возвращает true при успехе.
+// Загружает готовый буфер на устройство. Возвращает HTTP-код ответа
+// (0 — соединение не состоялось); 200 = успех, 409 = устройство уже
+// принимает другой файл.
 async function _uploadBuffer(buf, fileName, label) {
     const progBar  = document.getElementById('uploadProgressBar');
     const progWrap = document.getElementById('uploadProgressWrap');
@@ -1585,21 +1611,35 @@ async function _uploadBuffer(buf, fileName, label) {
         });
         xhr.onload = () => {
             progWrap.style.display = 'none';
-            resolve(xhr.status === 200);
+            resolve(xhr.status);
         };
         xhr.onerror = () => {
             progWrap.style.display = 'none';
-            resolve(false);
+            resolve(0);
         };
         xhr.send(buf);
     });
 }
 
 async function processAndUpload() {
+    // Повторный клик по кнопке во время загрузки: игнорируем, а не запускаем
+    // второй цикл параллельно с первым.
+    if (_uploadBusy) return;
     const fileEl = document.getElementById('fileInput');
     const files  = Array.from(fileEl.files);
     if (!files.length) { setStatus('uploadStatus', 'Select a file first.', 'err'); return; }
 
+    _setUploadBusy(true);
+    try {
+        await _processAndUploadInner(fileEl, files);
+    } finally {
+        // Снимаем блокировку в любом случае — иначе одна исключительная
+        // ситуация навсегда оставила бы кнопку неактивной.
+        _setUploadBusy(false);
+    }
+}
+
+async function _processAndUploadInner(fileEl, files) {
     const total = files.length;
     let ok = 0, fail = 0;
 
@@ -1644,8 +1684,17 @@ async function processAndUpload() {
         for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
             const attemptLabel = attempt > 1 ? `${label} — attempt ${attempt}/${MAX_ATTEMPTS}` : label;
             setStatus('uploadStatus', `${attemptLabel} — uploading...`, '');
-            success = await _uploadBuffer(buf, fileName, attemptLabel);
+            const code = await _uploadBuffer(buf, fileName, attemptLabel);
+            success = (code === 200);
             if (success) break;
+            // 409 — устройство занято чужой загрузкой (другая вкладка, другой
+            // браузер). Повторять бессмысленно и вредно: попытка попадёт в
+            // середину чужой передачи. Отдаём решение пользователю.
+            if (code === 409) {
+                setStatus('uploadStatus',
+                    `${label} — device is busy with another upload. Try again later.`, 'err');
+                break;
+            }
             if (attempt < MAX_ATTEMPTS) {
                 setStatus('uploadStatus', `${attemptLabel} — failed, retrying in 2s...`, 'err');
                 await new Promise(r => setTimeout(r, 2000));

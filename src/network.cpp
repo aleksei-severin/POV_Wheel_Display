@@ -19,6 +19,15 @@ File uploadFile;
 // Взводится обработчиком тела /upload, читается обработчиком запроса: тело и
 // ответ — разные колбэки, а сказать браузеру о неудаче нужно именно в ответе.
 static bool uploadFailed = false;
+// Владелец текущей загрузки. uploadFile — один на всё устройство, поэтому две
+// параллельные загрузки (двойной клик по Convert&Upload) писали бы куски двух
+// разных тел в один файл: получается мусор, который не отличить от битой
+// картинки. Второй запрос не трогает состояние и получает 409.
+static AsyncWebServerRequest *uploadOwner = nullptr;
+static uint32_t uploadLastChunkMs = 0;
+// Если от владельца давно не было куска — считаем передачу мёртвой (клиент
+// исчез без TCP disconnect) и отдаём слот новому запросу.
+#define UPLOAD_OWNER_TIMEOUT_MS  5000
 
 String hostName;
 String currentDisplayFile = "";   // Имя файла, загруженного в frameBuffer
@@ -739,6 +748,13 @@ void setupNetwork() {
 
     server.on("/upload", HTTP_POST, [](AsyncWebServerRequest *request){
         last_web_activity_time = millis();
+        // Этот запрос не получал слот (шла чужая загрузка) — он ничего не писал,
+        // поэтому здесь только честный отказ, без чистки чужого файла.
+        if (request != uploadOwner) {
+            request->send(409, "text/plain", "Upload already in progress");
+            return;
+        }
+        uploadOwner = nullptr;
         // Если uploadFile всё ещё открыт — передача прервалась на полуслове.
         // Закрываем и удаляем незавершённый файл, чтобы не оставлять мусор 0 kB.
         if (uploadFile) {
@@ -763,6 +779,14 @@ void setupNetwork() {
         last_web_activity_time = millis();
         String filepath = "/" + (request->hasParam("name") ? request->getParam("name")->value() : "temp.bin");
         if (index == 0) {
+            // Слот занят живой загрузкой (куски идут прямо сейчас) — второй
+            // запрос отбрасываем целиком: ни файла, ни флагов он не трогает.
+            if (uploadFile && uploadOwner && uploadOwner != request &&
+                (millis() - uploadLastChunkMs) < UPLOAD_OWNER_TIMEOUT_MS) {
+                webLogf("[WARN] Parallel upload rejected: %s", filepath.c_str());
+                return;
+            }
+            uploadOwner  = request;
             uploadFailed = false;
             // Если предыдущая загрузка не завершилась корректно — убираем мусор
             if (uploadFile) {
@@ -779,7 +803,12 @@ void setupNetwork() {
             // Регистрируем обработчик разрыва соединения (обновление страницы,
             // потеря связи): закрываем и удаляем незавершённый файл немедленно.
             // onDisconnect — метод request, вызывается при TCP disconnect.
-            request->onDisconnect([](){
+            // Проверка владельца обязательна: колбэк срабатывает и при штатном
+            // закрытии соединения, уже после того как слот мог перейти к
+            // следующей загрузке — без неё он удалил бы чужой файл.
+            request->onDisconnect([request](){
+                if (uploadOwner != request) return;
+                uploadOwner = nullptr;
                 if (uploadFile) {
                     String badPath = uploadFile.path();
                     uploadFile.close();
@@ -788,6 +817,9 @@ void setupNetwork() {
                 }
             });
         }
+        // Кусок от запроса, которому слот не достался — молча выбрасываем.
+        if (request != uploadOwner) return;
+        uploadLastChunkMs = millis();
         // Записываем только если ещё не сорвались: после ошибки файла уже нет,
         // и продолжать сыпать в него куски незачем.
         if (uploadFile && !uploadFailed) {
