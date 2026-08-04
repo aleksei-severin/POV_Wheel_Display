@@ -794,17 +794,7 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
       </div>
     </div>
 
-    <!-- Radial Gain — компенсация падения яркости к периферии.
-         Диод на большом радиусе размазывает свет по большей длине дуги, поэтому
-         кажется тусклее. 0 % — выключено, 100 % — полная компенсация (яркость ∝ r). -->
-    <div class="slider-row">
-      <div class="slider-label">
-        <span>Radial Gain</span>
-        <span class="val"><span id="radVal">80%</span></span>
-      </div>
-      <input type="range" id="radSlide" min="0" max="100" value="80" step="5"
-             oninput="document.getElementById('radVal').textContent=this.value+'%'; syncSettings()">
-    </div>
+    <!-- Radial Gain зафиксирован в прошивке (RADIAL_GAIN_PCT = 80 %) -->
 
     <!-- Arm order — лучей всегда 6, настраивается только их порядок в цепочке -->
     <div class="slider-row">
@@ -818,23 +808,15 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
       </button>
     </div>
 
-    <!-- Spoke Offset -->
-    <div class="slider-row">
-      <div class="slider-label">
-        <span>Hub Offset</span>
-        <span class="val"><span id="spokeVal">0</span> mm</span>
-      </div>
-      <input type="range" id="spokeSlide" min="-50" max="50" value="0" step="1"
-             oninput="document.getElementById('spokeVal').textContent=this.value; syncSettings()">
-    </div>
+    <!-- Hub Offset убран: лучи расходятся строго из центра оси -->
 
     <!-- Angle -->
     <div class="slider-row">
       <div class="slider-label">
         <span>Angle Offset</span>
-        <span class="val"><span id="aVal">90</span>&deg;</span>
+        <span class="val"><span id="aVal">93</span>&deg;</span>
       </div>
-      <input type="range" id="aSlide" min="0" max="360" value="90"
+      <input type="range" id="aSlide" min="0" max="360" value="93"
              oninput="document.getElementById('aVal').textContent=this.value; syncSettings()">
     </div>
 
@@ -1970,13 +1952,11 @@ function syncSettings() {
         const co   = document.getElementById('coSlide').value;
         const circ = document.getElementById('wheelCirc').value || wheelCircMm;
         const ao    = _armReverse ? 1 : 0;
-        const spoke = document.getElementById('spokeSlide').value;
         const abl   = document.getElementById('ablSlide').value;
-        const rad   = document.getElementById('radSlide').value;
         const rg    = document.getElementById('rgSlide').value;
         const gg    = document.getElementById('ggSlide').value;
         const bg    = document.getElementById('bgSlide').value;
-        fetch(`/settings?bmin=${bmin}&bmax=${bmax}&a=${a}&g=${g}&s=${s}&co=${co}&circ=${circ}&ao=${ao}&spoke=${spoke}&abl=${abl}&rad=${rad}&rg=${rg}&gg=${gg}&bg=${bg}`);
+        fetch(`/settings?bmin=${bmin}&bmax=${bmax}&a=${a}&g=${g}&s=${s}&co=${co}&circ=${circ}&ao=${ao}&abl=${abl}&rg=${rg}&gg=${gg}&bg=${bg}`);
         _syncTimer = null;
     }, 50);
 }
@@ -2073,11 +2053,6 @@ function _applySettings(d) {
     if (d.lux !== undefined) {
         document.getElementById('luxVal').textContent = Math.round(d.lux);
     }
-    if (d.spoke !== undefined) {
-        const v = Math.max(-50, Math.min(50, d.spoke));
-        document.getElementById('spokeSlide').value = v;
-        document.getElementById('spokeVal').textContent = v;
-    }
     if (d.abl !== undefined) {
         const v = Math.round(d.abl);
         document.getElementById('ablSlide').value = v;
@@ -2085,11 +2060,6 @@ function _applySettings(d) {
     }
     if (d.abl_rms !== undefined) {
         _updateAblRms(d.abl_rms);
-    }
-    if (d.rad !== undefined) {
-        const v = Math.round(d.rad);
-        document.getElementById('radSlide').value = v;
-        document.getElementById('radVal').textContent = v + '%';
     }
     if (d.rg !== undefined) {
         const v = Math.round(d.rg);

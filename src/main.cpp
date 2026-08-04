@@ -21,7 +21,7 @@ volatile uint8_t global_brightness = 8; // единицы SK9822 (0–31)
 
 RTC_DATA_ATTR uint8_t min_brightness = 1;  // единицы SK9822 (1–31)
 RTC_DATA_ATTR uint8_t max_brightness = 31; // единицы SK9822 (1–31), 31 = максимум тока
-RTC_DATA_ATTR volatile int global_angle_offset = 90;
+RTC_DATA_ATTR volatile int global_angle_offset = 93;
 
 uint8_t* frameBuffer = nullptr;
 
@@ -140,9 +140,7 @@ RTC_DATA_ATTR volatile float global_r_gain        = 100.0f; // 0..100 %, 100 = �
 RTC_DATA_ATTR volatile float global_g_gain        = 80.0f;
 RTC_DATA_ATTR volatile float global_b_gain        = 100.0f;
 RTC_DATA_ATTR volatile uint16_t wheel_circumference = 2355;
-RTC_DATA_ATTR volatile int16_t  global_spoke_offset = 0;   // мм, 0 = лучи из центра
 RTC_DATA_ATTR volatile bool     global_arm_reverse  = false; // порядок лучей в цепочке
-RTC_DATA_ATTR volatile float    global_radial_gain  = 80.0f; // радиальная компенсация яркости, 0–100 %
 RTC_DATA_ATTR volatile float    global_abl_limit    = 40.0f; // ABL: 0–100 %, 100 = без ограничения
 volatile float                  global_abl_rms      = 0.0f;  // RMS загрузка тока 0.0–1.0
 volatile float                  global_render_span    = 0.0f; // угол между обновлениями ленты, °
@@ -384,27 +382,6 @@ static float   lut_last_contrast = -999.0f;
 static float   lut_last_sat      = -1.0f;
 static int16_t lut_sat_fxp       = 256;
 
-// Угловые поправки (в градусах) для каждого из 44 LED на стороне луча.
-// Пересчитываются при изменении global_spoke_offset — не внутри горячего цикла.
-// Дробные: угол теперь считается в float, округлять до целого градуса незачем.
-static float   spoke_corr[LEDS_PER_SIDE] = {};
-static bool    spoke_active              = false;
-static int16_t spoke_last                = -999;
-
-static void updateSpokeCorrIfNeeded() {
-    int16_t off = global_spoke_offset;
-    if (off == spoke_last) return;
-    spoke_last   = off;
-    spoke_active = (off != 0);
-    const float step = (LED_R_OUTER_MM - LED_R_INNER_MM) / (float)(LEDS_PER_SIDE - 1);
-    for (int i = 0; i < LEDS_PER_SIDE; i++) {
-        float r_mm = LED_R_INNER_MM + i * step;
-        spoke_corr[i] = spoke_active
-            ? atan2f((float)off, r_mm) * (360.0f / (2.0f * 3.14159265f))
-            : 0.0f;
-    }
-}
-
 // Поканальные коэффициенты для каждого из 44 диодов, 8.8 fixed point (256 = ×1.0).
 // Свёрнуты два независимых множителя, оба применяются после насыщенности:
 //
@@ -414,28 +391,27 @@ static void updateSpokeCorrIfNeeded() {
 //  • Радиальная компенсация. За оборот диод на радиусе r засвечивает кольцо
 //    площадью 2πr·Δr, поэтому при постоянном потоке яркость падает как 1/r:
 //    край в 49/273 = 0.18 раза тусклее ступицы. Поднять край нельзя — он и так
-//    на максимуме, поэтому гасим центр: gain = (r/R_outer)^k. Потерянный общий
-//    ток возвращает ABL — лимит разрешает поднять bri_level.
+//    на максимуме, поэтому гасим центр: gain = (r/R_outer)^k, где k фиксировано
+//    RADIAL_GAIN_PCT. Потерянный общий ток возвращает ABL — лимит разрешает
+//    поднять bri_level.
 //
 // Свёртка бесплатна: в горячем цикле как было одно умножение на канал, так и
 // осталось, просто коэффициент берётся из своей таблицы.
 static uint16_t gain_r[LEDS_PER_SIDE];
 static uint16_t gain_g[LEDS_PER_SIDE];
 static uint16_t gain_b[LEDS_PER_SIDE];
-static float    gain_last_rad = -1.0f;
 static float    gain_last_r   = -1.0f;
 static float    gain_last_g   = -1.0f;
 static float    gain_last_b   = -1.0f;
 
 static void updateGainTablesIfNeeded() {
-    if (global_radial_gain == gain_last_rad && global_r_gain == gain_last_r &&
-        global_g_gain      == gain_last_g   && global_b_gain == gain_last_b) return;
-    gain_last_rad = global_radial_gain;
+    if (global_r_gain == gain_last_r &&
+        global_g_gain == gain_last_g && global_b_gain == gain_last_b) return;
     gain_last_r   = global_r_gain;
     gain_last_g   = global_g_gain;
     gain_last_b   = global_b_gain;
 
-    float k  = global_radial_gain * 0.01f;   // 0 = компенсация выключена, 1 = полная
+    const float k = RADIAL_GAIN_PCT * 0.01f;  // фиксировано: 0 = выкл, 1 = полная
     float cr = global_r_gain * 0.01f;
     float cg = global_g_gain * 0.01f;
     float cb = global_b_gain * 0.01f;
@@ -621,33 +597,19 @@ static void fillSectorIntoBuffer(uint8_t* buf, uint8_t buf_idx, float sector0, f
         uint8_t* dst_f = led_ptr + (ray * LEDS_PER_ARM) * 4;                      // LED 0–43
         uint8_t* dst_b = led_ptr + (ray * LEDS_PER_ARM + LEDS_PER_ARM - 1) * 4;   // LED 87–44
 
-        const uint16_t* rows[ANG_TAPS_MAX];
-        int             wts[ANG_TAPS_MAX];
-
-        if (!spoke_active) {
-            // Смещения спицы нет — набор секторов и весов общий для всех 44 диодов,
-            // так что разбор угла выносим из цикла по диодам.
-            const uint16_t* rows_b[ANG_TAPS_MAX];
-            int             wts_b[ANG_TAPS_MAX];
-            int nf = boxWeights(bf, span, frame, rows,   wts);
-            int nb = boxWeights(bb, span, frame, rows_b, wts_b);
-            for (int i = 0; i < LEDS_PER_SIDE; i++) {
-                int kr = gain_r[i], kg = gain_g[i], kb = gain_b[i];
-                pixel_sum += samplePix(rows,   wts,   nf, i, sat, kr, kg, kb, dst_f + i * 4);
-                pixel_sum += samplePix(rows_b, wts_b, nb, i, sat, kr, kg, kb, dst_b - i * 4);
-            }
-        } else {
-            // Луч смещён от оси: у каждого диода свой угол (spoke_corr до ±46°).
-            for (int i = 0; i < LEDS_PER_SIDE; i++) {
-                int kr = gain_r[i], kg = gain_g[i], kb = gain_b[i];
-                int n;
-
-                n = boxWeights(bf + spoke_corr[i], span, frame, rows, wts);  // лицевая: прибавляется
-                pixel_sum += samplePix(rows, wts, n, i, sat, kr, kg, kb, dst_f + i * 4);
-
-                n = boxWeights(bb - spoke_corr[i], span, frame, rows, wts);  // обратная: вычитается
-                pixel_sum += samplePix(rows, wts, n, i, sat, kr, kg, kb, dst_b - i * 4);
-            }
+        // Лучи расходятся строго из центра, поэтому все 44 диода стороны лежат на
+        // одном радиусе — набор секторов и весов у них общий, и разбор угла
+        // выносится из цикла по диодам.
+        const uint16_t* rows_f[ANG_TAPS_MAX];
+        int             wts_f[ANG_TAPS_MAX];
+        const uint16_t* rows_b[ANG_TAPS_MAX];
+        int             wts_b[ANG_TAPS_MAX];
+        int nf = boxWeights(bf, span, frame, rows_f, wts_f);
+        int nb = boxWeights(bb, span, frame, rows_b, wts_b);
+        for (int i = 0; i < LEDS_PER_SIDE; i++) {
+            int kr = gain_r[i], kg = gain_g[i], kb = gain_b[i];
+            pixel_sum += samplePix(rows_f, wts_f, nf, i, sat, kr, kg, kb, dst_f + i * 4);
+            pixel_sum += samplePix(rows_b, wts_b, nb, i, sat, kr, kg, kb, dst_b - i * 4);
         }
     }
 
@@ -917,10 +879,9 @@ void renderingTask(void* pvParameters) {
             webLog("[PWR] Rendering started");
         }
 
-        // LUT, поправки спицы и радиальную компенсацию обновляем один раз
-        // за проход — powf/atan2f не место в горячем цикле.
+        // LUT и таблицы усиления обновляем один раз за проход — powf не место
+        // в горячем цикле.
         updateLUTIfNeeded();
-        updateSpokeCorrIfNeeded();
         updateGainTablesIfNeeded();
 
         float last_psi  = 0.0f;   // угол ротора на момент последнего обновления ленты
@@ -1439,7 +1400,6 @@ void setup() {
     // Таблицы рендера — до первого кадра: пока они не построены,
     // радиальные коэффициенты нулевые и картинка была бы чёрной.
     rebuildGammaLUT();
-    updateSpokeCorrIfNeeded();
     updateGainTablesIfNeeded();
     last_web_activity_time = millis();  // Считаем загрузку страницы активностью
 

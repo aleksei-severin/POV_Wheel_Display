@@ -498,18 +498,9 @@ void setupNetwork() {
         if (request->hasParam("ao")) {
             global_arm_reverse = request->getParam("ao")->value().toInt() != 0;
         }
-        if (request->hasParam("spoke")) {
-            int sv = request->getParam("spoke")->value().toInt();
-            if (sv >= -50 && sv <= 50) global_spoke_offset = (int16_t)sv;
-        }
         if (request->hasParam("abl")) {
             float v = request->getParam("abl")->value().toFloat();
             if (v >= 0.0f && v <= 100.0f) global_abl_limit = v;
-        }
-        // Радиальная компенсация яркости: 0 = выключена, 100 = полная (∝ r)
-        if (request->hasParam("rad")) {
-            float v = request->getParam("rad")->value().toFloat();
-            if (v >= 0.0f && v <= 100.0f) global_radial_gain = v;
         }
         if (request->hasParam("rg")) {
             float v = request->getParam("rg")->value().toFloat();
@@ -543,8 +534,8 @@ void setupNetwork() {
         snprintf(buf, sizeof(buf),
             "{\"bmin\":%u,\"bmax\":%u,\"angle\":%d,\"brightness\":%u,\"eff_bri\":%u"
             ",\"gamma\":%.1f,\"saturation\":%.1f,\"contrast\":%.1f"
-            ",\"circ\":%u,\"ao\":%u,\"spoke\":%d,\"lux\":%.0f"
-            ",\"abl\":%.1f,\"abl_rms\":%.1f,\"rad\":%.0f"
+            ",\"circ\":%u,\"ao\":%u,\"lux\":%.0f"
+            ",\"abl\":%.1f,\"abl_rms\":%.1f"
             ",\"rg\":%.1f,\"gg\":%.1f,\"bg\":%.1f"
             ",\"slideshow\":%s"
             ",\"ver\":%lu,\"fver\":%lu}",
@@ -553,9 +544,8 @@ void setupNetwork() {
             (unsigned)global_effective_brightness,
             (float)global_gamma, (float)global_saturation, (float)global_contrast,
             (unsigned)wheel_circumference, (unsigned)(global_arm_reverse ? 1 : 0),
-            (int)global_spoke_offset, (float)last_lux_value,
+            (float)last_lux_value,
             (float)global_abl_limit, (float)(global_abl_rms * 100.0f),
-            (float)global_radial_gain,
             (float)global_r_gain, (float)global_g_gain, (float)global_b_gain,
             slideshowActive ? "true" : "false",
             (unsigned long)state_version, (unsigned long)file_version

@@ -9,7 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 POV (Persistence of Vision) Wheel Display — an ESP32-S3 embedded system that drives 528 SK9822-A addressable LEDs across a 6-arm spinning rotor. Six Hall effect sensors (one per arm) synchronize LED rendering to rotation and detect rotation direction. Features a web UI and OTA updates.
 
-**Hardware revision: V5.** Earlier revisions used a BQ25792 charger, BH1750 lux sensor, ICM45605 IMU, an I2C bus, a TXU0104 level shifter, a DRV5032 wake sensor, a single Hall sensor, and a configurable 1–8 arm count. All of that is gone — do not reintroduce it.
+**Hardware revision: V5.** Earlier revisions used a BQ25792 charger, BH1750 lux sensor, ICM45605 IMU, an I2C bus, a TXU0104 level shifter, a DRV5032 wake sensor, a single Hall sensor, and a configurable 1–8 arm count. All of that is gone — do not reintroduce it. The arms now radiate exactly from the axis centre, so the per-LED angular correction for an off-axis spoke (the old **Hub Offset** setting, `global_spoke_offset`) is gone too: every LED on a face shares one angle, and `fillSectorIntoBuffer()` resolves the box weights once per face instead of once per LED.
 
 ## Build & Upload Commands
 
@@ -75,7 +75,7 @@ The tone curve is **one** curve for all three channels — two tables only becau
 
 ### Radial Brightness
 
-An LED at radius `r` spreads a constant flux over a ring of area `2πr·Δr`, so perceived brightness falls as `1/r` — the rim looks 49/273 = 0.18× as bright as the hub. The rim is already at full output, so the only fix is dimming the centre: `gain = (r / LED_R_OUTER_MM) ^ (global_radial_gain/100)`, so the outermost LED is always ×1.000 and **the rim never gets dimmer** — only the hub does. Little total brightness is lost either: the lower current sum lets ABL raise `bri_level` back up. Exposed as **Radial Gain** in the web UI (0 = off, 100 = full physical compensation).
+An LED at radius `r` spreads a constant flux over a ring of area `2πr·Δr`, so perceived brightness falls as `1/r` — the rim looks 49/273 = 0.18× as bright as the hub. The rim is already at full output, so the only fix is dimming the centre: `gain = (r / LED_R_OUTER_MM) ^ (RADIAL_GAIN_PCT/100)`, so the outermost LED is always ×1.000 and **the rim never gets dimmer** — only the hub does. Little total brightness is lost either: the lower current sum lets ABL raise `bri_level` back up. `RADIAL_GAIN_PCT` is fixed at 80 in [include/config.h](include/config.h) and is no longer adjustable from the web UI.
 
 This is why a white frame reports ~51 % RMS with stock settings: white balance ×0.81, radial mean ×0.65. RMS is normalised *current*, not brightness — 100 % would be all 528 LEDs at full white and current 31.
 
@@ -149,7 +149,7 @@ GET  /list              # JSON list of .bin files on LittleFS
 GET  /play?file=X       # Load and start playing file X
 GET  /stop              # Stop rendering
 GET  /delete?file=X     # Delete file from LittleFS
-GET  /settings          # bmin,bmax,a,g,s,co,circ,ao,spoke,abl,rad,rg,gg,bg
+GET  /settings          # bmin,bmax,a,g,s,co,circ,ao,abl,rg,gg,bg
 GET  /get_settings      # JSON of all settings + lux + state/file version counters
 GET  /battery           # JSON: {vbat,vusb,chg,usb,soc,ocv,sag}  (chg: 0=discharging 1=charging 2=done)
 GET  /info              # JSON: {rpm,dir,pwr,step,fill}  (step: °/LED update, fill: µs)
