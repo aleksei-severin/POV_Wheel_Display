@@ -7,6 +7,7 @@
 #include <LittleFS.h>
 #include <Preferences.h>
 #include <HTTPClient.h>
+#include <esp_heap_caps.h>
 #include <stdarg.h>
 #include <vector>
 #include <memory>
@@ -611,9 +612,16 @@ void setupNetwork() {
     server.on("/fs_info", HTTP_GET, [](AsyncWebServerRequest *request){
         size_t total = LittleFS.totalBytes();
         size_t used  = LittleFS.usedBytes();
-        char buf[64];
-        snprintf(buf, sizeof(buf), "{\"total\":%u,\"used\":%u,\"free\":%u}",
-                 (unsigned)total, (unsigned)used, (unsigned)(total - used));
+        // Анимация целиком живёт в PSRAM, поэтому места на флеше мало —
+        // браузер должен уметь предупредить о слишком длинном ролике ДО заливки,
+        // а не ловить "PSRAM alloc failed" при воспроизведении. Отдаём самый
+        // большой непрерывный блок: ps_malloc просит именно непрерывный.
+        size_t ps_free = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+                 "{\"total\":%u,\"used\":%u,\"free\":%u,\"psram_free\":%u,\"frame_size\":%u}",
+                 (unsigned)total, (unsigned)used, (unsigned)(total - used),
+                 (unsigned)ps_free, (unsigned)FRAME_SIZE);
         request->send(200, "application/json", buf);
     });
 

@@ -570,13 +570,31 @@ static void fillSectorIntoBuffer(uint8_t* buf, uint8_t buf_idx, float sector0, f
 
     const int sat = lut_sat_fxp;
 
-    // Кадр анимации вычисляется по абсолютному времени — не раз в оборот, а при каждом секторе.
-    // lastFrameSwitchTime сбрасывается при загрузке файла; elapsed растёт непрерывно,
-    // поэтому кадр может смениться прямо посередине оборота при высоком fps.
+    // Номер кадра считается по абсолютному времени, но ЗАЩЁЛКИВАЕТСЯ на границе
+    // 60°. Шесть лучей рисуют по своему сектору одновременно, поэтому полная
+    // картинка успевает лечь за 1/6 оборота — это и есть период обновления
+    // изображения (RPM/10 кадров в секунду, 20 Гц на 200 об/мин). Смена кадра
+    // посреди такой развёртки оставляла часть круга от кадра N, а часть от N+1:
+    // на видео 10 fps это заметный шов. Защёлка привязывает смену к границе
+    // развёртки, где шов есть и так.
+    static uint32_t latched_frame_idx = 0;
+    static int      latched_sector60  = -1;
     uint32_t frame_idx;
     if (totalFrames > 1 && frameDelay > 0) {
-        uint32_t elapsed_ms = millis() - lastFrameSwitchTime;
-        frame_idx = (elapsed_ms / frameDelay) % totalFrames;
+        // base приходит ненормированным (anchor + ω·Δt может уйти в минус или
+        // за 360°), а нам нужен именно номер сектора 0..5.
+        float sn = fmodf(sector0, 360.0f);
+        if (sn < 0.0f) sn += 360.0f;
+        int s60 = (int)(sn * (1.0f / 60.0f));
+        if (s60 != latched_sector60) {
+            latched_sector60 = s60;
+            uint32_t elapsed_ms = millis() - lastFrameSwitchTime;
+            latched_frame_idx = (elapsed_ms / frameDelay) % totalFrames;
+        }
+        // Новый файл может оказаться короче предыдущего, а защёлка пережила бы
+        // загрузку со старым значением — и адресация ушла бы за конец буфера.
+        if (latched_frame_idx >= totalFrames) latched_frame_idx = 0;
+        frame_idx = latched_frame_idx;
     } else {
         frame_idx = 0;
     }

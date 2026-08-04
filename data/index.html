@@ -632,11 +632,46 @@ input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); 
     <p class="card-title">Upload animation</p>
 
     <div class="upload-zone" id="uploadZone" onclick="document.getElementById('fileInput').click()">
-      <input type="file" id="fileInput" accept="image/*" multiple style="display:none">
+      <input type="file" id="fileInput" accept="image/*,video/*" multiple style="display:none">
       <div class="drop-thumb"><canvas id="dropThumbCanvas" width="192" height="192"></canvas></div>
       <div class="upload-icon">&#8679;</div>
-      <div class="upload-text">Drop <span>.gif</span> or image here<br>or click to browse</div>
+      <div class="upload-text">Drop <span>video</span>, <span>.gif</span> or image here<br>or click to browse</div>
     </div>
+
+    <!-- Параметры извлечения кадров из видео. Показывается только когда выбрано видео. -->
+    <div id="videoOpts" style="display:none;margin-top:8px;gap:8px;align-items:center;flex-wrap:wrap;">
+      <div style="display:flex;align-items:center;gap:4px;">
+        <span style="font-size:11px;color:var(--text-hint);">FPS</span>
+        <select id="vidFps" onchange="onVideoOptsChange()"
+          style="background:var(--bg-deep);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--font-mono);font-size:13px;padding:5px 4px;">
+          <option value="5">5</option>
+          <option value="10" selected>10</option>
+          <option value="15">15</option>
+        </select>
+      </div>
+      <div style="display:flex;align-items:center;gap:4px;">
+        <span style="font-size:11px;color:var(--text-hint);">Frame</span>
+        <select id="vidFit" onchange="onVideoOptsChange()"
+          style="background:var(--bg-deep);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--font-mono);font-size:13px;padding:5px 4px;">
+          <option value="crop" selected>Crop</option>
+          <option value="fit">Fit</option>
+        </select>
+      </div>
+      <div style="display:flex;align-items:center;gap:4px;">
+        <span style="font-size:11px;color:var(--text-hint);">Start</span>
+        <input type="number" id="vidStart" min="0" step="0.5" value="0" onchange="onVideoOptsChange()"
+          style="width:48px;background:var(--bg-deep);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--font-mono);font-size:13px;padding:5px 4px;text-align:center;">
+        <span style="font-size:11px;color:var(--text-hint);">s</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:4px;">
+        <span style="font-size:11px;color:var(--text-hint);">Len</span>
+        <input type="number" id="vidLen" min="0.5" step="0.5" value="10" onchange="onVideoOptsChange()"
+          style="width:48px;background:var(--bg-deep);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--font-mono);font-size:13px;padding:5px 4px;text-align:center;">
+        <span style="font-size:11px;color:var(--text-hint);">s</span>
+      </div>
+      <div id="vidBudget" style="font-size:11px;color:var(--text-hint);font-family:var(--font-mono);width:100%;"></div>
+    </div>
+
     <div class="upload-queue-label" id="uploadQueue"></div>
     <div class="status-bar" id="uploadStatus">Waiting for file...</div>
     <div class="progress-wrap" id="uploadProgressWrap">
@@ -945,6 +980,7 @@ const R_INNER_FRAC  = 0.495 * 49 / 273;   // inner LED (49 mm)  -> 0.0889
 const FRAME_BYTES   = 360 * LEDS_PER_SIDE * 2;
 const SRC_SIZE_IMG  = 600;                // рабочий холст для статичной картинки
 const SRC_SIZE_GIF  = 400;                // для кадров GIF — их много, экономим время
+const SRC_SIZE_VID  = 400;                // видео: та же цена за кадр, что и GIF
 
 // Пороги упорядоченного дизеринга 4×4, в долях уровня: (m + 0.5)/16 ∈ (0,1).
 // 5 бит на R/B — это 32 уровня, и на плавном градиенте они видны полосами.
@@ -1083,6 +1119,228 @@ function renderGIFFrames(gif) {
     return frames;
 }
 
+// ===================== VIDEO =====================
+// Декодированием занимается сам браузер: <video> + drawImage. Своего демуксера
+// здесь нет и не нужно — страница отдаётся с LittleFS и обязана работать без
+// интернета, а WebCodecs+mp4box потянули бы за собой CDN. Что браузер умеет
+// проигрывать, то и конвертируется (H.264/VP9/AV1 — везде, HEVC — не везде).
+
+function isVideoFile(f) {
+    return (f.type && f.type.startsWith('video/')) ||
+           /\.(mp4|m4v|mov|webm|mkv|ogv|avi)$/i.test(f.name);
+}
+
+// Открывает File как <video>. Ждём именно loadeddata, а не loadedmetadata:
+// к этому моменту первый кадр уже декодирован и его можно рисовать, а
+// currentTime честно равен 0 — иначе первая же перемотка на 0 не сдвинула бы
+// позицию, событие seeked не пришло бы, и кадр ушёл бы в таймаут.
+function openVideo(file) {
+    return new Promise((res, rej) => {
+        const v = document.createElement('video');
+        v.preload = 'auto';
+        v.muted = true;          // без mute часть браузеров не отдаёт кадры без жеста
+        v.playsInline = true;
+        v.src = URL.createObjectURL(file);
+        v.onloadeddata = () => res(v);
+        v.onerror = () => {
+            URL.revokeObjectURL(v.src);
+            rej(new Error('browser cannot decode this video'));
+        };
+    });
+}
+
+function closeVideo(v) {
+    try { URL.revokeObjectURL(v.src); } catch (e) {}
+    v.removeAttribute('src');
+    try { v.load(); } catch (e) {}
+}
+
+// Перемотка на заданную секунду. Таймаут РАЗРЕШАЕТ промис, а не отклоняет:
+// если декодер завис на одном кадре, честнее продублировать кадр, чем уронить
+// конвертацию всего ролика на 90-м кадре из 100.
+function seekVideo(v, t) {
+    return new Promise(res => {
+        // Позиция уже нужная — нужный кадр на экране, seeked не придёт.
+        if (Math.abs(v.currentTime - t) < 1e-3) { res(); return; }
+        let done = false;
+        let tm = 0;
+        const finish = () => {
+            if (done) return;
+            done = true;
+            v.removeEventListener('seeked', finish);
+            clearTimeout(tm);
+            res();
+        };
+        tm = setTimeout(finish, 3000);
+        v.addEventListener('seeked', finish);
+        v.currentTime = t;
+    });
+}
+
+// Кадр видео в квадратный рабочий холст. crop — обрезка по центру (как у
+// картинок), fit — вписать целиком с чёрными полями: у 16:9 обрезка съедает
+// половину ширины, и для роликов это чаще не то, что нужно.
+function drawVideoFrame(v, wCtx, S, fit) {
+    wCtx.clearRect(0, 0, S, S);
+    const vw = v.videoWidth, vh = v.videoHeight;
+    if (!vw || !vh) return;
+    if (fit === 'fit') {
+        const k = Math.min(S / vw, S / vh);
+        const dw = vw * k, dh = vh * k;
+        wCtx.drawImage(v, 0, 0, vw, vh, (S - dw) / 2, (S - dh) / 2, dw, dh);
+    } else {
+        const sq = Math.min(vw, vh);
+        wCtx.drawImage(v, (vw - sq) / 2, (vh - sq) / 2, sq, sq, 0, 0, S, S);
+    }
+}
+
+// Извлекает кадры покадровой перемоткой. Медленно (seek — десятки мс на кадр),
+// зато детерминированно и без зависимости от скорости воспроизведения.
+async function extractVideoFrames(file, opts, onProgress) {
+    const v = await openVideo(file);
+    try {
+        const S = SRC_SIZE_VID;
+        const work = document.createElement('canvas');
+        work.width = S; work.height = S;
+        const wCtx = work.getContext('2d', {willReadFrequently: true});
+        wCtx.imageSmoothingEnabled = true;
+        wCtx.imageSmoothingQuality = 'high';
+
+        const dur   = isFinite(v.duration) ? v.duration : (opts.start + opts.len);
+        const start = Math.max(0, Math.min(opts.start, Math.max(0, dur - 0.05)));
+        const len   = Math.max(0.1, Math.min(opts.len, dur - start));
+        const n     = Math.max(1, Math.min(Math.round(len * opts.fps), opts.maxFrames));
+
+        const frames = [];
+        for (let i = 0; i < n; i++) {
+            await seekVideo(v, start + i / opts.fps);
+            drawVideoFrame(v, wCtx, S, opts.fit);
+            // ss=2, как у GIF: кадров много, 3×3 растянуло бы конвертацию втрое.
+            frames.push(toPolarBuffer(work, 2));
+            if (onProgress) onProgress(i + 1, n);
+        }
+        return frames;
+    } finally {
+        closeVideo(v);
+    }
+}
+
+// Постер: один кадр с момента t, сразу во все холсты (миниатюра дропзоны и
+// превью). Один openVideo на оба — декодер поднимается недёшево.
+async function drawVideoPoster(file, targets, fit, t) {
+    const v = await openVideo(file);
+    try {
+        const dur = isFinite(v.duration) ? Math.max(0, v.duration - 0.05) : 0;
+        await seekVideo(v, Math.min(t || 0, dur));
+        for (const tg of targets) drawVideoFrame(v, tg.ctx, tg.size, fit);
+    } finally {
+        closeVideo(v);
+    }
+}
+
+// Длительность ролика; кешируется — используется на каждое изменение опций.
+let _vidDurCache = null;
+async function videoDuration(file) {
+    const key = file.name + '|' + file.size;
+    if (_vidDurCache && _vidDurCache.key === key) return _vidDurCache.dur;
+    const v = await openVideo(file);
+    const dur = isFinite(v.duration) ? v.duration : 0;
+    closeVideo(v);
+    _vidDurCache = { key, dur };
+    return dur;
+}
+
+// ---- Лимиты устройства ----
+// Анимация грузится в PSRAM ЦЕЛИКОМ (стримить с флеша нельзя: любое обращение
+// к флешу гасит кеш инструкций и морозит renderingTask), поэтому потолок задаёт
+// не место на файловой системе, а самый большой свободный кусок PSRAM.
+let _devLimits = null;
+
+async function loadDevLimits(force) {
+    if (_devLimits && !force) return _devLimits;
+    try {
+        const d = await fetch('/fs_info').then(r => r.json());
+        _devLimits = {
+            psFree: (typeof d.psram_free === 'number' && d.psram_free > 0) ? d.psram_free : null,
+            fsFree: (typeof d.free === 'number') ? d.free : null
+        };
+    } catch (e) {
+        _devLimits = { psFree: null, fsFree: null };
+    }
+    return _devLimits;
+}
+
+function maxFramesForDevice() {
+    const HDR = 8;
+    const MARGIN = 256 * 1024;      // запас на служебные аллокации во время загрузки
+    let byPsram = 240;              // прошивка без psram_free: считаем по 8 МБ PSRAM
+    if (_devLimits && _devLimits.psFree) {
+        byPsram = Math.floor((_devLimits.psFree - MARGIN) / FRAME_BYTES);
+    }
+    let byFs = Infinity;
+    if (_devLimits && _devLimits.fsFree) {
+        byFs = Math.floor((_devLimits.fsFree - HDR) / FRAME_BYTES);
+    }
+    // Счётчик кадров в заголовке ANI5 — uint16.
+    return Math.max(1, Math.min(byPsram, byFs, 65535));
+}
+
+// ---- UI параметров видео ----
+let _selectedIsVideo = false;
+
+function _vidOpts() {
+    const el = id => document.getElementById(id);
+    return {
+        fps:   parseInt(el('vidFps').value, 10) || 10,
+        fit:   el('vidFit').value,
+        start: Math.max(0,   parseFloat(el('vidStart').value) || 0),
+        len:   Math.max(0.5, parseFloat(el('vidLen').value)   || 10)
+    };
+}
+
+// Считает, сколько кадров получится и влезет ли это в устройство.
+async function _updateVideoBudget(file) {
+    const el = document.getElementById('vidBudget');
+    if (!file) return;
+    const o = _vidOpts();
+    await loadDevLimits(true);
+    const maxF = maxFramesForDevice();
+
+    let dur = 0;
+    try {
+        dur = await videoDuration(file);
+    } catch (e) {
+        // Кодек не поддержан браузером — сказать об этом лучше сейчас, чем
+        // после того, как пользователь нажмёт Upload.
+        el.textContent = '';
+        setStatus('uploadStatus', `${file.name} — ${e.message}`, 'err');
+        return;
+    }
+    const avail = dur > 0 ? Math.max(0.1, dur - o.start) : o.len;
+    const want  = Math.max(1, Math.round(Math.min(o.len, avail) * o.fps));
+    const n     = Math.min(want, maxF);
+    const kb    = ((8 + n * FRAME_BYTES) / 1024).toFixed(0);
+
+    let txt = (dur > 0 ? `source ${dur.toFixed(1)} s · ` : '') +
+              `${(n / o.fps).toFixed(1)} s @ ${o.fps} fps = ${n} frames · ${kb} kB`;
+    if (n < want) txt += `  — capped, device fits ${maxF} frames (${(maxF / o.fps).toFixed(1)} s)`;
+    el.textContent  = txt;
+    el.style.color  = (n < want) ? '#ff6600' : 'var(--text-hint)';
+
+    setStatus('uploadStatus', `${file.name} — ${n} frames ready. Press Upload.`, 'ok');
+}
+
+function onVideoOptsChange() {
+    const files = Array.from(document.getElementById('fileInput').files || []);
+    if (!files.length || !isVideoFile(files[0])) return;
+    const o = _vidOpts();
+    drawVideoPoster(files[0], [
+        { ctx: document.getElementById('dropThumbCanvas').getContext('2d'), size: 192 },
+        { ctx: previewCtx, size: 200 }
+    ], o.fit, o.start).catch(() => {});
+    _updateVideoBudget(files[0]);
+}
+
 // ===================== STATE =====================
 // Версия состояния устройства: синхронизирует несколько браузерных вкладок.
 // Обновляется сервером при изменении настроек, файлов или воспроизведения.
@@ -1098,6 +1356,15 @@ function _showDropThumb(file) {
     const zone   = document.getElementById('uploadZone');
     const canvas = document.getElementById('dropThumbCanvas');
     const ctx    = canvas.getContext('2d', {willReadFrequently: true});
+    if (isVideoFile(file)) {
+        // Видео через FileReader→Image не открыть — берём кадр из <video>.
+        // Заодно заполняем и превью: одно открытие декодера на оба холста.
+        const o = _vidOpts();
+        drawVideoPoster(file, [{ ctx, size: 192 }, { ctx: previewCtx, size: 200 }], o.fit, o.start)
+            .then(() => zone.classList.add('has-preview'))
+            .catch(() => {});
+        return;
+    }
     const r = new FileReader();
     r.onload = ev => {
         const img = new Image();
@@ -1126,7 +1393,7 @@ function _clearDropThumb() {
         e.preventDefault();
         zone.style.borderColor = '';
         const files = Array.from(e.dataTransfer.files).filter(f =>
-            f.type.startsWith('image/') || f.name.toLowerCase().endsWith('.gif'));
+            f.type.startsWith('image/') || f.name.toLowerCase().endsWith('.gif') || isVideoFile(f));
         if (!files.length) return;
         // Подставляем файлы в input через DataTransfer
         const dt = new DataTransfer();
@@ -1149,17 +1416,26 @@ document.getElementById('fileInput').addEventListener('change', function(e) {
     }
 
     const first = files[0];
+    _selectedIsVideo = isVideoFile(first);
+    document.getElementById('videoOpts').style.display = _selectedIsVideo ? 'flex' : 'none';
+
     _showDropThumb(first);
 
-    const r2 = new FileReader();
-    r2.onload = ev => {
-        const img = new Image();
-        img.onload = () => drawCenteredSquare(img, previewCtx, 200);
-        img.src = ev.target.result;
-    };
-    r2.readAsDataURL(first);
+    if (!_selectedIsVideo) {
+        const r2 = new FileReader();
+        r2.onload = ev => {
+            const img = new Image();
+            img.onload = () => drawCenteredSquare(img, previewCtx, 200);
+            img.src = ev.target.result;
+        };
+        r2.readAsDataURL(first);
+    }
 
-    if (files.length === 1) {
+    if (_selectedIsVideo) {
+        // Видео НЕ конвертируем при выборе: это десятки секунд работы, и опции
+        // (fps, длина, кадрирование) ещё могут поменяться. Считаем только бюджет.
+        _updateVideoBudget(first);
+    } else if (files.length === 1) {
         setStatus('uploadStatus', `${first.name} — converting...`, '');
         _convertFile(first).then(({ buf, frameCount }) => {
             const sizeKb = (buf.length / 1024).toFixed(1);
@@ -1209,13 +1485,41 @@ function buildFileName(prefix, rawBase) {
     return { name: safe, warning: `"${rawBase}" — ${reason}. Saving as: ${safe}` };
 }
 
+// Собирает файл анимации: "ANI5" + кол-во кадров (uint16 LE) + задержка мс
+// (uint16 LE) + кадры RGB565 подряд. frames — массив Uint8Array по FRAME_BYTES.
+function packANI5(frames, delayMs) {
+    const buf = new Uint8Array(8 + frames.length * FRAME_BYTES);
+    buf[0] = 65; buf[1] = 78; buf[2] = 73; buf[3] = 53;   // "ANI5" ("ANIM" = старые RGB888)
+    buf[4] = frames.length & 0xFF; buf[5] = (frames.length >> 8) & 0xFF;
+    const dd = Math.max(1, Math.min(65535, delayMs | 0));
+    buf[6] = dd & 0xFF; buf[7] = (dd >> 8) & 0xFF;
+    let off = 8;
+    for (const f of frames) { buf.set(f, off); off += f.length; }
+    return buf;
+}
+
 // Конвертирует один File в Uint8Array (polar bin). Возвращает {buf, fileName} или бросает ошибку.
-async function _convertFile(file) {
-    const isGif = file.name.toLowerCase().endsWith('.gif');
-    const prefix = isGif ? 'gif_' : 'img_';
+async function _convertFile(file, label) {
+    const isVid = isVideoFile(file);
+    const isGif = !isVid && file.name.toLowerCase().endsWith('.gif');
+    const prefix = isVid ? 'vid_' : (isGif ? 'gif_' : 'img_');
     const rawBase = file.name.replace(/\.[^/.]+$/, '');
     const { name: fileName, warning: nameWarning } = buildFileName(prefix, rawBase);
     if (nameWarning) setStatus('uploadStatus', nameWarning, '');
+
+    if (isVid) {
+        const o = _vidOpts();
+        await loadDevLimits(true);
+        o.maxFrames = maxFramesForDevice();
+        const tag = label || file.name;
+        const frames = await extractVideoFrames(file, o, (done, total) => {
+            setStatus('uploadStatus',
+                `${tag} — decoding ${done}/${total} frames (${(done * 100 / total).toFixed(0)}%)`, '');
+        });
+        // Задержка кадра в заголовке — целые миллисекунды, uint16.
+        const delay = Math.max(1, Math.round(1000 / o.fps));
+        return { buf: packANI5(frames, delay), fileName, frameCount: frames.length };
+    }
 
     if (isGif) {
         const ab = await new Promise((res, rej) => {
@@ -1227,15 +1531,7 @@ async function _convertFile(file) {
         const gif = new MinimalGIF(ab);
         gif.parse();
         const frames = renderGIFFrames(gif);
-        const frameBytes = FRAME_BYTES;
-        const totalSize = 8 + frames.length * frameBytes;
-        const buf = new Uint8Array(totalSize);
-        buf[0]=65;buf[1]=78;buf[2]=73;buf[3]=53; // "ANI5" — кадры RGB565 ("ANIM" = старые RGB888)
-        buf[4]=frames.length&0xFF; buf[5]=(frames.length>>8)&0xFF;
-        const dd = frames[0].delay || 100;
-        buf[6]=dd&0xFF; buf[7]=(dd>>8)&0xFF;
-        let off = 8;
-        for (const f of frames) { buf.set(f.data, off); off += f.data.length; }
+        const buf = packANI5(frames.map(f => f.data), frames[0].delay || 100);
         return { buf, fileName, frameCount: frames.length };
     } else {
         const dataUrl = await new Promise((res, rej) => {
@@ -1312,7 +1608,7 @@ async function processAndUpload() {
         setStatus('uploadStatus', `${label} — converting...`, '');
         let buf, fileName, frameCount;
         try {
-            ({ buf, fileName, frameCount } = await _convertFile(file));
+            ({ buf, fileName, frameCount } = await _convertFile(file, label));
         } catch(err) {
             setStatus('uploadStatus', `${label} — convert error: ${err.message}`, 'err');
             fail++;
