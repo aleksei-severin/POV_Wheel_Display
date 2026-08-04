@@ -64,10 +64,10 @@ Three things keep it usable:
 Order matters and is deliberate:
 
 ```
-source → lut_tone[] (gamma + contrast) → saturation → per-LED gain → SK9822 brightness byte
+RGB565 code → lut_tone5/6[] (gamma + contrast) → saturation → per-LED gain → SK9822 brightness byte
 ```
 
-`lut_tone` is **one** table for all three channels. The per-channel R/G/B gains are display white balance, not image processing, so they are applied *after* saturation — folded together with the radial compensation into `gain_r/g/b[44]` (8.8 fixed point) by `updateGainTablesIfNeeded()`. Keeping the gains inside the LUT (as earlier revisions did) made saturation operate on an already-unbalanced "white" and pull it further off neutral: with G=60 % and saturation 1.5, neutral grey came out at an effective G of 45 %, and the cast grew with the saturation slider. Folding the two gains costs nothing — the hot loop still does one multiply per channel.
+The tone curve is **one** curve for all three channels — two tables only because R/B carry 5 bits and G carries 6, and each is evaluated at the exact code fraction (`i/31`, `i/63`) rather than via an 8-bit intermediate, which would shift the dark end where gamma is steepest. The per-channel R/G/B gains are display white balance, not image processing, so they are applied *after* saturation — folded together with the radial compensation into `gain_r/g/b[44]` (8.8 fixed point) by `updateGainTablesIfNeeded()`. Keeping the gains inside the LUT (as earlier revisions did) made saturation operate on an already-unbalanced "white" and pull it further off neutral: with G=60 % and saturation 1.5, neutral grey came out at an effective G of 45 %, and the cast grew with the saturation slider. Folding the two gains costs nothing — the hot loop still does one multiply per channel.
 
 `global_effective_brightness` (the SK9822 5-bit current field) is global per frame; the per-LED shaping all happens in the 8-bit PWM values.
 
@@ -85,8 +85,10 @@ Per-sensor mechanical/threshold spread would otherwise inject a phase jump 6× p
 
 ### Frame Buffer Format
 
-- **Static image:** `FRAME_SIZE` = `360 sectors × 44 LEDs × 3 bytes` = **47,520 bytes** of raw RGB
-- **Animation:** `"ANIM"` magic (4 bytes) + frame count (2) + frame delay ms (2) + N × `FRAME_SIZE`
+- **Pixel is RGB565 little-endian** — `(r5<<11) | (g6<<5) | b5`. 5 bits on R/B is a level step of 8/255, far finer than the sub-LED edge placement the browser's area-averaging exists to produce; what 32 levels *would* wreck is a smooth gradient, so the converter dithers with a 4×4 Bayer threshold (mean over a tile stays within 0.5/255 of the true value — no DC shift, and 0→0 / 31→255 map exactly, so the white point does not move). Unpacking on device is free: the 5/6-bit code *is* the index into `lut_tone5[32]` / `lut_tone6[64]`, so `samplePix` does one aligned 16-bit load instead of three byte loads.
+- **Static image:** `FRAME_SIZE` = `360 sectors × 44 LEDs × 2 bytes` = **31,680 bytes**
+- **Animation:** `"ANI5"` magic (4 bytes) + frame count (2) + frame delay ms (2) + N × `FRAME_SIZE`
+- **Legacy RGB888 (47,520 B/frame, `"ANIM"` magic) is converted at load**, frame by frame through one scratch buffer — the whole animation is never expanded to 888, that is the point. So the PSRAM saving applies immediately to everything already uploaded; only re-uploaded files shrink on flash. `/preview` converts too, so the browser only ever sees RGB565. Legacy conversion rounds rather than truncates (truncation would darken by half a level) and does **not** dither — the source is already quantised, so noise would only add grain.
 - All files uploaded to LittleFS must have a `.bin` extension
 - The browser builds the polar buffer by **area-averaging** each 1°×LED-pitch cell over a 600×600 (400×400 for GIF) working canvas. Nearest-neighbour sampling frayed rim edges before the data ever reached the device — files converted by older UI builds keep those jaggies until re-uploaded.
 - Buffer lives in PSRAM; the old buffer is freed only after the new one is fully read
@@ -94,7 +96,7 @@ Per-sensor mechanical/threshold spread would otherwise inject a phase jump 6× p
 - **Swapping the buffer is a handshake, not a store.** The renderer addresses a frame as `frameBuffer + frame_idx·FRAME_SIZE` with `frame_idx` derived from `totalFrames`, so publishing the new `totalFrames` before the new `frameBuffer` sends it far past the end of the old allocation — blocky PSRAM garbage on the rim, worse the heavier the incoming animation. `loadFrameFromFile()` clears `newFrameReady`, waits for `render_in_fill` to drop, and only then swaps and frees. `renderingTask` raises `render_in_fill` *before* testing `newFrameReady` so the loader cannot slip into the gap.
 - The read is chunked with `vTaskDelay(1)` between blocks: a multi-megabyte straight read saturates the shared MSPI controller that `renderingTask` also uses to reach PSRAM.
 - **Never write NVS or flash while rendering.** A flash write disables the instruction cache on *both* cores and freezes `renderingTask` (which runs from flash) for tens of ms. `last_file` is therefore deferred via `pending_last_file` and flushed on `PWR_OFF` / before deep sleep.
-- Files shorter than `FRAME_SIZE` (e.g. old 41,040-byte V4 files) are zero-padded, not rejected — they will render wrong. Re-upload the source image/GIF instead.
+- Files that match neither a known magic nor a known frame size are zero-padded to `FRAME_SIZE`, not rejected — they will render wrong. Re-upload the source image/GIF instead.
 
 ### Power Management (two-stage)
 
@@ -166,7 +168,8 @@ ALS-PT19 photodiode with a 12 kΩ load on `PIN_ADC_LIGHT` (IO9), sampled every 1
 #define LEDS_PER_SIDE      44    // per face of the arm PCB
 #define LEDS_PER_ARM       88    // both faces
 #define NUM_LEDS          528
-#define FRAME_SIZE      47520    // 360 × 44 × 3
+#define FRAME_SIZE      31680    // 360 × 44 × 2  (RGB565)
+#define FRAME_SIZE_888  47520    // старый формат, конвертируется при загрузке
 #define LED_R_INNER_MM   49.0f   // radius of innermost LED
 #define LED_R_OUTER_MM  273.0f   // radius of outermost LED
 

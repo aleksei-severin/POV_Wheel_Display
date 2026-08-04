@@ -936,15 +936,27 @@ class MinimalGIF {
 }
 
 // ===================== POLAR MAPPING =====================
-// V5: 360 sectors × 44 LEDs × 3 = 47520 bytes == FRAME_SIZE on device.
+// V5: 360 sectors × 44 LEDs × 2 = 31680 bytes == FRAME_SIZE on device (RGB565 LE).
 // Physical arm geometry: innermost LED at 49 mm, outermost at 273 mm.
 // Image is sampled as a centered square; inner cutout mirrors the LED offset from the hub.
 const LEDS_PER_SIDE = 44;
 const R_OUTER_FRAC  = 0.495;              // outer LED (273 mm) -> image edge
 const R_INNER_FRAC  = 0.495 * 49 / 273;   // inner LED (49 mm)  -> 0.0889
-const FRAME_BYTES   = 360 * LEDS_PER_SIDE * 3;
+const FRAME_BYTES   = 360 * LEDS_PER_SIDE * 2;
 const SRC_SIZE_IMG  = 600;                // рабочий холст для статичной картинки
 const SRC_SIZE_GIF  = 400;                // для кадров GIF — их много, экономим время
+
+// Пороги упорядоченного дизеринга 4×4, в долях уровня: (m + 0.5)/16 ∈ (0,1).
+// 5 бит на R/B — это 32 уровня, и на плавном градиенте они видны полосами.
+// Байер разменивает полосу на регулярный шум амплитудой в один уровень: на
+// вращающемся ободе шум не читается, а полоса читается.
+const BAYER4 = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map(m => (m + 0.5) / 16);
+
+// Квантование 0..255 → 0..lvl со смещением порога d.
+function q565(v, lvl, d) {
+    const x = (v * lvl / 255 + d) | 0;
+    return x < 0 ? 0 : (x > lvl ? lvl : x);
+}
 
 // Полярная выборка с усреднением по ячейке.
 // На периферии один сектор (1°) занимает несколько пикселей исходника, поэтому
@@ -1007,9 +1019,14 @@ function toPolarBuffer(srcCanvas, ss) {
                     sb += sData[i00 + 2] * w00 + sData[i10 + 2] * w10 + sData[i01 + 2] * w01 + sData[i11 + 2] * w11;
                 }
             }
-            buf[off++] = (sr / n + 0.5) | 0;
-            buf[off++] = (sg / n + 0.5) | 0;
-            buf[off++] = (sb / n + 0.5) | 0;
+            // Дизеринг общий на три канала: порог зависит только от места
+            // ячейки, поэтому нейтральный серый остаётся нейтральным.
+            const d = BAYER4[((sector & 3) << 2) | (r & 3)];
+            const v = (q565(sr / n, 31, d) << 11) |
+                      (q565(sg / n, 63, d) <<  5) |
+                       q565(sb / n, 31, d);
+            buf[off++] = v & 0xFF;   // little-endian — устройство читает пиксель одним uint16
+            buf[off++] = v >>> 8;
         }
     }
     return buf;
@@ -1213,7 +1230,7 @@ async function _convertFile(file) {
         const frameBytes = FRAME_BYTES;
         const totalSize = 8 + frames.length * frameBytes;
         const buf = new Uint8Array(totalSize);
-        buf[0]=65;buf[1]=78;buf[2]=73;buf[3]=77; // "ANIM"
+        buf[0]=65;buf[1]=78;buf[2]=73;buf[3]=53; // "ANI5" — кадры RGB565 ("ANIM" = старые RGB888)
         buf[4]=frames.length&0xFF; buf[5]=(frames.length>>8)&0xFF;
         const dd = frames[0].delay || 100;
         buf[6]=dd&0xFF; buf[7]=(dd>>8)&0xFF;
@@ -1361,7 +1378,7 @@ async function processAndUpload() {
 }
 
 // ===================== ПРЕВЬЮ КОЛЕСА =====================
-// Рисует один фрейм (360×44×3 байт, полярный буфер) на canvas как кольцо колеса.
+// Рисует один фрейм (360×44 пикселей RGB565, полярный буфер) на canvas как кольцо колеса.
 // Каждый пиксель canvas обратно проецируется: угол → сектор, радиус → LED.
 function drawWheelPreview(buf, canvas) {
     const SIZE = canvas.width;  // квадратный canvas
@@ -1386,11 +1403,15 @@ function drawWheelPreview(buf, canvas) {
             const ledF = (r - minR) / (maxR - minR) * (LEDS_PER_SIDE - 1);
             const led  = Math.min(LEDS_PER_SIDE - 1, Math.max(0, Math.round(ledF)));
 
-            const off = (sector * LEDS_PER_SIDE + led) * 3;
+            const off = (sector * LEDS_PER_SIDE + led) * 2;
+            const v   = buf[off] | (buf[off + 1] << 8);
             const pi  = (y * SIZE + x) * 4;
-            img.data[pi]     = buf[off];
-            img.data[pi + 1] = buf[off + 1];
-            img.data[pi + 2] = buf[off + 2];
+            // Развёртка кода в 8 бит — репликация старших битов: даёт ровно то
+            // же значение, что и устройство, где код i означает долю i/31 (i/63).
+            const r5 = v >>> 11, g6 = (v >>> 5) & 63, b5 = v & 31;
+            img.data[pi]     = (r5 << 3) | (r5 >> 2);
+            img.data[pi + 1] = (g6 << 2) | (g6 >> 4);
+            img.data[pi + 2] = (b5 << 3) | (b5 >> 2);
             img.data[pi + 3] = 255;
         }
     }

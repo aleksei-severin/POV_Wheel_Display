@@ -148,7 +148,8 @@ volatile float                  global_abl_rms      = 0.0f;  // RMS загруз
 volatile float                  global_render_span    = 0.0f; // угол между обновлениями ленты, °
 volatile uint32_t               global_render_fill_us = 0;    // время сборки кадра, мкс
 volatile uint8_t                global_effective_brightness = 8;
-uint8_t lut_tone[256];
+uint8_t lut_tone5[32];
+uint8_t lut_tone6[64];
 
 // --- КЕШ ТЕЛЕМЕТРИИ ПИТАНИЯ ---
 // Обновляется из loop() (Core 1), читается из /battery (Core 0).
@@ -358,13 +359,21 @@ void blankAllLEDs_DMA() {
 // разбалансированному белому и растаскивала его дальше — нейтральный серый
 // уезжал в цвет тем сильнее, чем выше насыщенность. Теперь порядок такой:
 //   гамма+контраст → насыщенность → баланс белого × радиальная компенсация.
+// Таблиц две — по одной на разрядность канала в RGB565. Кривая берётся от
+// точной доли кода (i/31, i/63), а не от развёрнутого 8-битного значения:
+// лишнее округление на входе гаммы сдвигало бы тёмный край, где она круче всего.
 void rebuildGammaLUT() {
     float g      = global_gamma;
     float factor = 1.0f + global_contrast * 0.02f; // 0% → 1.0, 100% → 3.0
-    for (int i = 0; i < 256; i++) {
-        float v = powf(i / 255.0f, g) * 255.0f;    // гамма
-        v = 128.0f + (v - 128.0f) * factor;         // контраст
-        lut_tone[i] = (uint8_t)constrain((int)(v + 0.5f), 0, 255);
+    for (int i = 0; i < 64; i++) {
+        float v = powf(i / 63.0f, g) * 255.0f;      // гамма
+        v = 128.0f + (v - 128.0f) * factor;          // контраст
+        lut_tone6[i] = (uint8_t)constrain((int)(v + 0.5f), 0, 255);
+    }
+    for (int i = 0; i < 32; i++) {
+        float v = powf(i / 31.0f, g) * 255.0f;
+        v = 128.0f + (v - 128.0f) * factor;
+        lut_tone5[i] = (uint8_t)constrain((int)(v + 0.5f), 0, 255);
     }
 }
 
@@ -468,8 +477,8 @@ static void updateLUTIfNeeded() {
 // (сумма ровно 256). Возвращает число задействованных секторов.
 #define ANG_TAPS_MAX 4
 
-static inline int boxWeights(float c, float span, const uint8_t* frame,
-                             const uint8_t** rows, int* w)
+static inline int boxWeights(float c, float span, const uint16_t* frame,
+                             const uint16_t** rows, int* w)
 {
     float a = c - span * 0.5f;
     float b = a + span;
@@ -490,7 +499,7 @@ static inline int boxWeights(float c, float span, const uint8_t* frame,
         if (ww > w[best]) best = j;
         int s = (i0 + j) % 360;
         if (s < 0) s += 360;
-        rows[j] = frame + s * (LEDS_PER_SIDE * 3);
+        rows[j] = frame + s * LEDS_PER_SIDE;   // шаг в пикселях: кадр типизован как uint16
     }
     // Остаток округления кладём в самый весомый отвод — так он не может увести
     // маленький вес в минус, а суммарная яркость остаётся точной.
@@ -502,16 +511,17 @@ static inline int boxWeights(float c, float span, const uint8_t* frame,
 // Байт яркости (dst[0]) заполняется отдельным проходом — он зависит от суммы по кадру.
 // Смешивание идёт ПОСЛЕ гамма-таблицы: усреднять надо световой поток, а не код,
 // иначе наполовину перекрытый край выйдет втрое темнее, чем должен.
-static inline uint32_t samplePix(const uint8_t** rows, const int* w, int n, int i3,
+static inline uint32_t samplePix(const uint16_t** rows, const int* w, int n, int i,
                                  int sat, int kr, int kg, int kb, uint8_t* dst)
 {
     int r = 0, g = 0, b = 0;
     for (int j = 0; j < n; j++) {
-        const uint8_t* p  = rows[j] + i3;
-        int            ww = w[j];
-        r += lut_tone[p[0]] * ww;
-        g += lut_tone[p[1]] * ww;
-        b += lut_tone[p[2]] * ww;
+        // Распаковка RGB565 бесплатна: поле кода — сразу индекс своей таблицы.
+        uint16_t v  = rows[j][i];
+        int      ww = w[j];
+        r += lut_tone5[ v >> 11        ] * ww;
+        g += lut_tone6[(v >>  5) & 0x3F] * ww;
+        b += lut_tone5[ v        & 0x1F] * ww;
     }
     r >>= 8;  g >>= 8;  b >>= 8;
 
@@ -570,7 +580,9 @@ static void fillSectorIntoBuffer(uint8_t* buf, uint8_t buf_idx, float sector0, f
     } else {
         frame_idx = 0;
     }
-    const uint8_t* frame = frameBuffer + frame_idx * FRAME_SIZE;
+    // Кадр адресуется как массив пикселей: FRAME_SIZE кратен 2, ps_malloc
+    // выравнивает начало, поэтому 16-битные чтения всегда выровнены.
+    const uint16_t* frame = (const uint16_t*)(frameBuffer + frame_idx * FRAME_SIZE);
 
     uint8_t bri_level = global_brightness & 0x1F; // 0–31
     float   abl       = global_abl_limit;          // 0–100 %
@@ -591,20 +603,20 @@ static void fillSectorIntoBuffer(uint8_t* buf, uint8_t buf_idx, float sector0, f
         uint8_t* dst_f = led_ptr + (ray * LEDS_PER_ARM) * 4;                      // LED 0–43
         uint8_t* dst_b = led_ptr + (ray * LEDS_PER_ARM + LEDS_PER_ARM - 1) * 4;   // LED 87–44
 
-        const uint8_t* rows[ANG_TAPS_MAX];
-        int            wts[ANG_TAPS_MAX];
+        const uint16_t* rows[ANG_TAPS_MAX];
+        int             wts[ANG_TAPS_MAX];
 
         if (!spoke_active) {
             // Смещения спицы нет — набор секторов и весов общий для всех 44 диодов,
             // так что разбор угла выносим из цикла по диодам.
-            const uint8_t* rows_b[ANG_TAPS_MAX];
-            int            wts_b[ANG_TAPS_MAX];
+            const uint16_t* rows_b[ANG_TAPS_MAX];
+            int             wts_b[ANG_TAPS_MAX];
             int nf = boxWeights(bf, span, frame, rows,   wts);
             int nb = boxWeights(bb, span, frame, rows_b, wts_b);
             for (int i = 0; i < LEDS_PER_SIDE; i++) {
                 int kr = gain_r[i], kg = gain_g[i], kb = gain_b[i];
-                pixel_sum += samplePix(rows,   wts,   nf, i * 3, sat, kr, kg, kb, dst_f + i * 4);
-                pixel_sum += samplePix(rows_b, wts_b, nb, i * 3, sat, kr, kg, kb, dst_b - i * 4);
+                pixel_sum += samplePix(rows,   wts,   nf, i, sat, kr, kg, kb, dst_f + i * 4);
+                pixel_sum += samplePix(rows_b, wts_b, nb, i, sat, kr, kg, kb, dst_b - i * 4);
             }
         } else {
             // Луч смещён от оси: у каждого диода свой угол (spoke_corr до ±46°).
@@ -613,10 +625,10 @@ static void fillSectorIntoBuffer(uint8_t* buf, uint8_t buf_idx, float sector0, f
                 int n;
 
                 n = boxWeights(bf + spoke_corr[i], span, frame, rows, wts);  // лицевая: прибавляется
-                pixel_sum += samplePix(rows, wts, n, i * 3, sat, kr, kg, kb, dst_f + i * 4);
+                pixel_sum += samplePix(rows, wts, n, i, sat, kr, kg, kb, dst_f + i * 4);
 
                 n = boxWeights(bb - spoke_corr[i], span, frame, rows, wts);  // обратная: вычитается
-                pixel_sum += samplePix(rows, wts, n, i * 3, sat, kr, kg, kb, dst_b - i * 4);
+                pixel_sum += samplePix(rows, wts, n, i, sat, kr, kg, kb, dst_b - i * 4);
             }
         }
     }

@@ -196,6 +196,36 @@ void safeOTAShutdown() {
     webLog("[OTA] Display off, FS unmounted, starting update...");
 }
 
+// --- Совместимость со старым форматом RGB888 ---------------------------------
+// Кадры, залитые до перехода на RGB565, лежат на флеше как 47520 байт RGB888.
+// Переливать библиотеку не нужно — конвертируем при загрузке, и экономия PSRAM
+// (и длины анимации) работает сразу на всём, что уже есть. Вес самого файла
+// упадёт только у перезалитых.
+//
+// Дизеринга здесь намеренно нет: исходник уже квантован до 8 бит, и добавлять
+// шум к готовым данным смысла не имеет — упорядоченный дизеринг живёт в
+// браузерном конвертере, где под ним есть непрерывные значения.
+// Округление, а не отбрасывание младших битов: усечение систематически
+// затемняло бы кадр на пол-уровня.
+static inline uint16_t pack565(int r, int g, int b) {
+    int r5 = (r * 31 + 127) / 255;
+    int g6 = (g * 63 + 127) / 255;
+    int b5 = (b * 31 + 127) / 255;
+    return (uint16_t)((r5 << 11) | (g6 << 5) | b5);
+}
+
+// Допускается src == dst: запись идёт медленнее чтения (2 байта против 3),
+// так что конвертация на месте безопасна.
+static void frame888to565(const uint8_t* src, uint8_t* dst) {
+    for (int p = 0; p < SECTORS * LEDS_PER_SIDE; p++) {
+        uint16_t v = pack565(src[0], src[1], src[2]);
+        dst[0] = (uint8_t)(v & 0xFF);   // little-endian — рендер читает пиксель одним uint16
+        dst[1] = (uint8_t)(v >> 8);
+        src += 3;
+        dst += 2;
+    }
+}
+
 void loadFrameFromFile(String path) {
     File f = LittleFS.open(path, "r");
     if (!f) return;
@@ -221,54 +251,80 @@ void loadFrameFromFile(String path) {
 
     size_t fileSize = f.size();
 
-    if (fileSize > FRAME_SIZE) {
-        char magic[4];
-        f.read((uint8_t*)magic, 4);
-        if (magic[0] == 'A' && magic[1] == 'N' && magic[2] == 'I' && magic[3] == 'M') {
-            f.read((uint8_t*)&newTotalFrames, 2);
-            f.read((uint8_t*)&newFrameDelay,  2);
+    // Формат задаётся magic'ом: "ANI5" — кадры RGB565, "ANIM" — старые RGB888.
+    // Статичная картинка заголовка не имеет и различается по размеру файла.
+    char magic[4] = {0, 0, 0, 0};
+    if (fileSize >= 8) f.read((uint8_t*)magic, 4);
+    bool anim565 = (memcmp(magic, "ANI5", 4) == 0);
+    bool anim888 = (memcmp(magic, "ANIM", 4) == 0);
 
-            size_t dataSize = newTotalFrames * FRAME_SIZE;
-            newBuf = (uint8_t*)ps_malloc(dataSize);
+    if (anim565 || anim888) {
+        f.read((uint8_t*)&newTotalFrames, 2);
+        f.read((uint8_t*)&newFrameDelay,  2);
 
-            if (newBuf) {
-                // Отрисовка уже погашена, беречь шину не от кого — читаем
-                // крупными блоками, чтобы чёрная пауза вышла как можно короче.
-                // Уступаем такт раз в 32 КБ: сплошное чтение мегабайтами
-                // держало бы lwIP без CPU и роняло соединения.
-                size_t got = 0;
-                while (got < dataSize) {
-                    size_t want = dataSize - got;
-                    if (want > 32768) want = 32768;
-                    int n = f.read(newBuf + got, want);
-                    if (n <= 0) break;
-                    got += (size_t)n;
-                    vTaskDelay(1);
+        size_t dataSize = (size_t)newTotalFrames * FRAME_SIZE;
+        newBuf = (uint8_t*)ps_malloc(dataSize);
+
+        // Старому формату нужен буфер под ОДИН исходный кадр: разворачивать всю
+        // анимацию в RGB888 нельзя — ради этого объёма всё и затевалось.
+        uint8_t* tmp = nullptr;
+        if (newBuf && anim888) {
+            tmp = (uint8_t*)ps_malloc(FRAME_SIZE_888);
+            if (!tmp) { free(newBuf); newBuf = nullptr; }
+        }
+
+        if (newBuf) {
+            // Отрисовка уже погашена, беречь шину не от кого — читаем целыми
+            // кадрами, чтобы чёрная пауза вышла как можно короче. Уступаем такт
+            // раз в кадр (~32 КБ): сплошное чтение мегабайтами держало бы lwIP
+            // без CPU и роняло соединения.
+            uint32_t got = 0;
+            for (; got < newTotalFrames; got++) {
+                uint8_t* dst = newBuf + (size_t)got * FRAME_SIZE;
+                bool ok;
+                if (anim888) {
+                    ok = (f.read(tmp, FRAME_SIZE_888) == (int)FRAME_SIZE_888);
+                    if (ok) frame888to565(tmp, dst);
+                } else {
+                    ok = (f.read(dst, FRAME_SIZE) == (int)FRAME_SIZE);
                 }
-                // Файл оказался короче заявленного числа кадров — хвост должен
-                // быть чёрным, а не мусором из PSRAM.
-                if (got < dataSize) {
-                    memset(newBuf + got, 0, dataSize - got);
-                    webLogf("[WARN] Short read: %u of %u bytes",
-                            (unsigned)got, (unsigned)dataSize);
-                }
-            } else {
-                newTotalFrames = 0;
-                webLog("[ERR] PSRAM alloc failed");
+                if (!ok) break;
+                vTaskDelay(1);
+            }
+            // Файл оказался короче заявленного числа кадров — хвост должен
+            // быть чёрным, а не мусором из PSRAM.
+            if (got < newTotalFrames) {
+                size_t done = (size_t)got * FRAME_SIZE;
+                memset(newBuf + done, 0, dataSize - done);
+                webLogf("[WARN] Short read: %u of %u frames",
+                        (unsigned)got, (unsigned)newTotalFrames);
             }
         } else {
-            f.seek(0);
-            newBuf = (uint8_t*)ps_malloc(FRAME_SIZE);
-            // Обнуляем перед чтением: файл может оказаться короче кадра
-            // (например, снятый со старой версии железа) — хвост должен быть
-            // чёрным, а не мусором из PSRAM.
-            if (newBuf) { memset(newBuf, 0, FRAME_SIZE); f.read(newBuf, FRAME_SIZE); }
+            newTotalFrames = 0;
+            webLog("[ERR] PSRAM alloc failed");
         }
+        if (tmp) free(tmp);
     } else {
+        // Статичная картинка: старая — FRAME_SIZE_888 байт, новая — FRAME_SIZE.
+        bool legacy = (fileSize >= FRAME_SIZE_888);
         newBuf = (uint8_t*)ps_malloc(FRAME_SIZE);
+        // Обнуляем перед чтением: файл может оказаться короче кадра (например,
+        // снятый со старой версии железа) — хвост должен быть чёрным, а не
+        // мусором из PSRAM.
         if (newBuf) {
             memset(newBuf, 0, FRAME_SIZE);
-            f.read(newBuf, (fileSize < FRAME_SIZE) ? fileSize : FRAME_SIZE);
+            f.seek(0);
+            if (legacy) {
+                uint8_t* tmp = (uint8_t*)ps_malloc(FRAME_SIZE_888);
+                if (tmp) {
+                    memset(tmp, 0, FRAME_SIZE_888);
+                    f.read(tmp, FRAME_SIZE_888);
+                    frame888to565(tmp, newBuf);
+                    free(tmp);
+                }
+            } else {
+                f.read(newBuf, (fileSize < FRAME_SIZE) ? fileSize : FRAME_SIZE);
+            }
         }
     }
 
@@ -823,33 +879,41 @@ void setupNetwork() {
             return;
         }
 
-        // Определяем смещение первого фрейма
+        // Определяем смещение первого фрейма и его формат.
         uint8_t hdr[8];
         f.read(hdr, 8);
         size_t offset = 0;
-        if (hdr[0]=='A' && hdr[1]=='N' && hdr[2]=='I' && hdr[3]=='M') {
-            offset = 8;  // ANIM: пропускаем magic + frame_count + frame_delay
+        bool   legacy = false;
+        if (hdr[0]=='A' && hdr[1]=='N' && hdr[2]=='I' && hdr[3]=='5') {
+            offset = 8;                             // RGB565: magic + frame_count + frame_delay
+        } else if (hdr[0]=='A' && hdr[1]=='N' && hdr[2]=='I' && hdr[3]=='M') {
+            offset = 8;  legacy = true;             // старая анимация RGB888
         } else {
-            offset = 0;  // Статичное изображение — данные с начала
+            offset = 0;                             // статичное изображение — данные с начала
+            legacy = (f.size() >= FRAME_SIZE_888);
         }
 
-        size_t toRead = FRAME_SIZE;
-        if (f.size() < offset + toRead) toRead = f.size() - offset;
+        // Наружу всегда уходит RGB565: браузеру незачем знать о старом формате.
+        size_t srcLen = legacy ? FRAME_SIZE_888 : FRAME_SIZE;
+        size_t avail  = f.size() - offset;
 
         // Читаем в PSRAM; ownership передаётся лямбде через shared_ptr —
         // память освобождается автоматически когда AsyncWebServer завершит отправку.
-        // Кадр вырос до 47520 байт — держать его во внутреннем heap накладно.
-        auto frameBuf = std::shared_ptr<uint8_t>((uint8_t*)ps_malloc(toRead), free);
+        // Кадр великоват, чтобы держать его во внутреннем heap.
+        auto frameBuf = std::shared_ptr<uint8_t>((uint8_t*)ps_malloc(srcLen), free);
         if (!frameBuf) {
             f.close();
             request->send(500, "text/plain", "OOM");
             return;
         }
+        // Обнуляем: обрезанный файл должен дать чёрный хвост, а не мусор из PSRAM.
+        memset(frameBuf.get(), 0, srcLen);
         f.seek(offset);
-        f.read(frameBuf.get(), toRead);
+        f.read(frameBuf.get(), (avail < srcLen) ? avail : srcLen);
         f.close();
+        if (legacy) frame888to565(frameBuf.get(), frameBuf.get());
 
-        size_t capturedSize = toRead;
+        size_t capturedSize = FRAME_SIZE;
         AsyncWebServerResponse* resp = request->beginChunkedResponse(
             "application/octet-stream",
             [frameBuf, capturedSize](uint8_t* buf, size_t maxLen, size_t index) -> size_t {
