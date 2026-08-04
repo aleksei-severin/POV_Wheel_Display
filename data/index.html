@@ -1270,6 +1270,12 @@ async function loadDevLimits(force) {
     return _devLimits;
 }
 
+// Резерв на файловой системе: LittleFS нельзя заполнять до последнего байта,
+// часть блоков нужна ему под метаданные. Без резерва запись обрывалась на
+// середине файла — и, поскольку результат write() на устройстве не
+// проверялся, битый файл выглядел как успешно загруженный.
+const FS_RESERVE = 128 * 1024;
+
 function maxFramesForDevice() {
     const HDR = 8;
     const MARGIN = 256 * 1024;      // запас на служебные аллокации во время загрузки
@@ -1279,7 +1285,7 @@ function maxFramesForDevice() {
     }
     let byFs = Infinity;
     if (_devLimits && _devLimits.fsFree) {
-        byFs = Math.floor((_devLimits.fsFree - HDR) / FRAME_BYTES);
+        byFs = Math.floor((_devLimits.fsFree - FS_RESERVE - HDR) / FRAME_BYTES);
     }
     // Счётчик кадров в заголовке ANI5 — uint16.
     return Math.max(1, Math.min(byPsram, byFs, 65535));
@@ -1597,9 +1603,12 @@ async function processAndUpload() {
     const total = files.length;
     let ok = 0, fail = 0;
 
-    // Проверяем свободное место один раз перед началом
+    // Проверяем свободное место один раз перед началом. Из отчёта LittleFS
+    // вычитаем резерв: заполнять файловую систему под ноль нельзя — часть
+    // блоков уйдёт под метаданные, и запись оборвётся на середине файла.
     let fsFree = Infinity;
     try { fsFree = (await fetch('/fs_info').then(r => r.json())).free; } catch(e) {}
+    if (isFinite(fsFree)) fsFree = Math.max(0, fsFree - FS_RESERVE);
 
     for (let i = 0; i < total; i++) {
         const file = files[i];
@@ -1716,23 +1725,29 @@ function drawWheelPreview(buf, canvas) {
 
 // Загружает превью для одного файла. Возвращает Promise.
 // Использует кэш _thumbCache чтобы не перезагружать при повторном вызове loadFiles().
-const _thumbCache = {};  // fname → ImageData (80×80)
+// Ключ включает размер файла, и он же уходит в URL: перезалитый под тем же
+// именем файл обязан дать новое превью. Раньше ключом было одно имя, а на
+// /preview стоит Cache-Control: max-age=300 — после перезаливки и вкладка, и
+// HTTP-кеш браузера показывали старую картинку.
+const _thumbCache = {};  // "fname|size" → ImageData (80×80)
 
-async function _loadThumb(fname, canvas) {
-    if (_thumbCache[fname]) {
+async function _loadThumb(fname, size, canvas) {
+    const key = `${fname}|${size}`;
+    if (_thumbCache[key]) {
         const ctx = canvas.getContext('2d');
-        ctx.putImageData(_thumbCache[fname], 0, 0);
+        ctx.putImageData(_thumbCache[key], 0, 0);
         return;
     }
     try {
-        const resp = await _fetchTimeout(`/preview?file=${encodeURIComponent(fname)}`, {}, 8000);
+        const resp = await _fetchTimeout(
+            `/preview?file=${encodeURIComponent(fname)}&v=${size}`, {}, 8000);
         if (!resp.ok) return;
         const ab  = await resp.arrayBuffer();
         const buf = new Uint8Array(ab);
         if (buf.length < FRAME_BYTES) return;
         drawWheelPreview(buf, canvas);
         // Кэшируем ImageData для быстрого повторного рендеринга
-        _thumbCache[fname] = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height);
+        _thumbCache[key] = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height);
     } catch(e) { /* молча игнорируем — превью необязательно */ }
 }
 
@@ -1762,7 +1777,7 @@ function loadFiles() {
         (async () => {
             for (const f of files) {
                 const canvas = document.getElementById(`thumb-${CSS.escape(f.name)}`);
-                if (canvas) await _loadThumb(f.name, canvas);
+                if (canvas) await _loadThumb(f.name, f.size, canvas);
             }
         })();
     });

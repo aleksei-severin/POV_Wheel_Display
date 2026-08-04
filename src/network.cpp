@@ -16,6 +16,9 @@
 AsyncWebServer server(80);
 Preferences prefs;
 File uploadFile;
+// Взводится обработчиком тела /upload, читается обработчиком запроса: тело и
+// ответ — разные колбэки, а сказать браузеру о неудаче нужно именно в ответе.
+static bool uploadFailed = false;
 
 String hostName;
 String currentDisplayFile = "";   // Имя файла, загруженного в frameBuffer
@@ -262,6 +265,17 @@ void loadFrameFromFile(String path) {
     if (anim565 || anim888) {
         f.read((uint8_t*)&newTotalFrames, 2);
         f.read((uint8_t*)&newFrameDelay,  2);
+
+        // Размер файла обязан быть заголовок + N кадров. Не сходится — файл
+        // залит не полностью или со сдвигом, и рендер покажет шум. Сказать об
+        // этом в лог дешевле, чем гадать, глядя на обод.
+        size_t expect = 8 + (size_t)newTotalFrames *
+                            (size_t)(anim888 ? FRAME_SIZE_888 : FRAME_SIZE);
+        if (fileSize != expect) {
+            webLogf("[WARN] %s: size %u, header says %u frames (expected %u)",
+                    path.c_str(), (unsigned)fileSize,
+                    (unsigned)newTotalFrames, (unsigned)expect);
+        }
 
         size_t dataSize = (size_t)newTotalFrames * FRAME_SIZE;
         newBuf = (uint8_t*)ps_malloc(dataSize);
@@ -580,12 +594,16 @@ void setupNetwork() {
             const char* fn = file.name();
             size_t fnlen = strlen(fn);
             if (fnlen >= 4 && strcmp(fn + fnlen - 4, ".bin") == 0) {
-                // Читаем заголовок: ANIM-файл → берём кол-во кадров
+                // Читаем заголовок: ANI5/ANIM — берём кол-во кадров. Раньше
+                // распознавался только ANIM, и у всех новых анимаций счётчик
+                // кадров в списке пропадал — а по нему видно, бьётся ли размер
+                // файла с заголовком.
                 uint16_t frames = 0;
                 if (file.size() > 6) {
                     uint8_t hdr[6];
                     file.read(hdr, 6);
-                    if (hdr[0]=='A' && hdr[1]=='N' && hdr[2]=='I' && hdr[3]=='M') {
+                    if (hdr[0]=='A' && hdr[1]=='N' && hdr[2]=='I' &&
+                        (hdr[3]=='5' || hdr[3]=='M')) {
                         frames = hdr[4] | (hdr[5] << 8);
                     }
                 }
@@ -731,12 +749,21 @@ void setupNetwork() {
             request->send(500, "text/plain", "Upload incomplete");
             return;
         }
+        // Тело записалось не полностью (кончилось место, пропущенный кусок).
+        // Файл уже удалён в обработчике тела — здесь только честный ответ,
+        // иначе браузер посчитает битый файл успешно залитым.
+        if (uploadFailed) {
+            uploadFailed = false;
+            request->send(507, "text/plain", "Write failed (out of space?)");
+            return;
+        }
         state_version++;
         request->send(200, "text/plain", "OK");
     }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
         last_web_activity_time = millis();
         String filepath = "/" + (request->hasParam("name") ? request->getParam("name")->value() : "temp.bin");
         if (index == 0) {
+            uploadFailed = false;
             // Если предыдущая загрузка не завершилась корректно — убираем мусор
             if (uploadFile) {
                 String badPath = uploadFile.path();
@@ -761,9 +788,41 @@ void setupNetwork() {
                 }
             });
         }
-        if (uploadFile) uploadFile.write(data, len);
+        // Записываем только если ещё не сорвались: после ошибки файла уже нет,
+        // и продолжать сыпать в него куски незачем.
+        if (uploadFile && !uploadFailed) {
+            // Позиция в файле обязана совпадать с index. Не совпала — кусок
+            // тела потерялся или пришёл дважды, и всё, что дальше, легло бы со
+            // сдвигом: кадры поехали бы относительно заголовка, а это ровно тот
+            // «шум вместо картинки», который не отличить от битого файла.
+            if (index != uploadFile.position()) {
+                webLogf("[ERR] Upload out of sync at %u (file at %u): %s",
+                        (unsigned)index, (unsigned)uploadFile.position(), filepath.c_str());
+                uploadFailed = true;
+            } else if (uploadFile.write(data, len) != len) {
+                // LittleFS кончилось место. Раньше результат write() не
+                // проверялся: файл молча обрезался, а браузер получал 200 OK.
+                webLogf("[ERR] Short write at %u/%u (no space?): %s",
+                        (unsigned)index, (unsigned)total, filepath.c_str());
+                uploadFailed = true;
+            }
+            if (uploadFailed) {
+                uploadFile.close();
+                LittleFS.remove(filepath);
+                return;
+            }
+        }
         if (index + len == total && uploadFile) {
+            // Размер обязан совпасть с заявленным Content-Length.
+            size_t written = uploadFile.position();
             uploadFile.close();  // после close() объект становится false — сигнал onRequest об успехе
+            if (written != total) {
+                webLogf("[ERR] Size mismatch %u != %u, removed: %s",
+                        (unsigned)written, (unsigned)total, filepath.c_str());
+                LittleFS.remove(filepath);
+                uploadFailed = true;
+                return;
+            }
             file_version++;
         }
     });
