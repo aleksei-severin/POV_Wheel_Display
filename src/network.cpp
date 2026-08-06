@@ -530,14 +530,22 @@ void setupNetwork() {
     server.on("/get_settings", HTTP_GET, [](AsyncWebServerRequest *request){
         // Фоновый поллинг — не сбрасывает таймер активности.
         // snprintf в стековый буфер — ноль heap-аллокаций, не фрагментирует SRAM.
-        char buf[448];
+
+        // Имя загруженного файла без ведущего '/': по нему веб-интерфейс
+        // подсвечивает активную строку в списке и пишет «Now playing».
+        // Раньше этого поля не было, и после перезагрузки страницы (или в
+        // соседней вкладке) понять, что именно светится, было нельзя.
+        const char* curf = currentDisplayFile.c_str();
+        if (*curf == '/') curf++;
+
+        char buf[512];
         snprintf(buf, sizeof(buf),
             "{\"bmin\":%u,\"bmax\":%u,\"angle\":%d,\"brightness\":%u,\"eff_bri\":%u"
             ",\"gamma\":%.1f,\"saturation\":%.1f,\"contrast\":%.1f"
             ",\"circ\":%u,\"ao\":%u,\"lux\":%.0f"
             ",\"abl\":%.1f,\"abl_rms\":%.1f"
             ",\"rg\":%.1f,\"gg\":%.1f,\"bg\":%.1f"
-            ",\"slideshow\":%s"
+            ",\"slideshow\":%s,\"file\":\"%s\",\"play\":%u"
             ",\"ver\":%lu,\"fver\":%lu}",
             (unsigned)min_brightness, (unsigned)max_brightness,
             (int)global_angle_offset, (unsigned)global_brightness,
@@ -548,6 +556,7 @@ void setupNetwork() {
             (float)global_abl_limit, (float)(global_abl_rms * 100.0f),
             (float)global_r_gain, (float)global_g_gain, (float)global_b_gain,
             slideshowActive ? "true" : "false",
+            curf, (unsigned)(force_stop_display ? 0 : 1),
             (unsigned long)state_version, (unsigned long)file_version
         );
         request->send(200, "application/json", buf);

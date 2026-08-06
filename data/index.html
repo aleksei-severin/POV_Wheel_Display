@@ -1,875 +1,924 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>POV WHEEL CONTROL</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<meta charset="UTF-8">
+<!-- Масштабирование НЕ запрещаем: user-scalable=no ломает доступность, а на
+     солнце страницу нередко хочется приблизить. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#0b1017">
+<title>POV Wheel</title>
 <style>
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-html, body { overflow-x: hidden; max-width: 100%; }
+/* =========================================================================
+   Шрифты только системные. Страница отдаётся с LittleFS, и устройство обычно
+   раздаёт свой собственный AP без выхода в интернет — ссылка на Google Fonts
+   в этом режиме просто висела до таймаута и роняла первый рендер.
+   ========================================================================= */
 
+/* ---------- Токены темы ---------- */
 :root {
-  --bg-base:    #0a0f1a;
-  --bg-card:    #0f172a;
-  --bg-deep:    #060b14;
-  --bg-input:   #070d1a;
-  --border:     #1e3a5f;
-  --border-dim: #132847;
-  --accent:     #38bdf8;
-  --accent-dim: #1d4ed8;
-  --text:       #e2e8f0;
-  --text-muted: #64748b;
-  --text-hint:  #475569;
-  --green:      #34d399;
-  --yellow:     #fbbf24;
-  --red:        #f87171;
-  --orange:     #fb923c;
-  --purple:     #818cf8;
-  --font-ui:    'DM Sans', sans-serif;
-  --font-mono:  'Space Mono', monospace;
-  --r-card:     14px;
-  --r-elem:     10px;
+  color-scheme: dark;
+  --bg:          #0b1017;
+  --surface:     #121a25;
+  --surface-2:   #18222f;
+  --surface-3:   #202d3d;
+  --border:      #27384c;
+  --border-soft: #1b2734;
+  --text:        #eaf1f8;
+  --text-2:      #a8b9cc;
+  --text-3:      #8194a9;
+  --accent:      #4cc2f1;
+  --accent-ink:  #04141f;
+  --accent-soft: #10303f;
+  --ok:          #3ddc97;
+  --ok-soft:     #0d3226;
+  --warn:        #f5b544;
+  --warn-soft:   #37280b;
+  --danger:      #ff7d7d;
+  --danger-soft: #3a1516;
+  --blue:        #8f9cf7;
+  --track:       #26333f;
+  --shadow:      0 1px 2px rgba(0,0,0,.45), 0 10px 28px rgba(0,0,0,.32);
+  --ring:        0 0 0 3px rgba(76,194,241,.35);
 }
+html[data-theme="light"] {
+  color-scheme: light;
+  --bg:          #eef2f7;
+  --surface:     #ffffff;
+  --surface-2:   #f4f7fb;
+  --surface-3:   #e8eef6;
+  --border:      #d3dde8;
+  --border-soft: #e4ebf3;
+  --text:        #101c2b;
+  --text-2:      #4b5c70;
+  --text-3:      #64768b;
+  --accent:      #0b78ab;
+  --accent-ink:  #ffffff;
+  --accent-soft: #dcf0fa;
+  --ok:          #08805a;
+  --ok-soft:     #dcf5ea;
+  --warn:        #96610a;
+  --warn-soft:   #fbeed3;
+  --danger:      #c62f2f;
+  --danger-soft: #fbe0e0;
+  --blue:        #4048c4;
+  --track:       #d9e2ec;
+  --shadow:      0 1px 2px rgba(16,28,43,.06), 0 10px 26px rgba(16,28,43,.10);
+  --ring:        0 0 0 3px rgba(11,120,171,.28);
+}
+
+* , *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body { max-width: 100%; overflow-x: hidden; }
 
 body {
-  font-family: var(--font-ui);
-  background: var(--bg-base);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+               "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+  font-size: 15px;
+  line-height: 1.45;
+  background: var(--bg);
   color: var(--text);
   min-height: 100vh;
-  padding-bottom: 32px;
+  -webkit-text-size-adjust: 100%;
+  -webkit-tap-highlight-color: transparent;
+  padding-bottom: env(safe-area-inset-bottom);
 }
 
-/* ---- Topbar ---- */
-.topbar {
-  background: var(--bg-deep);
-  border-bottom: 1px solid var(--border);
-  padding: 14px 28px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  min-width: 0;
-  width: 100%;
-}
-.topbar-left { display: flex; flex-direction: column; gap: 3px; }
-.topbar-title {
-  font-family: var(--font-mono);
-  font-size: 14px;
-  color: var(--accent);
-  letter-spacing: 2px;
-  text-transform: uppercase;
-}
-.topbar-ip {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--text-hint);
-}
-.topbar-right { display: flex; align-items: center; gap: 20px; }
-.status-pill {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  font-size: 12px;
-  font-weight: 500;
-}
-.log-dot {
-  width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
-}
-.log-dot.online  { background: var(--green);  box-shadow: 0 0 6px var(--green); }
-.log-dot.offline { background: var(--red);    box-shadow: 0 0 6px var(--red); }
-#logStatusText { color: var(--red); }
-.ota-btn {
-  font-size: 11px;
-  padding: 5px 14px;
-  border-radius: 7px;
-  border: 1px solid #ff660044;
-  background: transparent;
-  color: #ff6600;
-  font-family: var(--font-ui);
-  cursor: pointer;
-  transition: background 0.15s;
-}
-.ota-btn:hover { background: #ff6600; color: #fff; }
-
-/* ---- Grid layout ---- */
-.main-grid {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 16px;
-  padding: 20px 16px 0;
-  align-items: stretch;
-  /* min-width: 0 на grid-container предотвращает распирание дочерних элементов */
-  min-width: 0;
-}
-.main-grid > .card {
-  height: 100%;
-  min-width: 0;   /* grid item не уходит за границу трека */
-  overflow: hidden;
+.mono {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+               "Liberation Mono", monospace;
+  font-variant-numeric: tabular-nums;
 }
 
-@media (max-width: 900px) {
-  .main-grid {
-    grid-template-columns: 1fr;
-    align-items: start;
-    padding: 12px 12px 0;
-  }
-  .main-grid > .card { height: auto; }
-}
+:focus-visible { outline: none; box-shadow: var(--ring); border-radius: 8px; }
 
-/* ---- Card ---- */
-.card {
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: var(--r-card);
-  padding: 20px;
-}
-.card-title {
-  font-family: var(--font-ui);
-  font-size: 20px;
-  font-weight: 700;
-  letter-spacing: 0.5px;
-  color: var(--text);
-  margin-bottom: 16px;
-  text-align: center;
-}
-.card-title-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 16px;
-}
-.card-title-row .card-title { margin-bottom: 0; text-align: left; font-size: 14px; }
+.wrap { max-width: 1240px; margin: 0 auto; padding: 0 16px; }
 
-/* ---- Live Metrics card ---- */
-.wheel-vis {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  margin-bottom: 14px;
+/* =========================== Шапка =========================== */
+/* Непрозрачный фон, а не backdrop-filter: размытие подложки на слабых
+   мобильных GPU даёт рывки при прокрутке и артефакты отрисовки. */
+.app-header {
+  position: sticky; top: 0; z-index: 40;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border-soft);
 }
-svg.wheel { filter: drop-shadow(0 0 14px #1d4ed855); }
-.speed-block { text-align: center; margin-bottom: 14px; }
-.speed-value {
-  font-family: var(--font-mono);
-  font-size: clamp(28px, 5vw, 44px);
-  font-weight: 700;
-  color: var(--text);
-  line-height: 1;
+.app-header .wrap {
+  display: flex; align-items: center; gap: 12px;
+  min-height: 58px; padding-top: 8px; padding-bottom: 8px;
 }
-.speed-unit {
-  font-size: 14px;
-  color: var(--text-muted);
-  margin-left: 4px;
+.brand { display: flex; flex-direction: column; min-width: 0; margin-right: auto; }
+.brand b {
+  font-size: 15px; font-weight: 700; letter-spacing: .02em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.speed-label {
-  font-size: 11px;
-  color: var(--text-hint);
-  margin-top: 5px;
-  text-transform: uppercase;
-  letter-spacing: 1px;
+.brand small {
+  font-size: 12px; color: var(--text-3);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.metrics-row {
-  display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
-  gap: 10px;
-}
-.mini-metric {
-  background: var(--bg-input);
-  border-radius: var(--r-elem);
-  padding: 11px 10px;
-  text-align: center;
-}
-.mini-val {
-  display: block;
-  font-family: var(--font-mono);
-  font-size: 18px;
-  font-weight: 700;
-  color: var(--text);
-}
-.mini-val.accent { color: var(--accent); }
-.mini-label {
-  display: block;
-  font-size: 9px;
-  color: var(--text-hint);
-  text-transform: uppercase;
-  letter-spacing: 1px;
-  margin-top: 3px;
-}
-.wheel-circ-input {
-  background: transparent;
-  border: none;
-  outline: none;
-  font-family: var(--font-mono);
-  font-size: 14px;
-  font-weight: 700;
-  color: var(--text);
-  text-align: center;
-  width: 60px;
-  cursor: text;
-  padding: 0;
-}
-
-/* ---- Power Status card ---- */
-.power-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 9px 0;
-  border-bottom: 1px solid var(--border-dim);
-  font-size: 13px;
-}
-.power-row:last-child { border-bottom: none; }
-.power-label { color: var(--text-muted); font-size: 12px; }
-.power-val { font-family: var(--font-mono); font-size: 13px; }
-.power-unit { font-size: 11px; color: var(--text-hint); margin-left: 2px; }
-.badge {
-  font-size: 10px; padding: 3px 9px; border-radius: 20px;
-  font-weight: 600; letter-spacing: 0.5px;
-}
-.badge-green { background: #052e16; color: var(--green); border: 1px solid #166534; }
-.badge-blue  { background: #0c2340; color: var(--accent); border: 1px solid #164e73; }
-.badge-dim   { background: #111827; color: var(--text-muted); border: 1px solid var(--border); }
-.battery-bar-wrap {
-  background: var(--bg-input);
-  border-radius: var(--r-elem);
-  padding: 12px;
-  margin-top: 14px;
-}
-.battery-bar-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 8px;
-}
-.battery-bar-label { font-size: 11px; color: var(--text-muted); }
-.battery-bar-pct   { font-family: var(--font-mono); font-size: 13px; color: var(--green); }
-.battery-bar-track {
-  height: 5px; background: var(--border); border-radius: 3px; overflow: hidden;
-}
-.battery-bar-fill {
-  height: 100%;
-  background: linear-gradient(90deg, #065f46, var(--green));
-  border-radius: 3px;
-  width: 0%;
-  transition: width 0.5s;
-}
-
-/* ---- Storage & Upload card ---- */
-.upload-zone {
-  border: 1.5px dashed var(--border);
-  border-radius: 12px;
-  padding: 20px;
-  text-align: center;
-  cursor: pointer;
-  transition: all 0.2s;
-  position: relative;
-}
-.upload-zone:hover { border-color: var(--accent); background: #060b14; }
-.upload-zone input[type="file"] {
-  position: absolute; inset: 0; width: 100%; height: 100%;
-  opacity: 0; cursor: pointer;
-}
-.upload-icon { font-size: 26px; color: var(--border); margin-bottom: 6px; transition: color 0.2s; }
-.upload-zone:hover .upload-icon { color: var(--accent); }
-.upload-text { font-size: 12px; color: var(--text-hint); line-height: 1.5; }
-.upload-text span { color: var(--accent); font-weight: 500; }
-
-/* Круглая миниатюра в зоне дропа */
-.drop-thumb {
-  width: 96px; height: 96px;
-  border-radius: 50%;
-  overflow: hidden;
-  margin: 0 auto 8px;
-  border: 2px solid var(--border);
-  display: none;
-}
-.drop-thumb canvas {
-  width: 96px; height: 96px;
-  display: block;
-}
-.upload-zone.has-preview .upload-icon { display: none; }
-.upload-zone.has-preview .drop-thumb  { display: block; }
-.upload-zone.has-preview { border-color: var(--accent); }
-
-.status-bar {
-  font-size: 11px;
-  color: var(--text-muted);
-  padding: 7px 10px;
-  background: var(--bg-input);
-  border-radius: 8px;
-  border-left: 2px solid var(--border);
-  margin-top: 10px;
-  min-height: 30px;
-  font-family: var(--font-mono);
-}
-.status-bar.ok  { border-color: var(--green); color: var(--green); }
-.status-bar.err { border-color: var(--red);   color: var(--red); }
-
-.progress-wrap { margin-top: 6px; display: none; }
-.progress-track { height: 3px; background: var(--border); border-radius: 2px; overflow: hidden; }
-.progress-fill  { height: 100%; background: linear-gradient(90deg, var(--accent-dim), var(--accent)); border-radius: 2px; width: 0%; transition: width 0.15s; }
-
-.upload-queue-label {
-  font-size: 11px; color: var(--text-hint); margin-top: 7px;
-  font-family: var(--font-mono); display: none;
-}
-
-.fs-header {
-  display: flex; justify-content: space-between; align-items: center;
-  margin-bottom: 6px;
-}
-.fs-label { font-size: 11px; color: var(--text-muted); }
-.fs-pct   { font-family: var(--font-mono); font-size: 11px; color: var(--accent); }
-.fs-track { height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; margin-bottom: 14px; }
-.fs-fill  { height: 100%; background: linear-gradient(90deg, var(--accent-dim), var(--accent)); border-radius: 2px; transition: width 0.4s; width: 0%; }
-
-.file-item {
-  display: flex; align-items: center;
-  background: var(--bg-input);
-  border-radius: var(--r-elem);
-  padding: 10px 12px;
-  margin-bottom: 8px;
-  gap: 10px;
-}
-.file-item .fname {
-  flex: 1; font-family: var(--font-mono); font-size: 11px;
-  color: #cbd5e1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.file-item .fsize { font-size: 11px; color: var(--text-hint); white-space: nowrap; }
-.file-item .acts  { display: flex; gap: 6px; }
-
-.btn-icon {
-  width: 30px; height: 30px;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  background: transparent;
-  color: var(--text-muted);
-  cursor: pointer;
-  display: flex; align-items: center; justify-content: center;
-  font-size: 13px; font-family: var(--font-ui);
-  transition: all 0.15s;
-  padding: 0;
-}
-.btn-icon:hover { background: var(--border); color: var(--text); }
-.btn-icon.play  { color: var(--green); border-color: #166534; }
-.btn-icon.play:hover { background: #052e16; }
-.btn-icon.del   { color: var(--red);   border-color: #7f1d1d; }
-.btn-icon.del:hover  { background: #1a0505; }
-
-/* ---- Buttons ---- */
-.btn-primary {
-  display: block; width: 100%;
-  padding: 11px;
-  border: none; border-radius: var(--r-elem);
-  background: var(--accent-dim);
-  color: #fff;
-  font-family: var(--font-ui); font-size: 13px; font-weight: 600;
-  cursor: pointer; letter-spacing: 0.3px;
-  transition: background 0.15s;
-  margin-top: 10px;
-}
-.btn-primary:hover { background: #2563eb; }
-.btn-stop {
-  display: block; width: 100%;
-  padding: 10px;
-  border: 1px solid #7f1d1d; border-radius: var(--r-elem);
-  background: #1a0505;
-  color: var(--red);
-  font-family: var(--font-ui); font-size: 13px; font-weight: 600;
-  cursor: pointer; margin-top: 10px;
-  transition: background 0.15s;
-}
-.btn-stop:hover { background: #2d0808; }
-
-.btn-album {
-  flex: 1;
-  padding: 10px;
-  border: 1px solid #166534; border-radius: var(--r-elem);
-  background: #052e16;
-  color: var(--green);
-  font-family: var(--font-ui); font-size: 13px; font-weight: 600;
-  cursor: pointer;
-  transition: background 0.15s;
+.conn {
+  display: inline-flex; align-items: center; gap: 7px;
+  font-size: 13px; font-weight: 600; color: var(--text-2);
+  padding: 6px 10px; border-radius: 999px;
+  background: var(--surface-2); border: 1px solid var(--border-soft);
   white-space: nowrap;
 }
-.btn-album:hover       { background: #065f46; }
-.btn-album.active      { background: var(--green); color: #000; border-color: var(--green); }
-.btn-album.active:hover{ background: #6ee7b7; }
+.log-dot { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; background: var(--text-3); }
+.log-dot.online  { background: var(--ok);     box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent); }
+.log-dot.offline { background: var(--danger); box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 22%, transparent); }
 
-/* ---- Settings card ---- */
-.slider-row { margin-bottom: 14px; }
-.slider-label {
-  display: flex; justify-content: space-between; align-items: center;
-  font-size: 12px; color: var(--text-muted); margin-bottom: 7px;
+/* =========================== Кнопки =========================== */
+.btn {
+  --btn-bg: var(--surface-2);
+  --btn-fg: var(--text);
+  --btn-bd: var(--border);
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  min-height: 44px; padding: 0 16px;
+  border: 1px solid var(--btn-bd); border-radius: 12px;
+  background: var(--btn-bg); color: var(--btn-fg);
+  font: inherit; font-size: 14px; font-weight: 600;
+  cursor: pointer; user-select: none;
+  transition: filter .15s, background .15s, border-color .15s, transform .05s;
 }
-.slider-label .val { font-family: var(--font-mono); color: var(--accent); font-size: 12px; }
+.btn:hover  { filter: brightness(1.12); }
+.btn:active { transform: translateY(1px); }
+.btn:disabled { opacity: .45; cursor: not-allowed; filter: none; }
+.btn-primary { --btn-bg: var(--accent); --btn-fg: var(--accent-ink); --btn-bd: transparent; font-weight: 700; }
+.btn-ok      { --btn-bg: var(--ok-soft); --btn-fg: var(--ok); --btn-bd: color-mix(in srgb, var(--ok) 35%, transparent); }
+.btn-ok.active { --btn-bg: var(--ok); --btn-fg: var(--accent-ink); }
+html[data-theme="light"] .btn-ok.active { --btn-fg: #fff; }
+.btn-danger  { --btn-bg: var(--danger-soft); --btn-fg: var(--danger); --btn-bd: color-mix(in srgb, var(--danger) 35%, transparent); }
+.btn-ghost   { --btn-bg: transparent; --btn-fg: var(--text-2); }
+.btn-sm      { min-height: 36px; padding: 0 12px; font-size: 13px; border-radius: 10px; }
+.btn-block   { width: 100%; }
+.btn-icon    { min-height: 44px; width: 44px; padding: 0; font-size: 16px; }
 
-/* custom range */
+/* =========================== Живая сводка =========================== */
+.hero { padding: 16px 0 4px; }
+.stat-row {
+  display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+}
+.stat {
+  display: flex; align-items: center; gap: 14px;
+  background: var(--surface); border: 1px solid var(--border-soft);
+  border-radius: 16px; padding: 14px 16px; box-shadow: var(--shadow);
+  min-width: 0;
+}
+.stat-body { min-width: 0; }
+.stat-k {
+  font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
+  color: var(--text-3); font-weight: 700;
+}
+.stat-v { font-size: 26px; font-weight: 700; line-height: 1.15; letter-spacing: -.01em; }
+.stat-v small { font-size: 14px; font-weight: 600; color: var(--text-3); margin-left: 3px; }
+.stat-sub {
+  font-size: 12px; color: var(--text-3); margin-top: 2px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.stat.is-ok   .stat-v { color: var(--ok); }
+.stat.is-warn .stat-v { color: var(--warn); }
+
+/* Ротор: 6 лучей, скорость вращения пропорциональна rpm — состояние читается
+   боковым зрением, без чтения цифр. */
+.rotor { width: 46px; height: 46px; flex: 0 0 auto; }
+.rotor .spin { transform-origin: 50% 50%; animation: rotor-spin 2s linear infinite; animation-play-state: paused; }
+.rotor.run .spin { animation-play-state: running; }
+.rotor.rev .spin { animation-direction: reverse; }
+@keyframes rotor-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .rotor .spin { animation: none !important; } }
+
+/* Полоса батареи внутри плитки */
+.mini-bar { height: 6px; border-radius: 3px; background: var(--track); overflow: hidden; margin-top: 7px; }
+.mini-bar > i { display: block; height: 100%; width: 0; border-radius: 3px; background: var(--ok); transition: width .5s; }
+
+/* Что играет сейчас */
+.nowbar {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin-top: 12px; padding: 12px 16px;
+  background: var(--surface); border: 1px solid var(--border-soft);
+  border-radius: 16px; box-shadow: var(--shadow);
+}
+.nowbar .np-k {
+  font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
+  color: var(--text-3); font-weight: 700;
+}
+.nowbar .np-v { font-size: 15px; font-weight: 600; word-break: break-all; }
+.nowbar .np-left { flex: 1 1 220px; min-width: 0; }
+
+/* =========================== Вкладки =========================== */
+.tabs-bar {
+  position: sticky; top: 58px; z-index: 30;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border-soft);
+  margin-top: 14px;
+}
+.tabs {
+  display: flex; gap: 4px; overflow-x: auto; scrollbar-width: none;
+  padding: 6px 0;
+}
+.tabs::-webkit-scrollbar { display: none; }
+.tab {
+  flex: 0 0 auto; min-height: 42px; padding: 0 16px; white-space: nowrap;
+  border: none; background: transparent; color: var(--text-3);
+  font: inherit; font-size: 14px; font-weight: 600; cursor: pointer;
+  border-radius: 11px; display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+  transition: background .15s, color .15s;
+}
+.tab:hover { color: var(--text-2); background: var(--surface-2); }
+.tab[aria-selected="true"] { color: var(--accent-ink); background: var(--accent); }
+.tab .tab-badge {
+  font-size: 11px; font-weight: 700; padding: 1px 6px; border-radius: 999px;
+  background: color-mix(in srgb, currentColor 18%, transparent);
+}
+
+.panel { padding: 18px 0 40px; }
+.panel[hidden] { display: none; }
+.cols {
+  display: grid; gap: 16px; align-items: start;
+  grid-template-columns: 1fr;
+}
+@media (min-width: 900px) {
+  .cols-2   { grid-template-columns: 1fr 1fr; }
+  .cols-a   { grid-template-columns: minmax(320px, 400px) 1fr; }
+}
+
+/* =========================== Карточки =========================== */
+.card {
+  background: var(--surface); border: 1px solid var(--border-soft);
+  border-radius: 18px; padding: 18px; box-shadow: var(--shadow);
+  min-width: 0;
+}
+.card > h2 {
+  font-size: 16px; font-weight: 700; letter-spacing: -.01em;
+  display: flex; align-items: center; gap: 8px; margin-bottom: 4px;
+}
+.card > .card-note { font-size: 13px; color: var(--text-3); margin-bottom: 14px; }
+.card > h2 + *:not(.card-note) { margin-top: 14px; }
+.sep { height: 1px; background: var(--border-soft); margin: 18px 0; }
+
+/* =========================== Органы управления =========================== */
+.ctl { margin-bottom: 18px; }
+.ctl:last-child { margin-bottom: 0; }
+.ctl-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+  margin-bottom: 9px;
+}
+.ctl-name { font-size: 14px; font-weight: 600; color: var(--text); }
+.ctl-val {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 14px; font-weight: 700; color: var(--accent); white-space: nowrap;
+}
+.ctl-val .muted { color: var(--text-3); font-weight: 600; }
+.ctl-val .live  { color: var(--warn); }
+.ctl-hint { font-size: 12.5px; color: var(--text-3); margin-top: 8px; line-height: 1.4; }
+
+/* Ползунки: трек 6 px, ручка 22 px — попадание пальцем без прицеливания. */
 input[type="range"] {
   -webkit-appearance: none; appearance: none;
-  width: 100%; height: 4px;
-  background: var(--border); border-radius: 2px;
-  outline: none; cursor: pointer; display: block;
+  display: block; width: 100%; height: 22px; background: transparent;
+  cursor: pointer; outline: none;
+  --p: 0;
 }
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 6px; border-radius: 3px;
+  background: linear-gradient(90deg,
+    var(--accent) 0 calc(var(--p) * 1%), var(--track) calc(var(--p) * 1%) 100%);
+}
+input[type="range"]::-moz-range-track { height: 6px; border-radius: 3px; background: var(--track); }
+input[type="range"]::-moz-range-progress { height: 6px; border-radius: 3px; background: var(--accent); }
 input[type="range"]::-webkit-slider-thumb {
   -webkit-appearance: none; appearance: none;
-  width: 14px; height: 14px; border-radius: 50%;
-  background: var(--accent);
-  border: 2px solid var(--bg-base);
-  cursor: pointer;
+  width: 22px; height: 22px; margin-top: -8px; border-radius: 50%;
+  background: var(--accent); border: 3px solid var(--surface);
+  box-shadow: 0 1px 4px rgba(0,0,0,.45);
 }
 input[type="range"]::-moz-range-thumb {
-  width: 14px; height: 14px; border-radius: 50%;
-  background: var(--accent);
-  border: 2px solid var(--bg-base);
-  cursor: pointer;
+  width: 22px; height: 22px; border-radius: 50%; border: 3px solid var(--surface);
+  background: var(--accent); box-shadow: 0 1px 4px rgba(0,0,0,.45);
 }
+input[type="range"].r-slider { --c: var(--danger); }
+input[type="range"].g-slider { --c: var(--ok); }
+input[type="range"].b-slider { --c: var(--blue); }
+input[type="range"].r-slider::-webkit-slider-thumb,
+input[type="range"].g-slider::-webkit-slider-thumb,
+input[type="range"].b-slider::-webkit-slider-thumb { background: var(--c); }
+input[type="range"].r-slider::-moz-range-thumb,
+input[type="range"].g-slider::-moz-range-thumb,
+input[type="range"].b-slider::-moz-range-thumb { background: var(--c); }
+input[type="range"].r-slider::-webkit-slider-runnable-track,
+input[type="range"].g-slider::-webkit-slider-runnable-track,
+input[type="range"].b-slider::-webkit-slider-runnable-track {
+  background: linear-gradient(90deg, var(--c) 0 calc(var(--p) * 1%), var(--track) calc(var(--p) * 1%) 100%);
+}
+input[type="range"].r-slider::-moz-range-progress,
+input[type="range"].g-slider::-moz-range-progress,
+input[type="range"].b-slider::-moz-range-progress { background: var(--c); }
 
-/* Цветные RGB thumb'ы */
-input[type="range"].r-slider::-webkit-slider-thumb { background: var(--red); }
-input[type="range"].r-slider::-moz-range-thumb     { background: var(--red); }
-input[type="range"].g-slider::-webkit-slider-thumb { background: var(--green); }
-input[type="range"].g-slider::-moz-range-thumb     { background: var(--green); }
-input[type="range"].b-slider::-webkit-slider-thumb { background: var(--purple); }
-input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); }
-
-/* Dual-range brightness */
-.bri-wrap { position: relative; height: 28px; margin-bottom: 4px; user-select: none; }
+/* Двойной ползунок яркости */
+.bri-wrap { position: relative; height: 30px; user-select: none; }
 .bri-track {
-  position: absolute; top: 50%; left: 0; right: 0;
-  height: 4px; background: var(--border); border-radius: 2px;
-  transform: translateY(-50%);
+  position: absolute; top: 50%; left: 0; right: 0; height: 6px;
+  background: var(--track); border-radius: 3px; transform: translateY(-50%);
 }
 .bri-fill {
-  position: absolute; top: 50%; height: 4px;
-  background: linear-gradient(90deg, var(--accent-dim), var(--accent));
-  border-radius: 2px; transform: translateY(-50%); pointer-events: none;
+  position: absolute; top: 50%; height: 6px; border-radius: 3px;
+  background: var(--accent); transform: translateY(-50%); pointer-events: none;
 }
 .bri-cursor {
   position: absolute; top: 50%; transform: translate(-50%, -50%);
-  width: 3px; height: 12px;
-  background: var(--yellow);
-  pointer-events: none; z-index: 10;
-  box-shadow: 0 0 5px var(--yellow);
-  transition: left 0.3s;
+  width: 4px; height: 20px; border-radius: 2px; background: var(--warn);
+  box-shadow: 0 0 0 2px var(--surface); pointer-events: none; z-index: 6;
+  transition: left .3s;
 }
 .bri-wrap input[type="range"] {
-  position: absolute; width: 100%; height: 28px; top: 0; left: 0;
-  margin: 0; padding: 0; background: transparent; pointer-events: none;
-  touch-action: none;
+  position: absolute; inset: 0; width: 100%; height: 30px; margin: 0;
+  background: transparent; pointer-events: none; touch-action: none;
 }
-.bri-wrap input[type="range"]::-webkit-slider-thumb { pointer-events: all; }
-.bri-wrap input[type="range"]::-moz-range-thumb     { pointer-events: all; }
-.bri-labels {
-  display: flex; justify-content: space-between;
-  font-size: 11px; color: var(--text-hint); margin-bottom: 12px;
-  font-family: var(--font-mono);
-}
-.bri-labels .v  { color: var(--accent); }
-.bri-labels .now { color: var(--yellow); }
+.bri-wrap input[type="range"]::-webkit-slider-runnable-track { background: transparent; }
+.bri-wrap input[type="range"]::-moz-range-track { background: transparent; }
+.bri-wrap input[type="range"]::-moz-range-progress { background: transparent; }
+.bri-wrap input[type="range"]::-webkit-slider-thumb { pointer-events: auto; }
+.bri-wrap input[type="range"]::-moz-range-thumb     { pointer-events: auto; }
 
-/* ABL RMS marker */
+/* Маркер фактического тока на шкале LED Power */
 .abl-wrap { position: relative; }
 #ablRmsMark {
-  position: absolute; top: 50%; width: 3px; height: 12px;
-  background: var(--yellow); box-shadow: 0 0 5px var(--yellow);
-  transform: translate(-50%, -50%); pointer-events: none;
-  border-radius: 1px;
-  transition: left 0.5s;
+  position: absolute; top: 50%; width: 4px; height: 20px; border-radius: 2px;
+  background: var(--warn); box-shadow: 0 0 0 2px var(--surface);
+  transform: translate(-50%, -50%); pointer-events: none; transition: left .5s;
 }
 
-/* IMAGE CORRECTION block */
-.img-correction-title {
-  font-size: 9px; letter-spacing: 1px; text-transform: uppercase;
-  color: var(--text-hint); text-align: center; margin: 14px 0 10px;
+/* Числовые поля / селекты */
+.field {
+  display: inline-flex; align-items: center; gap: 8px;
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: 12px; padding: 0 12px; min-height: 44px;
 }
-/* IMAGE + COLOR two-column grid */
-.img-color-grid {
-  display: grid; grid-template-columns: 1fr 1fr;
-  gap: 0 16px;
+.field > label { font-size: 13px; color: var(--text-3); white-space: nowrap; }
+.field input, .field select {
+  background: transparent; border: none; outline: none; color: var(--text);
+  font: inherit; font-size: 15px; font-weight: 600;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  min-width: 0; padding: 0;
 }
-.img-restore-btn {
-  display: block; width: 100%; margin-top: 12px;
-  padding: 6px 0; border-radius: var(--r-elem);
-  background: transparent; border: 1px solid var(--border);
-  color: var(--text-muted); font-size: 11px; letter-spacing: 0.5px;
-  cursor: pointer; transition: border-color 0.2s, color 0.2s;
-}
-.img-restore-btn:hover { border-color: var(--accent); color: var(--accent); }
-/* Каждая колонка — единая сетка: все строки делят одни треки.
-   Обе колонки идентичны → слайдеры одинаковой ширины. */
-.img-color-col {
-  display: grid;
-  grid-template-columns: 14px 1fr 30px;
-  grid-template-rows: auto auto auto auto;
-  align-items: center;
-  column-gap: 7px;
-  row-gap: 9px;
-}
-.mini-label {
-  font-size: 11px; color: var(--text-muted); white-space: nowrap;
-}
-.mini-val {
-  font-family: var(--font-mono); font-size: 11px;
-  color: var(--accent); text-align: right; white-space: nowrap;
-}
-.img-color-col input[type="range"] {
-  height: 3px; margin: 0; width: 100%;
-}
-.img-color-col input[type="range"].r-slider::-webkit-slider-thumb { background: var(--red); }
-.img-color-col input[type="range"].r-slider::-moz-range-thumb     { background: var(--red); }
-.img-color-col input[type="range"].g-slider::-webkit-slider-thumb { background: var(--green); }
-.img-color-col input[type="range"].g-slider::-moz-range-thumb     { background: var(--green); }
-.img-color-col input[type="range"].b-slider::-webkit-slider-thumb { background: var(--purple); }
-.img-color-col input[type="range"].b-slider::-moz-range-thumb     { background: var(--purple); }
+.field input { width: 62px; text-align: right; }
+.field select { cursor: pointer; }
+.field .unit { font-size: 12px; color: var(--text-3); }
 
-/* ---- Log card ---- */
-.card-log {
-  display: flex;
-  flex-direction: column;
-  align-self: start;
-  overflow: hidden;
+/* Пары «параметр — значение» */
+.kv { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 11px 0; border-bottom: 1px solid var(--border-soft); }
+.kv:last-child { border-bottom: none; }
+.kv-k { font-size: 14px; color: var(--text-2); }
+.kv-v {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums; font-size: 14px; font-weight: 600;
 }
-.card-log .log-box {
-  flex: 1;
-  min-height: 0;
-}
-.log-box {
-  background: var(--bg-deep);
-  border-radius: var(--r-elem);
-  padding: 12px 14px;
-  overflow-x: hidden;
-  overflow-y: auto;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  line-height: 1.9;
-  scrollbar-width: thin;
-  scrollbar-color: var(--border) transparent;
-}
-.log-box::-webkit-scrollbar { width: 4px; }
-.log-box::-webkit-scrollbar-track { background: transparent; }
-.log-box::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
-.log-line { white-space: pre-wrap; word-break: break-all; }
-.log-controls {
-  display: flex; justify-content: space-between; align-items: center;
-  margin-top: 8px;
-}
-.log-badge { font-size: 10px; color: var(--text-hint); font-family: var(--font-mono); }
-.log-clear-btn {
-  background: transparent;
-  border: 1px solid var(--border);
-  color: var(--text-muted);
-  font-size: 11px;
-  padding: 4px 12px;
-  border-radius: 7px;
-  cursor: pointer;
-  font-family: var(--font-ui);
-  transition: background 0.15s;
-}
-.log-clear-btn:hover { background: var(--border); color: var(--text); }
+.kv-v .unit { font-size: 12px; color: var(--text-3); margin-left: 2px; font-weight: 500; }
 
-/* ---- Divider ---- */
-.divider { height: 1px; background: var(--border-dim); margin: 16px 0; }
+.badge {
+  display: inline-block; font-size: 11.5px; font-weight: 700; letter-spacing: .02em;
+  padding: 4px 10px; border-radius: 999px; white-space: nowrap;
+  background: var(--surface-3); color: var(--text-2); border: 1px solid var(--border-soft);
+}
+.badge-ok    { background: var(--ok-soft);     color: var(--ok);     border-color: color-mix(in srgb, var(--ok) 30%, transparent); }
+.badge-acc   { background: var(--accent-soft); color: var(--accent); border-color: color-mix(in srgb, var(--accent) 30%, transparent); }
+.badge-warn  { background: var(--warn-soft);   color: var(--warn);   border-color: color-mix(in srgb, var(--warn) 30%, transparent); }
 
-/* ---- Preview canvas (hidden, functional) ---- */
-#preview { display: none; width: 0; height: 0; }
+/* =========================== Загрузка =========================== */
+.upload-zone {
+  position: relative; display: block; width: 100%;
+  border: 2px dashed var(--border); border-radius: 16px;
+  background: var(--surface-2); padding: 22px 16px; text-align: center;
+  cursor: pointer; transition: border-color .2s, background .2s;
+}
+.upload-zone:hover, .upload-zone.drag { border-color: var(--accent); background: var(--accent-soft); }
+.upload-zone input[type="file"] { display: none; }
+.upload-icon { font-size: 30px; line-height: 1; color: var(--text-3); margin-bottom: 8px; }
+.upload-zone:hover .upload-icon { color: var(--accent); }
+.upload-text { font-size: 14px; color: var(--text-2); }
+.upload-text b { color: var(--accent); }
+.upload-text small { display: block; margin-top: 4px; font-size: 12px; color: var(--text-3); }
+.drop-thumb {
+  display: none; width: 108px; height: 108px; margin: 0 auto 10px;
+  border-radius: 50%; overflow: hidden; border: 2px solid var(--border);
+  background: #000;
+}
+.drop-thumb canvas { display: block; width: 108px; height: 108px; }
+.upload-zone.has-preview .upload-icon { display: none; }
+.upload-zone.has-preview .drop-thumb  { display: block; }
+.upload-zone.has-preview { border-style: solid; border-color: var(--accent); }
 
-/* ---- Миниатюра колеса в списке файлов ---- */
+.opt-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.opt-row .field { flex: 0 1 auto; }
+.opt-note {
+  width: 100%; font-size: 12px; color: var(--text-3); margin-top: 2px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.status-bar {
+  margin-top: 12px; padding: 10px 12px; border-radius: 12px;
+  background: var(--surface-2); border: 1px solid var(--border-soft);
+  border-left: 3px solid var(--border);
+  font-size: 12.5px; line-height: 1.45; color: var(--text-2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  word-break: break-word; min-height: 42px;
+}
+.status-bar.ok  { border-left-color: var(--ok);     color: var(--ok);     background: var(--ok-soft); }
+.status-bar.err { border-left-color: var(--danger); color: var(--danger); background: var(--danger-soft); }
+
+.progress-wrap { display: none; margin-top: 10px; }
+.progress-track { height: 6px; border-radius: 3px; background: var(--track); overflow: hidden; }
+.progress-fill  { height: 100%; width: 0; border-radius: 3px; background: var(--accent); transition: width .15s; }
+.upload-queue-label { display: none; margin-top: 10px; font-size: 12.5px; color: var(--text-3); word-break: break-word; }
+
+/* =========================== Файлы =========================== */
+.meter-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-bottom: 7px; }
+.meter-head .k { font-size: 13px; color: var(--text-2); }
+.meter-head .v {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px; font-weight: 700; color: var(--accent);
+}
+.meter { height: 8px; border-radius: 4px; background: var(--track); overflow: hidden; }
+.meter > i { display: block; height: 100%; width: 0; border-radius: 4px; background: var(--accent); transition: width .4s; }
+.meter-sub { font-size: 12px; color: var(--text-3); margin-top: 6px; }
+
+.file-list { display: flex; flex-direction: column; gap: 8px; }
+.file {
+  position: relative; display: flex; align-items: center; gap: 12px;
+  padding: 10px; border-radius: 14px;
+  background: var(--surface-2); border: 1px solid var(--border-soft);
+  transition: border-color .15s, background .15s;
+}
+.file:hover { border-color: var(--border); }
+.file.playing { border-color: var(--ok); background: color-mix(in srgb, var(--ok) 8%, var(--surface-2)); }
 .file-thumb {
-  width: 48px; height: 48px;
-  border-radius: 50%;
-  flex-shrink: 0;
-  background: var(--bg-deep);
-  border: 1px solid var(--border-dim);
-  overflow: hidden;
+  flex: 0 0 auto; width: 56px; height: 56px; border-radius: 50%;
+  overflow: hidden; background: #000; border: 1px solid var(--border-soft);
 }
-.file-thumb canvas {
-  width: 48px; height: 48px;
-  display: block;
+.file-thumb canvas { display: block; width: 56px; height: 56px; }
+.file-main { flex: 1 1 auto; min-width: 0; text-align: left; background: none; border: none; color: inherit; font: inherit; cursor: pointer; padding: 0; }
+.file-name {
+  display: block; font-size: 14px; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.file-thumb .thumb-spinner {
-  width: 100%; height: 100%;
-  display: flex; align-items: center; justify-content: center;
-  font-size: 18px; opacity: 0.3;
+.file-sub { display: flex; align-items: center; gap: 7px; margin-top: 3px; font-size: 12px; color: var(--text-3); flex-wrap: wrap; }
+.tag {
+  font-size: 10px; font-weight: 800; letter-spacing: .06em; padding: 2px 6px;
+  border-radius: 5px; background: var(--surface-3); color: var(--text-2);
 }
+.tag-vid { background: color-mix(in srgb, var(--blue) 20%, transparent); color: var(--blue); }
+.tag-gif { background: var(--warn-soft); color: var(--warn); }
+.tag-img { background: var(--accent-soft); color: var(--accent); }
+.file-acts { flex: 0 0 auto; display: flex; gap: 6px; }
+.file-confirm {
+  display: none; position: absolute; inset: 0; align-items: center; gap: 8px;
+  padding: 0 10px; border-radius: 14px;
+  background: color-mix(in srgb, var(--danger) 12%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
+}
+.file.confirm .file-confirm { display: flex; }
+.file-confirm span { flex: 1; font-size: 13px; font-weight: 600; color: var(--danger); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.empty { padding: 22px 10px; text-align: center; font-size: 13px; color: var(--text-3); }
 
-/* ---- Dot pulse ---- */
-@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
-.dot-pulse {
-  display: inline-block; width: 7px; height: 7px;
-  border-radius: 50%; background: var(--green);
-  animation: pulse 2s ease-in-out infinite;
+/* =========================== Лог =========================== */
+.log-box {
+  background: var(--surface-2); border: 1px solid var(--border-soft);
+  border-radius: 14px; padding: 12px 14px;
+  height: clamp(320px, 55vh, 620px); overflow: auto; overscroll-behavior: contain;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px; line-height: 1.65;
+  scrollbar-width: thin; scrollbar-color: var(--border) transparent;
 }
+.log-box::-webkit-scrollbar { width: 8px; }
+.log-box::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+.log-line { white-space: pre-wrap; word-break: break-word; }
+.log-controls { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 12px; }
+.log-badge { font-size: 12px; color: var(--text-3); }
 
-@media (max-width: 600px) {
-  .topbar { padding: 12px 16px; }
+/* =========================== Уведомления =========================== */
+.toasts {
+  position: fixed; left: 50%; transform: translateX(-50%);
+  bottom: calc(16px + env(safe-area-inset-bottom)); z-index: 90;
+  display: flex; flex-direction: column; gap: 8px; align-items: center;
+  width: min(420px, calc(100vw - 32px)); pointer-events: none;
+}
+.toast {
+  width: 100%; padding: 12px 16px; border-radius: 12px;
+  background: var(--surface-3); border: 1px solid var(--border);
+  color: var(--text); font-size: 14px; font-weight: 600;
+  box-shadow: var(--shadow); animation: toast-in .2s ease-out;
+}
+.toast.ok  { background: var(--ok-soft);     color: var(--ok);     border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+.toast.err { background: var(--danger-soft); color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, transparent); }
+@keyframes toast-in { from { opacity: 0; transform: translateY(10px); } }
+
+/* =========================== Справка =========================== */
+details.help {
+  margin-top: 14px; border: 1px solid var(--border-soft); border-radius: 12px;
+  background: var(--surface-2); overflow: hidden;
+}
+details.help > summary {
+  padding: 11px 14px; cursor: pointer; font-size: 13px; font-weight: 600;
+  color: var(--text-2); list-style: none;
+}
+details.help > summary::-webkit-details-marker { display: none; }
+details.help > summary::before { content: "?  "; color: var(--accent); font-weight: 800; }
+details.help .help-body { padding: 0 14px 14px; font-size: 13px; color: var(--text-3); line-height: 1.55; }
+details.help .help-body p { margin-bottom: 8px; }
+details.help .help-body b { color: var(--text-2); }
+
+#preview { display: none; }
+
+/* =========================== Мелкий экран =========================== */
+@media (max-width: 640px) {
+  body { font-size: 15px; }
+  .wrap { padding: 0 12px; }
+  .app-header .wrap { min-height: 54px; }
+  .tabs-bar { top: 54px; }
+  .stat-row { grid-template-columns: 1fr 1fr; }
+  /* Батарея занимает всю ширину: в две колонки третья плитка оставляла
+     пустую половину строки. */
+  .stat-row > .stat:nth-child(3) { grid-column: 1 / -1; }
+  .stat { padding: 12px; gap: 10px; flex-direction: column; align-items: flex-start; }
+  .stat-v { font-size: 22px; }
+  .rotor { width: 34px; height: 34px; }
+  .file-thumb, .file-thumb canvas { width: 48px; height: 48px; }
+  .file-sub { gap: 6px; font-size: 11.5px; }
+  .card { padding: 16px 14px; border-radius: 16px; }
+  .brand small { display: none; }
+}
+/* Узкий телефон: убираем пиктограммы вкладок, чтобы все четыре подписи
+   помещались в строку и не приходилось её прокручивать. */
+@media (max-width: 430px) {
+  .tab { padding: 0 12px; }
+  .tab-ico { display: none; }
+}
+@media (max-width: 380px) {
+  .stat-row { grid-template-columns: 1fr; }
 }
 </style>
 </head>
 <body>
 
-<!-- ---- Topbar ---- -->
-<header class="topbar">
-  <div class="topbar-left">
-    <span class="topbar-title">Pixels of Velocity</span>
-    <span class="topbar-ip" id="deviceName">CONNECTING...</span>
-  </div>
-  <div class="topbar-right">
-    <div class="status-pill">
-      <span class="log-dot offline" id="logDot"></span>
-      <span id="logStatusText">OFFLINE</span>
+<!-- ================= Шапка ================= -->
+<header class="app-header">
+  <div class="wrap">
+    <div class="brand">
+      <b>POV Wheel</b>
+      <small id="deviceName">connecting…</small>
     </div>
-    <button class="ota-btn" onclick="fetch('/ping').then(()=>window.location.href='/update')">&#8679; OTA Update</button>
+    <span class="conn">
+      <span class="log-dot offline" id="logDot"></span>
+      <span id="logStatusText">Offline</span>
+    </span>
+    <button class="btn btn-icon btn-ghost" id="themeBtn" onclick="toggleTheme()" title="Light / dark theme" aria-label="Toggle theme">◐</button>
+    <button class="btn btn-sm btn-ghost" onclick="goOta()" title="Firmware update over the air">OTA</button>
   </div>
 </header>
 
-<!-- ---- Main 4-column grid ---- -->
-<div class="main-grid">
+<!-- ================= Живая сводка ================= -->
+<div class="wrap hero">
+  <div class="stat-row">
 
-  <!-- Card 2: Storage & Upload -->
-  <div class="card" id="uploadCard">
-    <p class="card-title">Upload animation</p>
-
-    <div class="upload-zone" id="uploadZone" onclick="pickUploadFiles()">
-      <input type="file" id="fileInput" accept="image/*,video/*" multiple style="display:none">
-      <div class="drop-thumb"><canvas id="dropThumbCanvas" width="192" height="192"></canvas></div>
-      <div class="upload-icon">&#8679;</div>
-      <div class="upload-text">Drop <span>video</span>, <span>.gif</span> or image here<br>or click to browse</div>
-    </div>
-
-    <!-- Параметры извлечения кадров из видео. Показывается только когда выбрано видео. -->
-    <div id="videoOpts" style="display:none;margin-top:8px;gap:8px;align-items:center;flex-wrap:wrap;">
-      <div style="display:flex;align-items:center;gap:4px;">
-        <span style="font-size:11px;color:var(--text-hint);">FPS</span>
-        <select id="vidFps" onchange="onVideoOptsChange()"
-          style="background:var(--bg-deep);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--font-mono);font-size:13px;padding:5px 4px;">
-          <option value="5">5</option>
-          <option value="10" selected>10</option>
-          <option value="15">15</option>
-        </select>
-      </div>
-      <div style="display:flex;align-items:center;gap:4px;">
-        <span style="font-size:11px;color:var(--text-hint);">Frame</span>
-        <select id="vidFit" onchange="onVideoOptsChange()"
-          style="background:var(--bg-deep);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--font-mono);font-size:13px;padding:5px 4px;">
-          <option value="crop" selected>Crop</option>
-          <option value="fit">Fit</option>
-        </select>
-      </div>
-      <div style="display:flex;align-items:center;gap:4px;">
-        <span style="font-size:11px;color:var(--text-hint);">Start</span>
-        <input type="number" id="vidStart" min="0" step="0.5" value="0" onchange="onVideoOptsChange()"
-          style="width:48px;background:var(--bg-deep);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--font-mono);font-size:13px;padding:5px 4px;text-align:center;">
-        <span style="font-size:11px;color:var(--text-hint);">s</span>
-      </div>
-      <div style="display:flex;align-items:center;gap:4px;">
-        <span style="font-size:11px;color:var(--text-hint);">Len</span>
-        <input type="number" id="vidLen" min="0.5" step="0.5" value="10" onchange="onVideoOptsChange()"
-          style="width:48px;background:var(--bg-deep);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--font-mono);font-size:13px;padding:5px 4px;text-align:center;">
-        <span style="font-size:11px;color:var(--text-hint);">s</span>
-      </div>
-      <div id="vidBudget" style="font-size:11px;color:var(--text-hint);font-family:var(--font-mono);width:100%;"></div>
-    </div>
-
-    <div class="upload-queue-label" id="uploadQueue"></div>
-    <div class="status-bar" id="uploadStatus">Waiting for file...</div>
-    <div class="progress-wrap" id="uploadProgressWrap">
-      <div class="progress-track">
-        <div class="progress-fill" id="uploadProgressBar"></div>
+    <div class="stat" id="stateCard">
+      <svg class="rotor" id="rotor" viewBox="0 0 100 100" aria-hidden="true">
+        <circle cx="50" cy="50" r="46" fill="none" stroke="currentColor" stroke-width="3" opacity=".18"/>
+        <g class="spin" id="rotorSpin" stroke="currentColor" stroke-width="7" stroke-linecap="round">
+          <path d="M50 50 L50 8"/><path d="M50 50 L86 29"/><path d="M50 50 L86 71"/>
+          <path d="M50 50 L50 92"/><path d="M50 50 L14 71"/><path d="M50 50 L14 29"/>
+        </g>
+        <circle cx="50" cy="50" r="8" fill="currentColor"/>
+      </svg>
+      <div class="stat-body">
+        <div class="stat-k">Display</div>
+        <div class="stat-v" id="pwrState">—</div>
+        <div class="stat-sub" id="pwrHint">waiting for device</div>
       </div>
     </div>
-    <button class="btn-primary" id="btnUpload" onclick="processAndUpload()">&#9654; Convert &amp; Upload</button>
 
-    <div class="divider"></div>
-
-    <p class="card-title">Storage</p>
-    <div class="fs-header">
-      <span class="fs-label" id="fsLabel">Loading...</span>
-      <span class="fs-pct" id="fsPct"></span>
-    </div>
-    <div class="fs-track"><div class="fs-fill" id="fsFill"></div></div>
-
-    <!-- Кнопки управления воспроизведением -->
-    <div style="display:flex;gap:8px;margin-top:10px;align-items:center;">
-      <button class="btn-album" id="albumBtn" onclick="toggleAlbum()">&#9654;&#9654; Start Slideshow</button>
-      <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;">
-        <input type="number" id="albumSecs" min="1" max="99" value="10"
-          style="width:44px;background:var(--bg-deep);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--font-mono);font-size:14px;padding:6px 4px;text-align:center;">
-        <span style="font-size:11px;color:var(--text-hint);">sec</span>
+    <div class="stat">
+      <div class="stat-body">
+        <div class="stat-k">Speed</div>
+        <div class="stat-v mono"><span id="infoSpeed">--</span><small>km/h</small></div>
+        <div class="stat-sub"><span class="mono" id="infoRpm">--</span> rpm <span id="infoDir"></span></div>
       </div>
-      <button class="btn-stop" style="margin-top:0;flex:1;" onclick="stopDisplay()">&#9632; Stop Display</button>
     </div>
 
-    <div id="fileList" style="margin-top:8px;"></div>
+    <div class="stat" style="display:block">
+      <div class="stat-body" style="width:100%">
+        <div class="stat-k" style="display:flex;justify-content:space-between;align-items:center">
+          <span>Battery</span><span class="badge" id="chgStat">--</span>
+        </div>
+        <div class="stat-v mono"><span id="batPct">--%</span></div>
+        <div class="mini-bar"><i id="batBar"></i></div>
+      </div>
+    </div>
+
   </div>
 
-  <!-- Card: POV Display — метрики + настройки -->
-  <div class="card">
-    <p class="card-title">POV Display</p>
+  <div class="nowbar">
+    <div class="np-left">
+      <div class="np-k">Now playing</div>
+      <div class="np-v" id="nowPlaying">nothing</div>
+    </div>
+    <button class="btn btn-ok" id="albumBtn" onclick="toggleAlbum()">
+      <span id="albumBtnIcon">⏩</span><span id="albumBtnLabel">Slideshow</span>
+    </button>
+    <button class="btn btn-danger" onclick="stopDisplay()">■ Stop</button>
+  </div>
+</div>
 
-    <!-- Speed + RPM -->
-    <div class="speed-block" id="speedBlock" onclick="toggleWheelCircEdit()" style="cursor:pointer;" title="Click to set wheel circumference">
-      <div style="display:flex;align-items:baseline;justify-content:center;gap:14px;">
-        <div>
-          <span class="speed-value" id="infoSpeed">--</span>
-          <span class="speed-unit">km/h</span>
+<!-- ================= Вкладки ================= -->
+<div class="tabs-bar">
+  <div class="wrap">
+    <div class="tabs" role="tablist">
+      <button class="tab" role="tab" id="tab-library" aria-selected="true"  aria-controls="panel-library" onclick="showTab('library')"><span class="tab-ico">🖼</span>Library</button>
+      <button class="tab" role="tab" id="tab-display" aria-selected="false" aria-controls="panel-display" onclick="showTab('display')"><span class="tab-ico">💡</span>Display</button>
+      <button class="tab" role="tab" id="tab-tune"    aria-selected="false" aria-controls="panel-tune"    onclick="showTab('tune')"><span class="tab-ico">🎛</span>Calibration</button>
+      <button class="tab" role="tab" id="tab-log"     aria-selected="false" aria-controls="panel-log"     onclick="showTab('log')"><span class="tab-ico">📄</span>Log</button>
+    </div>
+  </div>
+</div>
+
+<main class="wrap">
+
+<!-- ---------------- Вкладка: библиотека ---------------- -->
+<section class="panel" id="panel-library" role="tabpanel" aria-labelledby="tab-library">
+  <div class="cols cols-a">
+
+    <!-- Загрузка -->
+    <div class="card" id="uploadCard">
+      <h2>Add artwork</h2>
+      <p class="card-note">Picture, GIF or video — converted to the wheel format right here in the browser.</p>
+
+      <label class="upload-zone" id="uploadZone">
+        <input type="file" id="fileInput" accept="image/*,video/*" multiple>
+        <div class="drop-thumb"><canvas id="dropThumbCanvas" width="216" height="216"></canvas></div>
+        <div class="upload-icon">⬆</div>
+        <div class="upload-text">
+          Drop a <b>video</b>, <b>GIF</b> or <b>image</b><br>or tap to choose
+          <small>Only the centre square is used — the wheel is round</small>
         </div>
-        <div>
-          <span class="speed-value" id="infoRpm" style="font-size:32px;">--</span>
-          <span class="speed-unit">rpm</span>
-          <span class="speed-unit" id="infoDir" style="color:var(--yellow);"></span>
+      </label>
+
+      <!-- Опции извлечения кадров: только для видео -->
+      <div class="opt-row" id="videoOpts" style="display:none">
+        <span class="field"><label for="vidFps">FPS</label>
+          <select id="vidFps" onchange="onVideoOptsChange()">
+            <option value="5">5</option><option value="10" selected>10</option><option value="15">15</option>
+          </select></span>
+        <span class="field"><label for="vidFit">Frame</label>
+          <select id="vidFit" onchange="onVideoOptsChange()">
+            <option value="crop" selected>Crop</option><option value="fit">Fit</option>
+          </select></span>
+        <span class="field"><label for="vidStart">Start</label>
+          <input type="number" id="vidStart" min="0" step="0.5" value="0" onchange="onVideoOptsChange()"><span class="unit">s</span></span>
+        <span class="field"><label for="vidLen">Length</label>
+          <input type="number" id="vidLen" min="0.5" step="0.5" value="10" onchange="onVideoOptsChange()"><span class="unit">s</span></span>
+        <div class="opt-note" id="vidBudget"></div>
+      </div>
+
+      <div class="upload-queue-label" id="uploadQueue"></div>
+      <div class="status-bar" id="uploadStatus">Waiting for a file…</div>
+      <div class="progress-wrap" id="uploadProgressWrap">
+        <div class="progress-track"><div class="progress-fill" id="uploadProgressBar"></div></div>
+      </div>
+      <button class="btn btn-primary btn-block" id="btnUpload" onclick="processAndUpload()" style="margin-top:12px">↑ Convert &amp; upload</button>
+
+      <details class="help">
+        <summary>How long can an animation be?</summary>
+        <div class="help-body">
+          <p>The whole animation lives in the device's RAM, so length is capped by free memory — roughly <b>24 s at 10 fps</b> on a fresh device. The upload panel shows the real limit once a video is selected.</p>
+          <p>Image refresh on the wheel is <b>rpm ÷ 10</b> — 20 fps at 200 rpm. Below ~100 rpm video starts to look choppy.</p>
         </div>
-      </div>
+      </details>
     </div>
 
-    <!-- Скрытый ввод окружности колеса -->
-    <div id="wheelCircWrap" style="display:none;margin-bottom:14px;">
-      <div style="background:var(--bg-input);border-radius:var(--r-elem);padding:10px 12px;display:flex;align-items:center;gap:8px;">
-        <span style="font-size:12px;color:var(--text-muted);flex:1;">Wheel circumference</span>
-        <input class="wheel-circ-input" type="text" id="wheelCirc" value="2355" maxlength="4"
-               style="font-family:var(--font-mono);font-size:14px;font-weight:700;color:var(--text);background:transparent;border:none;outline:none;width:48px;text-align:right;">
-        <span style="font-size:11px;color:var(--text-hint);">mm</span>
-      </div>
-    </div>
+    <!-- Библиотека -->
+    <div class="card">
+      <h2>Library</h2>
+      <p class="card-note">Tap a row to play it on the wheel.</p>
 
-    <!-- Battery bar -->
-    <div class="battery-bar-wrap" style="margin-top:0;margin-bottom:14px;">
-      <div class="battery-bar-header">
-        <span class="battery-bar-label">Battery level</span>
-        <div style="display:flex;align-items:center;gap:8px;">
-          <span class="badge badge-dim" id="chgStat">--</span>
-          <span class="battery-bar-pct" id="batPct">--%</span>
+      <div class="file-list" id="fileList"></div>
+
+      <div class="sep"></div>
+
+      <div class="meter-head">
+        <span class="k" id="fsLabel">Loading…</span>
+        <span class="v" id="fsPct"></span>
+      </div>
+      <div class="meter"><i id="fsFill"></i></div>
+      <div class="meter-sub" id="fsSub"></div>
+
+      <div class="sep"></div>
+
+      <div class="ctl" style="margin-bottom:0">
+        <div class="ctl-head">
+          <span class="ctl-name">Slideshow</span>
+          <span class="field" style="min-height:38px">
+            <label for="albumSecs">every</label>
+            <input type="number" id="albumSecs" min="1" max="99" value="10" style="width:44px">
+            <span class="unit">s</span>
+          </span>
         </div>
-      </div>
-      <div class="battery-bar-track">
-        <div class="battery-bar-fill" id="batBar"></div>
+        <p class="ctl-hint">Cycles through every file in the library. Start it from the button at the top of the page.</p>
       </div>
     </div>
 
-    <!-- Power rows -->
-    <div class="power-row">
-      <span class="power-label">Battery voltage</span>
-      <div><span class="power-val" id="batV">--</span><span class="power-unit">V</span></div>
-    </div>
-    <div class="power-row">
-      <span class="power-label">USB voltage</span>
-      <div><span class="power-val" id="usbV">--</span><span class="power-unit">V</span></div>
-    </div>
+  </div>
+</section>
 
-    <div class="divider"></div>
+<!-- ---------------- Вкладка: дисплей ---------------- -->
+<section class="panel" id="panel-display" role="tabpanel" aria-labelledby="tab-display" hidden>
+  <div class="cols cols-2">
 
-    <!-- Brightness dual-range -->
-    <div class="slider-row">
-      <div class="slider-label">
-        <span>Brightness</span>
-        <span class="val">
-          <span id="bMinVal">1</span>&nbsp;–&nbsp;<span id="bMaxVal">31</span>
-          &nbsp;<span class="now" style="color:var(--yellow)">NOW&nbsp;<span id="briVal">--</span></span>
-          &nbsp;<span style="color:var(--text-hint);font-size:10px;"><span id="luxVal">--</span>&nbsp;lx</span>
-        </span>
-      </div>
-      <div class="bri-wrap">
-        <div class="bri-track"></div>
-        <div class="bri-fill" id="drFill"></div>
-        <div class="bri-cursor" id="drCursor"></div>
-        <input type="range" id="bMinSlide" min="1" max="31" value="1">
-        <input type="range" id="bMaxSlide" min="1" max="31" value="31">
-      </div>
-    </div>
+    <div class="card">
+      <h2>Brightness</h2>
+      <p class="card-note">The device dims itself in the dark and brightens in daylight. You set the range it is allowed to use.</p>
 
-    <!-- LED Power -->
-    <div class="slider-row">
-      <div class="slider-label">
-        <span>LED Power</span>
-        <span class="val">
-          <span id="ablVal">40%</span>
-          <span id="ablRmsLabel" style="color:var(--yellow);font-size:10px;margin-left:6px;">RMS --</span>
-        </span>
+      <div class="ctl">
+        <div class="ctl-head">
+          <span class="ctl-name">Allowed range</span>
+          <span class="ctl-val"><span id="bMinVal">1</span>–<span id="bMaxVal">31</span><span class="muted"> / 31</span></span>
+        </div>
+        <div class="bri-wrap">
+          <div class="bri-track"></div>
+          <div class="bri-fill" id="drFill"></div>
+          <div class="bri-cursor" id="drCursor"></div>
+          <input type="range" id="bMinSlide" min="1" max="31" value="1"  aria-label="Minimum brightness">
+          <input type="range" id="bMaxSlide" min="1" max="31" value="31" aria-label="Maximum brightness">
+        </div>
+        <p class="ctl-hint">
+          Right now the wheel runs at <b class="mono" style="color:var(--warn)"><span id="briVal">--</span></b>
+          (yellow marker), ambient light <span class="mono"><span id="luxVal">--</span> lx</span>.
+        </p>
       </div>
-      <div class="abl-wrap">
-        <input type="range" id="ablSlide" min="0" max="100" value="40"
-               oninput="document.getElementById('ablVal').textContent=this.value+'%'; syncSettings()">
-        <div id="ablRmsMark"></div>
+
+      <div class="sep"></div>
+
+      <div class="ctl">
+        <div class="ctl-head">
+          <span class="ctl-name">Power limit</span>
+          <span class="ctl-val"><span id="ablVal">40%</span> <span class="live" id="ablRmsLabel">RMS --</span></span>
+        </div>
+        <div class="abl-wrap">
+          <input type="range" id="ablSlide" min="0" max="100" value="40" aria-label="Power limit"
+                 oninput="document.getElementById('ablVal').textContent=this.value+'%'; syncSettings()">
+          <div id="ablRmsMark"></div>
+        </div>
+        <p class="ctl-hint">Caps how much current all 528 LEDs may draw together. Lower it to make the battery last longer; the yellow marker is what the current picture actually draws.</p>
       </div>
     </div>
 
-    <!-- Radial Gain зафиксирован в прошивке (RADIAL_GAIN_PCT = 80 %) -->
+    <div class="card">
+      <h2>Power</h2>
+      <p class="card-note">Battery charge is estimated from the open-circuit voltage, so it stays put when the LEDs switch on.</p>
 
-    <!-- Arm order — лучей всегда 6, настраивается только их порядок в цепочке -->
-    <div class="slider-row">
-      <div class="slider-label">
-        <span>Arm Order</span>
-        <span class="val" id="armOrderVal">Normal</span>
+      <div class="kv"><span class="kv-k">Battery voltage</span><span class="kv-v"><span id="batV">--</span><span class="unit">V</span></span></div>
+      <div class="kv"><span class="kv-k">USB voltage</span><span class="kv-v"><span id="usbV">--</span><span class="unit">V</span></span></div>
+      <div class="kv"><span class="kv-k">Charger</span><span class="kv-v"><span class="badge" id="chgStat2">--</span></span></div>
+
+      <div class="sep"></div>
+
+      <div class="ctl" style="margin-bottom:0">
+        <div class="ctl-head">
+          <span class="ctl-name">Wheel circumference</span>
+          <span class="field" style="min-height:38px">
+            <input type="text" id="wheelCirc" value="2355" maxlength="4" inputmode="numeric"><span class="unit">mm</span>
+          </span>
+        </div>
+        <p class="ctl-hint">Only used to turn rpm into km/h. A 700×35C tyre is about 2168 mm; 29″ MTB about 2300 mm.</p>
       </div>
-      <button id="armOrderBtn" onclick="toggleArmOrder()"
-              style="width:100%;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--r-elem);color:var(--text-muted);font-size:12px;padding:8px;cursor:pointer;">
-        Flip &mdash; use if the image splits into shuffled wedges
-      </button>
+
+      <details class="help">
+        <summary>Why do the LEDs stay dark while I pedal slowly?</summary>
+        <div class="help-body">
+          <p>Below <b>100 rpm</b> the wheel turns too slowly for the image to hold together, so the arms are powered down. They light up again above <b>120 rpm</b>. After 3 s without rotation the device idles, and after a minute it sleeps until it feels a bump.</p>
+        </div>
+      </details>
     </div>
 
-    <!-- Hub Offset убран: лучи расходятся строго из центра оси -->
+  </div>
+</section>
 
-    <!-- Angle -->
-    <div class="slider-row">
-      <div class="slider-label">
-        <span>Angle Offset</span>
-        <span class="val"><span id="aVal">93</span>&deg;</span>
+<!-- ---------------- Вкладка: калибровка ---------------- -->
+<section class="panel" id="panel-tune" role="tabpanel" aria-labelledby="tab-tune" hidden>
+  <div class="cols cols-2">
+
+    <div class="card">
+      <h2>Geometry</h2>
+      <p class="card-note">Touch these only if the picture comes out rotated or scrambled.</p>
+
+      <div class="ctl">
+        <div class="ctl-head">
+          <span class="ctl-name">Rotation</span>
+          <span class="ctl-val"><span id="aVal">93</span>°</span>
+        </div>
+        <input type="range" id="aSlide" min="0" max="360" value="93"
+               oninput="document.getElementById('aVal').textContent=this.value; syncSettings()">
+        <p class="ctl-hint">Turns the whole image around the hub. Use it to stand the picture upright.</p>
       </div>
-      <input type="range" id="aSlide" min="0" max="360" value="93"
-             oninput="document.getElementById('aVal').textContent=this.value; syncSettings()">
+
+      <div class="ctl">
+        <div class="ctl-head">
+          <span class="ctl-name">Arm order</span>
+          <span class="ctl-val" id="armOrderVal">Normal</span>
+        </div>
+        <button class="btn btn-block" id="armOrderBtn" onclick="toggleArmOrder()">⇄ Flip arm order</button>
+        <p class="ctl-hint">If the image breaks into six shuffled wedges, flip this. Doing so restarts the sensor calibration, so give the wheel a few turns afterwards.</p>
+      </div>
+
+      <div class="sep"></div>
+
+      <div class="kv"><span class="kv-k">Angular step</span><span class="kv-v"><span id="infoStep">--</span><span class="unit">°/update</span></span></div>
+      <div class="kv"><span class="kv-k">Frame build time</span><span class="kv-v"><span id="infoFill">--</span><span class="unit">µs</span></span></div>
+      <details class="help">
+        <summary>What do these two numbers mean?</summary>
+        <div class="help-body">
+          <p><b>Angular step</b> is how far an arm travels between two LED updates — the real limit of sharpness at the rim. It grows with speed: about 1° at 190 rpm, 2° at 390 rpm.</p>
+          <p><b>Frame build time</b> must stay well under the time it takes to clock a frame out (~860 µs), otherwise the processor, not the LED bus, becomes the bottleneck.</p>
+        </div>
+      </details>
     </div>
 
-    <!-- IMAGE + COLOR two-column grid -->
-    <p class="img-correction-title">Image Correction</p>
+    <div class="card">
+      <h2>Colour</h2>
+      <p class="card-note">Gamma, saturation and contrast shape the picture; R/G/B set the white balance of the LEDs.</p>
 
-    <div class="img-color-grid">
-      <div class="img-color-col">
-        <span class="mini-label" title="Gamma">γ</span>
+      <div class="ctl">
+        <div class="ctl-head">
+          <span class="ctl-name">Gamma</span>
+          <span class="ctl-val" id="gVal">2.5</span>
+        </div>
         <input type="range" id="gSlide" min="10" max="50" value="25"
                oninput="document.getElementById('gVal').textContent=(this.value/10).toFixed(1); syncSettings()">
-        <span class="mini-val" id="gVal">2.5</span>
-        <span class="mini-label" title="Saturation">S</span>
+        <p class="ctl-hint">Higher = deeper shadows and a cleaner black; lower = flatter, brighter mid-tones.</p>
+      </div>
+
+      <div class="ctl">
+        <div class="ctl-head">
+          <span class="ctl-name">Saturation</span>
+          <span class="ctl-val" id="sVal">1.5</span>
+        </div>
         <input type="range" id="sSlide" min="10" max="30" value="15"
                oninput="document.getElementById('sVal').textContent=(this.value/10).toFixed(1); syncSettings()">
-        <span class="mini-val" id="sVal">1.5</span>
-        <span class="mini-label" title="Contrast">C</span>
+        <p class="ctl-hint">LEDs spinning at speed wash colours out; above 1.0 puts them back.</p>
+      </div>
+
+      <div class="ctl">
+        <div class="ctl-head">
+          <span class="ctl-name">Contrast</span>
+          <span class="ctl-val" id="coVal">5%</span>
+        </div>
         <input type="range" id="coSlide" min="0" max="100" value="5"
                oninput="document.getElementById('coVal').textContent=this.value+'%'; syncSettings()">
-        <span class="mini-val" id="coVal">5%</span>
       </div>
-      <div class="img-color-col">
-        <span class="mini-label" style="color:var(--red)">R</span>
+
+      <div class="sep"></div>
+
+      <div class="ctl">
+        <div class="ctl-head"><span class="ctl-name" style="color:var(--danger)">Red</span><span class="ctl-val" id="rgVal" style="color:var(--danger)">100%</span></div>
         <input type="range" class="r-slider" id="rgSlide" min="0" max="100" step="5" value="100"
                oninput="document.getElementById('rgVal').textContent=this.value+'%'; syncSettings()">
-        <span class="mini-val" id="rgVal" style="color:var(--red)">100%</span>
-        <span class="mini-label" style="color:var(--green)">G</span>
+      </div>
+      <div class="ctl">
+        <div class="ctl-head"><span class="ctl-name" style="color:var(--ok)">Green</span><span class="ctl-val" id="ggVal" style="color:var(--ok)">80%</span></div>
         <input type="range" class="g-slider" id="ggSlide" min="0" max="100" step="5" value="80"
                oninput="document.getElementById('ggVal').textContent=this.value+'%'; syncSettings()">
-        <span class="mini-val" id="ggVal" style="color:var(--green)">80%</span>
-        <span class="mini-label" style="color:var(--purple)">B</span>
+      </div>
+      <div class="ctl">
+        <div class="ctl-head"><span class="ctl-name" style="color:var(--blue)">Blue</span><span class="ctl-val" id="bgVal" style="color:var(--blue)">100%</span></div>
         <input type="range" class="b-slider" id="bgSlide" min="0" max="100" step="5" value="100"
                oninput="document.getElementById('bgVal').textContent=this.value+'%'; syncSettings()">
-        <span class="mini-val" id="bgVal" style="color:var(--purple)">100%</span>
+        <p class="ctl-hint">Green LEDs are the brightest of the three, so green usually sits lower than the others. Aim for neutral white, not maximum output.</p>
       </div>
+
+      <button class="btn btn-block" onclick="restoreImgDefaults()">↺ Restore defaults</button>
     </div>
 
-    <button class="img-restore-btn" onclick="restoreImgDefaults()">Restore Defaults</button>
   </div>
+</section>
 
-  <!-- Card 5: Device Log -->
-  <div class="card card-log">
-    <p class="card-title">Device log</p>
+<!-- ---------------- Вкладка: лог ---------------- -->
+<section class="panel" id="panel-log" role="tabpanel" aria-labelledby="tab-log" hidden>
+  <div class="card">
+    <h2>Device log</h2>
+    <p class="card-note">Live messages from the device. Scroll up to pause auto-follow.</p>
     <div class="log-box" id="logBox"></div>
     <div class="log-controls">
       <span class="log-badge" id="logBadge"></span>
-      <button class="log-clear-btn" onclick="clearLogView()">&#10005; Clear</button>
+      <button class="btn btn-sm btn-ghost" onclick="clearLogView()">✕ Clear view</button>
     </div>
   </div>
+</section>
 
-</div><!-- /main-grid -->
+</main>
 
-<!-- hidden preview canvas — used for GIF/image conversion -->
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<!-- скрытый холст: используется при конвертации изображений/GIF -->
 <canvas id="preview" width="200" height="200"></canvas>
 
 <script>
@@ -1313,7 +1362,7 @@ async function _updateVideoBudget(file) {
               `${(n / o.fps).toFixed(1)} s @ ${o.fps} fps = ${n} frames · ${kb} kB`;
     if (n < want) txt += `  — capped, device fits ${maxF} frames (${(maxF / o.fps).toFixed(1)} s)`;
     el.textContent  = txt;
-    el.style.color  = (n < want) ? '#ff6600' : 'var(--text-hint)';
+    el.style.color  = (n < want) ? 'var(--warn)' : 'var(--text-3)';
 
     setStatus('uploadStatus', `${file.name} — ${n} frames ready. Press Upload.`, 'ok');
 }
@@ -1323,7 +1372,7 @@ function onVideoOptsChange() {
     if (!files.length || !isVideoFile(files[0])) return;
     const o = _vidOpts();
     drawVideoPoster(files[0], [
-        { ctx: document.getElementById('dropThumbCanvas').getContext('2d'), size: 192 },
+        { ctx: document.getElementById('dropThumbCanvas').getContext('2d'), size: 216 },
         { ctx: previewCtx, size: 200 }
     ], o.fit, o.start).catch(() => {});
     _updateVideoBudget(files[0]);
@@ -1338,6 +1387,83 @@ let _fileVersion  = null;  // отдельная версия списка фа�
 const previewCanvas = document.getElementById('preview'); // 200×200 buffer
 const previewCtx = previewCanvas.getContext('2d', {willReadFrequently: true});
 
+// ===================== ТЕМА =====================
+// Тёмная по умолчанию (устройство катают вечером), но на солнце экран телефона
+// читается только в светлой — поэтому выбор сохраняется, а начальное значение
+// берётся из системной настройки.
+function applyTheme(t) {
+    document.documentElement.setAttribute('data-theme', t);
+    document.querySelector('meta[name="theme-color"]')
+            .setAttribute('content', t === 'light' ? '#eef2f7' : '#0b1017');
+    const b = document.getElementById('themeBtn');
+    if (b) b.textContent = (t === 'light') ? '☀' : '☾';
+}
+function toggleTheme() {
+    const next = document.documentElement.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+    try { localStorage.setItem('pov-theme', next); } catch (e) {}
+    applyTheme(next);
+}
+(function initTheme() {
+    let t = null;
+    try { t = localStorage.getItem('pov-theme'); } catch (e) {}
+    if (!t) t = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+    applyTheme(t);
+})();
+
+// ===================== ВКЛАДКИ =====================
+const TABS = ['library', 'display', 'tune', 'log'];
+function showTab(name) {
+    for (const t of TABS) {
+        const btn = document.getElementById('tab-' + t);
+        const pan = document.getElementById('panel-' + t);
+        const on  = (t === name);
+        btn.setAttribute('aria-selected', on ? 'true' : 'false');
+        pan.hidden = !on;
+    }
+    try { localStorage.setItem('pov-tab', name); } catch (e) {}
+    if (name === 'log') {
+        // Возвращаем автопрокрутку: пользователь пришёл смотреть свежие строки.
+        const box = document.getElementById('logBox');
+        _logAutoScroll = true;
+        box.scrollTop = box.scrollHeight;
+    }
+}
+
+// ===================== УВЕДОМЛЕНИЯ =====================
+// Раньше play/stop/delete отрабатывали молча — нажатие выглядело как «не сработало».
+function toast(msg, kind) {
+    const box = document.getElementById('toasts');
+    const el = document.createElement('div');
+    el.className = 'toast' + (kind ? ' ' + kind : '');
+    el.textContent = msg;
+    box.appendChild(el);
+    setTimeout(() => {
+        el.style.transition = 'opacity .25s';
+        el.style.opacity = '0';
+        setTimeout(() => el.remove(), 260);
+    }, 2400);
+}
+
+function goOta() {
+    fetch('/ping').then(() => window.location.href = '/update')
+                  .catch(() => toast('Device is offline', 'err'));
+}
+
+// ===================== ЗАЛИВКА ТРЕКА ПОЛЗУНКОВ =====================
+// Заполненная часть трека рисуется градиентом по переменной --p: наглядно
+// видно, где стоит значение, без разглядывания положения ручки.
+function _paintRange(el) {
+    const min = +el.min || 0, max = +el.max || 100;
+    const p = max > min ? ((+el.value - min) / (max - min)) * 100 : 0;
+    el.style.setProperty('--p', p.toFixed(2));
+}
+function refreshRanges() {
+    document.querySelectorAll('input[type="range"]').forEach(_paintRange);
+}
+document.addEventListener('input', e => {
+    if (e.target.tagName === 'INPUT' && e.target.type === 'range') _paintRange(e.target);
+}, true);
+
 // ===================== FILE INPUT =====================
 // Идёт ли прямо сейчас цикл конвертации/загрузки. Повторный запуск запрещён:
 // два параллельных POST /upload пишутся на устройстве в один открытый файл,
@@ -1345,21 +1471,16 @@ const previewCtx = previewCanvas.getContext('2d', {willReadFrequently: true});
 // посреди цикла — список файлов читается по ходу, а не только в начале.
 let _uploadBusy = false;
 
-function pickUploadFiles() {
-    if (_uploadBusy) return;
-    document.getElementById('fileInput').click();
-}
-
 // Блокировка/разблокировка органов управления загрузкой на время цикла
 function _setUploadBusy(busy) {
     _uploadBusy = busy;
     const btn  = document.getElementById('btnUpload');
     const zone = document.getElementById('uploadZone');
+    const inp  = document.getElementById('fileInput');
     btn.disabled = busy;
-    btn.style.opacity = busy ? '0.5' : '';
-    btn.style.cursor  = busy ? 'not-allowed' : '';
+    inp.disabled = busy;               // <label> сам не кликнет по disabled-инпуту
     zone.style.opacity = busy ? '0.5' : '';
-    zone.style.cursor  = busy ? 'not-allowed' : '';
+    zone.style.pointerEvents = busy ? 'none' : '';
 }
 
 // Показывает круглую миниатюру в зоне дропа из File объекта
@@ -1371,7 +1492,7 @@ function _showDropThumb(file) {
         // Видео через FileReader→Image не открыть — берём кадр из <video>.
         // Заодно заполняем и превью: одно открытие декодера на оба холста.
         const o = _vidOpts();
-        drawVideoPoster(file, [{ ctx, size: 192 }, { ctx: previewCtx, size: 200 }], o.fit, o.start)
+        drawVideoPoster(file, [{ ctx, size: 216 }, { ctx: previewCtx, size: 200 }], o.fit, o.start)
             .then(() => zone.classList.add('has-preview'))
             .catch(() => {});
         return;
@@ -1380,7 +1501,7 @@ function _showDropThumb(file) {
     r.onload = ev => {
         const img = new Image();
         img.onload = () => {
-            drawCenteredSquare(img, ctx, 192);
+            drawCenteredSquare(img, ctx, 216);
             zone.classList.add('has-preview');
         };
         img.src = ev.target.result;
@@ -1391,22 +1512,22 @@ function _showDropThumb(file) {
 function _clearDropThumb() {
     const zone   = document.getElementById('uploadZone');
     const canvas = document.getElementById('dropThumbCanvas');
-    canvas.getContext('2d').clearRect(0, 0, 192, 192);
+    canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
     zone.classList.remove('has-preview');
 }
 
 // Drag-and-drop на зону загрузки
 (function() {
     const zone = document.getElementById('uploadZone');
-    zone.addEventListener('dragover', e => { e.preventDefault(); zone.style.borderColor = 'var(--accent)'; });
-    zone.addEventListener('dragleave', ()  => { zone.style.borderColor = ''; });
+    zone.addEventListener('dragover',  e => { e.preventDefault(); zone.classList.add('drag'); });
+    zone.addEventListener('dragleave', ()  => zone.classList.remove('drag'));
     zone.addEventListener('drop', e => {
         e.preventDefault();
-        zone.style.borderColor = '';
+        zone.classList.remove('drag');
         if (_uploadBusy) return;   // не подменяем файлы посреди загрузки
         const files = Array.from(e.dataTransfer.files).filter(f =>
             f.type.startsWith('image/') || f.name.toLowerCase().endsWith('.gif') || isVideoFile(f));
-        if (!files.length) return;
+        if (!files.length) { toast('Unsupported file type', 'err'); return; }
         // Подставляем файлы в input через DataTransfer
         const dt = new DataTransfer();
         files.forEach(f => dt.items.add(f));
@@ -1696,15 +1817,18 @@ async function _processAndUploadInner(fileEl, files) {
 
     // Итоговый статус
     if (total === 1) {
-        if (ok) setStatus('uploadStatus', `Uploaded: ${files[0].name}`, 'ok');
+        if (ok) { setStatus('uploadStatus', `Uploaded: ${files[0].name}`, 'ok'); toast('Uploaded', 'ok'); }
         // ошибка уже показана внутри _uploadBuffer
     } else {
         if (fail === 0) {
             setStatus('uploadStatus', `All ${ok} file(s) uploaded successfully.`, 'ok');
+            toast(`${ok} files uploaded`, 'ok');
         } else if (ok === 0) {
             setStatus('uploadStatus', `Upload failed: all ${fail} file(s) had errors.`, 'err');
+            toast('Upload failed', 'err');
         } else {
             setStatus('uploadStatus', `Done: ${ok} uploaded, ${fail} failed.`, '');
+            toast(`${ok} uploaded, ${fail} failed`);
         }
     }
     // Сбрасываем input и превью чтобы можно было выбрать те же файлы снова
@@ -1783,52 +1907,126 @@ async function _loadThumb(fname, size, canvas) {
 }
 
 // ===================== FILE MANAGER =====================
+// Имя файла на устройстве несёт префикс типа (img_/gif_/vid_) и расширение —
+// пользователю нужен не он, а понятная подпись и метка типа.
+function _prettyName(n) {
+    return n.replace(/\.bin$/i, '').replace(/^(img|gif|vid)_/i, '');
+}
+function _fileKind(n) {
+    if (/^vid_/i.test(n)) return ['VIDEO', 'tag-vid'];
+    if (/^gif_/i.test(n)) return ['GIF',   'tag-gif'];
+    return ['IMAGE', 'tag-img'];
+}
+function _fmtSize(b) {
+    return b >= 1024 * 1024 ? (b / 1048576).toFixed(1) + ' MB'
+                            : (b / 1024).toFixed(0) + ' kB';
+}
+
+let _nowPlaying = '';        // имя файла, загруженного в буфер устройства
+let _displayOn  = false;     // false — вывод остановлен кнопкой Stop
+
+function _renderNowPlaying() {
+    const el = document.getElementById('nowPlaying');
+    if (!el) return;
+    if (!_nowPlaying) {
+        el.textContent = 'nothing';
+        el.style.color = 'var(--text-3)';
+    } else if (!_displayOn) {
+        el.textContent = _prettyName(_nowPlaying) + ' — stopped';
+        el.style.color = 'var(--text-3)';
+    } else {
+        el.textContent = _prettyName(_nowPlaying);
+        el.style.color = '';
+    }
+    // Подсветка активной строки в списке
+    document.querySelectorAll('.file').forEach(row => {
+        row.classList.toggle('playing',
+            _displayOn && !!_nowPlaying && row.dataset.name === _nowPlaying);
+    });
+}
+
+function _setNowPlaying(name, on) {
+    _nowPlaying = name || '';
+    _displayOn  = !!on;
+    _renderNowPlaying();
+}
+
 function loadFiles() {
     return fetch('/list').then(r => r.json()).then(files => {
         const list = document.getElementById('fileList');
         if (!files.length) {
-            list.innerHTML = '<div style="color:var(--text-hint);font-size:12px;padding:8px 0;">No files stored.</div>';
+            list.innerHTML = '<div class="empty">Nothing stored yet.<br>Upload a picture to get started.</div>';
             return;
         }
-        list.innerHTML = files.map(f =>
-            `<div class="file-item" id="fi-${CSS.escape(f.name)}">
-                <div class="file-thumb">
-                    <canvas width="80" height="80" id="thumb-${CSS.escape(f.name)}"></canvas>
+        list.innerHTML = files.map((f, i) => {
+            const [kind, cls] = _fileKind(f.name);
+            const frames = f.frames ? `<span>${f.frames} frames</span>` : '<span>still image</span>';
+            const esc = f.name.replace(/'/g, "\\'");
+            return `<div class="file" data-name="${f.name}" id="fi-${i}">
+                <div class="file-thumb"><canvas width="80" height="80" id="thumb-${i}"></canvas></div>
+                <button class="file-main" onclick="playFile('${esc}')" title="Play on the wheel">
+                    <span class="file-name">${_prettyName(f.name)}</span>
+                    <span class="file-sub"><span class="tag ${cls}">${kind}</span>${frames}<span>${_fmtSize(f.size)}</span></span>
+                </button>
+                <div class="file-acts">
+                    <button class="btn btn-icon btn-ok" onclick="playFile('${esc}')" title="Play" aria-label="Play">▶</button>
+                    <button class="btn btn-icon btn-ghost" onclick="askDelete(${i})" title="Delete" aria-label="Delete">✕</button>
                 </div>
-                <span class="fname">${f.name.replace(/\.bin$/i,'')}${f.frames ? `<span style="color:var(--text-hint);font-size:0.85em;margin-left:6px;">${f.frames}&nbsp;fr</span>` : ''}</span>
-                <span class="fsize">${(f.size/1024).toFixed(1)}&nbsp;kB</span>
-                <div class="acts">
-                    <button class="btn-icon play" onclick="playFile('${f.name}')" title="Play">&#9654;</button>
-                    <button class="btn-icon del" onclick="deleteFile('${f.name}')" title="Delete">&#10005;</button>
+                <div class="file-confirm">
+                    <span>Delete “${_prettyName(f.name)}”?</span>
+                    <button class="btn btn-sm btn-danger" onclick="deleteFile('${esc}')">Delete</button>
+                    <button class="btn btn-sm btn-ghost" onclick="cancelDelete(${i})">Cancel</button>
                 </div>
-             </div>`
-        ).join('');
+             </div>`;
+        }).join('');
+
+        _renderNowPlaying();
 
         // Загружаем превью последовательно чтобы не перегружать ESP32
         (async () => {
-            for (const f of files) {
-                const canvas = document.getElementById(`thumb-${CSS.escape(f.name)}`);
-                if (canvas) await _loadThumb(f.name, f.size, canvas);
+            for (let i = 0; i < files.length; i++) {
+                const canvas = document.getElementById(`thumb-${i}`);
+                if (canvas) await _loadThumb(files[i].name, files[i].size, canvas);
             }
         })();
     });
 }
 
+function askDelete(i)    { const r = document.getElementById('fi-' + i); if (r) r.classList.add('confirm'); }
+function cancelDelete(i) { const r = document.getElementById('fi-' + i); if (r) r.classList.remove('confirm'); }
+
 function loadFSInfo() {
     return fetch('/fs_info').then(r => r.json()).then(d => {
         const pct = d.total ? (d.used / d.total * 100) : 0;
         document.getElementById('fsFill').style.width = pct.toFixed(1) + '%';
-        const fmt = v => Math.round(v/1024).toLocaleString('ru-RU').replace(/ /g, ' ');
-        document.getElementById('fsLabel').textContent =
-            `${fmt(d.free)} kB free of ${fmt(d.total)} kB`;
-        document.getElementById('fsPct').textContent = pct.toFixed(0) + '%';
+        const mb = v => (v / 1048576).toFixed(1);
+        document.getElementById('fsLabel').textContent = 'Storage';
+        document.getElementById('fsPct').textContent   =
+            `${mb(d.free)} MB free of ${mb(d.total)} MB`;
+        // Длину анимации ограничивает не флеш, а PSRAM — говорим об этом прямо.
+        const sub = document.getElementById('fsSub');
+        if (typeof d.psram_free === 'number' && d.psram_free > 0 && d.frame_size) {
+            const maxF = Math.max(0, Math.floor((d.psram_free - 262144) / d.frame_size));
+            sub.textContent = `Animation memory fits about ${maxF} frames (~${(maxF / 10).toFixed(0)} s at 10 fps)`;
+        } else {
+            sub.textContent = '';
+        }
     });
 }
 
-function playFile(name)   { fetch(`/play?file=${encodeURIComponent(name)}`); }
+function playFile(name) {
+    fetch(`/play?file=${encodeURIComponent(name)}`).then(() => {
+        _setNowPlaying(name, true);
+        toast('Playing ' + _prettyName(name), 'ok');
+    }).catch(() => toast('Device is offline', 'err'));
+}
 
 function stopDisplay() {
-    fetch('/stop');
+    fetch('/stop').then(() => {
+        _displayOn = false;
+        _renderNowPlaying();
+        toast('Display stopped');
+    }).catch(() => toast('Device is offline', 'err'));
     _albumSetActive(false);
 }
 
@@ -1839,13 +2037,9 @@ function _albumSetActive(active) {
     _albumRunning = active;
     const btn = document.getElementById('albumBtn');
     if (!btn) return;
-    if (active) {
-        btn.classList.add('active');
-        btn.innerHTML = '&#9724; Stop Slideshow';
-    } else {
-        btn.classList.remove('active');
-        btn.innerHTML = '&#9654;&#9654; Start Slideshow';
-    }
+    btn.classList.toggle('active', active);
+    document.getElementById('albumBtnIcon').textContent  = active ? '⏹' : '⏩';
+    document.getElementById('albumBtnLabel').textContent = active ? 'Stop slideshow' : 'Slideshow';
 }
 
 function _albumDelayMs() {
@@ -1859,11 +2053,13 @@ function toggleAlbum() {
     if (_albumRunning) {
         fetch('/album?action=stop');
         _albumSetActive(false);
+        toast('Slideshow stopped');
         return;
     }
     fetch(`/album?action=start&delay=${_albumDelayMs()}`).then(r => {
-        if (r.ok) _albumSetActive(true);
-    });
+        if (r.ok) { _albumSetActive(true); toast('Slideshow started', 'ok'); }
+        else toast('Nothing to show — library is empty', 'err');
+    }).catch(() => toast('Device is offline', 'err'));
 }
 
 // Живое обновление интервала: если слайдшоу уже идёт — применяем без перезапуска
@@ -1875,19 +2071,23 @@ document.getElementById('albumSecs').addEventListener('change', function() {
 function deleteFile(name) {
     fetch(`/delete?file=${encodeURIComponent(name)}`).then(() => {
         delete _thumbCache[name];
+        toast('Deleted ' + _prettyName(name));
         loadFiles();
         loadFSInfo();
-    });
+    }).catch(() => toast('Delete failed', 'err'));
 }
 
 // ===================== ABL RMS MARKER =====================
+// Половина ширины ручки ползунка: маркер и заливка должны совпадать с её
+// геометрией, иначе на краях шкалы они разъезжаются на десяток пикселей.
+const THUMB_R = 11;
+
 function _updateAblRms(rms) {
     const mark  = document.getElementById('ablRmsMark');
     const label = document.getElementById('ablRmsLabel');
     if (!mark || !label) return;
-    const thumbR = 7; // половина ширины thumb (14px / 2)
     const p = rms / 100; // 0..1
-    mark.style.left = `calc(${thumbR}px + ${p} * (100% - ${2 * thumbR}px))`;
+    mark.style.left = `calc(${THUMB_R}px + ${p} * (100% - ${2 * THUMB_R}px))`;
     label.textContent = `RMS ${rms.toFixed(0)}%`;
 }
 
@@ -1904,11 +2104,10 @@ function updateDualRange() {
     const minV = +document.getElementById('bMinSlide').value;
     const maxV = +document.getElementById('bMaxSlide').value;
     const fill = document.getElementById('drFill');
-    const thumbR = 7; // половина ширины thumb (14px / 2)
     const pMin = pct(minV) / 100;
     const pMax = pct(maxV) / 100;
-    fill.style.left  = `calc(${thumbR}px + ${pMin} * (100% - ${2 * thumbR}px))`;
-    fill.style.width = `calc(${(pMax - pMin)} * (100% - ${2 * thumbR}px))`;
+    fill.style.left  = `calc(${THUMB_R}px + ${pMin} * (100% - ${2 * THUMB_R}px))`;
+    fill.style.width = `calc(${(pMax - pMin)} * (100% - ${2 * THUMB_R}px))`;
     document.getElementById('bMinVal').textContent = minV;
     document.getElementById('bMaxVal').textContent = maxV;
     updateBriCursor(currentBrightness);
@@ -1918,10 +2117,9 @@ function updateBriCursor(val) {
     currentBrightness = val;
     // Курсор NOW движется по всему треку, ABL может опустить ниже MIN
     const clamped = Math.min(Math.max(val, BRI_MIN), BRI_MAX);
-    const thumbR = 7;
     const p = pct(clamped) / 100;
     document.getElementById('drCursor').style.left =
-        `calc(${thumbR}px + ${p} * (100% - ${2 * thumbR}px))`;
+        `calc(${THUMB_R}px + ${p} * (100% - ${2 * THUMB_R}px))`;
     document.getElementById('briVal').textContent = clamped;
 }
 
@@ -1936,7 +2134,9 @@ function restoreImgDefaults() {
     set('rgSlide', 100, ['rgVal', '100%']);
     set('ggSlide',  80, ['ggVal', '80%']);
     set('bgSlide', 100, ['bgVal', '100%']);
+    refreshRanges();
     syncSettings();
+    toast('Colour settings restored');
 }
 
 // Дебаунс: синхронизируем не чаще 1 раза в 150 мс при перетаскивании ползунка
@@ -2021,6 +2221,7 @@ function toggleArmOrder() {
     _armReverse = !_armReverse;
     _applyArmOrder();
     syncSettings();
+    toast('Arm order: ' + (_armReverse ? 'reversed' : 'normal'));
 }
 
 function _applySettings(d) {
@@ -2078,24 +2279,26 @@ function _applySettings(d) {
     }
     if (d.slideshow !== undefined) _albumSetActive(d.slideshow);
     updateDualRange();
+    refreshRanges();
+}
+
+// Что именно сейчас в буфере устройства. Поле появилось в прошивке V5 —
+// на старой его нет, тогда просто не показываем «Now playing».
+function _applyPlayState(d) {
+    if (d.file === undefined) return;
+    _setNowPlaying(d.file, d.play !== 0 && d.play !== false);
 }
 
 function loadSettings() {
     return fetch('/get_settings').then(r => r.json()).then(d => {
         _applySettings(d);
+        _applyPlayState(d);
         updateBriCursor(d.eff_bri !== undefined ? d.eff_bri : d.brightness);
     }).catch(() => {});
 }
 
 // ===================== INFO (RPM + SPEED) =====================
 let wheelCircMm = 2355;
-
-function toggleWheelCircEdit() {
-    const wrap = document.getElementById('wheelCircWrap');
-    const visible = wrap.style.display !== 'none';
-    wrap.style.display = visible ? 'none' : 'block';
-    if (!visible) document.getElementById('wheelCirc').focus();
-}
 
 document.getElementById('wheelCirc').addEventListener('change', function() {
     let v = parseInt(this.value);
@@ -2107,16 +2310,44 @@ document.getElementById('wheelCirc').addEventListener('change', function() {
     updateInfo();
 });
 
+// Состояние силовой части: 0 — простой, 1 — питание на первом луче и замер
+// оборотов, 2 — полный рендер. Это первый вопрос, который задаёт пользователь
+// («почему не светится?»), а раньше поле pwr забиралось и выбрасывалось.
+const PWR_STATES = [
+    { t: 'Idle',     c: '',        h: 'spin the wheel or press play' },
+    { t: 'Spinning', c: 'is-warn', h: 'faster — LEDs light up above 120 rpm' },
+    { t: 'Running',  c: 'is-ok',   h: 'image is live on the wheel' }
+];
+
 function updateInfo() {
     return fetch('/info').then(r => r.json()).then(d => {
         const rpm = d.rpm;
+        const rev = (rpm > 0 && d.dir !== undefined && d.dir < 0);
         document.getElementById('infoRpm').textContent = rpm.toFixed(0);
-        // Обратное вращение определяется по порядку срабатывания датчиков Холла
-        document.getElementById('infoDir').textContent =
-            (rpm > 0 && d.dir !== undefined && d.dir < 0) ? 'rev' : '';
+        document.getElementById('infoDir').textContent = rev ? '· reverse' : '';
         // speed (km/h) = circumference(mm) * rpm / 60 / 1000 * 3.6
         const kmh = wheelCircMm * rpm * 0.00006;
         document.getElementById('infoSpeed').textContent = kmh.toFixed(1);
+
+        // Состояние + подпись
+        const st = PWR_STATES[d.pwr] || PWR_STATES[0];
+        const card = document.getElementById('stateCard');
+        card.className = 'stat ' + st.c;
+        document.getElementById('pwrState').textContent = st.t;
+        document.getElementById('pwrHint').textContent  = st.h;
+
+        // Ротор крутится в такт колесу; период зажат, чтобы не мигать на высоких rpm
+        const rotor = document.getElementById('rotor');
+        rotor.classList.toggle('run', rpm > 1);
+        rotor.classList.toggle('rev', rev);
+        if (rpm > 1) {
+            const sec = Math.min(4, Math.max(0.4, 60 / rpm));
+            document.getElementById('rotorSpin').style.animationDuration = sec.toFixed(2) + 's';
+        }
+
+        // Диагностика рендера
+        if (d.step !== undefined) document.getElementById('infoStep').textContent = d.step.toFixed(2);
+        if (d.fill !== undefined) document.getElementById('infoFill').textContent = d.fill;
     });
     // Нет .catch() — ошибка пробрасывается в _pollInfo для остановки цепочки
 }
@@ -2139,20 +2370,26 @@ function updateBatteryStatus() {
 
         // Обновляем полоску батареи
         const pct = (d.soc !== undefined) ? d.soc : _voltToPct(d.vbat);
-        document.getElementById('batBar').style.width = pct.toFixed(0) + '%';
+        const bar = document.getElementById('batBar');
+        bar.style.width = pct.toFixed(0) + '%';
+        // Цвет полосы — по остатку: до 15 % красная, до 35 % жёлтая.
+        bar.style.background = pct < 15 ? 'var(--danger)' : (pct < 35 ? 'var(--warn)' : 'var(--ok)');
         document.getElementById('batPct').textContent = pct.toFixed(0) + '%';
 
         // IP2312U: состояние заряда выводится из наличия USB и уровня на IO8
         if (d.chg !== undefined) {
-            const el = document.getElementById('chgStat');
             const chgMap = [
-                ['Discharging', 'badge-dim'],
-                ['Charging',    'badge-blue'],
-                ['Charge Done', 'badge-green'],
+                ['Discharging', 'badge'],
+                ['Charging',    'badge badge-acc'],
+                ['Charged',     'badge badge-ok'],
             ];
             const entry = chgMap[d.chg];
-            el.textContent = entry ? entry[0] : '--';
-            el.className   = 'badge ' + (entry ? entry[1] : 'badge-dim');
+            for (const id of ['chgStat', 'chgStat2']) {
+                const el = document.getElementById(id);
+                if (!el) continue;
+                el.textContent = entry ? entry[0] : '--';
+                el.className   = entry ? entry[1] : 'badge';
+            }
         }
     });
     // Нет .catch() — ошибка пробрасывается в _pollBattery для остановки цепочки
@@ -2173,26 +2410,29 @@ let _logLines      = [];     // Вся накопленная история в 
 let _logAutoScroll = true;
 
 function _logColor(msg) {
-    if (msg.includes('[NET]'))  return '#38bdf8';
+    if (msg.includes('[NET]'))  return 'var(--accent)';
     if (msg.includes('[PWR]'))  return '#fb923c';
-    if (msg.includes('[BMS]'))  return '#fbbf24';
-    if (msg.includes('[DISP]')) return '#34d399';
-    if (msg.includes('[ERR]'))  return '#f87171';
-    if (msg.includes('[SYS]'))  return '#cbd5e1';
-    return '#64748b';
+    if (msg.includes('[BMS]'))  return 'var(--warn)';
+    if (msg.includes('[DISP]')) return 'var(--ok)';
+    if (msg.includes('[ERR]'))  return 'var(--danger)';
+    if (msg.includes('[WARN]')) return 'var(--warn)';
+    if (msg.includes('[SYS]'))  return 'var(--text-2)';
+    return 'var(--text-3)';
 }
 
 function _logRender() {
     const box = document.getElementById('logBox');
     box.innerHTML = _logLines.map(l => {
         if (l.special === 'restart') {
-            return `<div class="log-line" style="color:#fb923c;text-align:center;border-top:1px solid #fb923c44;border-bottom:1px solid #fb923c44;padding:2px 0;margin:2px 0;">${_escHtml(l.msg)}</div>`;
+            return `<div class="log-line" style="color:#fb923c;text-align:center;border-top:1px solid #fb923c44;border-bottom:1px solid #fb923c44;padding:2px 0;margin:4px 0;">${_escHtml(l.msg)}</div>`;
         }
         return `<div class="log-line" style="color:${_logColor(l.msg)}">${_escHtml(l.msg)}</div>`;
     }).join('');
     if (_logAutoScroll) box.scrollTop = box.scrollHeight;
     const badge = document.getElementById('logBadge');
-    badge.textContent = _logLines.length > 0 ? `${_logLines.length} lines` : '';
+    badge.textContent = _logLines.length > 0
+        ? `${_logLines.length} lines` + (_logAutoScroll ? '' : ' · auto-scroll paused')
+        : '';
 }
 
 function _escHtml(s) {
@@ -2304,11 +2544,12 @@ function _setOnline(online) {
     if (online) {
         dot.className    = 'log-dot online';
         text.textContent = 'Online';
-        text.style.color = 'var(--green)';
+        text.style.color = 'var(--ok)';
     } else {
         dot.className    = 'log-dot offline';
         text.textContent = 'Offline';
-        text.style.color = 'var(--red)';
+        text.style.color = 'var(--danger)';
+        document.getElementById('pwrHint').textContent = 'no connection to the device';
     }
 }
 
@@ -2343,6 +2584,7 @@ async function _pollSettings() {
         const d = await r.json();
         updateBriCursor(d.eff_bri !== undefined ? d.eff_bri : d.brightness);
         if (d.abl_rms !== undefined) _updateAblRms(d.abl_rms);
+        _applyPlayState(d);
         if (_stateVersion !== null && d.ver === 0 && _stateVersion > 0) {
             _stateVersion = null;
             _conn.pollActive = false;
@@ -2508,17 +2750,12 @@ async function _pingLoop() {
     }, { passive: true });
 })();
 
-function _syncLogHeight() {
-    const ref = document.getElementById('uploadCard');
-    const log = document.querySelector('.card-log');
-    if (!ref || !log) return;
-    log.style.maxHeight = ref.offsetHeight + 'px';
-}
-
 window.onload = () => {
-    _syncLogHeight();
-    window.addEventListener('resize', _syncLogHeight);
-    new ResizeObserver(_syncLogHeight).observe(document.getElementById('uploadCard'));
+    let tab = null;
+    try { tab = localStorage.getItem('pov-tab'); } catch (e) {}
+    showTab(TABS.includes(tab) ? tab : 'library');
+    refreshRanges();
+    updateDualRange();
     // Запускаем только ping-цикл. Он сам определит когда устройство онлайн
     // и запустит синхронизацию + polling. Это работает корректно и при первой
     // загрузке страницы, и при переподключении после ребута устройства.
