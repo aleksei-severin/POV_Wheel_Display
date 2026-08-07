@@ -1512,7 +1512,9 @@ function toggleTheme() {
 
 // ===================== ВКЛАДКИ =====================
 const TABS = ['library', 'display', 'tune', 'wifi', 'log'];
+let _activeTab = 'library';
 function showTab(name) {
+    _activeTab = name;
     for (const t of TABS) {
         const btn = document.getElementById('tab-' + t);
         const pan = document.getElementById('panel-' + t);
@@ -2751,6 +2753,12 @@ async function _initialSync() {
 // Правило: при ЛЮБОЙ ошибке цепочка завершается (не планирует следующий вызов).
 // Перезапуск — только через _startPolling() из ping-цикла после восстановления связи.
 // Это исключает burst быстрых retry пока ping ещё не зафиксировал офлайн.
+// Каждый HTTP-запрос будит на устройстве задачу AsyncTCP с приоритетом 10 —
+// выше, чем у отрисовки. Ядро ей теперь закреплено (ядро 0, см. platformio.ini),
+// но лишний трафик всё равно ни к чему: страница в кармане не должна долбить
+// колесо, а телеметрия, которую никто не смотрит, может подождать.
+function _pollDelay(ms) { return document.hidden ? Math.max(ms, 10000) : ms; }
+
 async function _pollSettings() {
     if (!_conn.online) return;
     try {
@@ -2775,7 +2783,7 @@ async function _pollSettings() {
             loadFSInfo();
         }
         if (d.fver !== undefined) _fileVersion = d.fver;
-        setTimeout(_pollSettings, 2000);
+        setTimeout(_pollSettings, _pollDelay(3000));
     } catch(e) {
         _conn.pollActive = false;
     }
@@ -2785,7 +2793,7 @@ async function _pollInfo() {
     if (!_conn.online) return;
     try {
         await updateInfo();
-        setTimeout(_pollInfo, 1000);
+        setTimeout(_pollInfo, _pollDelay(1000));
     } catch(e) {
         _conn.pollActive = false;
     }
@@ -2795,7 +2803,7 @@ async function _pollBattery() {
     if (!_conn.online) return;
     try {
         await updateBatteryStatus();
-        setTimeout(_pollBattery, 2000);
+        setTimeout(_pollBattery, _pollDelay(5000));
     } catch(e) {
         _conn.pollActive = false;
     }
@@ -2805,7 +2813,8 @@ async function _pollLogs() {
     if (!_conn.online) return;
     try {
         await _logPoll();
-        setTimeout(_pollLogs, 2000);
+        // Лог нужен часто только когда его смотрят
+        setTimeout(_pollLogs, _pollDelay(_activeTab === 'log' ? 2000 : 6000));
     } catch(e) {
         _conn.pollActive = false;
     }
@@ -2825,6 +2834,14 @@ function _startPolling() {
 function _stopPolling() {
     _conn.pollActive = false;
 }
+
+// Вернулись на вкладку — обновляем показания сразу, не дожидаясь длинного
+// интервала, на который цепочки ушли, пока страница была скрыта.
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden || !_conn.online) return;
+    updateInfo().catch(() => {});
+    updateBatteryStatus().catch(() => {});
+});
 
 // Главный ping-цикл: единственная функция которая определяет онлайн/офлайн.
 // Интервал: 2с. Таймаут 5с — ESP32 во время рендеринга может отвечать медленно.
@@ -2847,7 +2864,7 @@ async function _pingLoop() {
             _stopPolling();
         }
     }
-    _conn.pingTimer = setTimeout(_pingLoop, 2000);
+    _conn.pingTimer = setTimeout(_pingLoop, _pollDelay(2000));
 }
 
 // ===================== ДВИЖОК ПОЛЗУНКОВ =====================
