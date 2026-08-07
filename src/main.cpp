@@ -570,6 +570,8 @@ static void updateLUTIfNeeded() {
 // Раскладывает интервал [c - span/2, c + span/2] на секторы кадра и их веса
 // (сумма ровно 256). Возвращает число задействованных секторов.
 #define ANG_TAPS_MAX 4
+// При смешивании двух соседних кадров отводы обоих складываются в один список.
+#define ANG_TAPS_BLEND (2 * ANG_TAPS_MAX)
 
 static inline int boxWeights(float c, float span, const uint16_t* frame,
                              const uint16_t** rows, int* w)
@@ -599,6 +601,46 @@ static inline int boxWeights(float c, float span, const uint16_t* frame,
     // маленький вес в минус, а суммарная яркость остаётся точной.
     w[best] += 256 - acc;
     return n;
+}
+
+// Тот же набор отводов, но из ДВУХ соседних кадров анимации, с весами (1−α) и α.
+//
+// Зачем. Круг красят шесть лучей, и каждая точка обода загорается один раз за
+// 1/6 оборота — соседние точки по разные стороны от границы сектора освещаются
+// с разницей в целую развёртку. Пока номер кадра целый, эта разница означала
+// скачок на ЦЕЛЫЙ кадр, и на границах шести секторов появлялся стык: у спирали
+// витки переставали сходиться. Непрерывная позиция в кадрах вместе с этим
+// смешиванием уменьшает скачок до доли кадра — ровно до того, насколько
+// анимация успевает измениться за 1/6 оборота, а меньше уже физически нельзя.
+//
+// Отводы обоих кадров кладём в один список: samplePix остаётся неизменным,
+// сумма весов по-прежнему ровно 256, лишних проходов по диодам нет.
+static inline int boxWeightsBlend(float c, float span, const uint16_t* fa,
+                                  ptrdiff_t d_next, int a256,
+                                  const uint16_t** rows, int* w)
+{
+    if (a256 <= 0) return boxWeights(c, span, fa, rows, w);
+
+    const uint16_t* r0[ANG_TAPS_MAX];
+    int             w0[ANG_TAPS_MAX];
+    const int n = boxWeights(c, span, fa, r0, w0);
+
+    const int inv = 256 - a256;
+    int acc = 0, best = 0, m = 0;
+    for (int j = 0; j < n; j++, m++) {
+        rows[m] = r0[j];
+        w[m]    = (w0[j] * inv) >> 8;
+        acc += w[m];
+        if (w[m] > w[best]) best = m;
+    }
+    for (int j = 0; j < n; j++, m++) {
+        rows[m] = r0[j] + d_next;      // тот же угол в следующем кадре
+        w[m]    = (w0[j] * a256) >> 8;
+        acc += w[m];
+        if (w[m] > w[best]) best = m;
+    }
+    w[best] += 256 - acc;              // остаток округления — в самый весомый отвод
+    return m;
 }
 
 // Считает цвет одного диода и пишет его в DMA-буфер. Возвращает r+g+b для ABL/RMS.
@@ -664,34 +706,36 @@ static void fillSectorIntoBuffer(uint8_t* buf, uint8_t buf_idx, float sector0, f
 
     const int sat = lut_sat_fxp;
 
-    // Номер кадра считается по абсолютному времени, но ЗАЩЁЛКИВАЕТСЯ на границе
-    // 60°. Шесть лучей рисуют по своему сектору одновременно, поэтому полная
-    // картинка успевает лечь за 1/6 оборота — это и есть период обновления
-    // изображения (RPM/10 кадров в секунду, 20 Гц на 200 об/мин). Смена кадра
-    // посреди такой развёртки оставляла часть круга от кадра N, а часть от N+1:
-    // на видео 10 fps это заметный шов. Защёлка привязывает смену к границе
-    // развёртки, где шов есть и так.
-    static uint32_t latched_frame_idx = 0;
-    static int      latched_sector60  = -1;
-    uint32_t frame_idx;
+    // Позиция в анимации НЕПРЕРЫВНА: целая часть — текущий кадр, дробная — вес
+    // следующего. Раньше номер кадра был целым и защёлкивался на границе 60°;
+    // защёлка убирала разнобой внутри одной развёртки, но взамен намертво
+    // привязывала стык к границам секторов. Каждая точка обода загорается раз
+    // в 1/6 оборота, и по разные стороны от границы сектора это происходит с
+    // разницей в целую развёртку — при целом номере кадра там оказывался скачок
+    // на ЦЕЛЫЙ кадр. На спирали витки переставали сходиться в шести местах.
+    //
+    // С непрерывной позицией и смешиванием (boxWeightsBlend) скачок падает до
+    // доли кадра: ровно до того, насколько анимация меняется за 1/6 оборота.
+    // Меньше физически нельзя — круг красят шесть лучей за конечное время.
+    uint32_t  frame_idx = 0;
+    ptrdiff_t d_next    = 0;   // смещение до следующего кадра, в пикселях
+    int       alpha256  = 0;
     if (totalFrames > 1 && frameDelay > 0) {
-        // base приходит ненормированным (anchor + ω·Δt может уйти в минус или
-        // за 360°), а нам нужен именно номер сектора 0..5.
-        float sn = fmodf(sector0, 360.0f);
-        if (sn < 0.0f) sn += 360.0f;
-        int s60 = (int)(sn * (1.0f / 60.0f));
-        if (s60 != latched_sector60) {
-            latched_sector60 = s60;
-            uint32_t elapsed_ms = millis() - lastFrameSwitchTime;
-            latched_frame_idx = (elapsed_ms / frameDelay) % totalFrames;
-        }
-        // Новый файл может оказаться короче предыдущего, а защёлка пережила бы
-        // загрузку со старым значением — и адресация ушла бы за конец буфера.
-        if (latched_frame_idx >= totalFrames) latched_frame_idx = 0;
-        frame_idx = latched_frame_idx;
-    } else {
-        frame_idx = 0;
+        uint32_t elapsed_ms = millis() - lastFrameSwitchTime;
+        uint32_t q          = elapsed_ms / frameDelay;
+        uint32_t rem        = elapsed_ms - q * frameDelay;
+        frame_idx = q % totalFrames;
+        alpha256  = (int)((rem * 256u) / frameDelay);
+        // Последний кадр смешивается с нулевым: GIF зациклен, и на стыке петли
+        // движение обязано остаться таким же плавным, как внутри неё.
+        uint32_t nxt = (frame_idx + 1u) % totalFrames;
+        // Разность считаем в знаковых: на петле nxt < frame_idx, и беззнаковое
+        // вычитание дало бы гигантское смещение вместо шага назад.
+        d_next = ((ptrdiff_t)nxt - (ptrdiff_t)frame_idx) * (ptrdiff_t)(FRAME_SIZE / 2);
     }
+    // Новый файл может оказаться короче предыдущего — страховка от адресации
+    // за конец буфера, если загрузка произошла между вычислением и чтением.
+    if (frame_idx >= totalFrames) { frame_idx = 0; d_next = 0; alpha256 = 0; }
     // Кадр адресуется как массив пикселей: FRAME_SIZE кратен 2, ps_malloc
     // выравнивает начало, поэтому 16-битные чтения всегда выровнены.
     const uint16_t* frame = (const uint16_t*)(frameBuffer + frame_idx * FRAME_SIZE);
@@ -718,12 +762,12 @@ static void fillSectorIntoBuffer(uint8_t* buf, uint8_t buf_idx, float sector0, f
         // Лучи расходятся строго из центра, поэтому все 44 диода стороны лежат на
         // одном радиусе — набор секторов и весов у них общий, и разбор угла
         // выносится из цикла по диодам.
-        const uint16_t* rows_f[ANG_TAPS_MAX];
-        int             wts_f[ANG_TAPS_MAX];
-        const uint16_t* rows_b[ANG_TAPS_MAX];
-        int             wts_b[ANG_TAPS_MAX];
-        int nf = boxWeights(bf, span, frame, rows_f, wts_f);
-        int nb = boxWeights(bb, span, frame, rows_b, wts_b);
+        const uint16_t* rows_f[ANG_TAPS_BLEND];
+        int             wts_f[ANG_TAPS_BLEND];
+        const uint16_t* rows_b[ANG_TAPS_BLEND];
+        int             wts_b[ANG_TAPS_BLEND];
+        int nf = boxWeightsBlend(bf, span, frame, d_next, alpha256, rows_f, wts_f);
+        int nb = boxWeightsBlend(bb, span, frame, d_next, alpha256, rows_b, wts_b);
         for (int i = 0; i < LEDS_PER_SIDE; i++) {
             int kr = gain_r[i], kg = gain_g[i], kb = gain_b[i];
             pixel_sum += samplePix(rows_f, wts_f, nf, i, sat, kr, kg, kb, dst_f + i * 4);
