@@ -929,7 +929,7 @@ details.help .help-body b { color: var(--text-2); }
 
   <!-- Кнопка одна на обе карточки: запрос уходит с обоими наборами полей -->
   <div class="card" style="margin-top:16px">
-    <button class="btn btn-primary btn-block" onclick="saveWifi()">Save &amp; apply both</button>
+    <button class="btn btn-primary btn-block" onclick="saveWifi()">Save &amp; Apply</button>
     <p class="ctl-hint" style="text-align:center">Saving drops the current connection while the radio restarts. Give it a few seconds, then reload the page.</p>
   </div>
 </section>
@@ -2130,14 +2130,21 @@ function loadFSInfo() {
         const pct = d.total ? (d.used / d.total * 100) : 0;
         document.getElementById('fsFill').style.width = pct.toFixed(1) + '%';
         const mb = v => (v / 1048576).toFixed(1);
-        document.getElementById('fsLabel').textContent = 'Storage';
+        document.getElementById('fsLabel').textContent = 'Storage (flash)';
         document.getElementById('fsPct').textContent   =
             `${mb(d.free)} MB free of ${mb(d.total)} MB`;
-        // Длину анимации ограничивает не флеш, а PSRAM — говорим об этом прямо.
+        // Длину анимации ограничивает не флеш, а PSRAM: кадры играются из
+        // оперативной памяти целиком. Флеша 12 МБ, PSRAM всего 8 — без этого
+        // пояснения свободное место на диске читается как предел длины ролика.
         const sub = document.getElementById('fsSub');
         if (typeof d.psram_free === 'number' && d.psram_free > 0 && d.frame_size) {
-            const maxF = Math.max(0, Math.floor((d.psram_free - 262144) / d.frame_size));
-            sub.textContent = `Animation memory fits about ${maxF} frames (~${(maxF / 10).toFixed(0)} s at 10 fps)`;
+            // Тот же расчёт, что и при проверке видео, — берём общую функцию,
+            // чтобы два места не разошлись в оценке.
+            _devLimits = { psFree: d.psram_free, fsFree: d.free };
+            const maxF = maxFramesForDevice();
+            sub.textContent =
+                `Animations play from RAM, not from storage — ${mb(d.psram_free)} MB of RAM free, ` +
+                `enough for about ${maxF} frames (~${(maxF / 10).toFixed(0)} s at 10 fps).`;
         } else {
             sub.textContent = '';
         }
