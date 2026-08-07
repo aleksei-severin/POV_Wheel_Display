@@ -1,5 +1,6 @@
 #include "config.h"
 #include "network.h"
+#include "effects.h"
 #include <WiFi.h>
 
 #include <Arduino.h>
@@ -91,6 +92,15 @@ static volatile uint8_t  last_hall_idx = 0;   // Индекс датчика п�
 static volatile uint32_t last_hall_rev = 0;   // Период оборота по этому датчику (0 = невалиден)
 static volatile uint32_t hall_seq      = 0;   // Счётчик событий
 static volatile int8_t   dir_score     = 0;   // Голосование за направление, [-4..4]
+
+// Пропущенный проход мимо датчика неотличим от честного оборота: интервал
+// между двумя срабатываниями ОДНОГО датчика получается ровно кратным (2×, 3×),
+// и обороты читаются вдвое-втрое меньше реальных. Счётчики ниже — для лога:
+// по ним видно, какой именно датчик теряет магнит.
+static volatile uint32_t hall_rev_skips    = 0;   // сколько замеров отвергнуто
+static volatile uint32_t hall_rev_skip_us  = 0;   // последний отвергнутый замер
+static volatile uint8_t  hall_rev_skip_idx = 0;   // и датчик, который его дал
+static volatile uint8_t  hall_rev_long     = 0;   // длинных замеров подряд
 
 // Калибровка углового положения датчиков.
 // hall_cal[k] — поправка в градусах к фазе, снимаемой с датчика k
@@ -198,13 +208,17 @@ struct __attribute__((packed)) SettingsBlob {
     float    gamma, saturation, contrast;
     float    r_gain, g_gain, b_gain, abl;
     float    rpm_on, rpm_off;                    // добавлены в версии 2
+    uint8_t  effect;                             // добавлены в версии 3
+    uint8_t  _pad2;
+    uint16_t speed_red;                          // км/ч красной зоны для эффекта Speed
 };
 static const uint16_t SETTINGS_MAGIC = 0x5056;   // 'PV'
-static const uint8_t  SETTINGS_VER   = 2;
+static const uint8_t  SETTINGS_VER   = 3;
 // Блоб растёт только в конец, поэтому старая запись читается как есть: новые
 // поля остаются нулями и отсеиваются проверкой диапазона — настройки,
 // сохранённые прошлой прошивкой, при обновлении не теряются.
 static const size_t   SETTINGS_V1_SIZE = 44;
+static const size_t   SETTINGS_V2_SIZE = 52;
 
 volatile bool   settings_dirty       = false;    // взводится из /settings и /album
 static uint32_t settings_dirty_since = 0;
@@ -229,6 +243,8 @@ static void fillSettingsBlob(SettingsBlob& b) {
     b.abl         = global_abl_limit;
     b.rpm_on      = rpm_render_on;
     b.rpm_off     = rpm_render_off;
+    b.effect      = effect_id;
+    b.speed_red   = effect_speed_red;
 }
 
 // Диапазоны проверяются и при чтении: одного magic мало, испорченный блоб не
@@ -239,6 +255,7 @@ static void loadSettingsFromNVS() {
     size_t got = prefs.getBytes("settings", &b, sizeof(b));
     bool ok = (b.magic == SETTINGS_MAGIC) &&
               ((got == sizeof(b)          && b.version == SETTINGS_VER) ||
+               (got == SETTINGS_V2_SIZE   && b.version == 2) ||
                (got == SETTINGS_V1_SIZE   && b.version == 1));
     if (!ok) {
         webLog("[SYS] No stored settings, using defaults");
@@ -266,6 +283,10 @@ static void loadSettingsFromNVS() {
     }
     global_arm_reverse = (b.arm_reverse != 0);
     slideshowActive    = (b.slideshow   != 0);
+    // Эффект сам НЕ запускается здесь: буферы кадра ещё не выделены, а PSRAM
+    // проверяется только в setup(). Запоминаем, запуск — ниже по setup().
+    if (b.effect > EFF_NONE && b.effect < EFF_COUNT) effect_id = b.effect;
+    if (b.speed_red >= 5 && b.speed_red <= 200)      effect_speed_red = b.speed_red;
     webLog("[SYS] Settings restored from NVS");
 }
 
@@ -344,7 +365,33 @@ void IRAM_ATTR hallInterruptHandler(void* arg) {
         else if (dir_score <= -2) rotation_dir = -1;
     }
 
-    last_hall_rev = seen ? rev : 0;
+    // Правдоподобность замера. За один оборот колесо не может замедлиться
+    // вполтора раза, а вот пропущенный проход мимо магнита даёт ровно такой
+    // же кратный замер. Без этой проверки один промах любого из шести
+    // датчиков превращался в «обороты упали вдвое» — автомат питания снимал
+    // питание с лучей, а через две секунды всё зажигалось обратно.
+    //
+    // Длинный замер принимаем только после подтверждения следующим: настоящее
+    // замедление видят ВСЕ шесть датчиков, а промах — один. Настоящую
+    // остановку это не маскирует: rpmEstimate считает ещё и время молчания
+    // датчиков, а оно растёт само по себе, никаких событий не требуя.
+    bool     rev_ok = seen;
+    uint32_t cur    = rotation_period;
+    if (rev_ok && cur != 0 && rev > cur + (cur >> 1)) {
+        if (hall_rev_long < 1) {
+            hall_rev_long++;
+            rev_ok            = false;
+            hall_rev_skips++;
+            hall_rev_skip_us  = rev;
+            hall_rev_skip_idx = (uint8_t)k;
+        } else {
+            hall_rev_long = 0;          // подтвердилось — колесо действительно замедлилось
+        }
+    } else if (rev_ok) {
+        hall_rev_long = 0;
+    }
+
+    last_hall_rev = rev_ok ? rev : 0;
     if (last_hall_rev) rotation_period = last_hall_rev;
 
     hall_last_us[k] = now;
@@ -1493,6 +1540,7 @@ static void setHallMask(uint8_t mask) {
     noInterrupts();
     hall_active_mask = mask;
     hall_seen_mask  &= mask;      // забываем метки времени обесточенных датчиков
+    hall_rev_long    = 0;         // набор подтверждений начинается заново
     hall_prev_idx    = 0xFF;      // порядок срабатывания надо набрать заново
     dir_score        = 0;
     if (mask == 0) rotation_period = 0;
@@ -1604,6 +1652,13 @@ void updateFileList() {
 void fileLoaderTask(void* pvParameters) {
     while (true) {
         xSemaphoreTake(fileLoaderSemaphore, portMAX_DELAY);
+        // Эффект проверяем первым: он не читает флеш, но так же ждёт, пока
+        // рендер отпустит буфер кадра, и в обработчике HTTP этому не место.
+        if (pending_effect >= 0) {
+            uint8_t want = (uint8_t)pending_effect;
+            pending_effect = -1;
+            effectsStart(want);
+        }
         if (pendingFilePath.length() > 0) {
             loadFrameFromFile(pendingFilePath);
             pendingFilePath = "";
@@ -1750,8 +1805,22 @@ void setup() {
     hallSemaphore       = xSemaphoreCreateBinary();
     fileLoaderSemaphore = xSemaphoreCreateBinary();
 
+    // Генератор эффектов: таблицы и задача Core 0. Создаём до автозапуска —
+    // восстановленный из NVS эффект должен подняться здесь же.
+    effectsInit();
+
     String last_file = prefs.getString("last_file", "");
-    if (last_file != "" && LittleFS.exists("/" + last_file)) {
+    if (effect_id != EFF_NONE) {
+        // Эффект имеет приоритет над последним файлом: он и был последним, что
+        // пользователь выбрал, а сохранённое имя файла осталось от прошлого раза.
+        uint8_t want = effect_id;
+        effect_id = EFF_NONE;               // effectsStart сам выставит и проверит PSRAM
+        if (effectsStart(want)) {
+            webLogf("[EFF] Autostart: %s", effectName(want));
+        } else {
+            webLog("[EFF] Autostart failed, no PSRAM");
+        }
+    } else if (last_file != "" && LittleFS.exists("/" + last_file)) {
         if (slideshowActive) {
             webLogf("[DISP] Autoplay (slideshow resume): %s", last_file.c_str());
         } else {
@@ -1813,12 +1882,16 @@ void loop() {
     }
 
     // --- Текущее состояние вращения ---
+    // micros() читаем ЗДЕСЬ ЖЕ, а не после interrupts(): loop() идёт на ядре 1
+    // с приоритетом 1 и вытесняется renderingTask. Вытеснение между чтением
+    // метки события и чтением времени раздувало бы «возраст» события на всю
+    // длительность паузы — то есть показало бы вымышленное падение оборотов.
     noInterrupts();
     uint32_t rev_period = rotation_period;
     uint32_t hall_t     = last_hall_time;
+    uint32_t now_us     = micros();
     interrupts();
 
-    uint32_t now_us = micros();
     uint32_t hall_age_us = UINT32_MAX;
     if (hall_t != 0) hall_age_us = (uint32_t)(now_us - hall_t);
 
@@ -1859,6 +1932,25 @@ void loop() {
                 slideCurrentIndex + 1, (int)savedFiles.size());
     }
 
+    // --- Диагностика пропусков датчиков ---
+    // Если какой-то луч регулярно не видит магнит, его номер виден здесь —
+    // это уже механика (зазор до магнита), а не прошивка. Реже раза в 5 с,
+    // иначе кольцевой буфер лога забьётся одной и той же строкой.
+    {
+        static uint32_t skips_seen    = 0;
+        static uint32_t skips_last_ms = 0;
+        uint32_t sk = hall_rev_skips;
+        if (sk != skips_seen && (now_ms - skips_last_ms) > 5000) {
+            webLogf("[HALL] Sensor %u missed the magnet: %lu ms instead of %lu (%lu total)",
+                    (unsigned)hall_rev_skip_idx + 1,
+                    (unsigned long)(hall_rev_skip_us / 1000),
+                    (unsigned long)(rev_period / 1000),
+                    (unsigned long)(sk - skips_seen));
+            skips_seen    = sk;
+            skips_last_ms = now_ms;
+        }
+    }
+
     // --- Пробуждение по вибродатчику ---
     bool vibration = false;
     if (wakeup_event) {
@@ -1879,7 +1971,12 @@ void loop() {
     // одного «свежего» события хватало бы, чтобы условие выполнилось.
     static const uint32_t RPM_UP_HOLD_MS      = 700;
     static const uint32_t RPM_RELIGHT_LOCK_MS = 1500;
+    // Выдержка на гашение. Длиннее интервала между событиями шести
+    // датчиков на пороговых оборотах (при 120 RPM это 83 мс), чтобы один
+    // сбойный замер гарантированно перекрылся следующим, хорошим.
+    static const uint32_t RPM_DOWN_HOLD_MS    = 400;
     static uint32_t rpm_above_since = 0;   // с какого момента обороты выше порога старта
+    static uint32_t rpm_below_since = 0;   // и ниже порога гашения
     static uint32_t spindown_ms     = 0;   // когда лента погасла из-за падения оборотов
 
     if (!content_ready) {
@@ -1917,11 +2014,23 @@ void loop() {
                 break;
 
             case PWR_FULL:
+                // Гашение тоже требует выдержки, как и розжиг. Раньше здесь хватало
+                // ОДНОГО низкого отсчёта, чтобы снять питание с пяти лучей и уйти в
+                // блокировку розжига на 2.2 с — несоразмерная цена за один выброс
+                // оценки. На реальном замедлении обороты продолжают падать, и
+                // выдержка лишь отодвигает гашение на свою длительность.
                 if (rpm < rpm_render_off) {
+                    if (rpm_below_since == 0) rpm_below_since = now_ms;
+                } else {
+                    rpm_below_since = 0;
+                }
+                if (rpm_below_since != 0 &&
+                    (now_ms - rpm_below_since) >= RPM_DOWN_HOLD_MS) {
                     // Запоминаем момент гашения: раньше этого времени лента не
                     // зажжётся, даже если оценка оборотов на миг подскочит.
                     spindown_ms     = now_ms;
                     rpm_above_since = 0;
+                    rpm_below_since = 0;
                     applyPowerState(PWR_SPINUP);
                 }
                 break;

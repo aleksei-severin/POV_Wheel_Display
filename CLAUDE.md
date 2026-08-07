@@ -123,6 +123,14 @@ Per-sensor mechanical/threshold spread would otherwise inject a phase jump 6× p
 
 `renderingTask` enforces the same RPM thresholds itself. It must — while rendering it preempts `loop()` (prio 1), so relying on `loop()` alone would leave the image running below threshold.
 
+### Wall Clock
+
+The clock lives in **newlib system time**, not in an `epoch + millis()` pair. System time is anchored to the RTC counter, which keeps running through deep sleep and through a software reset, and ESP-IDF restores it at startup (`esp_set_time_from_rtc`). The old pair could not: `millis()` restarts at zero in a new session, so the time was lost on *every* sleep — which is every 60 s of inactivity, making the Clock effect useless.
+
+`_currentEpoch()` rejects anything before 2023 as "never set", so if the restore ever fails the behaviour degrades to exactly what it was: `??:??:??` in the log and a bare dial until a browser connects. The browser re-syncs from `_logPoll()` whenever the device reports time 0 or drifts more than 5 s, so a power cut fixes itself as soon as any tab is open. Accuracy between syncs is that of the internal RTC RC oscillator — expect drift of seconds per hour of sleep, not milliseconds.
+
+`_time_tz_offset` stays in RTC memory (so local time shows immediately after a wake) but is range-checked on read: it now drives a clock face, not just log lines.
+
 ### Battery State of Charge
 
 `updateBatterySoc()` reconstructs open-circuit voltage before reading the LiPo curve; percentage is computed on-device and served as `soc`, not derived from `vbat` in the browser. Two reasons the naive terminal-voltage reading was useless: a 1S LiPo curve is flat in the middle (3.73–3.87 V spans 20–60 % SoC, so 20 mV is 6 %), and terminal voltage moves with load — the display coming on dropped the reading 15–20 %, plugging in the charger raised it 10–15 %.
@@ -135,7 +143,28 @@ Load current is never measured: `global_abl_rms` is *by construction* the normal
 
 `ocv` and `sag` are exposed in `/battery` for calibration: `ocv` should stay put when the display switches on, and `sag` shows where self-calibration settled.
 
+**A missed magnet pass is indistinguishable from a slow revolution, and that used to blank the display.** `rotation_period` is measured between two firings of the *same* sensor, so if one of the six misses its pass the next interval is an exact multiple — 2×, 3× — and the RPM reads half or a third of the truth. The `PWR_FULL → PWR_SPINUP` branch had no debounce at all, so one such sample cut power to arms 2–6 and bought a 2.2 s relight lockout: the display blinked once or twice a second at 130–180 rpm, less often as speed rose (a halved reading only crosses the off-threshold below 2× it), and looked stable above ~40 km/h. Three things now prevent it:
+
+- **The ISR rejects an implausible revolution** — one more than 1.5× the current period is held back until the *next* measurement confirms it. A real slowdown is seen by all six sensors, a miss by one. This does not mask a real stop: `rpmEstimate()` also counts sensor silence, which grows on its own with no events at all.
+- **`PWR_FULL → PWR_SPINUP` holds for 400 ms**, mirroring the 700 ms hold on the way up. Longer than the gap between six sensors' events at threshold speed (83 ms at 120 rpm), so one bad sample is always covered by the next good one. Measured cost on a genuine spin-down: blanking moves from ~400 ms to ~800 ms after the threshold is crossed, and `renderingTask` blanks the strip on its own `age_limit` well before that anyway.
+- **`micros()` is read inside the same `noInterrupts()` block** as `last_hall_time`. `loop()` runs at priority 1 on Core 1 and is preempted by `renderingTask`; a preemption between the two reads inflated the event age and invented a speed drop.
+
+`hall_rev_skips` counts rejected measurements and `loop()` logs `[HALL] Sensor N missed the magnet` at most once per 5 s. A sensor that keeps appearing there is a mechanical problem — magnet gap on that arm — not a firmware one.
+
 `setHallMask()` must be called on every power transition: it clears the timestamps of sensors that were unpowered, otherwise their first post-power-up event yields a bogus "revolution period".
+
+### Procedural Effects
+
+Frames can come from a generator instead of a file — that is the only way `Speed` can follow the wheel as you ride. [src/effects.cpp](src/effects.cpp) computes 360×44 RGB565 into its own pair of PSRAM buffers and publishes a finished frame by swapping `frameBuffer`; `frame_fmt` stays `FRAME_FMT_565`, so `renderingTask` needs no special case. Six effects: `Speed`, `Fire`, `Rainbow`, `Plasma`, `Ripples`, `Clock` (`EffectId` in [include/effects.h](include/effects.h) — the web UI sends the raw number, so the two lists must stay in step).
+
+- **Two buffers, not one.** The renderer holds the frame pointer for the duration of one sector fill; writing in place would show a half-updated frame, which on the Speed digits reads as a torn number.
+- **An effect and a file cannot be live at once.** `loadFrameFromFile()` calls `effectsStop()` before it swaps, otherwise the generator keeps writing into memory the loader has just freed. `effectsStop()` also hands the PSRAM back — a 480-frame animation wants all of it.
+- **`eff_mutex` guards start/stop against the generator.** Without it, the whole of `effectsStop()` fits between "generator read `effect_id`" and "generator started writing".
+- **Start and stop wait for the renderer to release the frame** (up to a second in the worst case), so `/effect` only queues `pending_effect` and `fileLoaderTask` does the work — the same reason `/play` defers.
+- **Fire is tuned by the spread between sectors, not by looks in one column.** While sparks were born in single sectors the spread sat near 12/255 and the effect read as an even glow; sparks are therefore seeded across an *arc* (a flame tongue is wider than one degree, and the angular blur erases anything narrower), which lifts it to ~45.
+- **The Speed mask uses screen coordinates, y down** — the same convention as the browser converter. A "maths" y-up sign flips every digit upside down. The number sits above centre and `km/h` below, clear of the 49 mm hub hole.
+- **The clock dial is built once, not per frame.** Ticks and the twelve numerals never move, so `buildClockBase()` renders them into a PSRAM frame at effect start and each frame is a `memcpy` plus three hands. The numerals use a 3×5 font because a 5×7 "12" would fill most of the ~110 mm of arc that one hour gets at that radius.
+- Which direction is "up" for the digits and for 12 o'clock follows from the `angle_offset` calibration — the frame is world-fixed, but where its zero lands on the wheel is what that setting decides.
 
 ### Module Breakdown
 
@@ -143,6 +172,7 @@ Load current is never measured: `global_abl_rms` is *by construction* the normal
 |------|------|
 | [src/main.cpp](src/main.cpp) | Setup, main loop, Hall/rotor tracking, rendering, power FSM, ADC telemetry, deep sleep |
 | [src/network.cpp](src/network.cpp) | WiFi (AP+STA), AsyncWebServer, file upload/playback, OTA, mDNS, web log |
+| [src/effects.cpp](src/effects.cpp) | Procedural effects: generator task, frame buffers, the six effects |
 | [include/config.h](include/config.h) | Pin map, display geometry, RPM thresholds, globals |
 | [data/index.html](data/index.html) | Web UI served from LittleFS (also does image→polar conversion in-browser) |
 
@@ -154,9 +184,10 @@ GET  /play?file=X       # Load and start playing file X
 GET  /stop              # Stop rendering
 GET  /delete?file=X     # Delete file from LittleFS
 GET  /settings          # bmin,bmax,a,g,s,co,circ,ao,abl,rg,gg,bg
-GET  /get_settings      # JSON of all settings + lux + state/file version counters
+GET  /get_settings      # JSON of all settings + lux + effect/speed_red + state/file version counters
 GET  /battery           # JSON: {vbat,vusb,chg,usb,soc,ocv,sag}  (chg: 0=discharging 1=charging 2=done)
-GET  /info              # JSON: {rpm,dir,pwr,step,fill}  (step: °/LED update, fill: µs)
+GET  /info              # JSON: {rpm,dir,pwr,step,fill,kmh}  (step: °/LED update, fill: µs)
+GET  /effect?id=N       # Procedural effect: 0 = off, 1..6 = EffectId. &speed_red=NN sets the red point
 GET  /preview?file=X    # First frame (FRAME_SIZE bytes) for browser-side thumbnail
 GET  /fs_info           # JSON: {total,used,free,psram_free,frame_size}  (psram_free = largest free PSRAM block; frame_size = FRAME_STRIDE_PAL, what a new upload will cost)
 GET  /album             # Slideshow control (action=start|stop&delay=ms)

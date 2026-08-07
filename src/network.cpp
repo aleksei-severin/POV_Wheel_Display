@@ -1,4 +1,5 @@
 #include "network.h"
+#include "effects.h"
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
@@ -12,6 +13,7 @@
 #include <vector>
 #include <memory>
 #include <algorithm>
+#include <sys/time.h>
 
 AsyncWebServer server(80);
 Preferences prefs;
@@ -71,26 +73,58 @@ RTC_DATA_ATTR static int32_t  _time_tz_offset   = 0;  // Смещение час
 
 static portMUX_TYPE _log_mux = portMUX_INITIALIZER_UNLOCKED;
 
-// Возвращает текущий Unix timestamp (секунды), используя сохранённую базу + millis().
-// После deep sleep millis() сбрасывается в 0, поэтому _time_epoch_base = 0 устанавливается
-// явно в resetTimeSync() вызываемом из setup() — это гарантирует ??:??:?? для загрузочных
-// сообщений и корректную ретроспективную расстановку меток после первой синхронизации.
+// Часы идут по СИСТЕМНОМУ времени newlib, а не по паре «epoch + millis()».
+// Разница принципиальная: системное время привязано к счётчику RTC, который
+// продолжает считать и в глубоком сне, и через программный сброс, а ESP-IDF
+// восстанавливает из него время на старте (esp_set_time_from_rtc). Пара с
+// millis() этого не умела — millis() в новой сессии начинается с нуля, и время
+// терялось при КАЖДОМ засыпании, то есть каждые 60 с простоя.
+//
+// Если восстановление почему-то не сработает, time() вернёт значение около нуля,
+// проверка ниже сочтёт время неизвестным, и поведение выродится в прежнее:
+// «??:??:??» в логе и пустой циферблат, пока не подключится браузер. То есть
+// хуже, чем было, стать не может.
+//
+// Порог — начало 2023 года: меньшее значение означает, что часы не заводили.
+#define TIME_VALID_FROM  1700000000UL
+
 static uint32_t _currentEpoch() {
-    if (_time_epoch_base == 0) return 0;
-    // Защита от uint32_t underflow когда millis() < _time_millis_base:
-    // такое случается если база была сохранена RTC, а millis() ещё не догнал её.
-    uint32_t now_ms = millis();
-    if (now_ms < _time_millis_base) return 0;
-    return _time_epoch_base + (now_ms - _time_millis_base) / 1000;
+    time_t now = time(nullptr);
+    if ((uint32_t)now < TIME_VALID_FROM) return 0;
+    return (uint32_t)now;
 }
 
-// Сбрасывает временну́ю базу — вызывать в начале setup().
-// Без этого после deep sleep _time_epoch_base != 0, но _time_millis_base стала,
-// из-за чего _currentEpoch() даёт UTC вместо локального времени до первой синхронизации.
+// Смещение пояса лежит в RTC-памяти и переживает сон вместе с часами. После
+// полного снятия питания там может оказаться что угодно, а теперь по нему
+// рисуется циферблат — поэтому проверяем диапазон реальных поясов (±14 ч).
+static int32_t _tzOffset() {
+    if (_time_tz_offset < -50400 || _time_tz_offset > 50400) return 0;
+    return _time_tz_offset;
+}
+
+// Местное время часы/минуты/секунды. false — браузер ещё не присылал /settime,
+// и показывать что-либо, кроме пустого циферблата, было бы враньём.
+bool localClock(int& h, int& m, int& s) {
+    uint32_t epoch = _currentEpoch();
+    if (epoch == 0) { h = m = s = 0; return false; }
+    int64_t local = (int64_t)epoch + (int64_t)_tzOffset();
+    if (local < 0) local = 0;
+    uint32_t secs = (uint32_t)(local % 86400);
+    h = (int)(secs / 3600);
+    m = (int)((secs % 3600) / 60);
+    s = (int)(secs % 60);
+    return true;
+}
+
+// Вызывается в начале setup(). Сами часы здесь НЕ сбрасываются — они живут в
+// системном времени и обязаны пережить сон. Обнуляется только пара, по которой
+// задним числом проставляются метки строк лога: она привязана к millis(), а он
+// в новой сессии начинается заново.
+// _time_tz_offset тоже сохраняем: он лежит в RTC, и после пробуждения время
+// сразу показывается местное, не дожидаясь браузера.
 void resetTimeSync() {
     _time_epoch_base  = 0;
     _time_millis_base = 0;
-    // _time_tz_offset не сбрасываем: браузер отправит его вместе со временем
 }
 
 // Форматирует "YYYY-MM-DD HH:MM:SS" из Unix timestamp с учётом часового пояса в буфер buf[20].
@@ -100,7 +134,7 @@ static void _fmtDateTime(uint32_t epoch, char* buf) {
         return;
     }
     // Применяем смещение часового пояса
-    int64_t local_epoch = (int64_t)epoch + (int64_t)_time_tz_offset;
+    int64_t local_epoch = (int64_t)epoch + (int64_t)_tzOffset();
     if (local_epoch < 0) local_epoch = 0;
 
     // Расчёт даты (алгоритм Томаса — без libc mktime/localtime)
@@ -287,6 +321,11 @@ void loadFrameFromFile(String path) {
     wakeRenderingTask();
     for (int i = 0; i < 1000 && render_in_fill;   i++) vTaskDelay(1);
     for (int i = 0; i <  200 && rendering_active; i++) vTaskDelay(1);
+
+    // Эффект и файл — два независимых источника кадра, и живыми одновременно
+    // они быть не могут: генератор продолжил бы писать в буфер, который мы
+    // сейчас освободим. Лента уже погашена, так что остановка ничего не стоит.
+    effectsStop();
 
     // Имя файла для автозапуска пишем здесь, а не в обработчике /play: запись
     // в NVS стирает страницу флеша и на десятки миллисекунд морозит рендер.
@@ -622,7 +661,7 @@ void setupNetwork() {
         const char* curf = currentDisplayFile.c_str();
         if (*curf == '/') curf++;
 
-        char buf[512];
+        char buf[576];
         snprintf(buf, sizeof(buf),
             "{\"bmin\":%u,\"bmax\":%u,\"angle\":%d,\"brightness\":%u,\"eff_bri\":%u"
             ",\"gamma\":%.1f,\"saturation\":%.1f,\"contrast\":%.1f"
@@ -631,6 +670,7 @@ void setupNetwork() {
             ",\"rg\":%.1f,\"gg\":%.1f,\"bg\":%.1f"
             ",\"slideshow\":%s,\"file\":\"%s\",\"play\":%u"
             ",\"rpm_on\":%.0f,\"rpm_off\":%.0f"
+            ",\"effect\":%u,\"speed_red\":%u"
             ",\"ver\":%lu,\"fver\":%lu}",
             (unsigned)min_brightness, (unsigned)max_brightness,
             (int)global_angle_offset, (unsigned)global_brightness,
@@ -643,6 +683,7 @@ void setupNetwork() {
             slideshowActive ? "true" : "false",
             curf, (unsigned)(force_stop_display ? 0 : 1),
             (float)rpm_render_on, (float)rpm_render_off,
+            (unsigned)effect_id, (unsigned)effect_speed_red,
             (unsigned long)state_version, (unsigned long)file_version
         );
         request->send(200, "application/json", buf);
@@ -746,6 +787,7 @@ void setupNetwork() {
             // погасив ленту, и по-прежнему ДО подмены буфера кадра.
             pendingPlayFile = fname;
             slideshowActive = false;
+            pending_effect  = -1;          // файл отменяет незакрытую заявку на эффект
             force_stop_display = false;
             // Передаём загрузку в fileLoaderTask (Core 0, приоритет 2).
             // Это освобождает WiFi-задачу немедленно — браузер получает ответ
@@ -767,9 +809,51 @@ void setupNetwork() {
         last_web_activity_time = millis();
         slideshowActive = false;
         force_stop_display = true;
+        // Эффект снимаем через заявку: остановка ждёт рендер, а держать на этом
+        // задачу AsyncTCP нельзя. PSRAM при этом вернётся длинным анимациям.
+        if (effect_id != EFF_NONE) {
+            pending_effect = EFF_NONE;
+            xSemaphoreGive(fileLoaderSemaphore);
+            settings_dirty = true;
+        }
         state_version++;
         webLog("[DISP] Stop");
         request->send(200, "text/plain", "Stopped");
+    });
+
+    // GET /effect?id=N[&speed_red=NN] — процедурный эффект вместо файла.
+    // id = 0 выключает эффекты и гасит ленту (то же, что /stop).
+    server.on("/effect", HTTP_GET, [](AsyncWebServerRequest *request){
+        last_web_activity_time = millis();
+        if (request->hasParam("speed_red")) {
+            long v = request->getParam("speed_red")->value().toInt();
+            if (v >= 5 && v <= 200) {
+                effect_speed_red = (uint16_t)v;
+                settings_dirty = true;
+            }
+        }
+        if (request->hasParam("id")) {
+            long id = request->getParam("id")->value().toInt();
+            if (id < 0 || id >= EFF_COUNT) {
+                request->send(400, "text/plain", "Bad effect id");
+                return;
+            }
+            slideshowActive = false;
+            pendingFilePath = "";          // эффект отменяет незакрытую заявку на файл
+            if (id == EFF_NONE) {
+                force_stop_display = true;
+            } else {
+                force_stop_display = false;
+                currentDisplayFile = "";   // в списке файлов подсвечивать нечего
+            }
+            // Саму смену делает fileLoaderTask: она ждёт, пока рендер отпустит
+            // буфер кадра, и задаче AsyncTCP на этом стоять нельзя.
+            pending_effect = (int8_t)id;
+            xSemaphoreGive(fileLoaderSemaphore);
+            settings_dirty = true;
+            state_version++;
+        }
+        request->send(200, "text/plain", "OK");
     });
 
     // GET /album?action=start|stop&delay=<мс> — управление слайдшоу
@@ -1046,11 +1130,15 @@ void setupNetwork() {
         // step — угол, который луч проходит между обновлениями ленты; это и есть
         // предел угловой чёткости. fill — время сборки кадра, для контроля запаса
         // по CPU (должно оставаться заметно меньше времени передачи по SPI).
-        char buf[112];
+        // kmh — та же скорость, что показывает эффект Speed. Считается здесь, а
+        // не в браузере: делить обороты на длину окружности в двух местах значит
+        // рано или поздно получить два разных числа на одном экране.
+        char buf[144];
         snprintf(buf, sizeof(buf),
-                 "{\"rpm\":%.1f,\"dir\":%d,\"pwr\":%u,\"step\":%.2f,\"fill\":%u}",
+                 "{\"rpm\":%.1f,\"dir\":%d,\"pwr\":%u,\"step\":%.2f,\"fill\":%u,\"kmh\":%.1f}",
                  rpm, (int)rotation_dir, (unsigned)power_state,
-                 (float)global_render_span, (unsigned)global_render_fill_us);
+                 (float)global_render_span, (unsigned)global_render_fill_us,
+                 currentSpeedKmh());
         request->send(200, "application/json", buf);
     });
 
@@ -1059,7 +1147,14 @@ void setupNetwork() {
     // tz — смещение часового пояса в секундах (UTC+2 → +7200, передаётся браузером)
     server.on("/settime", HTTP_POST, [](AsyncWebServerRequest *request){
         if (request->hasParam("t")) {
-            _time_epoch_base  = (uint32_t)request->getParam("t")->value().toInt();
+            uint32_t t = (uint32_t)request->getParam("t")->value().toInt();
+            // Ставим системные часы: дальше их держит счётчик RTC, и время
+            // переживёт и глубокий сон, и перезагрузку по OTA.
+            struct timeval tv = { .tv_sec = (time_t)t, .tv_usec = 0 };
+            settimeofday(&tv, nullptr);
+            // Эта пара нужна только ретроспективной простановке меток лога —
+            // она считает от millis() текущей сессии.
+            _time_epoch_base  = t;
             _time_millis_base = millis();
         }
         if (request->hasParam("tz")) {

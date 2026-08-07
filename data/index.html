@@ -271,6 +271,27 @@ html[data-theme="light"] .btn-ok.active { --btn-fg: #fff; }
 .card > h2 + *:not(.card-note) { margin-top: 14px; }
 .sep { height: 1px; background: var(--border-soft); margin: 18px 0; }
 
+/* Плитки эффектов. auto-fill, а не фиксированные колонки: на телефоне
+   раскладка сама сходится в одну колонку без отдельной медиа-точки. */
+.eff-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; }
+.eff {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 3px;
+  padding: 12px 14px; text-align: left; cursor: pointer;
+  background: var(--surface-2); color: var(--text-1);
+  border: 1px solid var(--border-soft); border-radius: 14px;
+  font: inherit; transition: border-color .15s, background .15s;
+}
+.eff:hover { border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+.eff.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.eff-ic { font-size: 20px; line-height: 1; }
+.eff-nm { font-weight: 650; font-size: 14px; }
+.eff.active .eff-nm { color: var(--accent); }
+.eff-ds { font-size: 12px; color: var(--text-3); line-height: 1.35; }
+
 /* =========================== Органы управления =========================== */
 .ctl { margin-bottom: 18px; }
 .ctl:last-child { margin-bottom: 0; }
@@ -691,6 +712,7 @@ details.help .help-body b { color: var(--text-2); }
       <button class="tab" role="tab" id="tab-library" aria-selected="true"  aria-controls="panel-library" onclick="showTab('library')">Library</button>
       <button class="tab" role="tab" id="tab-display" aria-selected="false" aria-controls="panel-display" onclick="showTab('display')">Display</button>
       <button class="tab" role="tab" id="tab-tune"    aria-selected="false" aria-controls="panel-tune"    onclick="showTab('tune')">Calibration</button>
+      <button class="tab" role="tab" id="tab-effects" aria-selected="false" aria-controls="panel-effects" onclick="showTab('effects')">Effects</button>
       <button class="tab" role="tab" id="tab-wifi"    aria-selected="false" aria-controls="panel-wifi"    onclick="showTab('wifi')">Wi-Fi</button>
       <button class="tab" role="tab" id="tab-log"     aria-selected="false" aria-controls="panel-log"     onclick="showTab('log')">Log</button>
     </div>
@@ -879,6 +901,34 @@ details.help .help-body b { color: var(--text-2); }
       </div>
 
       <button class="btn btn-block" onclick="restoreImgDefaults()">↺ Restore defaults</button>
+    </div>
+
+  </div>
+</section>
+
+<!-- ---------------- Вкладка: эффекты ---------------- -->
+<section class="panel" id="panel-effects" role="tabpanel" aria-labelledby="tab-effects" hidden>
+  <div class="cols">
+
+    <div class="card" style="max-width:760px">
+      <h2>Effects</h2>
+      <p class="card-note">These frames are computed on the wheel instead of being read from a file — which is the only way Speed can follow the wheel as you ride. Starting one hands the animation's memory back; press Stop, or play any file, to return to the library.</p>
+
+      <div class="eff-grid" id="effGrid"></div>
+
+      <div class="sep"></div>
+
+      <div class="ctl">
+        <div class="ctl-head">
+          <span class="ctl-name">Speed — fully red at</span>
+          <span class="ctl-val" id="effRedVal">40 km/h</span>
+        </div>
+        <input type="range" id="effRed" min="5" max="120" step="1" value="40"
+               oninput="document.getElementById('effRedVal').textContent=this.value+' km/h'; effSetRed()">
+        <p class="ctl-hint">The digits run from green at a standstill to fully red at this speed. Revolutions become km/h through the wheel circumference — set that on the Library tab (tap the km/h readout) or the number here means nothing.</p>
+      </div>
+
+      <button class="btn btn-danger btn-block" onclick="effApply(0)">■ Stop effects</button>
     </div>
 
   </div>
@@ -1794,7 +1844,7 @@ const previewCtx = previewCanvas.getContext('2d', {willReadFrequently: true});
 // командой uploadfs, поэтому «поправил, а не изменилось» почти всегда означает,
 // что в браузере старая версия. Метка рядом с именем устройства позволяет
 // проверить это за секунду, не гадая. Увеличивать при каждом изменении файла.
-const UI_BUILD = 'ui 9';
+const UI_BUILD = 'ui 12';
 
 // ===================== ТЕМА =====================
 // Тёмная по умолчанию (устройство катают вечером), но на солнце экран телефона
@@ -1820,7 +1870,7 @@ function toggleTheme() {
 })();
 
 // ===================== ВКЛАДКИ =====================
-const TABS = ['library', 'display', 'tune', 'wifi', 'log'];
+const TABS = ['library', 'display', 'tune', 'effects', 'wifi', 'log'];
 let _activeTab = 'library';
 function showTab(name) {
     _activeTab = name;
@@ -1839,7 +1889,74 @@ function showTab(name) {
         box.scrollTop = box.scrollHeight;
     }
     // Сетевые настройки не входят в общий поллинг — запрашиваем при открытии
+    if (name === 'effects') effBuildGrid();
     if (name === 'wifi') loadWifi();
+}
+
+// ===================== ЭФФЕКТЫ =====================
+// Порядок и id обязаны совпадать с enum EffectId в include/effects.h:
+// наружу уходит только число, и разъехавшийся список включит не тот эффект.
+const EFFECTS = [
+    {id: 1, icon: '🏁', name: 'Speed',   desc: 'Current speed in km/h — green at a crawl, red at the limit you set below.'},
+    {id: 2, icon: '🔥', name: 'Fire',    desc: 'Flames rise from the hub and flicker out at the rim.'},
+    {id: 3, icon: '🌈', name: 'Rainbow', desc: 'A spectrum spiral turning against the wheel.'},
+    {id: 4, icon: '🌀', name: 'Plasma',  desc: 'Four sine waves interfering — never quite repeats.'},
+    {id: 5, icon: '💧', name: 'Ripples', desc: 'Concentric waves from the centre. Stands perfectly still.'},
+    {id: 6, icon: '🕑', name: 'Clock',   desc: 'Numbered dial and three hands. Any open browser tab sets the clock; it then survives deep sleep.'},
+];
+let _effActive = 0;
+
+function effBuildGrid() {
+    const box = document.getElementById('effGrid');
+    if (!box || box.childElementCount) return;      // строится один раз
+    for (const e of EFFECTS) {
+        const b = document.createElement('button');
+        b.className = 'eff';
+        b.id = 'eff-' + e.id;
+        b.onclick = () => effApply(e.id);
+        // Через textContent, а не innerHTML: описания правятся руками, и
+        // однажды в них попадёт символ, который сломает разметку.
+        const ic = document.createElement('span'); ic.className = 'eff-ic'; ic.textContent = e.icon;
+        const nm = document.createElement('span'); nm.className = 'eff-nm'; nm.textContent = e.name;
+        const ds = document.createElement('span'); ds.className = 'eff-ds'; ds.textContent = e.desc;
+        b.append(ic, nm, ds);
+        box.appendChild(b);
+    }
+    effMark(_effActive);
+}
+
+function effMark(id) {
+    _effActive = id;
+    for (const e of EFFECTS) {
+        const b = document.getElementById('eff-' + e.id);
+        if (b) b.classList.toggle('active', e.id === id);
+    }
+}
+
+async function effApply(id) {
+    // Подсвечиваем сразу: устройство отвечает, как только заявка
+    // поставлена в очередь, а сам эффект поднимается ещё долю секунды.
+    effMark(id);
+    try {
+        const r = await _fetchTimeout('/effect?id=' + id, {}, 6000);
+        if (!r.ok) { toast('Effect rejected by device', 'err'); return; }
+        const e = EFFECTS.find(x => x.id === id);
+        toast(e ? e.name : 'Effects stopped');
+    } catch (err) {
+        toast('No connection', 'err');
+    }
+}
+
+// Порог красного едет ползунком — шлём не чаще раза в 300 мс, иначе на
+// каждое движение уходит запрос, а устройство взводит запись настроек.
+let _effRedTimer = null;
+function effSetRed() {
+    clearTimeout(_effRedTimer);
+    _effRedTimer = setTimeout(() => {
+        _effRedTimer = null;
+        const v = document.getElementById('effRed').value;
+        fetch('/effect?speed_red=' + v).catch(() => {});
+    }, 300);
 }
 
 // ===================== УВЕДОМЛЕНИЯ =====================
@@ -2747,6 +2864,15 @@ function _applySettings(d) {
     if (d.rpm_on  !== undefined && d.rpm_on  > 0) rpmOnVal  = Math.round(d.rpm_on);
     if (d.rpm_off !== undefined && d.rpm_off > 0) rpmOffVal = Math.round(d.rpm_off);
     if (d.slideshow !== undefined) _albumSetActive(d.slideshow);
+    if (d.effect !== undefined) effMark(d.effect);
+    if (d.speed_red !== undefined && d.speed_red > 0) {
+        const el = document.getElementById('effRed');
+        // Пока ползунок тянут, не перебиваем его ответом поллинга.
+        if (el && !_effRedTimer) {
+            el.value = d.speed_red;
+            document.getElementById('effRedVal').textContent = d.speed_red + ' km/h';
+        }
+    }
     updateDualRange();
     refreshRanges();
 }
@@ -2755,7 +2881,14 @@ function _applySettings(d) {
 // на старой его нет, тогда просто не показываем «Now playing».
 function _applyPlayState(d) {
     if (d.file === undefined) return;
-    _setNowPlaying(d.file, d.play !== 0 && d.play !== false);
+    const on = (d.play !== 0 && d.play !== false);
+    // Идёт эффект — файла нет, и подсвечивать в библиотеке нечего.
+    if (d.effect) {
+        const e = EFFECTS.find(x => x.id === d.effect);
+        _setNowPlaying(e ? e.icon + ' ' + e.name : 'Effect', on);
+        return;
+    }
+    _setNowPlaying(d.file, on);
 }
 
 function loadSettings() {
@@ -2877,23 +3010,21 @@ document.addEventListener('keydown', e => {
     closeRpmDialog();
 });
 
-// Состояние силовой части: 0 — простой, 1 — питание на первом луче и замер
-// оборотов, 2 — полный рендер. Это первый вопрос, который задаёт пользователь
-// («почему не светится?»), а раньше поле pwr забиралось и выбрасывалось.
-// Подсказку показываем только в состоянии SPINUP — единственном, где от
-// пользователя что-то требуется. Название состояния как таковое не выводим.
-const PWR_HINTS = ['', 'faster — LEDs light up above 120 rpm', ''];
-
 function updateInfo() {
     return fetch('/info').then(r => r.json()).then(d => {
         const rpm = d.rpm;
         const rev = (rpm > 0 && d.dir !== undefined && d.dir < 0);
         document.getElementById('infoRpm').textContent = rpm.toFixed(0);
         document.getElementById('infoDir').textContent = rev ? '· reverse' : '';
-        // speed (km/h) = circumference(mm) * rpm / 60 / 1000 * 3.6
-        const kmh = wheelCircMm * rpm * 0.00006;
+        // Скорость считает устройство — та же величина, что показывает эффект
+        // Speed. Своя формула здесь означала бы два разных числа на одном
+        // экране, стоит им разойтись на округлении. Старая прошивка поля не
+        // отдаёт — тогда считаем сами.
+        const kmh = (d.kmh !== undefined) ? d.kmh : (wheelCircMm * rpm * 0.00006);
         document.getElementById('infoSpeed').textContent = kmh.toFixed(1);
-        document.getElementById('pwrHint').textContent = PWR_HINTS[d.pwr] || '';
+        // Строку подсказки чистим здесь: в ней же выводится «no connection»,
+        // и без сброса она осталась бы висеть после восстановления связи.
+        document.getElementById('pwrHint').textContent = '';
     });
     // Нет .catch() — ошибка пробрасывается в _pollInfo для остановки цепочки
 }

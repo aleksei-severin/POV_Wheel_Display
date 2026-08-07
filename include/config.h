@@ -301,3 +301,6 @@ extern volatile bool ota_in_progress;
 // (переживает deep sleep). Безопасно вызывать из любого контекста.
 extern void webLog(const char* msg);
 extern void webLogf(const char* fmt, ...);
+
+// Местное время. false — синхронизации с браузером ещё не было.
+extern bool localClock(int& h, int& m, int& s);
