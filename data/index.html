@@ -384,7 +384,10 @@ input[type="range"].b-slider::-moz-range-progress { background: var(--c); }
   min-width: 0; padding: 0;
 }
 .field input { width: 62px; text-align: right; }
-.field select { cursor: pointer; }
+/* Раскрытый список рисует система по background-color самого select. При
+   прозрачном фоне он выходил белым, и в тёмной теме пункты не читались. */
+.field select { cursor: pointer; background: var(--surface-2); color: var(--text); }
+.field select option { background: var(--surface-2); color: var(--text); }
 .field .unit { font-size: 12px; color: var(--text-3); }
 
 /* Пары «параметр — значение» */
@@ -432,7 +435,11 @@ input[type="range"].b-slider::-moz-range-progress { background: var(--c); }
 
 /* Три параметра ролика всегда стоят одной строкой, подпись бюджета — под ними */
 .opt-row { display: none; gap: 8px; margin-top: 12px; }
-.opt-row.show { display: grid; grid-template-columns: minmax(0,.9fr) minmax(0,.85fr) minmax(0,1.25fr); }
+/* Для картинки и GIF в ряду только кадрирование, для видео — ещё fps и длина */
+.opt-row.show     { display: grid; grid-template-columns: minmax(0, 220px); }
+.opt-row.show.vid { grid-template-columns: minmax(0,.9fr) minmax(0,.85fr) minmax(0,1.25fr); }
+.opt-row .vid-only     { display: none; }
+.opt-row.vid .vid-only { display: inline-flex; }
 .opt-row .field { min-width: 0; padding: 0 9px; gap: 5px; }
 .opt-row .field label { font-size: 11.5px; }
 .opt-row .field input,
@@ -710,19 +717,21 @@ details.help .help-body b { color: var(--text-2); }
       </label>
 
       <!-- Опции извлечения кадров: только для видео -->
+      <!-- Кадрирование одинаково нужно картинке, GIF и видео, поэтому селект
+           Crop/Fit показывается всегда; FPS и длина — только для видео. -->
       <div class="opt-row" id="videoOpts">
-        <span class="field"><label for="vidFps">FPS</label>
-          <select id="vidFps" onchange="onVideoOptsChange()">
+        <span class="field vid-only"><label for="vidFps">FPS</label>
+          <select id="vidFps" onchange="onOptsChange()">
             <option value="5">5</option><option value="10" selected>10</option><option value="15">15</option>
           </select></span>
         <!-- Подписи у селекта кадрирования нет: значения Crop/Fit говорят сами
              за себя, а лишнее слово не даёт полю Length показать число целиком. -->
         <span class="field">
-          <select id="vidFit" onchange="onVideoOptsChange()" aria-label="Frame fitting">
+          <select id="vidFit" onchange="onOptsChange()" aria-label="Frame fitting">
             <option value="crop" selected>Crop</option><option value="fit">Fit</option>
           </select></span>
-        <span class="field"><label for="vidLen">Len</label>
-          <input type="number" id="vidLen" min="0.5" step="0.5" value="10" onchange="onVideoOptsChange()"><span class="unit">s</span></span>
+        <span class="field vid-only"><label for="vidLen">Len</label>
+          <input type="number" id="vidLen" min="0.5" step="0.5" value="10" onchange="onOptsChange()"><span class="unit">s</span></span>
         <div class="opt-note" id="vidBudget"></div>
       </div>
 
@@ -1177,11 +1186,10 @@ function toPolarBuffer(srcCanvas, ss) {
 }
 
 // Render all GIF frames to polar buffers
-function renderGIFFrames(gif) {
+function renderGIFFrames(gif, fit) {
     const canvas = document.createElement('canvas');
     canvas.width = gif.width; canvas.height = gif.height;
     const ctx = canvas.getContext('2d', {willReadFrequently: true});
-    const sq = Math.min(gif.width, gif.height);
     // Working canvas — square, centered crop. Больше исходного разрешения, чем
     // нужно ленте: полярная выборка усредняет по ячейке, ей есть что усреднять.
     const S = SRC_SIZE_GIF;
@@ -1217,14 +1225,173 @@ function renderGIFFrames(gif) {
         tmp.width = f.w; tmp.height = f.h;
         tmp.getContext('2d').putImageData(imgData, 0, 0);
         ctx.drawImage(tmp, f.x, f.y);
-        // Center-crop to square, scale to S×S
-        wCtx.clearRect(0, 0, S, S);
-        wCtx.drawImage(canvas, (gif.width - sq)/2, (gif.height - sq)/2, sq, sq, 0, 0, S, S);
+        // Кадрирование — общей функцией: Crop/Fit работают одинаково у GIF,
+        // картинок и видео.
+        drawSquare(canvas, wCtx, S, fit);
         // Кадров в GIF много — берём 2×2 подвыборки вместо 3×3, иначе конвертация
         // длинной анимации в браузере затягивается на десятки секунд.
         frames.push({ delay: f.delay, data: toPolarBuffer(work, 2) });
     }
     return frames;
+}
+
+// ===================== АНИМИРОВАННЫЙ WebP =====================
+// Пиксели декодирует браузер, контейнер разбираем сами.
+//
+// Напрашивался ImageDecoder из WebCodecs — он умеет анимированный WebP из
+// коробки. Но он объявлен только в ЗАЩИЩЁННОМ контексте, а страница отдаётся
+// устройством по обычному HTTP: в Chrome на http://192.168.4.1 объекта просто
+// нет. Поэтому идём иначе: WebP-анимация — это контейнер RIFF, где каждый кадр
+// (чанк ANMF) содержит внутри себя обычную статичную картинку VP8/VP8L. Её
+// достаточно завернуть в минимальный заголовок WebP и отдать браузеру как
+// обычный файл через createImageBitmap. Тот декодер есть везде и в защищённом
+// контексте не нуждается.
+//
+// Статичный WebP разбирать не нужно вовсе — он идёт общим путём для картинок.
+
+function isWebPFile(f) {
+    return (f.type === 'image/webp') || /\.webp$/i.test(f.name);
+}
+
+// Обход чанков RIFF в диапазоне [start, end)
+function _riffChunks(u8, start, end) {
+    const out = [];
+    let p = start;
+    while (p + 8 <= end) {
+        const tag  = String.fromCharCode(u8[p], u8[p+1], u8[p+2], u8[p+3]);
+        const size = (u8[p+4] | (u8[p+5] << 8) | (u8[p+6] << 16) | (u8[p+7] << 24)) >>> 0;
+        const body = p + 8;
+        if (body + size > end) break;          // обрезанный файл — дальше не идём
+        out.push({ tag, start: body, size });
+        p = body + size + (size & 1);          // чанки выровнены по чётной границе
+    }
+    return out;
+}
+
+// Разбирает анимацию: размер холста и описание каждого кадра.
+// null — не анимация (в том числе статичный WebP и просто не-WebP).
+function webpParseAnimation(ab) {
+    const u8 = new Uint8Array(ab);
+    if (u8.length < 21) return null;
+    const tag = p => String.fromCharCode(u8[p], u8[p+1], u8[p+2], u8[p+3]);
+    if (tag(0) !== 'RIFF' || tag(8) !== 'WEBP') return null;
+    const riffSize = (u8[4] | (u8[5] << 8) | (u8[6] << 16) | (u8[7] << 24)) >>> 0;
+    const end = Math.min(u8.length, 8 + riffSize);
+    const chunks = _riffChunks(u8, 12, end);
+    const vp8x = chunks.find(c => c.tag === 'VP8X');
+    if (!vp8x || vp8x.size < 10) return null;
+    const rd24 = p => u8[p] | (u8[p+1] << 8) | (u8[p+2] << 16);
+    const W = rd24(vp8x.start + 4) + 1;
+    const H = rd24(vp8x.start + 7) + 1;
+
+    // Ищем именно чанки ANMF, а не флаг ANIM в VP8X: флаг без кадров
+    // встречается у кривых конвертеров.
+    const frames = [];
+    for (const c of chunks) {
+        if (c.tag !== 'ANMF' || c.size < 16) continue;
+        const s  = c.start;
+        const fl = u8[s + 15];
+        frames.push({
+            x: rd24(s) * 2, y: rd24(s + 3) * 2,      // смещение хранится в парах пикселей
+            w: rd24(s + 6) + 1, h: rd24(s + 9) + 1,
+            dur: rd24(s + 12),
+            blend:   (fl & 0x02) === 0,               // 0 — смешивать с предыдущим кадром
+            dispose: (fl & 0x01) !== 0,               // 1 — очистить область после показа
+            sub: _riffChunks(u8, s + 16, c.start + c.size)
+        });
+    }
+    return frames.length ? { W, H, frames } : null;
+}
+
+function webpIsAnimated(ab) { return webpParseAnimation(ab) !== null; }
+
+const _u32le = v => [v & 255, (v >>> 8) & 255, (v >>> 16) & 255, (v >>> 24) & 255];
+const _u24le = v => [v & 255, (v >>> 8) & 255, (v >>> 16) & 255];
+
+// Заворачивает под-чанки одного кадра в самостоятельный статичный WebP.
+// Если у кадра есть отдельная альфа (ALPH), нужен расширенный заголовок VP8X —
+// без него браузер прочитает картинку без прозрачности.
+function webpStillFromFrame(u8, fr) {
+    const parts = [];
+    if (fr.sub.some(c => c.tag === 'ALPH')) {
+        const vp8x = new Uint8Array(18);
+        vp8x.set([0x56, 0x50, 0x38, 0x58], 0);       // 'VP8X'
+        vp8x.set(_u32le(10), 4);
+        vp8x[8] = 0x10;                               // флаг ALPHA
+        vp8x.set(_u24le(fr.w - 1), 12);
+        vp8x.set(_u24le(fr.h - 1), 15);
+        parts.push(vp8x);
+    }
+    for (const c of fr.sub) {
+        if (c.tag !== 'ALPH' && c.tag !== 'VP8 ' && c.tag !== 'VP8L') continue;
+        const pad = c.size & 1;
+        const out = new Uint8Array(8 + c.size + pad);
+        for (let i = 0; i < 4; i++) out[i] = c.tag.charCodeAt(i);
+        out.set(_u32le(c.size), 4);
+        out.set(u8.subarray(c.start, c.start + c.size), 8);
+        parts.push(out);
+    }
+    if (!parts.length) return null;
+    let body = 0;
+    for (const p of parts) body += p.length;
+    const file = new Uint8Array(12 + body);
+    file.set([0x52, 0x49, 0x46, 0x46], 0);            // 'RIFF'
+    file.set(_u32le(4 + body), 4);
+    file.set([0x57, 0x45, 0x42, 0x50], 8);            // 'WEBP'
+    let o = 12;
+    for (const p of parts) { file.set(p, o); o += p.length; }
+    return file;
+}
+
+async function extractWebPFrames(ab, fit, onProgress) {
+    const u8 = new Uint8Array(ab);
+    const anim = webpParseAnimation(ab);
+    if (!anim) throw new Error('not an animated WebP');
+
+    // Холст анимации: кадры могут быть меньше него и лежать со смещением.
+    const cv = document.createElement('canvas');
+    cv.width = anim.W; cv.height = anim.H;
+    const cx = cv.getContext('2d', {willReadFrequently: true});
+
+    const S = SRC_SIZE_GIF;               // кадров много, холст как у GIF
+    const work = document.createElement('canvas');
+    work.width = S; work.height = S;
+    const wCtx = work.getContext('2d', {willReadFrequently: true});
+    wCtx.imageSmoothingEnabled = true;
+    wCtx.imageSmoothingQuality = 'high';
+
+    const frames = [];
+    const n = anim.frames.length;
+    // ANI5 хранит одну задержку на всю анимацию — берём длительность первого кадра.
+    const delayMs = Math.max(1, anim.frames[0].dur || 100);
+
+    for (let i = 0; i < n; i++) {
+        const fr = anim.frames[i];
+        const still = webpStillFromFrame(u8, fr);
+        if (!still) throw new Error(`frame ${i + 1} has no image data`);
+        const bmp = await createImageBitmap(new Blob([still], { type: 'image/webp' }));
+        // «Не смешивать» означает, что пиксели кадра замещают то, что под ними.
+        if (!fr.blend) cx.clearRect(fr.x, fr.y, fr.w, fr.h);
+        cx.drawImage(bmp, fr.x, fr.y);
+        if (bmp.close) bmp.close();
+        drawSquare(cv, wCtx, S, fit);
+        frames.push(toPolarBuffer(work, 2));
+        // Утилизация относится к УЖЕ показанному кадру — чистим после съёмки.
+        if (fr.dispose) cx.clearRect(fr.x, fr.y, fr.w, fr.h);
+        if (onProgress) onProgress(i + 1, n);
+    }
+    return { frames, delayMs };
+}
+
+// Анимация целиком живёт в PSRAM устройства — что туда не влезет, оно просто не
+// сможет проиграть. Режем здесь, а не после заливки, иначе файл загрузится
+// успешно и не запустится.
+function _capFrames(frames, label) {
+    const maxF = maxFramesForDevice();
+    if (frames.length <= maxF) return frames;
+    setStatus('uploadStatus',
+        `${label} — ${frames.length} frames trimmed to ${maxF} (device memory)`, '');
+    return frames.slice(0, maxF);
 }
 
 // ===================== VIDEO =====================
@@ -1285,23 +1452,6 @@ function seekVideo(v, t) {
     });
 }
 
-// Кадр видео в квадратный рабочий холст. crop — обрезка по центру (как у
-// картинок), fit — вписать целиком с чёрными полями: у 16:9 обрезка съедает
-// половину ширины, и для роликов это чаще не то, что нужно.
-function drawVideoFrame(v, wCtx, S, fit) {
-    wCtx.clearRect(0, 0, S, S);
-    const vw = v.videoWidth, vh = v.videoHeight;
-    if (!vw || !vh) return;
-    if (fit === 'fit') {
-        const k = Math.min(S / vw, S / vh);
-        const dw = vw * k, dh = vh * k;
-        wCtx.drawImage(v, 0, 0, vw, vh, (S - dw) / 2, (S - dh) / 2, dw, dh);
-    } else {
-        const sq = Math.min(vw, vh);
-        wCtx.drawImage(v, (vw - sq) / 2, (vh - sq) / 2, sq, sq, 0, 0, S, S);
-    }
-}
-
 // Извлекает кадры покадровой перемоткой. Медленно (seek — десятки мс на кадр),
 // зато детерминированно и без зависимости от скорости воспроизведения.
 async function extractVideoFrames(file, opts, onProgress) {
@@ -1322,7 +1472,7 @@ async function extractVideoFrames(file, opts, onProgress) {
         const frames = [];
         for (let i = 0; i < n; i++) {
             await seekVideo(v, start + i / opts.fps);
-            drawVideoFrame(v, wCtx, S, opts.fit);
+            drawSquare(v, wCtx, S, opts.fit);
             // ss=2, как у GIF: кадров много, 3×3 растянуло бы конвертацию втрое.
             frames.push(toPolarBuffer(work, 2));
             if (onProgress) onProgress(i + 1, n);
@@ -1340,7 +1490,7 @@ async function drawVideoPoster(file, targets, fit, t) {
     try {
         const dur = isFinite(v.duration) ? Math.max(0, v.duration - 0.05) : 0;
         await seekVideo(v, Math.min(t || 0, dur));
-        for (const tg of targets) drawVideoFrame(v, tg.ctx, tg.size, fit);
+        for (const tg of targets) drawSquare(v, tg.ctx, tg.size, fit);
     } finally {
         closeVideo(v);
     }
@@ -1467,15 +1617,13 @@ async function _updateVideoBudget(file, resetLength) {
     setStatus('uploadStatus', `${file.name} — ${n} frames ready. Press Upload.`, 'ok');
 }
 
-function onVideoOptsChange() {
+// Любой из параметров изменился — перерисовываем миниатюру в новом кадрировании
+// и, для видео, пересчитываем бюджет кадров.
+function onOptsChange() {
     const files = Array.from(document.getElementById('fileInput').files || []);
-    if (!files.length || !isVideoFile(files[0])) return;
-    const o = _vidOpts();
-    drawVideoPoster(files[0], [
-        { ctx: document.getElementById('dropThumbCanvas').getContext('2d'), size: 216 },
-        { ctx: previewCtx, size: 200 }
-    ], o.fit, 0).catch(() => {});
-    _updateVideoBudget(files[0], false);
+    if (!files.length) return;
+    _showDropThumb(files[0]);
+    if (isVideoFile(files[0])) _updateVideoBudget(files[0], false);
 }
 
 // ===================== STATE =====================
@@ -1486,6 +1634,12 @@ let _fileVersion  = null;  // отдельная версия списка фа�
 
 const previewCanvas = document.getElementById('preview'); // 200×200 buffer
 const previewCtx = previewCanvas.getContext('2d', {willReadFrequently: true});
+
+// Метка сборки интерфейса. Страница живёт в LittleFS и обновляется отдельной
+// командой uploadfs, поэтому «поправил, а не изменилось» почти всегда означает,
+// что в браузере старая версия. Метка рядом с именем устройства позволяет
+// проверить это за секунду, не гадая. Увеличивать при каждом изменении файла.
+const UI_BUILD = 'ui 8';
 
 // ===================== ТЕМА =====================
 // Тёмная по умолчанию (устройство катают вечером), но на солнце экран телефона
@@ -1605,7 +1759,7 @@ function _showDropThumb(file) {
     r.onload = ev => {
         const img = new Image();
         img.onload = () => {
-            drawCenteredSquare(img, ctx, 216);
+            drawSquare(img, ctx, 216, _fitMode());
             zone.classList.add('has-preview');
         };
         img.src = ev.target.result;
@@ -1654,7 +1808,11 @@ document.getElementById('fileInput').addEventListener('change', function(e) {
 
     const first = files[0];
     _selectedIsVideo = isVideoFile(first);
-    document.getElementById('videoOpts').classList.toggle('show', _selectedIsVideo);
+    // Кадрирование предлагается для любого файла, fps и длина — только у видео
+    const opts = document.getElementById('videoOpts');
+    opts.classList.add('show');
+    opts.classList.toggle('vid', _selectedIsVideo);
+    document.getElementById('vidBudget').textContent = '';
 
     _showDropThumb(first);
 
@@ -1662,7 +1820,7 @@ document.getElementById('fileInput').addEventListener('change', function(e) {
         const r2 = new FileReader();
         r2.onload = ev => {
             const img = new Image();
-            img.onload = () => drawCenteredSquare(img, previewCtx, 200);
+            img.onload = () => drawSquare(img, previewCtx, 200, _fitMode());
             img.src = ev.target.result;
         };
         r2.readAsDataURL(first);
@@ -1687,13 +1845,29 @@ document.getElementById('fileInput').addEventListener('change', function(e) {
     }
 });
 
-// Draw image centered and square-cropped into a ctx of given size
-function drawCenteredSquare(img, ctx, size) {
-    const sq = Math.min(img.width, img.height);
-    const sx = (img.width  - sq) / 2;
-    const sy = (img.height - sq) / 2;
+// Вписывает источник в квадратный холст. crop — обрезка по центру (у широкого
+// кадра съедаются края), fit — целиком с чёрными полями. Одна и та же функция
+// для картинок, кадров GIF и WebP: кадрирование не должно зависеть от формата.
+function drawSquare(src, ctx, size, fit) {
+    // width — у картинки, холста и ImageBitmap; videoWidth — у <video>
+    const w = src.width  || src.videoWidth;
+    const h = src.height || src.videoHeight;
     ctx.clearRect(0, 0, size, size);
-    ctx.drawImage(img, sx, sy, sq, sq, 0, 0, size, size);
+    if (!w || !h) return;
+    if (fit === 'fit') {
+        const k = Math.min(size / w, size / h);
+        const dw = w * k, dh = h * k;
+        ctx.drawImage(src, 0, 0, w, h, (size - dw) / 2, (size - dh) / 2, dw, dh);
+    } else {
+        const sq = Math.min(w, h);
+        ctx.drawImage(src, (w - sq) / 2, (h - sq) / 2, sq, sq, 0, 0, size, size);
+    }
+}
+
+// Текущий режим кадрирования из панели параметров
+function _fitMode() {
+    const el = document.getElementById('vidFit');
+    return el ? el.value : 'crop';
 }
 
 // ===================== UPLOAD =====================
@@ -1737,19 +1911,50 @@ function packANI5(frames, delayMs) {
 }
 
 // Конвертирует один File в Uint8Array (polar bin). Возвращает {buf, fileName} или бросает ошибку.
+// Читает File целиком в ArrayBuffer
+function _readArrayBuffer(file) {
+    return new Promise((res, rej) => {
+        const r = new FileReader();
+        r.onload  = e => res(e.target.result);
+        r.onerror = rej;
+        r.readAsArrayBuffer(file);
+    });
+}
+
 async function _convertFile(file, label) {
-    const isVid = isVideoFile(file);
-    const isGif = !isVid && file.name.toLowerCase().endsWith('.gif');
-    const prefix = isVid ? 'vid_' : (isGif ? 'gif_' : 'img_');
+    const isVid  = isVideoFile(file);
+    const isGif  = !isVid && file.name.toLowerCase().endsWith('.gif');
+    const isWebp = !isVid && !isGif && isWebPFile(file);
+    const fit    = _fitMode();
+    const tag    = label || file.name;
+
+    // Анимированный WebP определяется только по содержимому, поэтому читаем
+    // файл до выбора имени: от этого зависит префикс.
+    let webpAb = null, webpAnim = false;
+    if (isWebp) {
+        webpAb   = await _readArrayBuffer(file);
+        webpAnim = webpIsAnimated(webpAb);
+    }
+
+    const prefix = isVid ? 'vid_' : (isGif ? 'gif_' : (webpAnim ? 'anm_' : 'img_'));
     const rawBase = file.name.replace(/\.[^/.]+$/, '');
     const { name: fileName, warning: nameWarning } = buildFileName(prefix, rawBase);
     if (nameWarning) setStatus('uploadStatus', nameWarning, '');
+
+    if (webpAnim) {
+        await loadDevLimits(true);
+        const { frames, delayMs } = await extractWebPFrames(webpAb, fit, (done, total) => {
+            setStatus('uploadStatus',
+                `${tag} — decoding ${done}/${total} frames (${(done * 100 / total).toFixed(0)}%)`, '');
+        });
+        const kept = _capFrames(frames, tag);
+        return { buf: packANI5(kept, delayMs), fileName, frameCount: kept.length };
+    }
 
     if (isVid) {
         const o = _vidOpts();
         await loadDevLimits(true);
         o.maxFrames = maxFramesForDevice();
-        const tag = label || file.name;
         const frames = await extractVideoFrames(file, o, (done, total) => {
             setStatus('uploadStatus',
                 `${tag} — decoding ${done}/${total} frames (${(done * 100 / total).toFixed(0)}%)`, '');
@@ -1760,17 +1965,14 @@ async function _convertFile(file, label) {
     }
 
     if (isGif) {
-        const ab = await new Promise((res, rej) => {
-            const r = new FileReader();
-            r.onload = e => res(e.target.result);
-            r.onerror = rej;
-            r.readAsArrayBuffer(file);
-        });
+        const ab = await _readArrayBuffer(file);
         const gif = new MinimalGIF(ab);
         gif.parse();
-        const frames = renderGIFFrames(gif);
-        const buf = packANI5(frames.map(f => f.data), frames[0].delay || 100);
-        return { buf, fileName, frameCount: frames.length };
+        await loadDevLimits(true);
+        const frames = renderGIFFrames(gif, fit);
+        const kept = _capFrames(frames, tag);
+        const buf = packANI5(kept.map(f => f.data), kept[0].delay || 100);
+        return { buf, fileName, frameCount: kept.length };
     } else {
         const dataUrl = await new Promise((res, rej) => {
             const r = new FileReader();
@@ -1792,7 +1994,7 @@ async function _convertFile(file, label) {
         const ctx = oc.getContext('2d', {willReadFrequently: true});
         ctx.imageSmoothingEnabled = true;
         ctx.imageSmoothingQuality = 'high';
-        drawCenteredSquare(img, ctx, SRC_SIZE_IMG);
+        drawSquare(img, ctx, SRC_SIZE_IMG, _fitMode());
         return { buf: toPolarBuffer(oc, 3), fileName };
     }
 }
@@ -2042,11 +2244,12 @@ async function _updateRotorArt() {
 // Имя файла на устройстве несёт префикс типа (img_/gif_/vid_) и расширение —
 // пользователю нужен не он, а понятная подпись и метка типа.
 function _prettyName(n) {
-    return n.replace(/\.bin$/i, '').replace(/^(img|gif|vid)_/i, '');
+    return n.replace(/\.bin$/i, '').replace(/^(img|gif|vid|anm)_/i, '');
 }
 function _fileKind(n) {
     if (/^vid_/i.test(n)) return ['VIDEO', 'tag-vid'];
     if (/^gif_/i.test(n)) return ['GIF',   'tag-gif'];
+    if (/^anm_/i.test(n)) return ['WEBP',  'tag-gif'];
     return ['IMAGE', 'tag-img'];
 }
 function _fmtSize(b) {
@@ -2734,7 +2937,8 @@ function _setOnline(online) {
 // Все запросы идут параллельно — ESP32 уже готов (ping прошёл).
 // _logPoll идёт последним т.к. он делает POST /settime и зависит от готовности сервера.
 async function _initialSync() {
-    document.getElementById('deviceName').textContent = window.location.hostname || 'pov-wheel';
+    document.getElementById('deviceName').textContent =
+        (window.location.hostname || 'pov-wheel') + ' · ' + UI_BUILD;
     // Сбрасываем версии — иначе polling не применит изменения после ребута.
     _stateVersion = null;
     _fileVersion  = null;
