@@ -34,6 +34,9 @@ uint32_t lastFrameSwitchTime = 0;
 volatile bool newFrameReady = false;
 volatile bool render_in_fill = false;   // renderingTask сейчас читает frameBuffer
 volatile bool frame_loading  = false;   // идёт чтение файла — отрисовка погашена
+// Лента сейчас светится. Загрузчик файла ждёт сброса этого флага, прежде чем
+// трогать флеш: пока он взведён, на диодах висит защёлкнутый кадр.
+volatile bool rendering_active = false;
 volatile bool ota_in_progress = false; // блокирует рендеринг на время OTA-обновления
 
 std::vector<String> savedFiles;
@@ -773,7 +776,6 @@ static void fillSectorIntoBuffer(uint8_t* buf, uint8_t buf_idx, float sector0, f
 // следующего обновления. Без этой поправки картинка уезжала тем сильнее,
 // чем выше обороты, и «Angle Offset» приходилось бы крутить под скорость.
 void renderingTask(void* pvParameters) {
-    static bool rendering_active = false;
     uint8_t active     = 0;
     bool    tx_pending = false;
 
@@ -1289,6 +1291,13 @@ static void flushLastFile() {
         prefs.putString("last_file", pending_last_file);
     }
     pending_last_file = "";
+}
+
+// Будит renderingTask вне очереди. Нужно загрузчику файла: иначе флаг
+// frame_loading будет замечен только на следующем событии Холла, и лента
+// успеет отсветить лишний кусок оборота старым кадром.
+void wakeRenderingTask() {
+    if (hallSemaphore) xSemaphoreGive(hallSemaphore);
 }
 
 static void setHallMask(uint8_t mask) {

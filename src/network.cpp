@@ -35,6 +35,9 @@ String apDefaultSsid;   // заводское имя — на случай сб�
 String staSsid;         // домашняя сеть, к которой подключаемся
 String staPass;
 String currentDisplayFile = "";   // Имя файла, загруженного в frameBuffer
+// Имя, которое нужно записать в NVS как последний воспроизведённый. Запись
+// откладывается до момента, когда лента уже погашена (см. loadFrameFromFile).
+static String pendingPlayFile = "";
 
 // Счётчик версии состояния: инкрементируется при любом изменении (настройки,
 // файлы, воспроизведение). Клиенты сравнивают с последней известной версией
@@ -258,8 +261,29 @@ void loadFrameFromFile(String path) {
     // (он исполняется из флеша и читает кадр из PSRAM) всё равно замирает —
     // но замирает не вовремя, и DMA продолжает светить кадром, снятым под
     // другим углом. На ободе это блочный мусор. Чёрное честнее.
+    //
+    // Ключевое здесь — ДОЖДАТЬСЯ гашения, а не просто попросить о нём. Раньше
+    // чтение файла начиналось сразу после сброса render_in_fill, и renderingTask
+    // замирал, не успев дойти до blankAllLEDs_DMA(): SK9822 держат последний
+    // защёлкнутый кадр сколь угодно долго, и всё время загрузки (у длинной
+    // анимации это секунды) на ободе висела застывшая картинка. Будим задачу
+    // сами, чтобы она увидела флаг сейчас, а не на следующем событии Холла.
     frame_loading = true;
-    for (int i = 0; i < 1000 && render_in_fill; i++) vTaskDelay(1);
+    wakeRenderingTask();
+    for (int i = 0; i < 1000 && render_in_fill;   i++) vTaskDelay(1);
+    for (int i = 0; i <  200 && rendering_active; i++) vTaskDelay(1);
+
+    // Имя файла для автозапуска пишем здесь, а не в обработчике /play: запись
+    // в NVS стирает страницу флеша и на десятки миллисекунд морозит рендер.
+    // Теперь она попадает в уже погашенное окно и ничего не портит, а на диск
+    // по-прежнему ложится ДО подмены буфера — падение во время загрузки
+    // оставит в NVS правильный файл.
+    if (pendingPlayFile.length()) {
+        if (prefs.getString("last_file", "") != pendingPlayFile) {
+            prefs.putString("last_file", pendingPlayFile);
+        }
+        pendingPlayFile = "";
+    }
 
     uint32_t  t_load        = millis();
     uint8_t*  newBuf        = nullptr;
@@ -688,9 +712,10 @@ void setupNetwork() {
         last_web_activity_time = millis();
         if (request->hasParam("file")) {
             String fname = request->getParam("file")->value();
-            // Сохраняем файл ДО загрузки: если загрузка упадёт с крашем,
-            // после перезагрузки устройство восстановит правильный файл.
-            prefs.putString("last_file", fname);
+            // Имя откладываем: писать в NVS прямо здесь значит стереть страницу
+            // флеша поверх работающего рендера. Загрузчик запишет его сам, уже
+            // погасив ленту, и по-прежнему ДО подмены буфера кадра.
+            pendingPlayFile = fname;
             slideshowActive = false;
             force_stop_display = false;
             // Передаём загрузку в fileLoaderTask (Core 0, приоритет 2).
@@ -699,8 +724,11 @@ void setupNetwork() {
             pendingFilePath = "/" + fname;
             request_play_flag = true;
             xSemaphoreGive(fileLoaderSemaphore);
+            // file_version НЕ трогаем: список файлов от воспроизведения не
+            // меняется, а его перезагрузка заставляла браузер снова дёргать
+            // /list — то есть читать флеш — ровно в тот момент, когда рендер
+            // только-только ожил после загрузки кадров.
             state_version++;
-            file_version++;
             webLogf("[DISP] Play: %s", fname.c_str());
             request->send(200, "text/plain", "Playing");
         }

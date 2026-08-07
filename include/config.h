@@ -147,6 +147,8 @@ extern volatile bool newFrameReady;
 // снятия флага, прежде чем подменять буфер, счётчик кадров и освобождать старый:
 // иначе рендер адресует новым числом кадров старый буфер и читает чужую память.
 extern volatile bool render_in_fill;
+extern volatile bool rendering_active;   // лента сейчас светится
+extern void wakeRenderingTask();         // разбудить renderingTask вне события Холла
 
 // true пока идёт чтение файла с LittleFS — отрисовка на это время гасится.
 // Держать картинку во время загрузки нельзя: операция с флешем отключает кеш
