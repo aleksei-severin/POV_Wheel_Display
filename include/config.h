@@ -55,6 +55,8 @@
 #define HALL_PIN_LIST   { 13, 21, 14, 18, 17, 16 }
 
 // Пороги включения/выключения отрисовки, об/мин (гистерезис 20 RPM)
+// Пороги по умолчанию. Рабочие значения лежат в rpm_render_on/off и
+// настраиваются из веб-интерфейса — колёса и магниты у всех разные.
 #define RPM_RENDER_ON   120.0f
 #define RPM_RENDER_OFF  100.0f
 
@@ -229,6 +231,16 @@ extern volatile bool global_arm_reverse;
 
 // ABL: лимит суммарного тока 0–100 %, 100 = без ограничения
 extern volatile float global_abl_limit;
+
+// Настройки изменились и ждут записи в NVS. Взводится обработчиками HTTP;
+// сама запись — из loop()/выключения питания, потому что стирание страницы
+// флеша гасит кеш инструкций на обоих ядрах и морозит renderingTask.
+extern volatile bool settings_dirty;
+
+// Обороты включения и выключения отрисовки. Гистерезис обязателен: без него
+// на пороге картинка мигала бы каждый оборот.
+extern volatile float rpm_render_on;
+extern volatile float rpm_render_off;
 
 // RMS загрузка тока за последний полный оборот, 0.0–1.0 (обновляется renderingTask)
 extern volatile float global_abl_rms;

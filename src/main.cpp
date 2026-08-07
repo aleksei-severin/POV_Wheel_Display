@@ -141,13 +141,128 @@ RTC_DATA_ATTR volatile float global_g_gain        = 80.0f;
 RTC_DATA_ATTR volatile float global_b_gain        = 100.0f;
 RTC_DATA_ATTR volatile uint16_t wheel_circumference = 2355;
 RTC_DATA_ATTR volatile bool     global_arm_reverse  = false; // порядок лучей в цепочке
-RTC_DATA_ATTR volatile float    global_abl_limit    = 40.0f; // ABL: 0–100 %, 100 = без ограничения
+RTC_DATA_ATTR volatile float    global_abl_limit    = 100.0f; // ABL: 0–100 %, 100 = без ограничения
 volatile float                  global_abl_rms      = 0.0f;  // RMS загрузка тока 0.0–1.0
 volatile float                  global_render_span    = 0.0f; // угол между обновлениями ленты, °
 volatile uint32_t               global_render_fill_us = 0;    // время сборки кадра, мкс
 volatile uint8_t                global_effective_brightness = 8;
+RTC_DATA_ATTR volatile float    rpm_render_on  = RPM_RENDER_ON;
+RTC_DATA_ATTR volatile float    rpm_render_off = RPM_RENDER_OFF;
 uint8_t lut_tone5[32];
 uint8_t lut_tone6[64];
+
+// =====================================================================
+//                  СОХРАНЕНИЕ НАСТРОЕК В NVS
+// =====================================================================
+// RTC_DATA_ATTR переживает только deep sleep: после снятия питания настройки
+// возвращались к заводским. Поэтому весь набор дублируется в NVS ОДНИМ блобом —
+// одна запись вместо дюжины ключей, то есть одно стирание страницы флеша
+// вместо дюжины.
+//
+// Запись отложена по той же причине, что и имя последнего файла: putBytes
+// отключает кеш инструкций на ОБОИХ ядрах, а renderingTask исполняется из
+// флеша и замирает на десятки миллисекунд. Ползунок настройки двигают
+// непрерывно, и запись на каждое движение означала бы рваную картинку и сотни
+// циклов стирания за минуту. Флаг взводится в обработчике /settings, сброс —
+// когда отрисовка заведомо не идёт.
+struct __attribute__((packed)) SettingsBlob {
+    uint16_t magic;
+    uint8_t  version;
+    uint8_t  bmin;
+    uint8_t  bmax;
+    uint8_t  arm_reverse;
+    uint8_t  slideshow;
+    uint8_t  _pad;
+    int16_t  angle;
+    uint16_t circ;
+    uint32_t slide_ms;
+    float    gamma, saturation, contrast;
+    float    r_gain, g_gain, b_gain, abl;
+    float    rpm_on, rpm_off;                    // добавлены в версии 2
+};
+static const uint16_t SETTINGS_MAGIC = 0x5056;   // 'PV'
+static const uint8_t  SETTINGS_VER   = 2;
+// Блоб растёт только в конец, поэтому старая запись читается как есть: новые
+// поля остаются нулями и отсеиваются проверкой диапазона — настройки,
+// сохранённые прошлой прошивкой, при обновлении не теряются.
+static const size_t   SETTINGS_V1_SIZE = 44;
+
+volatile bool   settings_dirty       = false;    // взводится из /settings и /album
+static uint32_t settings_dirty_since = 0;
+
+static void fillSettingsBlob(SettingsBlob& b) {
+    memset(&b, 0, sizeof(b));
+    b.magic       = SETTINGS_MAGIC;
+    b.version     = SETTINGS_VER;
+    b.bmin        = min_brightness;
+    b.bmax        = max_brightness;
+    b.arm_reverse = global_arm_reverse ? 1 : 0;
+    b.slideshow   = slideshowActive ? 1 : 0;
+    b.angle       = (int16_t)global_angle_offset;
+    b.circ        = wheel_circumference;
+    b.slide_ms    = slideInterval;
+    b.gamma       = global_gamma;
+    b.saturation  = global_saturation;
+    b.contrast    = global_contrast;
+    b.r_gain      = global_r_gain;
+    b.g_gain      = global_g_gain;
+    b.b_gain      = global_b_gain;
+    b.abl         = global_abl_limit;
+    b.rpm_on      = rpm_render_on;
+    b.rpm_off     = rpm_render_off;
+}
+
+// Диапазоны проверяются и при чтении: одного magic мало, испорченный блоб не
+// должен увести гамму или яркость туда, где рендер покажет мусор.
+static void loadSettingsFromNVS() {
+    SettingsBlob b;
+    memset(&b, 0, sizeof(b));   // хвост от старой записи должен читаться как нули
+    size_t got = prefs.getBytes("settings", &b, sizeof(b));
+    bool ok = (b.magic == SETTINGS_MAGIC) &&
+              ((got == sizeof(b)          && b.version == SETTINGS_VER) ||
+               (got == SETTINGS_V1_SIZE   && b.version == 1));
+    if (!ok) {
+        webLog("[SYS] No stored settings, using defaults");
+        return;
+    }
+    if (b.bmin >= 1 && b.bmin <= 31) min_brightness = b.bmin;
+    if (b.bmax >= 1 && b.bmax <= 31) max_brightness = b.bmax;
+    if (max_brightness < min_brightness) max_brightness = min_brightness;
+    global_angle_offset = ((b.angle % 360) + 360) % 360;
+    if (b.circ >= 2000 && b.circ <= 2500)             wheel_circumference = b.circ;
+    if (b.slide_ms >= 1000 && b.slide_ms <= 300000)   slideInterval = b.slide_ms;
+    if (b.gamma      >= 1.0f && b.gamma      <= 5.0f)   global_gamma      = b.gamma;
+    if (b.saturation >= 1.0f && b.saturation <= 3.0f)   global_saturation = b.saturation;
+    if (b.contrast   >= 0.0f && b.contrast   <= 100.0f) global_contrast   = b.contrast;
+    if (b.r_gain     >= 0.0f && b.r_gain     <= 100.0f) global_r_gain     = b.r_gain;
+    if (b.g_gain     >= 0.0f && b.g_gain     <= 100.0f) global_g_gain     = b.g_gain;
+    if (b.b_gain     >= 0.0f && b.b_gain     <= 100.0f) global_b_gain     = b.b_gain;
+    if (b.abl        >= 0.0f && b.abl        <= 100.0f) global_abl_limit  = b.abl;
+    // Порог остановки обязан быть ниже порога старта — иначе картинка мигала бы
+    // на границе каждый оборот.
+    if (b.rpm_on >= 30.0f && b.rpm_on <= 600.0f &&
+        b.rpm_off >= 20.0f && b.rpm_off < b.rpm_on) {
+        rpm_render_on  = b.rpm_on;
+        rpm_render_off = b.rpm_off;
+    }
+    global_arm_reverse = (b.arm_reverse != 0);
+    slideshowActive    = (b.slideshow   != 0);
+    webLog("[SYS] Settings restored from NVS");
+}
+
+// Сброс отложенных настроек. Вызывать только когда отрисовка остановлена.
+static void flushSettings() {
+    if (!settings_dirty) return;
+    SettingsBlob now, stored;
+    fillSettingsBlob(now);
+    size_t got = prefs.getBytes("settings", &stored, sizeof(stored));
+    // Сравниваем с записанным: повторная запись того же блоба зря жжёт флеш.
+    if (got != sizeof(stored) || memcmp(&now, &stored, sizeof(now)) != 0) {
+        prefs.putBytes("settings", &now, sizeof(now));
+        webLog("[SYS] Settings saved");
+    }
+    settings_dirty = false;
+}
 
 // --- КЕШ ТЕЛЕМЕТРИИ ПИТАНИЯ ---
 // Обновляется из loop() (Core 1), читается из /battery (Core 0).
@@ -852,7 +967,7 @@ void renderingTask(void* pvParameters) {
         // до момента, когда до автомата питания дойдут руки. Гистерезис 20 RPM:
         // старт на RPM_RENDER_ON, продолжение работы — до RPM_RENDER_OFF.
         float rpm_now = (rev > 0) ? 60000000.0f / (float)rev : 0.0f;
-        float rpm_thr = rendering_active ? RPM_RENDER_OFF : RPM_RENDER_ON;
+        float rpm_thr = rendering_active ? rpm_render_off : rpm_render_on;
 
         uint32_t age_us = (uint32_t)(micros() - anchor_t);
         if (!anchor_ok || rev == 0 || rpm_now < rpm_thr || age_us > age_limit) {
@@ -1202,9 +1317,10 @@ static void applyPowerState(PowerState target) {
             digitalWrite(PIN_EN_DCDC_ARM1, LOW);
             peripherals_active = false;
             last_dcdc_off_time = millis();
-            // Отрисовка остановлена — самое время сбросить отложенную запись
-            // в NVS: помешать она уже никому не может.
+            // Отрисовка остановлена — самое время сбросить отложенные записи
+            // в NVS: помешать они уже никому не могут.
             flushLastFile();
+            flushSettings();
             webLog("[PWR] Power off");
             break;
 
@@ -1247,6 +1363,7 @@ static void applyPowerState(PowerState target) {
 
 static void enterDeepSleep() {
     flushLastFile();
+    flushSettings();
     // Снимаем питание и глушим прерывания
     digitalWrite(PIN_EN_DCDC_REST, LOW);
     digitalWrite(PIN_EN_DCDC_ARM1, LOW);
@@ -1395,6 +1512,7 @@ void setup() {
     LittleFS.begin(true);
 
     setupNetwork();                     // здесь же открывается prefs
+    loadSettingsFromNVS();              // до построения таблиц: они зависят от гаммы и балансов
     loadHallCalibration();
 
     // Таблицы рендера — до первого кадра: пока они не построены,
@@ -1481,6 +1599,21 @@ void loop() {
 
     uint32_t now_ms = millis();
 
+    // --- Отложенная запись настроек ---
+    // Ждать выключения питания необязательно: пока колесо не раскручено до
+    // порога, renderingTask ничего не рисует, и запись во флеш никому не мешает.
+    // Пауза в 3 с нужна, чтобы перетаскивание ползунка (десятки запросов
+    // /settings подряд) уложилось в одну запись.
+    if (settings_dirty) {
+        if (settings_dirty_since == 0) settings_dirty_since = now_ms;
+        else if (power_state != PWR_FULL && (now_ms - settings_dirty_since) > 3000) {
+            flushSettings();
+            settings_dirty_since = 0;
+        }
+    } else {
+        settings_dirty_since = 0;
+    }
+
     // --- Текущее состояние вращения ---
     noInterrupts();
     uint32_t rev_period = rotation_period;
@@ -1555,7 +1688,7 @@ void loop() {
                 break;
 
             case PWR_SPINUP:
-                if (rpm >= RPM_RENDER_ON) {
+                if (rpm >= rpm_render_on) {
                     applyPowerState(PWR_FULL);
                 } else if (hall_age_us > 3000000UL &&
                            (now_ms - last_play_ms)      > 10000 &&
@@ -1566,7 +1699,7 @@ void loop() {
                 break;
 
             case PWR_FULL:
-                if (rpm < RPM_RENDER_OFF) applyPowerState(PWR_SPINUP);
+                if (rpm < rpm_render_off) applyPowerState(PWR_SPINUP);
                 break;
         }
     }

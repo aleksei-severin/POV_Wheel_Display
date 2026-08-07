@@ -30,6 +30,10 @@ static uint32_t uploadLastChunkMs = 0;
 #define UPLOAD_OWNER_TIMEOUT_MS  5000
 
 String hostName;
+String apSsid;          // имя собственной точки доступа (видно в списке сетей)
+String apDefaultSsid;   // заводское имя — на случай сброса поля в пустое
+String staSsid;         // домашняя сеть, к которой подключаемся
+String staPass;
 String currentDisplayFile = "";   // Имя файла, загруженного в frameBuffer
 
 // Счётчик версии состояния: инкрементируется при любом изменении (настройки,
@@ -398,15 +402,28 @@ void setupNetwork() {
 
     uint8_t mac[6];
     WiFi.macAddress(mac);
-    char nameBuf[20];
+    char nameBuf[24];
+
+    // hostName — имя для mDNS и OTA. В нём остаются только буквы, цифры и дефис:
+    // подчёркивание в DNS-имени недопустимо, а pov-wheel-XXXX.local должен
+    // работать независимо от того, как пользователь переименовал точку доступа.
     sprintf(nameBuf, "pov-wheel-%02x%02x", mac[4], mac[5]);
     hostName = String(nameBuf);
+
+    // Имя собственной точки доступа — то, что видно в списке сетей. Заводское
+    // POV_WHEEL_XXXX по последним двум байтам MAC, дальше его можно поменять.
+    sprintf(nameBuf, "POV_WHEEL_%02X%02X", mac[4], mac[5]);
+    apDefaultSsid = String(nameBuf);
+    apSsid  = prefs.getString("ap_ssid",  apDefaultSsid);
+    staSsid = prefs.getString("sta_ssid", HOTSPOT_SSID);
+    staPass = prefs.getString("sta_pass", HOTSPOT_PASS);
+    if (apSsid.length() == 0) apSsid = apDefaultSsid;
 
     WiFi.mode(WIFI_AP_STA);
 
     IPAddress apIP(192, 168, 4, 1);
     WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
-    WiFi.softAP(hostName.c_str(), "", 1);
+    WiFi.softAP(apSsid.c_str(), "", 1);
 
     // Подключение клиента к нашей точке доступа
     WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
@@ -423,7 +440,7 @@ void setupNetwork() {
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }, ARDUINO_EVENT_WIFI_AP_STADISCONNECTED);
 
-    WiFi.begin(HOTSPOT_SSID, HOTSPOT_PASS);
+    WiFi.begin(staSsid.c_str(), staPass.c_str());
 
     uint32_t startAttempt = millis();
     bool connected = false;
@@ -514,6 +531,17 @@ void setupNetwork() {
             float v = request->getParam("bg")->value().toFloat();
             if (v >= 0.0f && v <= 100.0f) global_b_gain = v;
         }
+        // Пороги старта/остановки отрисовки. Принимаем только парой и только
+        // когда порог остановки ниже порога старта: без гистерезиса картинка
+        // мигала бы на границе каждый оборот.
+        if (request->hasParam("rpm_on") && request->hasParam("rpm_off")) {
+            float on  = request->getParam("rpm_on")->value().toFloat();
+            float off = request->getParam("rpm_off")->value().toFloat();
+            if (on >= 30.0f && on <= 600.0f && off >= 20.0f && off < on) {
+                rpm_render_on  = on;
+                rpm_render_off = off;
+            }
+        }
         // Мгновенный пересчёт яркости — не ждём следующего тика датчика (50 мс)
         float ratio = constrain(last_lux_value / 1000.0f, 0.0f, 1.0f);
         global_brightness = (uint8_t)constrain(
@@ -523,6 +551,9 @@ void setupNetwork() {
         );
         // Пока рендеринг не активен — effective совпадает с brightness (ABL не применяется)
         if (!peripherals_active) global_effective_brightness = global_brightness;
+        // Записывать здесь нельзя — стирание флеша заморозит renderingTask.
+        // Просто помечаем: loop() сбросит настройки, когда отрисовка не идёт.
+        settings_dirty = true;
         state_version++;
         request->send(200, "text/plain", "OK");
     });
@@ -546,6 +577,7 @@ void setupNetwork() {
             ",\"abl\":%.1f,\"abl_rms\":%.1f"
             ",\"rg\":%.1f,\"gg\":%.1f,\"bg\":%.1f"
             ",\"slideshow\":%s,\"file\":\"%s\",\"play\":%u"
+            ",\"rpm_on\":%.0f,\"rpm_off\":%.0f"
             ",\"ver\":%lu,\"fver\":%lu}",
             (unsigned)min_brightness, (unsigned)max_brightness,
             (int)global_angle_offset, (unsigned)global_brightness,
@@ -557,6 +589,7 @@ void setupNetwork() {
             (float)global_r_gain, (float)global_g_gain, (float)global_b_gain,
             slideshowActive ? "true" : "false",
             curf, (unsigned)(force_stop_display ? 0 : 1),
+            (float)rpm_render_on, (float)rpm_render_off,
             (unsigned long)state_version, (unsigned long)file_version
         );
         request->send(200, "application/json", buf);
@@ -694,6 +727,7 @@ void setupNetwork() {
                 }
                 if (slideshowActive) {
                     // Слайдшоу уже идёт — только обновляем интервал, не сбрасываем индекс
+                    settings_dirty = true;
                     webLogf("[DISP] Slideshow interval -> %lus", (unsigned long)(slideInterval / 1000));
                     request->send(200, "text/plain", "OK");
                     return;
@@ -707,11 +741,13 @@ void setupNetwork() {
                 slideshowActive = true;
                 slideCurrentIndex = -1;  // loop() немедленно запустит первый файл
                 slideLastSwitch   = 0;
+                settings_dirty    = true;
                 state_version++;
                 webLogf("[DISP] Slideshow start, interval %lus", (unsigned long)(slideInterval / 1000));
                 request->send(200, "text/plain", "OK");
             } else if (action == "stop") {
                 slideshowActive = false;
+                settings_dirty  = true;
                 state_version++;
                 webLog("[DISP] Slideshow stop");
                 request->send(200, "text/plain", "OK");
@@ -855,6 +891,77 @@ void setupNetwork() {
                 return;
             }
             file_version++;
+        }
+    });
+
+    // GET /wifi — текущие сетевые настройки. Пароль домашней сети наружу не
+    // отдаём: страница ходит по открытому HTTP, а знать его браузеру незачем —
+    // пустое поле при сохранении означает «оставить прежний».
+    server.on("/wifi", HTTP_GET, [](AsyncWebServerRequest *request){
+        last_web_activity_time = millis();
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "{\"ap\":\"%s\",\"ap_default\":\"%s\",\"ssid\":\"%s\",\"pass_set\":%s"
+                 ",\"sta\":%s,\"ip\":\"%s\",\"host\":\"%s\"}",
+                 apSsid.c_str(), apDefaultSsid.c_str(), staSsid.c_str(),
+                 staPass.length() ? "true" : "false",
+                 (WiFi.status() == WL_CONNECTED) ? "true" : "false",
+                 (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString().c_str() : "",
+                 hostName.c_str());
+        request->send(200, "application/json", buf);
+    });
+
+    // GET /wifi_set?ap=&ssid=&pass= — сохранить и применить.
+    // Запись в NVS здесь прямая, не отложенная: смена сети и так рвёт
+    // соединение, пользователь может тут же выключить питание, и настройка
+    // обязана пережить это. Действие разовое — редкая пауза рендера допустима.
+    server.on("/wifi_set", HTTP_GET, [](AsyncWebServerRequest *request){
+        last_web_activity_time = millis();
+
+        String newAp   = request->hasParam("ap")   ? request->getParam("ap")->value()   : apSsid;
+        String newSsid = request->hasParam("ssid") ? request->getParam("ssid")->value() : staSsid;
+        // Пустой пароль в запросе = «не менять». Стереть его можно явным clear=1.
+        bool   clearPass = request->hasParam("clear") && request->getParam("clear")->value() == "1";
+        String newPass = clearPass ? String("")
+                       : (request->hasParam("pass") && request->getParam("pass")->value().length()
+                          ? request->getParam("pass")->value() : staPass);
+
+        newAp.trim();
+        newSsid.trim();
+        if (newAp.length() == 0) newAp = apDefaultSsid;
+        if (newAp.length() > 32 || newSsid.length() > 32 || newPass.length() > 63) {
+            request->send(400, "text/plain", "Name too long");
+            return;
+        }
+        // WPA2 не принимает ключ короче 8 символов; открытая сеть — пустой пароль.
+        if (newPass.length() > 0 && newPass.length() < 8) {
+            request->send(400, "text/plain", "Password must be 8+ characters");
+            return;
+        }
+
+        bool apChanged  = (newAp   != apSsid);
+        bool staChanged = (newSsid != staSsid) || (newPass != staPass);
+
+        if (apChanged)  prefs.putString("ap_ssid",  newAp);
+        if (staChanged) { prefs.putString("sta_ssid", newSsid); prefs.putString("sta_pass", newPass); }
+
+        apSsid  = newAp;
+        staSsid = newSsid;
+        staPass = newPass;
+
+        // Отвечаем ДО переподключения: перезапуск точки доступа рвёт TCP-сессию,
+        // и браузер иначе не увидел бы результата.
+        request->send(200, "text/plain", "OK");
+
+        if (apChanged) {
+            webLogf("[NET] AP renamed to %s", apSsid.c_str());
+            WiFi.softAP(apSsid.c_str(), "", 1);
+        }
+        if (staChanged) {
+            webLogf("[NET] Home network -> %s", staSsid.c_str());
+            WiFi.disconnect();
+            WiFi.begin(staSsid.c_str(), staPass.c_str());
+            last_reconnect_attempt = millis();
         }
     });
 
@@ -1063,7 +1170,7 @@ void loopNetwork() {
         if (sta_status != WL_CONNECTED && now_ms - last_reconnect_attempt > 30000) {
             last_reconnect_attempt = now_ms;
             webLog("[NET] WiFi reconnecting...");
-            WiFi.begin(HOTSPOT_SSID, HOTSPOT_PASS);
+            WiFi.begin(staSsid.c_str(), staPass.c_str());
         }
     }
 }

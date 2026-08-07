@@ -137,6 +137,9 @@ body {
   background: var(--btn-bg); color: var(--btn-fg);
   font: inherit; font-size: 14px; font-weight: 600;
   cursor: pointer; user-select: none;
+  /* pan-y, а не manipulation: палец, опущенный на кнопку в начале прокрутки,
+     должен прокручивать страницу, а не «залипать» на кнопке. */
+  touch-action: pan-y;
   transition: filter .15s, background .15s, border-color .15s, transform .05s;
 }
 .btn:hover  { filter: brightness(1.12); }
@@ -154,16 +157,19 @@ html[data-theme="light"] .btn-ok.active { --btn-fg: #fff; }
 
 /* =========================== Живая сводка =========================== */
 .hero { padding: 16px 0 4px; }
-.stat-row {
-  display: grid; gap: 12px;
-  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-}
+/* На телефоне все три плитки во всю ширину — так они читаются одним взглядом
+   и в плитку Display помещается ряд кнопок управления. */
+.stat-row { display: grid; gap: 12px; grid-template-columns: 1fr; }
+@media (min-width: 700px) { .stat-row { grid-template-columns: 1.7fr 1fr; } }
 .stat {
   display: flex; align-items: center; gap: 14px;
   background: var(--surface); border: 1px solid var(--border-soft);
   border-radius: 16px; padding: 14px 16px; box-shadow: var(--shadow);
   min-width: 0;
 }
+/* Плитка состояния: сверху превью + статус, снизу управление воспроизведением */
+.stat-main { flex-direction: column; align-items: stretch; gap: 12px; }
+.stat-head { display: flex; align-items: center; gap: 14px; min-width: 0; }
 .stat-body { min-width: 0; }
 .stat-k {
   font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
@@ -175,35 +181,44 @@ html[data-theme="light"] .btn-ok.active { --btn-fg: #fff; }
   font-size: 12px; color: var(--text-3); margin-top: 2px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.stat.is-ok   .stat-v { color: var(--ok); }
-.stat.is-warn .stat-v { color: var(--warn); }
 
-/* Ротор: 6 лучей, скорость вращения пропорциональна rpm — состояние читается
-   боковым зрением, без чтения цифр. */
-.rotor { width: 46px; height: 46px; flex: 0 0 auto; }
-.rotor .spin { transform-origin: 50% 50%; animation: rotor-spin 2s linear infinite; animation-play-state: paused; }
-.rotor.run .spin { animation-play-state: running; }
-.rotor.rev .spin { animation-direction: reverse; }
-@keyframes rotor-spin { to { transform: rotate(360deg); } }
-@media (prefers-reduced-motion: reduce) { .rotor .spin { animation: none !important; } }
-
-/* Полоса батареи внутри плитки */
-.mini-bar { height: 6px; border-radius: 3px; background: var(--track); overflow: hidden; margin-top: 7px; }
-.mini-bar > i { display: block; height: 100%; width: 0; border-radius: 3px; background: var(--ok); transition: width .5s; }
-
-/* Что играет сейчас */
-.nowbar {
-  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
-  margin-top: 12px; padding: 12px 16px;
-  background: var(--surface); border: 1px solid var(--border-soft);
-  border-radius: 16px; box-shadow: var(--shadow);
+/* Слева в плитке состояния — то, что реально светится на колесе: кадр
+   загруженного файла (тот же буфер превью, что и в списке, — устройство ради
+   него ничего дополнительно не читает). Пока файла нет — схема ротора. */
+.rotor { position: relative; width: 56px; height: 56px; flex: 0 0 auto; }
+.rotor canvas {
+  width: 100%; height: 100%; border-radius: 50%; display: none;
+  background: #000; box-shadow: 0 0 0 1px var(--border-soft);
 }
-.nowbar .np-k {
-  font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
-  color: var(--text-3); font-weight: 700;
+.rotor svg { width: 100%; height: 100%; display: block; }
+.rotor.has-art canvas { display: block; }
+.rotor.has-art svg    { display: none; }
+
+/* Скорость и обороты — одним кеглем, оба открывают свою настройку по клику */
+.readouts { display: flex; align-items: baseline; gap: 20px; flex-wrap: wrap; }
+.readouts .ro { cursor: pointer; white-space: nowrap; }
+.readouts .ro:hover { color: var(--accent); }
+.stat-sub #pwrHint:not(:empty)::before { content: " · "; }
+.stat-sub #infoDir:empty + #pwrHint::before { content: none; }
+
+/* Заряд и напряжения: две колонки со своими заголовками — «Battery» и «USB»
+   набраны одинаково и стоят каждый над своим числом. Отдельная полоса заряда
+   не нужна: процент рядом с напряжением элемента говорит то же самое точнее. */
+.volts { display: flex; align-items: flex-start; gap: 24px; width: 100%; }
+.volts > div { display: flex; flex-direction: column; line-height: 1.2; min-width: 0; }
+.volts .stat-k { margin-bottom: 4px; }
+.volts b { font-size: 20px; font-weight: 700; letter-spacing: -.01em; white-space: nowrap; }
+.volts .badge { margin-left: auto; flex: 0 0 auto; }
+
+/* Управление воспроизведением: интервал и обе кнопки строго в одну строку.
+   Подпись кнопки слайдшоу не меняется при включении (меняется только значок
+   и заливка), поэтому ширина ряда не скачет. */
+.np-actions { display: flex; align-items: center; gap: 8px; flex-wrap: nowrap; }
+.np-actions .btn {
+  flex: 1 1 0; min-width: 0; padding: 0 10px;
+  white-space: nowrap; overflow: hidden;
 }
-.nowbar .np-v { font-size: 15px; font-weight: 600; word-break: break-all; }
-.nowbar .np-left { flex: 1 1 220px; min-width: 0; }
+.np-actions .field { flex: 0 0 auto; min-height: 42px; padding: 0 10px; gap: 4px; }
 
 /* =========================== Вкладки =========================== */
 .tabs-bar {
@@ -238,8 +253,8 @@ html[data-theme="light"] .btn-ok.active { --btn-fg: #fff; }
   grid-template-columns: 1fr;
 }
 @media (min-width: 900px) {
-  .cols-2   { grid-template-columns: 1fr 1fr; }
-  .cols-a   { grid-template-columns: minmax(320px, 400px) 1fr; }
+  .cols-2 { grid-template-columns: 1fr 1fr; }
+  .cols-a { grid-template-columns: minmax(320px, 400px) 1fr; }
 }
 
 /* =========================== Карточки =========================== */
@@ -273,11 +288,18 @@ html[data-theme="light"] .btn-ok.active { --btn-fg: #fff; }
 .ctl-val .live  { color: var(--warn); }
 .ctl-hint { font-size: 12.5px; color: var(--text-3); margin-top: 8px; line-height: 1.4; }
 
-/* Ползунки: трек 6 px, ручка 22 px — попадание пальцем без прицеливания. */
+/* Ползунки: трек 6 px, ручка 22 px — попадание пальцем без прицеливания.
+   pointer-events: none — принципиально. Нативный range на мобильном ставит
+   значение по первому же касанию, поэтому палец, случайно опущенный на
+   ползунок при прокрутке, сразу сбивал настройку. Все указательные события
+   ловит обёртка .sl (см. «ДВИЖОК ПОЛЗУНКОВ» в скрипте): вертикальный жест
+   уходит странице нативной прокруткой, значение меняет только горизонтальный.
+   Клавиатура (Tab + стрелки) при этом продолжает работать. */
+.sl { position: relative; touch-action: pan-y; user-select: none; }
 input[type="range"] {
   -webkit-appearance: none; appearance: none;
   display: block; width: 100%; height: 22px; background: transparent;
-  cursor: pointer; outline: none;
+  cursor: pointer; outline: none; pointer-events: none; touch-action: pan-y;
   --p: 0;
 }
 input[type="range"]::-webkit-slider-runnable-track {
@@ -316,7 +338,7 @@ input[type="range"].g-slider::-moz-range-progress,
 input[type="range"].b-slider::-moz-range-progress { background: var(--c); }
 
 /* Двойной ползунок яркости */
-.bri-wrap { position: relative; height: 30px; user-select: none; }
+.bri-wrap { position: relative; height: 30px; user-select: none; touch-action: pan-y; }
 .bri-track {
   position: absolute; top: 50%; left: 0; right: 0; height: 6px;
   background: var(--track); border-radius: 3px; transform: translateY(-50%);
@@ -333,16 +355,14 @@ input[type="range"].b-slider::-moz-range-progress { background: var(--c); }
 }
 .bri-wrap input[type="range"] {
   position: absolute; inset: 0; width: 100%; height: 30px; margin: 0;
-  background: transparent; pointer-events: none; touch-action: none;
+  background: transparent;
 }
 .bri-wrap input[type="range"]::-webkit-slider-runnable-track { background: transparent; }
 .bri-wrap input[type="range"]::-moz-range-track { background: transparent; }
 .bri-wrap input[type="range"]::-moz-range-progress { background: transparent; }
-.bri-wrap input[type="range"]::-webkit-slider-thumb { pointer-events: auto; }
-.bri-wrap input[type="range"]::-moz-range-thumb     { pointer-events: auto; }
 
 /* Маркер фактического тока на шкале LED Power */
-.abl-wrap { position: relative; }
+.abl-wrap { position: relative; touch-action: pan-y; user-select: none; }
 #ablRmsMark {
   position: absolute; top: 50%; width: 4px; height: 20px; border-radius: 2px;
   background: var(--warn); box-shadow: 0 0 0 2px var(--surface);
@@ -410,10 +430,15 @@ input[type="range"].b-slider::-moz-range-progress { background: var(--c); }
 .upload-zone.has-preview .drop-thumb  { display: block; }
 .upload-zone.has-preview { border-style: solid; border-color: var(--accent); }
 
-.opt-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
-.opt-row .field { flex: 0 1 auto; }
+/* Три параметра ролика всегда стоят одной строкой, подпись бюджета — под ними */
+.opt-row { display: none; gap: 8px; margin-top: 12px; }
+.opt-row.show { display: grid; grid-template-columns: minmax(0,.9fr) minmax(0,.85fr) minmax(0,1.25fr); }
+.opt-row .field { min-width: 0; padding: 0 9px; gap: 5px; }
+.opt-row .field label { font-size: 11.5px; }
+.opt-row .field input,
+.opt-row .field select { width: 100%; min-width: 0; font-size: 14px; text-align: left; }
 .opt-note {
-  width: 100%; font-size: 12px; color: var(--text-3); margin-top: 2px;
+  grid-column: 1 / -1; font-size: 12px; color: var(--text-3); margin-top: 2px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
@@ -514,6 +539,25 @@ input[type="range"].b-slider::-moz-range-progress { background: var(--c); }
 .toast.err { background: var(--danger-soft); color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, transparent); }
 @keyframes toast-in { from { opacity: 0; transform: translateY(10px); } }
 
+/* =========================== Модальное окно =========================== */
+.modal {
+  position: fixed; inset: 0; z-index: 100; display: none;
+  align-items: center; justify-content: center; padding: 20px;
+  background: rgba(0,0,0,.55);
+}
+.modal.open { display: flex; }
+.modal-box {
+  width: min(380px, 100%); padding: 20px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 18px; box-shadow: 0 24px 60px rgba(0,0,0,.45);
+  animation: modal-in .16s ease-out;
+}
+@keyframes modal-in { from { opacity: 0; transform: translateY(12px) scale(.98); } }
+.modal-box h3 { font-size: 17px; font-weight: 700; margin-bottom: 6px; }
+.modal-box p  { font-size: 13px; color: var(--text-3); line-height: 1.5; margin-bottom: 16px; }
+.modal-actions { display: flex; gap: 8px; margin-top: 18px; }
+.modal-actions .btn { flex: 1; }
+
 /* =========================== Справка =========================== */
 details.help {
   margin-top: 14px; border: 1px solid var(--border-soft); border-radius: 12px;
@@ -537,23 +581,19 @@ details.help .help-body b { color: var(--text-2); }
   .wrap { padding: 0 12px; }
   .app-header .wrap { min-height: 54px; }
   .tabs-bar { top: 54px; }
-  .stat-row { grid-template-columns: 1fr 1fr; }
-  /* Батарея занимает всю ширину: в две колонки третья плитка оставляла
-     пустую половину строки. */
-  .stat-row > .stat:nth-child(3) { grid-column: 1 / -1; }
-  .stat { padding: 12px; gap: 10px; flex-direction: column; align-items: flex-start; }
+  .stat { padding: 12px 14px; gap: 12px; }
   .stat-v { font-size: 22px; }
-  .rotor { width: 34px; height: 34px; }
+  .rotor { width: 48px; height: 48px; }
   .file-thumb, .file-thumb canvas { width: 48px; height: 48px; }
   .file-sub { gap: 6px; font-size: 11.5px; }
   .card { padding: 16px 14px; border-radius: 16px; }
   .brand small { display: none; }
 }
-/* Узкий телефон: убираем пиктограммы вкладок, чтобы все четыре подписи
-   помещались в строку и не приходилось её прокручивать. */
+/* Узкий телефон: ужимаем вкладки, чтобы все пять подписей помещались в строку
+   и не приходилось её прокручивать. */
 @media (max-width: 430px) {
-  .tab { padding: 0 12px; }
-  .tab-ico { display: none; }
+  .tabs { gap: 2px; }
+  .tab { padding: 0 9px; font-size: 13.5px; }
 }
 @media (max-width: 380px) {
   .stat-row { grid-template-columns: 1fr; }
@@ -582,51 +622,58 @@ details.help .help-body b { color: var(--text-2); }
 <div class="wrap hero">
   <div class="stat-row">
 
-    <div class="stat" id="stateCard">
-      <svg class="rotor" id="rotor" viewBox="0 0 100 100" aria-hidden="true">
-        <circle cx="50" cy="50" r="46" fill="none" stroke="currentColor" stroke-width="3" opacity=".18"/>
-        <g class="spin" id="rotorSpin" stroke="currentColor" stroke-width="7" stroke-linecap="round">
-          <path d="M50 50 L50 8"/><path d="M50 50 L86 29"/><path d="M50 50 L86 71"/>
-          <path d="M50 50 L50 92"/><path d="M50 50 L14 71"/><path d="M50 50 L14 29"/>
-        </g>
-        <circle cx="50" cy="50" r="8" fill="currentColor"/>
-      </svg>
-      <div class="stat-body">
-        <div class="stat-k">Display</div>
-        <div class="stat-v" id="pwrState">—</div>
-        <div class="stat-sub" id="pwrHint">waiting for device</div>
+    <div class="stat stat-main">
+      <div class="stat-head">
+        <div class="rotor" id="rotor" aria-hidden="true">
+          <!-- 80×80 — тот же размер, что у миниатюр в списке: кеш превью общий -->
+          <canvas id="rotorArt" width="80" height="80"></canvas>
+          <svg viewBox="0 0 100 100">
+            <circle cx="50" cy="50" r="46" fill="none" stroke="currentColor" stroke-width="3" opacity=".18"/>
+            <g stroke="currentColor" stroke-width="7" stroke-linecap="round">
+              <path d="M50 50 L50 8"/><path d="M50 50 L86 29"/><path d="M50 50 L86 71"/>
+              <path d="M50 50 L50 92"/><path d="M50 50 L14 71"/><path d="M50 50 L14 29"/>
+            </g>
+            <circle cx="50" cy="50" r="8" fill="currentColor"/>
+          </svg>
+        </div>
+        <!-- Оба показания кликабельны и ведут туда, что на них влияет:
+             скорость — к окружности колеса, обороты — к порогам включения. -->
+        <div class="stat-body">
+          <div class="stat-k">Display</div>
+          <div class="stat-v mono readouts">
+            <span class="ro" onclick="openCircDialog()" title="Set wheel circumference"><span id="infoSpeed">--</span><small>km/h</small></span>
+            <span class="ro" onclick="openRpmDialog()" title="Set start / stop rpm"><span id="infoRpm">--</span><small>rpm</small></span>
+          </div>
+          <div class="stat-sub"><span id="infoDir"></span><span id="pwrHint"></span></div>
+        </div>
+      </div>
+      <div class="np-actions">
+        <span class="field" title="How long each file stays on screen">
+          <input type="number" id="albumSecs" min="1" max="99" value="10" style="width:34px"><span class="unit">s</span>
+        </span>
+        <button class="btn btn-ok" id="albumBtn" onclick="toggleAlbum()">
+          <span id="albumBtnIcon">⏩</span><span id="albumBtnLabel">Slideshow</span>
+        </button>
+        <button class="btn btn-danger" id="playBtn" onclick="togglePlay()">
+          <span id="playBtnLabel">■ Stop</span>
+        </button>
       </div>
     </div>
 
     <div class="stat">
-      <div class="stat-body">
-        <div class="stat-k">Speed</div>
-        <div class="stat-v mono"><span id="infoSpeed">--</span><small>km/h</small></div>
-        <div class="stat-sub"><span class="mono" id="infoRpm">--</span> rpm <span id="infoDir"></span></div>
-      </div>
-    </div>
-
-    <div class="stat" style="display:block">
-      <div class="stat-body" style="width:100%">
-        <div class="stat-k" style="display:flex;justify-content:space-between;align-items:center">
-          <span>Battery</span><span class="badge" id="chgStat">--</span>
+      <div class="stat-body volts">
+        <div>
+          <div class="stat-k">Battery</div>
+          <b class="mono"><span id="batPct">--%</span> <span id="batV">--</span>V</b>
         </div>
-        <div class="stat-v mono"><span id="batPct">--%</span></div>
-        <div class="mini-bar"><i id="batBar"></i></div>
+        <div>
+          <div class="stat-k">USB</div>
+          <b class="mono"><span id="usbV">--</span>V</b>
+        </div>
+        <span class="badge" id="chgStat">--</span>
       </div>
     </div>
 
-  </div>
-
-  <div class="nowbar">
-    <div class="np-left">
-      <div class="np-k">Now playing</div>
-      <div class="np-v" id="nowPlaying">nothing</div>
-    </div>
-    <button class="btn btn-ok" id="albumBtn" onclick="toggleAlbum()">
-      <span id="albumBtnIcon">⏩</span><span id="albumBtnLabel">Slideshow</span>
-    </button>
-    <button class="btn btn-danger" onclick="stopDisplay()">■ Stop</button>
   </div>
 </div>
 
@@ -634,10 +681,11 @@ details.help .help-body b { color: var(--text-2); }
 <div class="tabs-bar">
   <div class="wrap">
     <div class="tabs" role="tablist">
-      <button class="tab" role="tab" id="tab-library" aria-selected="true"  aria-controls="panel-library" onclick="showTab('library')"><span class="tab-ico">🖼</span>Library</button>
-      <button class="tab" role="tab" id="tab-display" aria-selected="false" aria-controls="panel-display" onclick="showTab('display')"><span class="tab-ico">💡</span>Display</button>
-      <button class="tab" role="tab" id="tab-tune"    aria-selected="false" aria-controls="panel-tune"    onclick="showTab('tune')"><span class="tab-ico">🎛</span>Calibration</button>
-      <button class="tab" role="tab" id="tab-log"     aria-selected="false" aria-controls="panel-log"     onclick="showTab('log')"><span class="tab-ico">📄</span>Log</button>
+      <button class="tab" role="tab" id="tab-library" aria-selected="true"  aria-controls="panel-library" onclick="showTab('library')">Library</button>
+      <button class="tab" role="tab" id="tab-display" aria-selected="false" aria-controls="panel-display" onclick="showTab('display')">Display</button>
+      <button class="tab" role="tab" id="tab-tune"    aria-selected="false" aria-controls="panel-tune"    onclick="showTab('tune')">Calibration</button>
+      <button class="tab" role="tab" id="tab-wifi"    aria-selected="false" aria-controls="panel-wifi"    onclick="showTab('wifi')">Wi-Fi</button>
+      <button class="tab" role="tab" id="tab-log"     aria-selected="false" aria-controls="panel-log"     onclick="showTab('log')">Log</button>
     </div>
   </div>
 </div>
@@ -650,8 +698,7 @@ details.help .help-body b { color: var(--text-2); }
 
     <!-- Загрузка -->
     <div class="card" id="uploadCard">
-      <h2>Add artwork</h2>
-      <p class="card-note">Picture, GIF or video — converted to the wheel format right here in the browser.</p>
+      <h2 style="margin-bottom:14px">Add Animation</h2>
 
       <label class="upload-zone" id="uploadZone">
         <input type="file" id="fileInput" accept="image/*,video/*" multiple>
@@ -659,23 +706,22 @@ details.help .help-body b { color: var(--text-2); }
         <div class="upload-icon">⬆</div>
         <div class="upload-text">
           Drop a <b>video</b>, <b>GIF</b> or <b>image</b><br>or tap to choose
-          <small>Only the centre square is used — the wheel is round</small>
         </div>
       </label>
 
       <!-- Опции извлечения кадров: только для видео -->
-      <div class="opt-row" id="videoOpts" style="display:none">
+      <div class="opt-row" id="videoOpts">
         <span class="field"><label for="vidFps">FPS</label>
           <select id="vidFps" onchange="onVideoOptsChange()">
             <option value="5">5</option><option value="10" selected>10</option><option value="15">15</option>
           </select></span>
-        <span class="field"><label for="vidFit">Frame</label>
-          <select id="vidFit" onchange="onVideoOptsChange()">
+        <!-- Подписи у селекта кадрирования нет: значения Crop/Fit говорят сами
+             за себя, а лишнее слово не даёт полю Length показать число целиком. -->
+        <span class="field">
+          <select id="vidFit" onchange="onVideoOptsChange()" aria-label="Frame fitting">
             <option value="crop" selected>Crop</option><option value="fit">Fit</option>
           </select></span>
-        <span class="field"><label for="vidStart">Start</label>
-          <input type="number" id="vidStart" min="0" step="0.5" value="0" onchange="onVideoOptsChange()"><span class="unit">s</span></span>
-        <span class="field"><label for="vidLen">Length</label>
+        <span class="field"><label for="vidLen">Len</label>
           <input type="number" id="vidLen" min="0.5" step="0.5" value="10" onchange="onVideoOptsChange()"><span class="unit">s</span></span>
         <div class="opt-note" id="vidBudget"></div>
       </div>
@@ -686,14 +732,6 @@ details.help .help-body b { color: var(--text-2); }
         <div class="progress-track"><div class="progress-fill" id="uploadProgressBar"></div></div>
       </div>
       <button class="btn btn-primary btn-block" id="btnUpload" onclick="processAndUpload()" style="margin-top:12px">↑ Convert &amp; upload</button>
-
-      <details class="help">
-        <summary>How long can an animation be?</summary>
-        <div class="help-body">
-          <p>The whole animation lives in the device's RAM, so length is capped by free memory — roughly <b>24 s at 10 fps</b> on a fresh device. The upload panel shows the real limit once a video is selected.</p>
-          <p>Image refresh on the wheel is <b>rpm ÷ 10</b> — 20 fps at 200 rpm. Below ~100 rpm video starts to look choppy.</p>
-        </div>
-      </details>
     </div>
 
     <!-- Библиотека -->
@@ -711,20 +749,6 @@ details.help .help-body b { color: var(--text-2); }
       </div>
       <div class="meter"><i id="fsFill"></i></div>
       <div class="meter-sub" id="fsSub"></div>
-
-      <div class="sep"></div>
-
-      <div class="ctl" style="margin-bottom:0">
-        <div class="ctl-head">
-          <span class="ctl-name">Slideshow</span>
-          <span class="field" style="min-height:38px">
-            <label for="albumSecs">every</label>
-            <input type="number" id="albumSecs" min="1" max="99" value="10" style="width:44px">
-            <span class="unit">s</span>
-          </span>
-        </div>
-        <p class="ctl-hint">Cycles through every file in the library. Start it from the button at the top of the page.</p>
-      </div>
     </div>
 
   </div>
@@ -732,9 +756,9 @@ details.help .help-body b { color: var(--text-2); }
 
 <!-- ---------------- Вкладка: дисплей ---------------- -->
 <section class="panel" id="panel-display" role="tabpanel" aria-labelledby="tab-display" hidden>
-  <div class="cols cols-2">
+  <div class="cols">
 
-    <div class="card">
+    <div class="card" style="max-width:640px">
       <h2>Brightness</h2>
       <p class="card-note">The device dims itself in the dark and brightens in daylight. You set the range it is allowed to use.</p>
 
@@ -761,43 +785,27 @@ details.help .help-body b { color: var(--text-2); }
       <div class="ctl">
         <div class="ctl-head">
           <span class="ctl-name">Power limit</span>
-          <span class="ctl-val"><span id="ablVal">40%</span> <span class="live" id="ablRmsLabel">RMS --</span></span>
+          <span class="ctl-val"><span id="ablVal">100%</span> <span class="live" id="ablRmsLabel">RMS --</span></span>
         </div>
         <div class="abl-wrap">
-          <input type="range" id="ablSlide" min="0" max="100" value="40" aria-label="Power limit"
+          <input type="range" id="ablSlide" min="0" max="100" value="100" aria-label="Power limit"
                  oninput="document.getElementById('ablVal').textContent=this.value+'%'; syncSettings()">
           <div id="ablRmsMark"></div>
         </div>
         <p class="ctl-hint">Caps how much current all 528 LEDs may draw together. Lower it to make the battery last longer; the yellow marker is what the current picture actually draws.</p>
       </div>
-    </div>
-
-    <div class="card">
-      <h2>Power</h2>
-      <p class="card-note">Battery charge is estimated from the open-circuit voltage, so it stays put when the LEDs switch on.</p>
-
-      <div class="kv"><span class="kv-k">Battery voltage</span><span class="kv-v"><span id="batV">--</span><span class="unit">V</span></span></div>
-      <div class="kv"><span class="kv-k">USB voltage</span><span class="kv-v"><span id="usbV">--</span><span class="unit">V</span></span></div>
-      <div class="kv"><span class="kv-k">Charger</span><span class="kv-v"><span class="badge" id="chgStat2">--</span></span></div>
 
       <div class="sep"></div>
 
       <div class="ctl" style="margin-bottom:0">
         <div class="ctl-head">
-          <span class="ctl-name">Wheel circumference</span>
-          <span class="field" style="min-height:38px">
-            <input type="text" id="wheelCirc" value="2355" maxlength="4" inputmode="numeric"><span class="unit">mm</span>
-          </span>
+          <span class="ctl-name">Magnet Position</span>
+          <span class="ctl-val"><span id="aVal">93</span>°</span>
         </div>
-        <p class="ctl-hint">Only used to turn rpm into km/h. A 700×35C tyre is about 2168 mm; 29″ MTB about 2300 mm.</p>
+        <input type="range" id="aSlide" min="0" max="360" value="93"
+               oninput="document.getElementById('aVal').textContent=this.value; syncSettings()">
+        <p class="ctl-hint">Use to stand the animation upright.</p>
       </div>
-
-      <details class="help">
-        <summary>Why do the LEDs stay dark while I pedal slowly?</summary>
-        <div class="help-body">
-          <p>Below <b>100 rpm</b> the wheel turns too slowly for the image to hold together, so the arms are powered down. They light up again above <b>120 rpm</b>. After 3 s without rotation the device idles, and after a minute it sleeps until it feels a bump.</p>
-        </div>
-      </details>
     </div>
 
   </div>
@@ -805,45 +813,9 @@ details.help .help-body b { color: var(--text-2); }
 
 <!-- ---------------- Вкладка: калибровка ---------------- -->
 <section class="panel" id="panel-tune" role="tabpanel" aria-labelledby="tab-tune" hidden>
-  <div class="cols cols-2">
+  <div class="cols">
 
-    <div class="card">
-      <h2>Geometry</h2>
-      <p class="card-note">Touch these only if the picture comes out rotated or scrambled.</p>
-
-      <div class="ctl">
-        <div class="ctl-head">
-          <span class="ctl-name">Rotation</span>
-          <span class="ctl-val"><span id="aVal">93</span>°</span>
-        </div>
-        <input type="range" id="aSlide" min="0" max="360" value="93"
-               oninput="document.getElementById('aVal').textContent=this.value; syncSettings()">
-        <p class="ctl-hint">Turns the whole image around the hub. Use it to stand the picture upright.</p>
-      </div>
-
-      <div class="ctl">
-        <div class="ctl-head">
-          <span class="ctl-name">Arm order</span>
-          <span class="ctl-val" id="armOrderVal">Normal</span>
-        </div>
-        <button class="btn btn-block" id="armOrderBtn" onclick="toggleArmOrder()">⇄ Flip arm order</button>
-        <p class="ctl-hint">If the image breaks into six shuffled wedges, flip this. Doing so restarts the sensor calibration, so give the wheel a few turns afterwards.</p>
-      </div>
-
-      <div class="sep"></div>
-
-      <div class="kv"><span class="kv-k">Angular step</span><span class="kv-v"><span id="infoStep">--</span><span class="unit">°/update</span></span></div>
-      <div class="kv"><span class="kv-k">Frame build time</span><span class="kv-v"><span id="infoFill">--</span><span class="unit">µs</span></span></div>
-      <details class="help">
-        <summary>What do these two numbers mean?</summary>
-        <div class="help-body">
-          <p><b>Angular step</b> is how far an arm travels between two LED updates — the real limit of sharpness at the rim. It grows with speed: about 1° at 190 rpm, 2° at 390 rpm.</p>
-          <p><b>Frame build time</b> must stay well under the time it takes to clock a frame out (~860 µs), otherwise the processor, not the LED bus, becomes the bottleneck.</p>
-        </div>
-      </details>
-    </div>
-
-    <div class="card">
+    <div class="card" style="max-width:640px">
       <h2>Colour</h2>
       <p class="card-note">Gamma, saturation and contrast shape the picture; R/G/B set the white balance of the LEDs.</p>
 
@@ -864,7 +836,7 @@ details.help .help-body b { color: var(--text-2); }
         </div>
         <input type="range" id="sSlide" min="10" max="30" value="15"
                oninput="document.getElementById('sVal').textContent=(this.value/10).toFixed(1); syncSettings()">
-        <p class="ctl-hint">LEDs spinning at speed wash colours out; above 1.0 puts them back.</p>
+        <p class="ctl-hint">How vivid the colours are. 1.0 is the picture as uploaded; higher makes colours purer and further apart from grey.</p>
       </div>
 
       <div class="ctl">
@@ -874,6 +846,7 @@ details.help .help-body b { color: var(--text-2); }
         </div>
         <input type="range" id="coSlide" min="0" max="100" value="5"
                oninput="document.getElementById('coVal').textContent=this.value+'%'; syncSettings()">
+        <p class="ctl-hint">Pushes light areas lighter and dark areas darker. A few percent is usually enough — large values swallow detail at both ends.</p>
       </div>
 
       <div class="sep"></div>
@@ -892,12 +865,72 @@ details.help .help-body b { color: var(--text-2); }
         <div class="ctl-head"><span class="ctl-name" style="color:var(--blue)">Blue</span><span class="ctl-val" id="bgVal" style="color:var(--blue)">100%</span></div>
         <input type="range" class="b-slider" id="bgSlide" min="0" max="100" step="5" value="100"
                oninput="document.getElementById('bgVal').textContent=this.value+'%'; syncSettings()">
+        <!-- Подсказка одна на все три ползунка: они настраиваются только вместе -->
         <p class="ctl-hint">Green LEDs are the brightest of the three, so green usually sits lower than the others. Aim for neutral white, not maximum output.</p>
       </div>
 
       <button class="btn btn-block" onclick="restoreImgDefaults()">↺ Restore defaults</button>
     </div>
 
+  </div>
+</section>
+
+<!-- ---------------- Вкладка: Wi-Fi ---------------- -->
+<section class="panel" id="panel-wifi" role="tabpanel" aria-labelledby="tab-wifi" hidden>
+  <div class="cols cols-2">
+
+    <div class="card">
+      <h2>Own network</h2>
+      <p class="card-note">The device always broadcasts its own open network — this is the name you look for in the Wi-Fi list.</p>
+
+      <div class="ctl">
+        <div class="ctl-head"><span class="ctl-name">Network name</span></div>
+        <span class="field" style="width:100%">
+          <input type="text" id="apSsid" maxlength="32" placeholder="POV_WHEEL_0000"
+                 autocapitalize="off" autocorrect="off" spellcheck="false" style="flex:1;width:auto;text-align:left">
+        </span>
+        <p class="ctl-hint">Leave empty to go back to the factory name <b class="mono" id="apDefault">POV_WHEEL_0000</b>.
+           Renaming restarts the access point, so you will have to rejoin under the new name.</p>
+      </div>
+
+      <div class="kv"><span class="kv-k">Address on this network</span><span class="kv-v mono">192.168.4.1</span></div>
+      <div class="kv"><span class="kv-k">mDNS name</span><span class="kv-v mono"><span id="mdnsName">--</span>.local</span></div>
+    </div>
+
+    <div class="card">
+      <h2>Home network</h2>
+      <p class="card-note">Optional. When it is in range the device joins it, so you can reach the page without leaving your own Wi-Fi.</p>
+
+      <div class="ctl">
+        <div class="ctl-head"><span class="ctl-name">Network name (SSID)</span></div>
+        <span class="field" style="width:100%">
+          <input type="text" id="staSsid" maxlength="32" placeholder="Home Wi-Fi"
+                 autocapitalize="off" autocorrect="off" spellcheck="false" style="flex:1;width:auto;text-align:left">
+        </span>
+      </div>
+
+      <div class="ctl">
+        <div class="ctl-head">
+          <span class="ctl-name">Password</span>
+          <span class="ctl-val" id="staPassState"></span>
+        </div>
+        <span class="field" style="width:100%">
+          <input type="password" id="staPass" maxlength="63" placeholder="leave empty to keep current"
+                 autocapitalize="off" autocorrect="off" spellcheck="false" style="flex:1;width:auto;text-align:left">
+        </span>
+        <p class="ctl-hint">At least 8 characters, or clear it for an open network.</p>
+      </div>
+
+      <div class="kv"><span class="kv-k">Status</span><span class="kv-v"><span class="badge" id="staState">--</span></span></div>
+      <div class="kv"><span class="kv-k">Address</span><span class="kv-v mono" id="staIp">--</span></div>
+    </div>
+
+  </div>
+
+  <!-- Кнопка одна на обе карточки: запрос уходит с обоими наборами полей -->
+  <div class="card" style="margin-top:16px">
+    <button class="btn btn-primary btn-block" onclick="saveWifi()">Save &amp; apply both</button>
+    <p class="ctl-hint" style="text-align:center">Saving drops the current connection while the radio restarts. Give it a few seconds, then reload the page.</p>
   </div>
 </section>
 
@@ -915,6 +948,50 @@ details.help .help-body b { color: var(--text-2); }
 </section>
 
 </main>
+
+<!-- Окружность колеса: влияет только на km/h, поэтому живёт в диалоге,
+     который открывается прямо с плитки скорости, а не в настройках дисплея. -->
+<div class="modal" id="circModal" onclick="if(event.target===this) closeCircDialog()">
+  <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="circTitle">
+    <h3 id="circTitle">Wheel circumference</h3>
+    <p>Used only to turn rpm into km/h. Roll the wheel one full turn and measure, or take it from the tyre:
+       700×35C ≈ 2168 mm, 28″ ≈ 2200 mm, 29″ MTB ≈ 2300 mm.</p>
+    <span class="field" style="width:100%">
+      <label for="wheelCirc">Circumference</label>
+      <input type="text" id="wheelCirc" value="2355" maxlength="4" inputmode="numeric" style="flex:1;width:auto">
+      <span class="unit">mm</span>
+    </span>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeCircDialog()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveCircDialog()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Пороги включения отрисовки. Открывается кликом по оборотам. -->
+<div class="modal" id="rpmModal" onclick="if(event.target===this) closeRpmDialog()">
+  <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="rpmTitle">
+    <h3 id="rpmTitle">Start / stop speed</h3>
+    <p>Below the stop threshold the wheel turns too slowly for the image to hold together, so the arms are powered down.
+       The two values must differ — without that gap the picture would flicker on and off at the boundary.</p>
+    <div style="display:flex;gap:8px">
+      <span class="field" style="flex:1">
+        <label for="rpmOn">Start</label>
+        <input type="number" id="rpmOn" min="30" max="600" step="5" value="120" inputmode="numeric" style="flex:1;width:auto">
+        <span class="unit">rpm</span>
+      </span>
+      <span class="field" style="flex:1">
+        <label for="rpmOff">Stop</label>
+        <input type="number" id="rpmOff" min="20" max="595" step="5" value="100" inputmode="numeric" style="flex:1;width:auto">
+        <span class="unit">rpm</span>
+      </span>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeRpmDialog()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveRpmDialog()">Save</button>
+    </div>
+  </div>
+</div>
 
 <div class="toasts" id="toasts" aria-live="polite"></div>
 
@@ -1330,18 +1407,31 @@ function _vidOpts() {
     return {
         fps:   parseInt(el('vidFps').value, 10) || 10,
         fit:   el('vidFit').value,
-        start: Math.max(0,   parseFloat(el('vidStart').value) || 0),
-        len:   Math.max(0.5, parseFloat(el('vidLen').value)   || 10)
+        start: 0,                                        // ролик всегда с начала
+        len:   Math.max(0.5, parseFloat(el('vidLen').value) || 10)
     };
 }
 
+// Сколько секунд при текущем fps влезет в устройство.
+function _vidMaxSeconds(fps) {
+    return maxFramesForDevice() / fps;
+}
+
+// Длина по умолчанию — весь ролик; если он не помещается в PSRAM, обрезаем до
+// того, что влезет. Пользователь сразу видит реальный предел, а не наткнётся
+// на него после нажатия Upload.
+function _vidSetDefaultLength(dur, fps) {
+    const inp = document.getElementById('vidLen');
+    const cap = _vidMaxSeconds(fps);
+    const len = Math.max(0.5, Math.min(dur > 0 ? dur : cap, cap));
+    inp.value = (Math.floor(len * 10) / 10).toFixed(1);
+}
+
 // Считает, сколько кадров получится и влезет ли это в устройство.
-async function _updateVideoBudget(file) {
+async function _updateVideoBudget(file, resetLength) {
     const el = document.getElementById('vidBudget');
     if (!file) return;
-    const o = _vidOpts();
     await loadDevLimits(true);
-    const maxF = maxFramesForDevice();
 
     let dur = 0;
     try {
@@ -1353,16 +1443,26 @@ async function _updateVideoBudget(file) {
         setStatus('uploadStatus', `${file.name} — ${e.message}`, 'err');
         return;
     }
-    const avail = dur > 0 ? Math.max(0.1, dur - o.start) : o.len;
+
+    let o = _vidOpts();
+    // При выборе файла ставим длину сами; при смене fps только ужимаем, если
+    // выбранная длина перестала помещаться, — вручную заданное не увеличиваем.
+    if (resetLength) _vidSetDefaultLength(dur, o.fps);
+    else if (o.len > _vidMaxSeconds(o.fps)) _vidSetDefaultLength(dur, o.fps);
+    o = _vidOpts();
+
+    const maxF  = maxFramesForDevice();
+    const avail = dur > 0 ? dur : o.len;
     const want  = Math.max(1, Math.round(Math.min(o.len, avail) * o.fps));
     const n     = Math.min(want, maxF);
     const kb    = ((8 + n * FRAME_BYTES) / 1024).toFixed(0);
 
     let txt = (dur > 0 ? `source ${dur.toFixed(1)} s · ` : '') +
               `${(n / o.fps).toFixed(1)} s @ ${o.fps} fps = ${n} frames · ${kb} kB`;
-    if (n < want) txt += `  — capped, device fits ${maxF} frames (${(maxF / o.fps).toFixed(1)} s)`;
+    const trimmed = (dur > 0 && n / o.fps < dur - 0.05);
+    if (trimmed) txt += `  — trimmed, device fits ${maxF} frames (${(maxF / o.fps).toFixed(1)} s)`;
     el.textContent  = txt;
-    el.style.color  = (n < want) ? 'var(--warn)' : 'var(--text-3)';
+    el.style.color  = trimmed ? 'var(--warn)' : 'var(--text-3)';
 
     setStatus('uploadStatus', `${file.name} — ${n} frames ready. Press Upload.`, 'ok');
 }
@@ -1374,8 +1474,8 @@ function onVideoOptsChange() {
     drawVideoPoster(files[0], [
         { ctx: document.getElementById('dropThumbCanvas').getContext('2d'), size: 216 },
         { ctx: previewCtx, size: 200 }
-    ], o.fit, o.start).catch(() => {});
-    _updateVideoBudget(files[0]);
+    ], o.fit, 0).catch(() => {});
+    _updateVideoBudget(files[0], false);
 }
 
 // ===================== STATE =====================
@@ -1411,7 +1511,7 @@ function toggleTheme() {
 })();
 
 // ===================== ВКЛАДКИ =====================
-const TABS = ['library', 'display', 'tune', 'log'];
+const TABS = ['library', 'display', 'tune', 'wifi', 'log'];
 function showTab(name) {
     for (const t of TABS) {
         const btn = document.getElementById('tab-' + t);
@@ -1427,6 +1527,8 @@ function showTab(name) {
         _logAutoScroll = true;
         box.scrollTop = box.scrollHeight;
     }
+    // Сетевые настройки не входят в общий поллинг — запрашиваем при открытии
+    if (name === 'wifi') loadWifi();
 }
 
 // ===================== УВЕДОМЛЕНИЯ =====================
@@ -1492,7 +1594,7 @@ function _showDropThumb(file) {
         // Видео через FileReader→Image не открыть — берём кадр из <video>.
         // Заодно заполняем и превью: одно открытие декодера на оба холста.
         const o = _vidOpts();
-        drawVideoPoster(file, [{ ctx, size: 216 }, { ctx: previewCtx, size: 200 }], o.fit, o.start)
+        drawVideoPoster(file, [{ ctx, size: 216 }, { ctx: previewCtx, size: 200 }], o.fit, 0)
             .then(() => zone.classList.add('has-preview'))
             .catch(() => {});
         return;
@@ -1550,7 +1652,7 @@ document.getElementById('fileInput').addEventListener('change', function(e) {
 
     const first = files[0];
     _selectedIsVideo = isVideoFile(first);
-    document.getElementById('videoOpts').style.display = _selectedIsVideo ? 'flex' : 'none';
+    document.getElementById('videoOpts').classList.toggle('show', _selectedIsVideo);
 
     _showDropThumb(first);
 
@@ -1566,8 +1668,9 @@ document.getElementById('fileInput').addEventListener('change', function(e) {
 
     if (_selectedIsVideo) {
         // Видео НЕ конвертируем при выборе: это десятки секунд работы, и опции
-        // (fps, длина, кадрирование) ещё могут поменяться. Считаем только бюджет.
-        _updateVideoBudget(first);
+        // (fps, длина, кадрирование) ещё могут поменяться. Считаем только бюджет
+        // и выставляем длину по умолчанию — весь ролик, сколько влезет в память.
+        _updateVideoBudget(first, true);
     } else if (files.length === 1) {
         setStatus('uploadStatus', `${first.name} — converting...`, '');
         _convertFile(first).then(({ buf, frameCount }) => {
@@ -1891,19 +1994,46 @@ async function _loadThumb(fname, size, canvas) {
     if (_thumbCache[key]) {
         const ctx = canvas.getContext('2d');
         ctx.putImageData(_thumbCache[key], 0, 0);
-        return;
+        return true;
     }
     try {
         const resp = await _fetchTimeout(
             `/preview?file=${encodeURIComponent(fname)}&v=${size}`, {}, 8000);
-        if (!resp.ok) return;
+        if (!resp.ok) return false;
         const ab  = await resp.arrayBuffer();
         const buf = new Uint8Array(ab);
-        if (buf.length < FRAME_BYTES) return;
+        if (buf.length < FRAME_BYTES) return false;
         drawWheelPreview(buf, canvas);
         // Кэшируем ImageData для быстрого повторного рендеринга
         _thumbCache[key] = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height);
+        return true;
     } catch(e) { /* молча игнорируем — превью необязательно */ }
+    return false;
+}
+
+// ---- Картинка в плитке состояния ----
+// Показываем то, что реально загружено в устройство, и крутим со скоростью
+// колеса. Берём тот же кадр, что и миниатюра в списке (кеш общий), поэтому
+// устройство ради этой картинки ничего дополнительно с флеша не читает —
+// а любое чтение флеша гасит рендеринг ленты.
+let _fileSizes   = {};   // имя файла → размер: ключ кеша превью
+let _rotorArtFor = '';   // для какого файла уже нарисована картинка
+
+async function _updateRotorArt() {
+    const rotor = document.getElementById('rotor');
+    const cv    = document.getElementById('rotorArt');
+    if (!rotor || !cv) return;
+    const name = _displayOn ? _nowPlaying : '';
+    if (!name || !_fileSizes[name]) {
+        if (_rotorArtFor !== '') { _rotorArtFor = ''; rotor.classList.remove('has-art'); }
+        return;
+    }
+    if (_rotorArtFor === name) return;
+    _rotorArtFor = name;
+    const ok = await _loadThumb(name, _fileSizes[name], cv);
+    // Файл мог смениться, пока грузилось превью — тогда результат уже не наш
+    if (ok && _rotorArtFor === name) rotor.classList.add('has-art');
+    else if (_rotorArtFor === name)  rotor.classList.remove('has-art');
 }
 
 // ===================== FILE MANAGER =====================
@@ -1926,23 +2056,20 @@ let _nowPlaying = '';        // имя файла, загруженного в �
 let _displayOn  = false;     // false — вывод остановлен кнопкой Stop
 
 function _renderNowPlaying() {
-    const el = document.getElementById('nowPlaying');
-    if (!el) return;
-    if (!_nowPlaying) {
-        el.textContent = 'nothing';
-        el.style.color = 'var(--text-3)';
-    } else if (!_displayOn) {
-        el.textContent = _prettyName(_nowPlaying) + ' — stopped';
-        el.style.color = 'var(--text-3)';
-    } else {
-        el.textContent = _prettyName(_nowPlaying);
-        el.style.color = '';
+    // Что играет — видно по превью в плитке состояния и по зелёной рамке
+    // в библиотеке, отдельной подписи для этого не нужно.
+    const btn = document.getElementById('playBtn');
+    if (btn) {
+        btn.className = 'btn ' + (_displayOn ? 'btn-danger' : 'btn-ok');
+        btn.disabled  = !_displayOn && !_nowPlaying;
+        document.getElementById('playBtnLabel').textContent = _displayOn ? '■ Stop' : '▶ Start';
     }
     // Подсветка активной строки в списке
     document.querySelectorAll('.file').forEach(row => {
         row.classList.toggle('playing',
             _displayOn && !!_nowPlaying && row.dataset.name === _nowPlaying);
     });
+    _updateRotorArt();
 }
 
 function _setNowPlaying(name, on) {
@@ -1954,8 +2081,11 @@ function _setNowPlaying(name, on) {
 function loadFiles() {
     return fetch('/list').then(r => r.json()).then(files => {
         const list = document.getElementById('fileList');
+        _fileSizes = {};
+        files.forEach(f => { _fileSizes[f.name] = f.size; });
         if (!files.length) {
             list.innerHTML = '<div class="empty">Nothing stored yet.<br>Upload a picture to get started.</div>';
+            _renderNowPlaying();
             return;
         }
         list.innerHTML = files.map((f, i) => {
@@ -2030,6 +2160,14 @@ function stopDisplay() {
     _albumSetActive(false);
 }
 
+// Одна кнопка на два состояния: пока идёт вывод — Stop, после остановки —
+// Start, который возвращает тот же файл, что был загружен последним.
+function togglePlay() {
+    if (_displayOn) { stopDisplay(); return; }
+    if (_nowPlaying) playFile(_nowPlaying);
+    else toast('Pick a file in the library first');
+}
+
 // ===================== ALBUM / SLIDESHOW =====================
 let _albumRunning = false;
 
@@ -2038,8 +2176,9 @@ function _albumSetActive(active) {
     const btn = document.getElementById('albumBtn');
     if (!btn) return;
     btn.classList.toggle('active', active);
-    document.getElementById('albumBtnIcon').textContent  = active ? '⏹' : '⏩';
-    document.getElementById('albumBtnLabel').textContent = active ? 'Stop slideshow' : 'Slideshow';
+    // Подпись не меняем — иначе ряд кнопок прыгает по ширине. Состояние видно
+    // по значку и заливке.
+    document.getElementById('albumBtnIcon').textContent = active ? '⏹' : '⏩';
 }
 
 function _albumDelayMs() {
@@ -2150,22 +2289,25 @@ function syncSettings() {
         const g    = (document.getElementById('gSlide').value / 10).toFixed(1);
         const s    = (document.getElementById('sSlide').value / 10).toFixed(1);
         const co   = document.getElementById('coSlide').value;
-        const circ = document.getElementById('wheelCirc').value || wheelCircMm;
-        const ao    = _armReverse ? 1 : 0;
+        // Берём сохранённое значение, а не содержимое поля: в диалоге может
+        // лежать недоредактированное число, которое пользователь ещё не принял.
+        const circ = wheelCircMm;
+        // Порядок лучей всегда прямой — настройка убрана из интерфейса
+        const ao    = 0;
         const abl   = document.getElementById('ablSlide').value;
         const rg    = document.getElementById('rgSlide').value;
         const gg    = document.getElementById('ggSlide').value;
         const bg    = document.getElementById('bgSlide').value;
-        fetch(`/settings?bmin=${bmin}&bmax=${bmax}&a=${a}&g=${g}&s=${s}&co=${co}&circ=${circ}&ao=${ao}&abl=${abl}&rg=${rg}&gg=${gg}&bg=${bg}`);
+        fetch(`/settings?bmin=${bmin}&bmax=${bmax}&a=${a}&g=${g}&s=${s}&co=${co}&circ=${circ}&ao=${ao}&abl=${abl}&rg=${rg}&gg=${gg}&bg=${bg}&rpm_on=${rpmOnVal}&rpm_off=${rpmOffVal}`);
         _syncTimer = null;
     }, 50);
 }
 
+// Ползунки диапазона не должны перехлёстываться: тянем один — другой уступает.
+// Какую из двух ручек взял пользователь, решает _slPick при нажатии.
 document.getElementById('bMinSlide').addEventListener('input', function() {
     const maxSlide = document.getElementById('bMaxSlide');
     if (+this.value > +maxSlide.value) maxSlide.value = this.value;
-    this.style.zIndex = 5;
-    maxSlide.style.zIndex = '';
     updateDualRange();
     syncSettings();
 });
@@ -2173,57 +2315,12 @@ document.getElementById('bMinSlide').addEventListener('input', function() {
 document.getElementById('bMaxSlide').addEventListener('input', function() {
     const minSlide = document.getElementById('bMinSlide');
     if (+this.value < +minSlide.value) minSlide.value = this.value;
-    this.style.zIndex = 5;
-    minSlide.style.zIndex = '';
     updateDualRange();
     syncSettings();
 });
 
-// При mousedown/touchstart определяем какой ползунок активировать по позиции клика.
-// Это решает застревание когда оба на одном значении: тянем влево → активируем MIN,
-// тянем вправо → активируем MAX.
-(function() {
-    const minSlide = document.getElementById('bMinSlide');
-    const maxSlide = document.getElementById('bMaxSlide');
-    function pickActive(e) {
-        const rect  = maxSlide.getBoundingClientRect();
-        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-        const ratio = (clientX - rect.left) / rect.width;
-        const clickVal = BRI_MIN + Math.round(ratio * (BRI_MAX - BRI_MIN));
-        const minV = +minSlide.value;
-        const maxV = +maxSlide.value;
-        // Если значения совпадают — выбираем по стороне относительно середины
-        if (minV === maxV) {
-            if (clickVal <= minV) {
-                minSlide.style.zIndex = 5; maxSlide.style.zIndex = '';
-            } else {
-                maxSlide.style.zIndex = 5; minSlide.style.zIndex = '';
-            }
-        }
-    }
-    minSlide.addEventListener('mousedown',  pickActive);
-    maxSlide.addEventListener('mousedown',  pickActive);
-    minSlide.addEventListener('touchstart', pickActive, {passive: true});
-    maxSlide.addEventListener('touchstart', pickActive, {passive: true});
-})();
-
 
 // ===================== SETTINGS =====================
-// Порядок лучей в цепочке SK9822 относительно направления вращения.
-// Если картинка распадается на переставленные секторы — жмём Flip.
-let _armReverse = false;
-
-function _applyArmOrder() {
-    document.getElementById('armOrderVal').textContent = _armReverse ? 'Reversed' : 'Normal';
-}
-
-function toggleArmOrder() {
-    _armReverse = !_armReverse;
-    _applyArmOrder();
-    syncSettings();
-    toast('Arm order: ' + (_armReverse ? 'reversed' : 'normal'));
-}
-
 function _applySettings(d) {
     document.getElementById('bMinSlide').value = d.bmin;
     document.getElementById('bMaxSlide').value = d.bmax;
@@ -2246,10 +2343,6 @@ function _applySettings(d) {
         const c = Math.max(2000, Math.min(2500, d.circ));
         wheelCircMm = c;
         document.getElementById('wheelCirc').value = c;
-    }
-    if (d.ao !== undefined) {
-        _armReverse = !!d.ao;
-        _applyArmOrder();
     }
     if (d.lux !== undefined) {
         document.getElementById('luxVal').textContent = Math.round(d.lux);
@@ -2277,6 +2370,8 @@ function _applySettings(d) {
         document.getElementById('bgSlide').value = v;
         document.getElementById('bgVal').textContent = v + '%';
     }
+    if (d.rpm_on  !== undefined && d.rpm_on  > 0) rpmOnVal  = Math.round(d.rpm_on);
+    if (d.rpm_off !== undefined && d.rpm_off > 0) rpmOffVal = Math.round(d.rpm_off);
     if (d.slideshow !== undefined) _albumSetActive(d.slideshow);
     updateDualRange();
     refreshRanges();
@@ -2300,24 +2395,120 @@ function loadSettings() {
 // ===================== INFO (RPM + SPEED) =====================
 let wheelCircMm = 2355;
 
-document.getElementById('wheelCirc').addEventListener('change', function() {
-    let v = parseInt(this.value);
+// Окружность колеса влияет ровно на одно число — km/h, поэтому она вынесена
+// в диалог, который открывается прямо с плитки скорости.
+function openCircDialog() {
+    const inp = document.getElementById('wheelCirc');
+    inp.value = wheelCircMm;
+    document.getElementById('circModal').classList.add('open');
+    setTimeout(() => { inp.focus(); inp.select(); }, 30);
+}
+
+function closeCircDialog() {
+    document.getElementById('circModal').classList.remove('open');
+}
+
+// ---- Пороги включения отрисовки ----
+// Держим в переменных, а не читаем из полей диалога: syncSettings() шлёт их
+// вместе с остальными настройками при любом движении любого ползунка.
+let rpmOnVal = 120, rpmOffVal = 100;
+
+function openRpmDialog() {
+    document.getElementById('rpmOn').value  = rpmOnVal;
+    document.getElementById('rpmOff').value = rpmOffVal;
+    document.getElementById('rpmModal').classList.add('open');
+    setTimeout(() => { const i = document.getElementById('rpmOn'); i.focus(); i.select(); }, 30);
+}
+
+function closeRpmDialog() {
+    document.getElementById('rpmModal').classList.remove('open');
+}
+
+function saveRpmDialog() {
+    let on  = parseInt(document.getElementById('rpmOn').value, 10);
+    let off = parseInt(document.getElementById('rpmOff').value, 10);
+    if (isNaN(on))  on  = rpmOnVal;
+    if (isNaN(off)) off = rpmOffVal;
+    on = Math.max(30, Math.min(600, on));
+    // Гистерезис обязателен: на равных порогах картинка мигала бы на границе.
+    off = Math.max(20, Math.min(on - 5, off));
+    rpmOnVal = on; rpmOffVal = off;
+    syncSettings();
+    closeRpmDialog();
+    toast(`Rendering: start ${on} rpm, stop ${off} rpm`, 'ok');
+}
+
+document.getElementById('rpmOn').addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); saveRpmDialog(); }
+});
+document.getElementById('rpmOff').addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); saveRpmDialog(); }
+});
+
+// ===================== СЕТЕВЫЕ НАСТРОЙКИ =====================
+function loadWifi() {
+    return _fetchTimeout('/wifi', {}, 5000).then(r => r.json()).then(d => {
+        const set = (id, v) => { const e = document.getElementById(id); if (e) e.value = v; };
+        set('apSsid',  d.ap   || '');
+        set('staSsid', d.ssid || '');
+        set('staPass', '');
+        document.getElementById('apDefault').textContent = d.ap_default || '';
+        document.getElementById('mdnsName').textContent  = d.host || '';
+        document.getElementById('staPassState').textContent = d.pass_set ? 'saved' : 'not set';
+        const st = document.getElementById('staState');
+        st.textContent = d.sta ? 'Connected' : 'Not connected';
+        st.className   = 'badge ' + (d.sta ? 'badge-ok' : '');
+        document.getElementById('staIp').textContent = d.sta ? (d.ip || '--') : '--';
+    }).catch(() => toast('Cannot read network settings', 'err'));
+}
+
+function saveWifi() {
+    const ap   = document.getElementById('apSsid').value.trim();
+    const ssid = document.getElementById('staSsid').value.trim();
+    const pass = document.getElementById('staPass').value;
+    if (pass.length > 0 && pass.length < 8) {
+        toast('Password must be at least 8 characters', 'err');
+        return;
+    }
+    const q = `/wifi_set?ap=${encodeURIComponent(ap)}&ssid=${encodeURIComponent(ssid)}` +
+              `&pass=${encodeURIComponent(pass)}`;
+    _fetchTimeout(q, {}, 8000).then(r => {
+        if (!r.ok) return r.text().then(t => { throw new Error(t || 'HTTP ' + r.status); });
+        toast('Saved — the radio is restarting', 'ok');
+        document.getElementById('staPass').value = '';
+        // Даём точке доступа подняться под новым именем, потом перечитываем
+        setTimeout(loadWifi, 4000);
+    }).catch(e => toast('Save failed: ' + e.message, 'err'));
+}
+
+function saveCircDialog() {
+    const inp = document.getElementById('wheelCirc');
+    let v = parseInt(inp.value, 10);
     if (isNaN(v)) v = wheelCircMm;
     v = Math.max(2000, Math.min(2500, v));
-    this.value = v;
+    inp.value = v;
     wheelCircMm = v;
     syncSettings();
-    updateInfo();
+    updateInfo().catch(() => {});
+    closeCircDialog();
+    toast(`Wheel circumference: ${v} mm`, 'ok');
+}
+
+document.getElementById('wheelCirc').addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); saveCircDialog(); }
+});
+document.addEventListener('keydown', e => {
+    if (e.key !== 'Escape') return;
+    closeCircDialog();
+    closeRpmDialog();
 });
 
 // Состояние силовой части: 0 — простой, 1 — питание на первом луче и замер
 // оборотов, 2 — полный рендер. Это первый вопрос, который задаёт пользователь
 // («почему не светится?»), а раньше поле pwr забиралось и выбрасывалось.
-const PWR_STATES = [
-    { t: 'Idle',     c: '',        h: 'spin the wheel or press play' },
-    { t: 'Spinning', c: 'is-warn', h: 'faster — LEDs light up above 120 rpm' },
-    { t: 'Running',  c: 'is-ok',   h: 'image is live on the wheel' }
-];
+// Подсказку показываем только в состоянии SPINUP — единственном, где от
+// пользователя что-то требуется. Название состояния как таковое не выводим.
+const PWR_HINTS = ['', 'faster — LEDs light up above 120 rpm', ''];
 
 function updateInfo() {
     return fetch('/info').then(r => r.json()).then(d => {
@@ -2328,26 +2519,7 @@ function updateInfo() {
         // speed (km/h) = circumference(mm) * rpm / 60 / 1000 * 3.6
         const kmh = wheelCircMm * rpm * 0.00006;
         document.getElementById('infoSpeed').textContent = kmh.toFixed(1);
-
-        // Состояние + подпись
-        const st = PWR_STATES[d.pwr] || PWR_STATES[0];
-        const card = document.getElementById('stateCard');
-        card.className = 'stat ' + st.c;
-        document.getElementById('pwrState').textContent = st.t;
-        document.getElementById('pwrHint').textContent  = st.h;
-
-        // Ротор крутится в такт колесу; период зажат, чтобы не мигать на высоких rpm
-        const rotor = document.getElementById('rotor');
-        rotor.classList.toggle('run', rpm > 1);
-        rotor.classList.toggle('rev', rev);
-        if (rpm > 1) {
-            const sec = Math.min(4, Math.max(0.4, 60 / rpm));
-            document.getElementById('rotorSpin').style.animationDuration = sec.toFixed(2) + 's';
-        }
-
-        // Диагностика рендера
-        if (d.step !== undefined) document.getElementById('infoStep').textContent = d.step.toFixed(2);
-        if (d.fill !== undefined) document.getElementById('infoFill').textContent = d.fill;
+        document.getElementById('pwrHint').textContent = PWR_HINTS[d.pwr] || '';
     });
     // Нет .catch() — ошибка пробрасывается в _pollInfo для остановки цепочки
 }
@@ -2365,16 +2537,15 @@ function _voltToPct(mv) {
 
 function updateBatteryStatus() {
     return fetch('/battery').then(r => r.json()).then(d => {
-        document.getElementById('batV').textContent = (d.vbat/1000).toFixed(2);
-        document.getElementById('usbV').textContent = (d.vusb/1000).toFixed(2);
+        // Десятых вольта достаточно: сотые — это шум АЦП и просадка под нагрузкой
+        document.getElementById('batV').textContent = (d.vbat/1000).toFixed(1);
+        document.getElementById('usbV').textContent = (d.vusb/1000).toFixed(1);
 
-        // Обновляем полоску батареи
         const pct = (d.soc !== undefined) ? d.soc : _voltToPct(d.vbat);
-        const bar = document.getElementById('batBar');
-        bar.style.width = pct.toFixed(0) + '%';
-        // Цвет полосы — по остатку: до 15 % красная, до 35 % жёлтая.
-        bar.style.background = pct < 15 ? 'var(--danger)' : (pct < 35 ? 'var(--warn)' : 'var(--ok)');
-        document.getElementById('batPct').textContent = pct.toFixed(0) + '%';
+        const el  = document.getElementById('batPct');
+        el.textContent = pct.toFixed(0) + '%';
+        // Цвет процента — по остатку: до 15 % красный, до 35 % жёлтый
+        el.style.color = pct < 15 ? 'var(--danger)' : (pct < 35 ? 'var(--warn)' : 'var(--ok)');
 
         // IP2312U: состояние заряда выводится из наличия USB и уровня на IO8
         if (d.chg !== undefined) {
@@ -2384,12 +2555,9 @@ function updateBatteryStatus() {
                 ['Charged',     'badge badge-ok'],
             ];
             const entry = chgMap[d.chg];
-            for (const id of ['chgStat', 'chgStat2']) {
-                const el = document.getElementById(id);
-                if (!el) continue;
-                el.textContent = entry ? entry[0] : '--';
-                el.className   = entry ? entry[1] : 'badge';
-            }
+            const el = document.getElementById('chgStat');
+            el.textContent = entry ? entry[0] : '--';
+            el.className   = entry ? entry[1] : 'badge';
         }
     });
     // Нет .catch() — ошибка пробрасывается в _pollBattery для остановки цепочки
@@ -2549,7 +2717,7 @@ function _setOnline(online) {
         dot.className    = 'log-dot offline';
         text.textContent = 'Offline';
         text.style.color = 'var(--danger)';
-        document.getElementById('pwrHint').textContent = 'no connection to the device';
+        document.getElementById('pwrHint').textContent = 'no connection';
     }
 }
 
@@ -2675,87 +2843,146 @@ async function _pingLoop() {
     _conn.pingTimer = setTimeout(_pingLoop, 2000);
 }
 
-// ===================== TOUCH SCROLL GUARD =====================
-// Проблема: браузер на мобильном при touchstart на input[range] сразу прыгает
-// ползунком к позиции пальца, даже если пользователь хотел прокрутить страницу.
-// Решение: перехватываем touchstart с preventDefault() чтобы отменить нативное
-// поведение слайдера, затем сами управляем value через touchmove.
-// Скролл восстанавливается когда определяем вертикальное направление.
-(function() {
-    // Исключаем dual-range brightness — у него своя логика pointer-events
-    const EXCLUDED = ['bMinSlide', 'bMaxSlide'];
+// ===================== ДВИЖОК ПОЛЗУНКОВ =====================
+// Нативный <input type="range"> на телефоне ставит значение по первому же
+// касанию. Из-за этого палец, опущенный на ползунок в начале прокрутки, сбивал
+// настройку — а прокрутить страницу в этом месте было почти невозможно.
+//
+// Поэтому у ползунков pointer-events: none, а жесты обрабатывает код ниже:
+//   • мышь и стилус — значение ставится сразу по X, как у обычного ползунка;
+//   • палец — значение не трогаем, пока не станет ясно, что жест горизонтальный;
+//   • вертикальный жест уходит странице: touch-action: pan-y разрешает нативную
+//     прокрутку с инерцией, а браузер присылает нам pointercancel — мы просто
+//     выходим, ничего не изменив;
+//   • короткий тап без движения ставит значение по месту касания.
+// Значение выставляется через dispatchEvent('input'), поэтому все обработчики
+// (oninput в разметке, парная логика двойного ползунка, отправка на устройство)
+// продолжают работать так же, как при нативном перетаскивании.
+const DRAG_SLOP = 8;   // px: с какого смещения жест считается определившимся
 
-    document.addEventListener('touchstart', function(e) {
-        const el = e.target;
-        if (el.tagName !== 'INPUT' || el.type !== 'range') return;
-        if (EXCLUDED.includes(el.id)) return;
+function _slSetValue(el, v) {
+    const step = +el.step || 1;
+    let x = Math.round(v / step) * step;
+    x = Math.min(+el.max, Math.max(+el.min, x));
+    x = +x.toFixed(6);          // 0.1+0.2 = 0.30000000000000004 — обрезаем хвост
+    if (el.value === String(x)) return;
+    el.value = x;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+}
 
-        // Запоминаем начальное значение слайдера и позицию пальца.
-        // НЕ вызываем preventDefault здесь — иначе вертикальный скролл по слайдеру невозможен.
-        const startX   = e.touches[0].clientX;
-        const startY   = e.touches[0].clientY;
-        const startVal = +el.value;
+// Полезная ширина трека — без половин ручки на концах, ровно как её считает
+// браузер; иначе на краях шкалы палец и ручка расходятся.
+function _slUsable(rect) { return Math.max(1, rect.width - 2 * THUMB_R); }
+
+function _slValueAtX(el, clientX, rect) {
+    const p = Math.min(1, Math.max(0, (clientX - rect.left - THUMB_R) / _slUsable(rect)));
+    return +el.min + p * (+el.max - +el.min);
+}
+
+// Какой ползунок зоны тянуть: ближайший по положению ручки. Если ручки сошлись
+// в одну точку (двойной ползунок яркости на одном значении) — решаем по стороне
+// касания, иначе один из двух становится недостижимым.
+function _slPick(zone, clientX) {
+    const list = Array.from(zone.querySelectorAll('input[type="range"]'));
+    if (list.length < 2) return list[0] || null;
+    const rect   = list[0].getBoundingClientRect();
+    const usable = _slUsable(rect);
+    const xOf = el => rect.left + THUMB_R +
+        ((+el.value - +el.min) / ((+el.max - +el.min) || 1)) * usable;
+    let best = list[0], bestD = Infinity;
+    for (const el of list) {
+        const d = Math.abs(clientX - xOf(el));
+        if (d < bestD) { bestD = d; best = el; }
+    }
+    if (Math.abs(xOf(list[0]) - xOf(list[1])) < 6) {
+        best = (clientX <= xOf(list[0])) ? list[0] : list[1];
+    }
+    return best;
+}
+
+function _slBind(zone) {
+    zone.addEventListener('pointerdown', e => {
+        if (e.button > 0) return;
+        const el = _slPick(zone, e.clientX);
+        if (!el || el.disabled) return;
+
         const rect     = el.getBoundingClientRect();
-        let decided    = false;
-        let activated  = false;
+        const startX   = e.clientX, startY = e.clientY;
+        const startVal = +el.value;
+        const span     = +el.max - +el.min;
+        const usable   = _slUsable(rect);
+        const touch    = (e.pointerType === 'touch');
+        let active     = !touch;      // мышь и стилус тянем сразу
+        let done       = false;
 
-        function onMove(ev) {
-            const dx = ev.touches[0].clientX - startX;
-            const dy = ev.touches[0].clientY - startY;
-            const adx = Math.abs(dx), ady = Math.abs(dy);
+        if (active) {
+            e.preventDefault();       // не выделять текст при перетаскивании
+            _slSetValue(el, _slValueAtX(el, e.clientX, rect));
+        }
 
-            if (!decided) {
-                if (ady > adx && ady > 6) {
-                    // Вертикальный свайп — отдаём скроллу
-                    decided = true;
-                    cleanup();
-                    return;
-                }
-                if (adx > 6) {
-                    decided   = true;
-                    activated = true;
-                    // Только теперь блокируем нативный скролл/прыжок ползунка
-                    ev.preventDefault();
-                }
+        const onMove = ev => {
+            if (ev.pointerId !== e.pointerId) return;
+            const dx = ev.clientX - startX, dy = ev.clientY - startY;
+            if (!active) {
+                // Вертикаль — это прокрутка, уходим и не трогаем значение
+                if (Math.abs(dy) > Math.abs(dx) && Math.abs(dy) > DRAG_SLOP) { finish(); return; }
+                if (Math.abs(dx) <= DRAG_SLOP) return;
+                active = true;
             }
+            _slSetValue(el, startVal + (dx / usable) * span);
+        };
 
-            if (!activated) return;
+        const onUp = ev => {
+            if (ev.pointerId !== e.pointerId) return;
+            const moved = Math.abs(ev.clientX - startX) > DRAG_SLOP ||
+                          Math.abs(ev.clientY - startY) > DRAG_SLOP;
+            if (touch && !active && !moved) _slSetValue(el, _slValueAtX(el, ev.clientX, rect));
+            finish();
+        };
 
-            // Управляем value вручную пропорционально смещению пальца
-            ev.preventDefault();
-            const range   = +el.max - +el.min;
-            const ratio   = dx / rect.width;
-            const step    = +el.step || 1;
-            const raw     = startVal + ratio * range;
-            const snapped = Math.round(raw / step) * step;
-            const clamped = Math.min(+el.max, Math.max(+el.min, snapped));
-            if (el.value !== String(clamped)) {
-                el.value = clamped;
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-            }
+        // pointercancel приходит, когда браузер забрал жест под прокрутку —
+        // именно это и нужно: выходим молча, значение остаётся прежним.
+        const onCancel = ev => { if (ev.pointerId === e.pointerId) finish(); };
+
+        function finish() {
+            if (done) return;
+            done = true;
+            window.removeEventListener('pointermove',   onMove);
+            window.removeEventListener('pointerup',     onUp);
+            window.removeEventListener('pointercancel', onCancel);
         }
 
-        function onEnd() {
-            cleanup();
-        }
+        window.addEventListener('pointermove',   onMove);
+        window.addEventListener('pointerup',     onUp);
+        window.addEventListener('pointercancel', onCancel);
+    });
+}
 
-        function cleanup() {
-            document.removeEventListener('touchmove', onMove);
-            el.removeEventListener('touchend',  onEnd);
+// Каждому ползунку нужна зона перехвата. У двойного ползунка яркости и у шкалы
+// тока такой контейнер уже есть, остальные оборачиваем на лету.
+function initSliders() {
+    document.querySelectorAll('input[type="range"]').forEach(el => {
+        let zone = el.parentElement;
+        if (!zone.classList.contains('sl') &&
+            !zone.classList.contains('bri-wrap') &&
+            !zone.classList.contains('abl-wrap')) {
+            zone = document.createElement('div');
+            zone.className = 'sl';
+            el.parentNode.insertBefore(zone, el);
+            zone.appendChild(el);
         }
-
-        // Слушаем на document с passive:false чтобы иметь возможность вызвать preventDefault
-        document.addEventListener('touchmove', onMove, { passive: false });
-        el.addEventListener('touchend',  onEnd);
-    }, { passive: true });
-})();
+        if (!zone._slBound) { zone._slBound = true; _slBind(zone); }
+    });
+}
 
 window.onload = () => {
     let tab = null;
     try { tab = localStorage.getItem('pov-tab'); } catch (e) {}
     showTab(TABS.includes(tab) ? tab : 'library');
+    initSliders();
     refreshRanges();
     updateDualRange();
+    _renderNowPlaying();
     // Запускаем только ping-цикл. Он сам определит когда устройство онлайн
     // и запустит синхронизацию + polling. Это работает корректно и при первой
     // загрузке страницы, и при переподключении после ребута устройства.
