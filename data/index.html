@@ -1094,21 +1094,176 @@ class MinimalGIF {
 const LEDS_PER_SIDE = 44;
 const R_OUTER_FRAC  = 0.495;              // outer LED (273 mm) -> image edge
 const R_INNER_FRAC  = 0.495 * 49 / 273;   // inner LED (49 mm)  -> 0.0889
-const FRAME_BYTES   = 360 * LEDS_PER_SIDE * 2;
+const FRAME_BYTES   = 360 * LEDS_PER_SIDE * 2;   // RGB565 — в этом виде приходит /preview
+// Формат кадра на устройстве: индекс в палитре из 256 цветов RGB888, палитра
+// своя на каждый кадр. Вдвое меньше RGB565 при МЕНЬШЕЙ ошибке — RGB565 тратит
+// квантование поровну на все 15840 пикселей независимо от содержимого, а
+// палитра только там, где цветов действительно много.
+const PAL_COLORS    = 256;
+const PAL_BYTES     = PAL_COLORS * 3;            // 768
+const IDX_BYTES     = 360 * LEDS_PER_SIDE;       // 15840
+const FRAME_STRIDE  = PAL_BYTES + IDX_BYTES;     // 16608 байт на кадр
 const SRC_SIZE_IMG  = 600;                // рабочий холст для статичной картинки
 const SRC_SIZE_GIF  = 400;                // для кадров GIF — их много, экономим время
 const SRC_SIZE_VID  = 400;                // видео: та же цена за кадр, что и GIF
 
-// Пороги упорядоченного дизеринга 4×4, в долях уровня: (m + 0.5)/16 ∈ (0,1).
-// 5 бит на R/B — это 32 уровня, и на плавном градиенте они видны полосами.
-// Байер разменивает полосу на регулярный шум амплитудой в один уровень: на
-// вращающемся ободе шум не читается, а полоса читается.
-const BAYER4 = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map(m => (m + 0.5) / 16);
+// =============== КВАНТОВАНИЕ КАДРА В ПАЛИТРУ (MEDIAN CUT) ===============
+// Дизеринга здесь нет и он не нужен: у RGB565 полосы на градиенте брались от
+// жёсткой сетки в 32 уровня на канал, а палитра расставляет свои 256 цветов по
+// тому, что в кадре реально есть. Отсутствие дизеринга — ещё и выигрыш:
+// устройство смешивает соседние кадры анимации, и разошедшийся между ними
+// шумовой узор был бы виден как «шевеление».
+//
+// Гистограмма строится по корзинам 6 бит на канал (262144 штуки). Пять бит
+// заметно дешевле по памяти, но на файлах с небольшим числом точных цветов
+// (логотипы, плоская графика) две разные краски попадали в одну корзину и
+// усреднялись; на шести битах этого практически не случается.
+const QBITS = 6, QB = 1 << QBITS, QN = QB * QB * QB, QSH = 8 - QBITS;
 
-// Квантование 0..255 → 0..lvl со смещением порога d.
-function q565(v, lvl, d) {
-    const x = (v * lvl / 255 + d) | 0;
-    return x < 0 ? 0 : (x > lvl ? lvl : x);
+let _qCnt = null, _qSr, _qSg, _qSb, _qNear, _qKey, _qLive, _qOrd, _qTmp, _qBr, _qBg, _qBb;
+
+function _qAlloc() {
+    if (_qCnt) return;
+    // Таблицы гистограммы переиспользуются между кадрами: после кадра обнуляются
+    // только занятые корзины, поэтому 4 МБ выделяются один раз за сессию.
+    _qCnt = new Int32Array(QN);  _qSr = new Int32Array(QN);
+    _qSg = new Int32Array(QN);   _qSb = new Int32Array(QN);
+    _qNear = new Uint8Array(QN);            // корзина → запись палитры
+    _qKey  = new Int32Array(IDX_BYTES);     // пиксель → корзина
+    // Разных корзин не может быть больше, чем пикселей.
+    _qLive = new Int32Array(IDX_BYTES);
+    _qOrd  = new Int32Array(IDX_BYTES);
+    _qTmp  = new Int32Array(IDX_BYTES);
+    _qBr = new Uint8Array(IDX_BYTES); _qBg = new Uint8Array(IDX_BYTES); _qBb = new Uint8Array(IDX_BYTES);
+}
+
+// rgb: Uint8Array(IDX_BYTES × 3) в порядке сектор→диод.
+// Возвращает Uint8Array(FRAME_STRIDE): палитра RGB888, затем индексы.
+function quantizeFrame(rgb) {
+    _qAlloc();
+    const cnt = _qCnt, sr = _qSr, sg = _qSg, sb = _qSb;
+    const live = _qLive, key = _qKey, ord = _qOrd, tmp = _qTmp;
+    const br = _qBr, bg = _qBg, bb = _qBb;
+
+    // --- гистограмма ---
+    let nLive = 0;
+    for (let p = 0, o = 0; p < IDX_BYTES; p++, o += 3) {
+        const r = rgb[o], g = rgb[o + 1], b = rgb[o + 2];
+        const k = ((r >> QSH) << (2 * QBITS)) | ((g >> QSH) << QBITS) | (b >> QSH);
+        key[p] = k;
+        if (cnt[k] === 0) live[nLive++] = k;
+        cnt[k]++; sr[k] += r; sg[k] += g; sb[k] += b;
+    }
+    for (let i = 0; i < nLive; i++) {
+        const k = live[i];
+        ord[i] = i;
+        br[i] = k >>> (2 * QBITS); bg[i] = (k >>> QBITS) & (QB - 1); bb[i] = k & (QB - 1);
+    }
+
+    // --- median cut ---
+    // Боксы — полуинтервалы в ord. Счётчик, длиннейшая сторона и её ось
+    // кэшируются: пересчитывать их для всех боксов на каждом шаге значило бы
+    // 256 проходов по всей гистограмме, а так пересчёт трогает только две
+    // половинки только что разрезанного бокса.
+    const blo = new Int32Array(PAL_COLORS), bhi = new Int32Array(PAL_COLORS);
+    const bcnt = new Float64Array(PAL_COLORS);
+    const bext = new Int32Array(PAL_COLORS), bax = new Int32Array(PAL_COLORS);
+    const csC = new Int32Array(QB);
+
+    function measure(i) {
+        const lo = blo[i], hi = bhi[i];
+        let r0 = 255, r1 = -1, g0 = 255, g1 = -1, b0 = 255, b1 = -1, c = 0;
+        for (let j = lo; j < hi; j++) {
+            const t = ord[j], R = br[t], G = bg[t], B = bb[t];
+            if (R < r0) r0 = R; if (R > r1) r1 = R;
+            if (G < g0) g0 = G; if (G > g1) g1 = G;
+            if (B < b0) b0 = B; if (B > b1) b1 = B;
+            c += cnt[live[t]];
+        }
+        const er = r1 - r0, eg = g1 - g0, eb = b1 - b0;
+        let e = er, ax = 0;
+        if (eg > e) { e = eg; ax = 1; }
+        if (eb > e) { e = eb; ax = 2; }
+        bcnt[i] = c; bext[i] = e; bax[i] = ax;
+    }
+
+    let nb = 1; blo[0] = 0; bhi[0] = nLive; measure(0);
+    while (nb < PAL_COLORS) {
+        // Режем бокс с максимумом «пикселей × длиннейшая сторона»: по одному
+        // числу пикселей палитра уходит на большие ровные заливки, по одному
+        // объёму — на редкий шум.
+        let bi = -1, bs = -1;
+        for (let i = 0; i < nb; i++) {
+            if (bhi[i] - blo[i] < 2 || bext[i] === 0) continue;
+            const s = bcnt[i] * bext[i];
+            if (s > bs) { bs = s; bi = i; }
+        }
+        if (bi < 0) break;
+
+        const lo = blo[bi], hi = bhi[bi], ax = bax[bi];
+        const co = (ax === 0) ? br : (ax === 1 ? bg : bb);
+        // Сортировка подсчётом по координате оси: значений всего QB, полноценная
+        // сортировка здесь была бы самой дорогой частью конвертации.
+        csC.fill(0);
+        for (let j = lo; j < hi; j++) csC[co[ord[j]]]++;
+        for (let v = 0, s = 0; v < QB; v++) { const c = csC[v]; csC[v] = s; s += c; }
+        for (let j = lo; j < hi; j++) { const t = ord[j]; tmp[csC[co[t]]++] = t; }
+        for (let j = lo; j < hi; j++) ord[j] = tmp[j - lo];
+
+        // Взвешенная медиана: делим по числу пикселей, а не корзин.
+        const half = bcnt[bi] / 2;
+        let acc = 0, k = 1;
+        for (let j = lo; j < hi; j++) {
+            acc += cnt[live[ord[j]]];
+            if (acc >= half) { k = j - lo + 1; break; }
+        }
+        if (k < 1) k = 1;
+        if (k > hi - lo - 1) k = hi - lo - 1;
+
+        bhi[bi] = lo + k;
+        blo[nb] = lo + k; bhi[nb] = hi;
+        measure(bi); measure(nb);
+        nb++;
+    }
+
+    // --- палитра: среднее по боксу, посчитанное по ИСХОДНЫМ 8 битам ---
+    const out = new Uint8Array(FRAME_STRIDE);
+    for (let i = 0; i < nb; i++) {
+        let c = 0, ar = 0, ag = 0, ab = 0;
+        for (let j = blo[i]; j < bhi[i]; j++) {
+            const k = live[ord[j]];
+            c += cnt[k]; ar += sr[k]; ag += sg[k]; ab += sb[k];
+        }
+        out[i * 3]     = Math.round(ar / c);
+        out[i * 3 + 1] = Math.round(ag / c);
+        out[i * 3 + 2] = Math.round(ab / c);
+    }
+
+    // --- индексы: БЛИЖАЙШАЯ запись палитры, а не запись своего бокса ---
+    // Границы боксов не совпадают с границами Вороного, и у корзины с краю
+    // соседний бокс нередко ближе. Поиск идёт по корзинам (их тысячи), а не по
+    // пикселям (их 15840), поэтому обходится в единицы миллисекунд.
+    const near = _qNear;
+    for (let i = 0; i < nLive; i++) {
+        const k = live[i], c = cnt[k];
+        const mr = sr[k] / c, mg = sg[k] / c, mb = sb[k] / c;
+        let best = 0, bd = Infinity;
+        for (let q = 0, o = 0; q < nb; q++, o += 3) {
+            const dr = mr - out[o], dg = mg - out[o + 1], db = mb - out[o + 2];
+            const d = dr * dr + dg * dg + db * db;
+            if (d < bd) { bd = d; best = q; }
+        }
+        near[k] = best;
+    }
+    for (let p = 0; p < IDX_BYTES; p++) out[PAL_BYTES + p] = near[key[p]];
+
+    // Чистим только занятые корзины — обнулять 262144 ячейки на каждый кадр
+    // дороже, чем сам median cut.
+    for (let i = 0; i < nLive; i++) {
+        const k = live[i];
+        cnt[k] = 0; sr[k] = 0; sg[k] = 0; sb[k] = 0;
+    }
+    return out;
 }
 
 // Полярная выборка с усреднением по ячейке.
@@ -1122,7 +1277,10 @@ function toPolarBuffer(srcCanvas, ss) {
     const W = srcCanvas.width, H = srcCanvas.height;
     const ctx = srcCanvas.getContext('2d', {willReadFrequently: true});
     const sData = ctx.getImageData(0, 0, W, H).data;
-    const buf = new Uint8Array(FRAME_BYTES);
+    // Промежуточный буфер RGB888 переиспользуется: квантователь всё равно
+    // копирует результат в свой кадр, а на анимации это сотни аллокаций.
+    if (!toPolarBuffer._rgb) toPolarBuffer._rgb = new Uint8Array(IDX_BYTES * 3);
+    const rgb = toPolarBuffer._rgb;
     const cx = W / 2, cy = H / 2;
     const minR = W * R_INNER_FRAC;
     const maxR = W * R_OUTER_FRAC;
@@ -1172,17 +1330,14 @@ function toPolarBuffer(srcCanvas, ss) {
                     sb += sData[i00 + 2] * w00 + sData[i10 + 2] * w10 + sData[i01 + 2] * w01 + sData[i11 + 2] * w11;
                 }
             }
-            // Дизеринг общий на три канала: порог зависит только от места
-            // ячейки, поэтому нейтральный серый остаётся нейтральным.
-            const d = BAYER4[((sector & 3) << 2) | (r & 3)];
-            const v = (q565(sr / n, 31, d) << 11) |
-                      (q565(sg / n, 63, d) <<  5) |
-                       q565(sb / n, 31, d);
-            buf[off++] = v & 0xFF;   // little-endian — устройство читает пиксель одним uint16
-            buf[off++] = v >>> 8;
+            // Округление, а не отбрасывание дробной части: усечение
+            // систематически затемняло бы кадр на пол-уровня.
+            rgb[off++] = Math.min(255, (sr / n + 0.5) | 0);
+            rgb[off++] = Math.min(255, (sg / n + 0.5) | 0);
+            rgb[off++] = Math.min(255, (sb / n + 0.5) | 0);
         }
     }
-    return buf;
+    return quantizeFrame(rgb);
 }
 
 // Render all GIF frames to polar buffers
@@ -1362,7 +1517,7 @@ async function extractWebPFrames(ab, fit, onProgress) {
 
     const frames = [];
     const n = anim.frames.length;
-    // ANI5 хранит одну задержку на всю анимацию — берём длительность первого кадра.
+    // ANI6 хранит одну задержку на всю анимацию — берём длительность первого кадра.
     const delayMs = Math.max(1, anim.frames[0].dur || 100);
 
     for (let i = 0; i < n; i++) {
@@ -1539,13 +1694,13 @@ function maxFramesForDevice() {
     const MARGIN = 256 * 1024;      // запас на служебные аллокации во время загрузки
     let byPsram = 240;              // прошивка без psram_free: считаем по 8 МБ PSRAM
     if (_devLimits && _devLimits.psFree) {
-        byPsram = Math.floor((_devLimits.psFree - MARGIN) / FRAME_BYTES);
+        byPsram = Math.floor((_devLimits.psFree - MARGIN) / FRAME_STRIDE);
     }
     let byFs = Infinity;
     if (_devLimits && _devLimits.fsFree) {
-        byFs = Math.floor((_devLimits.fsFree - FS_RESERVE - HDR) / FRAME_BYTES);
+        byFs = Math.floor((_devLimits.fsFree - FS_RESERVE - HDR) / FRAME_STRIDE);
     }
-    // Счётчик кадров в заголовке ANI5 — uint16.
+    // Счётчик кадров в заголовке ANI6 — uint16.
     return Math.max(1, Math.min(byPsram, byFs, 65535));
 }
 
@@ -1605,7 +1760,7 @@ async function _updateVideoBudget(file, resetLength) {
     const avail = dur > 0 ? dur : o.len;
     const want  = Math.max(1, Math.round(Math.min(o.len, avail) * o.fps));
     const n     = Math.min(want, maxF);
-    const kb    = ((8 + n * FRAME_BYTES) / 1024).toFixed(0);
+    const kb    = ((8 + n * FRAME_STRIDE) / 1024).toFixed(0);
 
     let txt = (dur > 0 ? `source ${dur.toFixed(1)} s · ` : '') +
               `${(n / o.fps).toFixed(1)} s @ ${o.fps} fps = ${n} frames · ${kb} kB`;
@@ -1639,7 +1794,7 @@ const previewCtx = previewCanvas.getContext('2d', {willReadFrequently: true});
 // командой uploadfs, поэтому «поправил, а не изменилось» почти всегда означает,
 // что в браузере старая версия. Метка рядом с именем устройства позволяет
 // проверить это за секунду, не гадая. Увеличивать при каждом изменении файла.
-const UI_BUILD = 'ui 8';
+const UI_BUILD = 'ui 9';
 
 // ===================== ТЕМА =====================
 // Тёмная по умолчанию (устройство катают вечером), но на солнце экран телефона
@@ -1897,11 +2052,16 @@ function buildFileName(prefix, rawBase) {
     return { name: safe, warning: `"${rawBase}" — ${reason}. Saving as: ${safe}` };
 }
 
-// Собирает файл анимации: "ANI5" + кол-во кадров (uint16 LE) + задержка мс
-// (uint16 LE) + кадры RGB565 подряд. frames — массив Uint8Array по FRAME_BYTES.
-function packANI5(frames, delayMs) {
-    const buf = new Uint8Array(8 + frames.length * FRAME_BYTES);
-    buf[0] = 65; buf[1] = 78; buf[2] = 73; buf[3] = 53;   // "ANI5" ("ANIM" = старые RGB888)
+// Собирает файл: "ANI6" + кол-во кадров (uint16 LE) + задержка мс (uint16 LE) +
+// кадры подряд, каждый — палитра 768 байт и следом 15840 индексов.
+// frames — массив Uint8Array по FRAME_STRIDE.
+//
+// Заголовок носит и одиночная картинка (кол-во кадров = 1). Раньше статичный
+// кадр писался вообще без заголовка и опознавался по размеру файла — с
+// появлением второго формата такое опознание перестало быть однозначным.
+function packANI6(frames, delayMs) {
+    const buf = new Uint8Array(8 + frames.length * FRAME_STRIDE);
+    buf[0] = 65; buf[1] = 78; buf[2] = 73; buf[3] = 54;   // "ANI6" (ANI5 = RGB565, ANIM = RGB888)
     buf[4] = frames.length & 0xFF; buf[5] = (frames.length >> 8) & 0xFF;
     const dd = Math.max(1, Math.min(65535, delayMs | 0));
     buf[6] = dd & 0xFF; buf[7] = (dd >> 8) & 0xFF;
@@ -1948,7 +2108,7 @@ async function _convertFile(file, label) {
                 `${tag} — decoding ${done}/${total} frames (${(done * 100 / total).toFixed(0)}%)`, '');
         });
         const kept = _capFrames(frames, tag);
-        return { buf: packANI5(kept, delayMs), fileName, frameCount: kept.length };
+        return { buf: packANI6(kept, delayMs), fileName, frameCount: kept.length };
     }
 
     if (isVid) {
@@ -1961,7 +2121,7 @@ async function _convertFile(file, label) {
         });
         // Задержка кадра в заголовке — целые миллисекунды, uint16.
         const delay = Math.max(1, Math.round(1000 / o.fps));
-        return { buf: packANI5(frames, delay), fileName, frameCount: frames.length };
+        return { buf: packANI6(frames, delay), fileName, frameCount: frames.length };
     }
 
     if (isGif) {
@@ -1971,7 +2131,7 @@ async function _convertFile(file, label) {
         await loadDevLimits(true);
         const frames = renderGIFFrames(gif, fit);
         const kept = _capFrames(frames, tag);
-        const buf = packANI5(kept.map(f => f.data), kept[0].delay || 100);
+        const buf = packANI6(kept.map(f => f.data), kept[0].delay || 100);
         return { buf, fileName, frameCount: kept.length };
     } else {
         const dataUrl = await new Promise((res, rej) => {
@@ -1995,7 +2155,9 @@ async function _convertFile(file, label) {
         ctx.imageSmoothingEnabled = true;
         ctx.imageSmoothingQuality = 'high';
         drawSquare(img, ctx, SRC_SIZE_IMG, _fitMode());
-        return { buf: toPolarBuffer(oc, 3), fileName };
+        // Одиночная картинка — тот же ANI6 из одного кадра: отдельного
+        // безголового формата больше нет.
+        return { buf: packANI6([toPolarBuffer(oc, 3)], 100), fileName };
     }
 }
 

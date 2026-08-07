@@ -246,6 +246,21 @@ static void frame888to565(const uint8_t* src, uint8_t* dst) {
     }
 }
 
+// Палитровый кадр → RGB565, для /preview. Наружу отдаётся только RGB565, чтобы
+// браузер рисовал миниатюры одним кодом независимо от формата файла.
+// src и dst обязаны быть РАЗНЫМИ: результат вдвое больше исходника.
+static void framePalTo565(const uint8_t* src, uint8_t* dst) {
+    const uint8_t* pal = src;
+    const uint8_t* idx = src + PAL_BYTES;
+    for (int p = 0; p < SECTORS * LEDS_PER_SIDE; p++) {
+        const uint8_t* c = pal + (size_t)idx[p] * 3;
+        uint16_t v = pack565(c[0], c[1], c[2]);
+        dst[0] = (uint8_t)(v & 0xFF);
+        dst[1] = (uint8_t)(v >> 8);
+        dst += 2;
+    }
+}
+
 void loadFrameFromFile(String path) {
     File f = LittleFS.open(path, "r");
     if (!f) return;
@@ -289,32 +304,41 @@ void loadFrameFromFile(String path) {
     uint8_t*  newBuf        = nullptr;
     uint32_t  newTotalFrames = 1;
     uint16_t  newFrameDelay  = 100;
+    uint8_t   newFmt         = FRAME_FMT_565;
 
     size_t fileSize = f.size();
 
-    // Формат задаётся magic'ом: "ANI5" — кадры RGB565, "ANIM" — старые RGB888.
-    // Статичная картинка заголовка не имеет и различается по размеру файла.
+    // Формат задаётся magic'ом: "ANI6" — палитра 256 цветов на кадр (основной),
+    // "ANI5" — кадры RGB565, "ANIM" — старые RGB888. Статичная картинка старого
+    // конвертера заголовка не имеет и различается по размеру файла.
     char magic[4] = {0, 0, 0, 0};
     if (fileSize >= 8) f.read((uint8_t*)magic, 4);
+    bool animpal = (memcmp(magic, "ANI6", 4) == 0);
     bool anim565 = (memcmp(magic, "ANI5", 4) == 0);
     bool anim888 = (memcmp(magic, "ANIM", 4) == 0);
 
-    if (anim565 || anim888) {
+    if (animpal || anim565 || anim888) {
         f.read((uint8_t*)&newTotalFrames, 2);
         f.read((uint8_t*)&newFrameDelay,  2);
+
+        // Палитровый кадр ложится в PSRAM как есть, RGB888 разворачивается в
+        // RGB565 — поэтому размер на диске и размер в памяти считаются отдельно.
+        size_t srcFrame = animpal ? FRAME_STRIDE_PAL
+                                  : (anim888 ? FRAME_SIZE_888 : FRAME_SIZE);
+        size_t dstFrame = animpal ? FRAME_STRIDE_PAL : FRAME_SIZE;
+        newFmt = animpal ? FRAME_FMT_PAL8 : FRAME_FMT_565;
 
         // Размер файла обязан быть заголовок + N кадров. Не сходится — файл
         // залит не полностью или со сдвигом, и рендер покажет шум. Сказать об
         // этом в лог дешевле, чем гадать, глядя на обод.
-        size_t expect = 8 + (size_t)newTotalFrames *
-                            (size_t)(anim888 ? FRAME_SIZE_888 : FRAME_SIZE);
+        size_t expect = 8 + (size_t)newTotalFrames * srcFrame;
         if (fileSize != expect) {
             webLogf("[WARN] %s: size %u, header says %u frames (expected %u)",
                     path.c_str(), (unsigned)fileSize,
                     (unsigned)newTotalFrames, (unsigned)expect);
         }
 
-        size_t dataSize = (size_t)newTotalFrames * FRAME_SIZE;
+        size_t dataSize = (size_t)newTotalFrames * dstFrame;
         newBuf = (uint8_t*)ps_malloc(dataSize);
 
         // Старому формату нужен буфер под ОДИН исходный кадр: разворачивать всю
@@ -332,21 +356,22 @@ void loadFrameFromFile(String path) {
             // без CPU и роняло соединения.
             uint32_t got = 0;
             for (; got < newTotalFrames; got++) {
-                uint8_t* dst = newBuf + (size_t)got * FRAME_SIZE;
+                uint8_t* dst = newBuf + (size_t)got * dstFrame;
                 bool ok;
                 if (anim888) {
                     ok = (f.read(tmp, FRAME_SIZE_888) == (int)FRAME_SIZE_888);
                     if (ok) frame888to565(tmp, dst);
                 } else {
-                    ok = (f.read(dst, FRAME_SIZE) == (int)FRAME_SIZE);
+                    ok = (f.read(dst, dstFrame) == (int)dstFrame);
                 }
                 if (!ok) break;
                 vTaskDelay(1);
             }
             // Файл оказался короче заявленного числа кадров — хвост должен
-            // быть чёрным, а не мусором из PSRAM.
+            // быть чёрным, а не мусором из PSRAM. Для палитрового формата ноль
+            // тоже безопасен: индекс 0 в обнулённой палитре — чёрный.
             if (got < newTotalFrames) {
-                size_t done = (size_t)got * FRAME_SIZE;
+                size_t done = (size_t)got * dstFrame;
                 memset(newBuf + done, 0, dataSize - done);
                 webLogf("[WARN] Short read: %u of %u frames",
                         (unsigned)got, (unsigned)newTotalFrames);
@@ -389,18 +414,22 @@ void loadFrameFromFile(String path) {
     }
 
     // Новый буфер готов. Переключаем целиком, а не по одному полю: рендер
-    // адресует кадр как frameBuffer + frame_idx·FRAME_SIZE, где frame_idx
-    // считается по totalFrames. Если новое число кадров окажется выставлено
-    // раньше нового буфера, рендер уедет далеко за пределы старого — на ободе
-    // это блочный мусор из PSRAM, тем заметнее, чем тяжелее новая анимация.
-    // Отрисовка уже стоит по frame_loading, так что гонки здесь нет.
+    // адресует кадр как frameBuffer + frame_idx·шаг, где frame_idx считается по
+    // totalFrames, а сам шаг — по frame_fmt. Если хоть одно из трёх полей
+    // окажется выставлено раньше нового буфера, рендер уедет за пределы старого
+    // — на ободе это блочный мусор из PSRAM, тем заметнее, чем тяжелее новая
+    // анимация. Отрисовка уже стоит по frame_loading, так что гонки здесь нет.
     uint8_t* oldBuf = frameBuffer;  // Запоминаем старый указатель для free()
 
     // Устанавливаем новые параметры и буфер
     totalFrames       = newTotalFrames;
     frameDelay        = newFrameDelay;
     currentFrameIndex = 0;
+    frame_fmt         = newFmt;
     frameBuffer       = newBuf;
+    // Развёрнутая палитра относится к прежнему буферу: номер кадра после
+    // загрузки снова 0, и без этого рендер принял бы старый разворот за свой.
+    palette_gen++;
 
     if (oldBuf != nullptr) free(oldBuf);
 
@@ -668,7 +697,7 @@ void setupNetwork() {
                     uint8_t hdr[6];
                     file.read(hdr, 6);
                     if (hdr[0]=='A' && hdr[1]=='N' && hdr[2]=='I' &&
-                        (hdr[3]=='5' || hdr[3]=='M')) {
+                        (hdr[3]=='6' || hdr[3]=='5' || hdr[3]=='M')) {
                         frames = hdr[4] | (hdr[5] << 8);
                     }
                 }
@@ -704,7 +733,7 @@ void setupNetwork() {
         snprintf(buf, sizeof(buf),
                  "{\"total\":%u,\"used\":%u,\"free\":%u,\"psram_free\":%u,\"frame_size\":%u}",
                  (unsigned)total, (unsigned)used, (unsigned)(total - used),
-                 (unsigned)ps_free, (unsigned)FRAME_SIZE);
+                 (unsigned)ps_free, (unsigned)FRAME_STRIDE_PAL);
         request->send(200, "application/json", buf);
     });
 
@@ -1096,9 +1125,10 @@ void setupNetwork() {
         free(buf);
     });
 
-    // GET /preview?file=X — возвращает первый фрейм (FRAME_SIZE байт) для рендеринга превью в браузере.
-    // Для ANIM-файла пропускает 8-байтовый заголовок и возвращает первый фрейм.
-    // Для статичного изображения возвращает данные с начала файла.
+    // GET /preview?file=X — первый кадр для миниатюры в браузере. Наружу всегда
+    // уходит RGB565 (FRAME_SIZE байт), в каком бы формате кадр ни лежал на
+    // флеше. Для файла с заголовком пропускает 8 байт; статичная картинка
+    // старого конвертера читается с начала.
     server.on("/preview", HTTP_GET, [](AsyncWebServerRequest *request){
         if (!request->hasParam("file")) {
             request->send(400, "text/plain", "Missing file");
@@ -1116,8 +1146,11 @@ void setupNetwork() {
         uint8_t hdr[8];
         f.read(hdr, 8);
         size_t offset = 0;
-        bool   legacy = false;
-        if (hdr[0]=='A' && hdr[1]=='N' && hdr[2]=='I' && hdr[3]=='5') {
+        bool   legacy = false;                      // RGB888
+        bool   pal    = false;                      // палитра 256 цветов
+        if (hdr[0]=='A' && hdr[1]=='N' && hdr[2]=='I' && hdr[3]=='6') {
+            offset = 8;  pal = true;                // основной формат
+        } else if (hdr[0]=='A' && hdr[1]=='N' && hdr[2]=='I' && hdr[3]=='5') {
             offset = 8;                             // RGB565: magic + frame_count + frame_delay
         } else if (hdr[0]=='A' && hdr[1]=='N' && hdr[2]=='I' && hdr[3]=='M') {
             offset = 8;  legacy = true;             // старая анимация RGB888
@@ -1126,25 +1159,35 @@ void setupNetwork() {
             legacy = (f.size() >= FRAME_SIZE_888);
         }
 
-        // Наружу всегда уходит RGB565: браузеру незачем знать о старом формате.
-        size_t srcLen = legacy ? FRAME_SIZE_888 : FRAME_SIZE;
+        // Наружу всегда уходит RGB565: браузеру незачем знать, в каком формате
+        // кадр лежит на флеше — превью рисуется одним кодом для всех файлов.
+        size_t srcLen = pal ? FRAME_STRIDE_PAL : (legacy ? FRAME_SIZE_888 : FRAME_SIZE);
         size_t avail  = f.size() - offset;
 
         // Читаем в PSRAM; ownership передаётся лямбде через shared_ptr —
         // память освобождается автоматически когда AsyncWebServer завершит отправку.
         // Кадр великоват, чтобы держать его во внутреннем heap.
-        auto frameBuf = std::shared_ptr<uint8_t>((uint8_t*)ps_malloc(srcLen), free);
+        //
+        // Палитровый кадр вдвое МЕНЬШЕ результата, поэтому разворачивать его на
+        // месте нельзя — выход догонит и затрёт ещё не прочитанные индексы.
+        // Держим исходник и результат в одном блоке друг за другом: лишние
+        // 16 кБ живут в PSRAM доли секунды.
+        size_t bufLen = pal ? (FRAME_SIZE + FRAME_STRIDE_PAL)
+                            : (srcLen > FRAME_SIZE ? srcLen : FRAME_SIZE);
+        auto frameBuf = std::shared_ptr<uint8_t>((uint8_t*)ps_malloc(bufLen), free);
         if (!frameBuf) {
             f.close();
             request->send(500, "text/plain", "OOM");
             return;
         }
         // Обнуляем: обрезанный файл должен дать чёрный хвост, а не мусор из PSRAM.
-        memset(frameBuf.get(), 0, srcLen);
+        memset(frameBuf.get(), 0, bufLen);
+        uint8_t* src = frameBuf.get() + (pal ? FRAME_SIZE : 0);
         f.seek(offset);
-        f.read(frameBuf.get(), (avail < srcLen) ? avail : srcLen);
+        f.read(src, (avail < srcLen) ? avail : srcLen);
         f.close();
-        if (legacy) frame888to565(frameBuf.get(), frameBuf.get());
+        if (pal)         framePalTo565(src, frameBuf.get());
+        else if (legacy) frame888to565(frameBuf.get(), frameBuf.get());
 
         size_t capturedSize = FRAME_SIZE;
         AsyncWebServerResponse* resp = request->beginChunkedResponse(

@@ -24,6 +24,10 @@ RTC_DATA_ATTR uint8_t max_brightness = 31; // единицы SK9822 (1–31), 31
 RTC_DATA_ATTR volatile int global_angle_offset = 93;
 
 uint8_t* frameBuffer = nullptr;
+// Стартовый буфер — один чёрный кадр RGB565 (см. setup): формат меняется вместе
+// с буфером в loadFrameFromFile.
+volatile uint8_t  frame_fmt   = FRAME_FMT_565;
+volatile uint32_t palette_gen = 1;
 
 // Глобальные переменные для поддержки GIF анимаций
 uint32_t currentFrameIndex = 0;
@@ -164,6 +168,7 @@ static inline float rpmEstimate(uint32_t period_us, uint32_t silence_us) {
 }
 uint8_t lut_tone5[32];
 uint8_t lut_tone6[64];
+uint8_t lut_tone8[256];
 
 // =====================================================================
 //                  СОХРАНЕНИЕ НАСТРОЕК В NVS
@@ -502,6 +507,15 @@ void rebuildGammaLUT() {
         v = 128.0f + (v - 128.0f) * factor;
         lut_tone5[i] = (uint8_t)constrain((int)(v + 0.5f), 0, 255);
     }
+    // Палитровому формату двух таблиц не нужно: палитра хранит канал в исходных
+    // 8 битах, промежуточного округления, ради которого R/B и G разведены, нет.
+    for (int i = 0; i < 256; i++) {
+        float v = powf(i / 255.0f, g) * 255.0f;
+        v = 128.0f + (v - 128.0f) * factor;
+        lut_tone8[i] = (uint8_t)constrain((int)(v + 0.5f), 0, 255);
+    }
+    // Развёрнутые палитры кадров построены по старой кривой — пересобрать.
+    palette_gen++;
 }
 
 // Кеш параметров LUT — обновляются в начале каждого оборота в renderingTask,
@@ -584,8 +598,10 @@ static void updateLUTIfNeeded() {
 // При смешивании двух соседних кадров отводы обоих складываются в один список.
 #define ANG_TAPS_BLEND (2 * ANG_TAPS_MAX)
 
-static inline int boxWeights(float c, float span, const uint16_t* frame,
-                             const uint16_t** rows, int* w)
+// Отдаёт НОМЕРА секторов и веса, а не готовые указатели: список секторов один
+// и тот же для RGB565 и для палитрового кадра, различается только адресация
+// пикселя. Указатели строит вызывающий, уже зная формат.
+static inline int boxWeightsSec(float c, float span, int* sec, int* w)
 {
     float a = c - span * 0.5f;
     float b = a + span;
@@ -606,7 +622,7 @@ static inline int boxWeights(float c, float span, const uint16_t* frame,
         if (ww > w[best]) best = j;
         int s = (i0 + j) % 360;
         if (s < 0) s += 360;
-        rows[j] = frame + s * LEDS_PER_SIDE;   // шаг в пикселях: кадр типизован как uint16
+        sec[j] = s;
     }
     // Остаток округления кладём в самый весомый отвод — так он не может увести
     // маленький вес в минус, а суммарная яркость остаётся точной.
@@ -624,54 +640,43 @@ static inline int boxWeights(float c, float span, const uint16_t* frame,
 // смешиванием уменьшает скачок до доли кадра — ровно до того, насколько
 // анимация успевает измениться за 1/6 оборота, а меньше уже физически нельзя.
 //
-// Отводы обоих кадров кладём в один список: samplePix остаётся неизменным,
-// сумма весов по-прежнему ровно 256, лишних проходов по диодам нет.
-static inline int boxWeightsBlend(float c, float span, const uint16_t* fa,
-                                  ptrdiff_t d_next, int a256,
-                                  const uint16_t** rows, int* w)
+// Отводы обоих кадров кладём в один список: проход по диодам остаётся один,
+// сумма весов по-прежнему ровно 256.
+//
+// Первые *n_a отводов относятся к текущему кадру, остальные — к следующему, и
+// секторы у них те же. Границу отдаём наружу: у палитрового формата палитра
+// своя на каждый кадр, поэтому отвод обязан знать, из какой брать цвет.
+static inline int boxWeightsSecBlend(float c, float span, int a256,
+                                     int* sec, int* w, int* n_a)
 {
-    if (a256 <= 0) return boxWeights(c, span, fa, rows, w);
-
-    const uint16_t* r0[ANG_TAPS_MAX];
-    int             w0[ANG_TAPS_MAX];
-    const int n = boxWeights(c, span, fa, r0, w0);
+    const int n = boxWeightsSec(c, span, sec, w);
+    *n_a = n;
+    if (a256 <= 0) return n;
 
     const int inv = 256 - a256;
-    int acc = 0, best = 0, m = 0;
-    for (int j = 0; j < n; j++, m++) {
-        rows[m] = r0[j];
-        w[m]    = (w0[j] * inv) >> 8;
-        acc += w[m];
-        if (w[m] > w[best]) best = m;
+    // n + j всегда больше j, поэтому копия отводов кадра B пишется поверх ещё
+    // не прочитанных ячеек — исходные веса разрешено править на месте.
+    for (int j = 0; j < n; j++) {
+        sec[n + j] = sec[j];
+        w[n + j]   = (w[j] * a256) >> 8;
+        w[j]       = (w[j] * inv)  >> 8;
     }
-    for (int j = 0; j < n; j++, m++) {
-        rows[m] = r0[j] + d_next;      // тот же угол в следующем кадре
-        w[m]    = (w0[j] * a256) >> 8;
-        acc += w[m];
-        if (w[m] > w[best]) best = m;
+    int acc = 0, best = 0;
+    for (int j = 0; j < 2 * n; j++) {
+        acc += w[j];
+        if (w[j] > w[best]) best = j;
     }
     w[best] += 256 - acc;              // остаток округления — в самый весомый отвод
-    return m;
+    return 2 * n;
 }
 
-// Считает цвет одного диода и пишет его в DMA-буфер. Возвращает r+g+b для ABL/RMS.
-// Байт яркости (dst[0]) заполняется отдельным проходом — он зависит от суммы по кадру.
-// Смешивание идёт ПОСЛЕ гамма-таблицы: усреднять надо световой поток, а не код,
-// иначе наполовину перекрытый край выйдет втрое темнее, чем должен.
-static inline uint32_t samplePix(const uint16_t** rows, const int* w, int n, int i,
+// Хвост обработки пикселя, общий для обоих форматов кадра: на вход уже
+// смешанный по отводам световой поток, на выход — байты DMA-буфера и r+g+b для
+// ABL/RMS. Байт яркости (dst[0]) заполняется отдельным проходом — он зависит от
+// суммы по всему кадру.
+static inline uint32_t finishPix(int r, int g, int b,
                                  int sat, int kr, int kg, int kb, uint8_t* dst)
 {
-    int r = 0, g = 0, b = 0;
-    for (int j = 0; j < n; j++) {
-        // Распаковка RGB565 бесплатна: поле кода — сразу индекс своей таблицы.
-        uint16_t v  = rows[j][i];
-        int      ww = w[j];
-        r += lut_tone5[ v >> 11        ] * ww;
-        g += lut_tone6[(v >>  5) & 0x3F] * ww;
-        b += lut_tone5[ v        & 0x1F] * ww;
-    }
-    r >>= 8;  g >>= 8;  b >>= 8;
-
     // Насыщенность — ДО баланса белого: нейтральный серый обязан остаться
     // нейтральным независимо от того, как скорректированы каналы дисплея.
     if (sat != 256) {
@@ -689,6 +694,66 @@ static inline uint32_t samplePix(const uint16_t** rows, const int* w, int n, int
     dst[2] = (uint8_t)g;
     dst[3] = (uint8_t)r;
     return (uint32_t)(r + g + b);
+}
+
+// Считает цвет одного диода из кадра RGB565 и пишет его в DMA-буфер.
+// Смешивание идёт ПОСЛЕ гамма-таблицы: усреднять надо световой поток, а не код,
+// иначе наполовину перекрытый край выйдет втрое темнее, чем должен.
+static inline uint32_t samplePix565(const uint16_t** rows, const int* w, int n, int i,
+                                    int sat, int kr, int kg, int kb, uint8_t* dst)
+{
+    int r = 0, g = 0, b = 0;
+    for (int j = 0; j < n; j++) {
+        // Распаковка RGB565 бесплатна: поле кода — сразу индекс своей таблицы.
+        uint16_t v  = rows[j][i];
+        int      ww = w[j];
+        r += lut_tone5[ v >> 11        ] * ww;
+        g += lut_tone6[(v >>  5) & 0x3F] * ww;
+        b += lut_tone5[ v        & 0x1F] * ww;
+    }
+    return finishPix(r >> 8, g >> 8, b >> 8, sat, kr, kg, kb, dst);
+}
+
+// То же для палитрового кадра. Тональная кривая уже применена к самой палитре
+// (pal_tone_*), поэтому в горячем цикле осталась одна выборка на канал — как и
+// было. Отводы следующего кадра берут свою палитру не ветвлением, а сдвигом
+// индекса на PAL_COLORS: poff[] посчитан один раз на сторону луча.
+static uint8_t pal_tone_r[2 * PAL_COLORS];
+static uint8_t pal_tone_g[2 * PAL_COLORS];
+static uint8_t pal_tone_b[2 * PAL_COLORS];
+
+static inline uint32_t samplePix8(const uint8_t** rows, const int* w, const int* poff,
+                                  int n, int i,
+                                  int sat, int kr, int kg, int kb, uint8_t* dst)
+{
+    int r = 0, g = 0, b = 0;
+    for (int j = 0; j < n; j++) {
+        int c  = rows[j][i] + poff[j];
+        int ww = w[j];
+        r += pal_tone_r[c] * ww;
+        g += pal_tone_g[c] * ww;
+        b += pal_tone_b[c] * ww;
+    }
+    return finishPix(r >> 8, g >> 8, b >> 8, sat, kr, kg, kb, dst);
+}
+
+// Разворот палитры кадра через тональную кривую. 768 выборок на кадр, но
+// делается это только при смене кадра (десяток раз в секунду), а не в цикле по
+// 528 диодам, который крутится сотни раз в секунду.
+static uint32_t pal_cache_a   = 0xFFFFFFFFu;
+static uint32_t pal_cache_b   = 0xFFFFFFFFu;
+static uint32_t pal_cache_gen = 0;
+
+static void expandPalette(const uint8_t* pal, int slot) {
+    uint8_t* dr = pal_tone_r + slot * PAL_COLORS;
+    uint8_t* dg = pal_tone_g + slot * PAL_COLORS;
+    uint8_t* db = pal_tone_b + slot * PAL_COLORS;
+    for (int i = 0; i < PAL_COLORS; i++) {
+        dr[i] = lut_tone8[pal[0]];
+        dg[i] = lut_tone8[pal[1]];
+        db[i] = lut_tone8[pal[2]];
+        pal += 3;
+    }
 }
 
 // Заполняет DMA-буфер данными сектора без отправки по SPI.
@@ -729,7 +794,7 @@ static void fillSectorIntoBuffer(uint8_t* buf, uint8_t buf_idx, float sector0, f
     // доли кадра: ровно до того, насколько анимация меняется за 1/6 оборота.
     // Меньше физически нельзя — круг красят шесть лучей за конечное время.
     uint32_t  frame_idx = 0;
-    ptrdiff_t d_next    = 0;   // смещение до следующего кадра, в пикселях
+    ptrdiff_t d_frame   = 0;   // смещение до следующего кадра, В КАДРАХ
     int       alpha256  = 0;
     if (totalFrames > 1 && frameDelay > 0) {
         uint32_t elapsed_ms = millis() - lastFrameSwitchTime;
@@ -742,14 +807,42 @@ static void fillSectorIntoBuffer(uint8_t* buf, uint8_t buf_idx, float sector0, f
         uint32_t nxt = (frame_idx + 1u) % totalFrames;
         // Разность считаем в знаковых: на петле nxt < frame_idx, и беззнаковое
         // вычитание дало бы гигантское смещение вместо шага назад.
-        d_next = ((ptrdiff_t)nxt - (ptrdiff_t)frame_idx) * (ptrdiff_t)(FRAME_SIZE / 2);
+        d_frame = (ptrdiff_t)nxt - (ptrdiff_t)frame_idx;
     }
     // Новый файл может оказаться короче предыдущего — страховка от адресации
     // за конец буфера, если загрузка произошла между вычислением и чтением.
-    if (frame_idx >= totalFrames) { frame_idx = 0; d_next = 0; alpha256 = 0; }
-    // Кадр адресуется как массив пикселей: FRAME_SIZE кратен 2, ps_malloc
-    // выравнивает начало, поэтому 16-битные чтения всегда выровнены.
-    const uint16_t* frame = (const uint16_t*)(frameBuffer + frame_idx * FRAME_SIZE);
+    if (frame_idx >= totalFrames) { frame_idx = 0; d_frame = 0; alpha256 = 0; }
+
+    const bool pal = (frame_fmt == FRAME_FMT_PAL8);
+
+    // RGB565: кадр адресуется как массив пикселей — FRAME_SIZE кратен 2,
+    // ps_malloc выравнивает начало, поэтому 16-битные чтения всегда выровнены.
+    const uint16_t* frame  = nullptr;
+    ptrdiff_t       d_next = 0;                 // то же смещение в пикселях
+    // Палитровый кадр: база указывает на палитру, индексы лежат следом.
+    const uint8_t*  idx_a  = nullptr;
+    const uint8_t*  idx_b  = nullptr;
+
+    if (pal) {
+        const uint8_t* base_a = frameBuffer + (size_t)frame_idx * FRAME_STRIDE_PAL;
+        const uint8_t* base_b = base_a + d_frame * (ptrdiff_t)FRAME_STRIDE_PAL;
+        idx_a = base_a + PAL_BYTES;
+        idx_b = base_b + PAL_BYTES;
+        // Разворачиваем палитру только когда сменился кадр, подменился буфер или
+        // пересобралась тональная кривая — иначе это была бы работа на каждый
+        // сектор вместо работы на кадр.
+        uint32_t nxt = (uint32_t)((ptrdiff_t)frame_idx + d_frame);
+        if (pal_cache_gen != palette_gen || pal_cache_a != frame_idx || pal_cache_b != nxt) {
+            expandPalette(base_a, 0);
+            expandPalette(base_b, 1);
+            pal_cache_gen = palette_gen;
+            pal_cache_a   = frame_idx;
+            pal_cache_b   = nxt;
+        }
+    } else {
+        frame  = (const uint16_t*)(frameBuffer + (size_t)frame_idx * FRAME_SIZE);
+        d_next = d_frame * (ptrdiff_t)(FRAME_SIZE / 2);
+    }
 
     uint8_t bri_level = global_brightness & 0x1F; // 0–31
     float   abl       = global_abl_limit;          // 0–100 %
@@ -773,16 +866,39 @@ static void fillSectorIntoBuffer(uint8_t* buf, uint8_t buf_idx, float sector0, f
         // Лучи расходятся строго из центра, поэтому все 44 диода стороны лежат на
         // одном радиусе — набор секторов и весов у них общий, и разбор угла
         // выносится из цикла по диодам.
-        const uint16_t* rows_f[ANG_TAPS_BLEND];
-        int             wts_f[ANG_TAPS_BLEND];
-        const uint16_t* rows_b[ANG_TAPS_BLEND];
-        int             wts_b[ANG_TAPS_BLEND];
-        int nf = boxWeightsBlend(bf, span, frame, d_next, alpha256, rows_f, wts_f);
-        int nb = boxWeightsBlend(bb, span, frame, d_next, alpha256, rows_b, wts_b);
-        for (int i = 0; i < LEDS_PER_SIDE; i++) {
-            int kr = gain_r[i], kg = gain_g[i], kb = gain_b[i];
-            pixel_sum += samplePix(rows_f, wts_f, nf, i, sat, kr, kg, kb, dst_f + i * 4);
-            pixel_sum += samplePix(rows_b, wts_b, nb, i, sat, kr, kg, kb, dst_b - i * 4);
+        int sec_f[ANG_TAPS_BLEND], wts_f[ANG_TAPS_BLEND], na_f;
+        int sec_b[ANG_TAPS_BLEND], wts_b[ANG_TAPS_BLEND], na_b;
+        int nf = boxWeightsSecBlend(bf, span, alpha256, sec_f, wts_f, &na_f);
+        int nb = boxWeightsSecBlend(bb, span, alpha256, sec_b, wts_b, &na_b);
+
+        if (pal) {
+            const uint8_t* rf[ANG_TAPS_BLEND]; int of[ANG_TAPS_BLEND];
+            const uint8_t* rb[ANG_TAPS_BLEND]; int ob[ANG_TAPS_BLEND];
+            for (int j = 0; j < nf; j++) {
+                rf[j] = (j < na_f ? idx_a : idx_b) + sec_f[j] * LEDS_PER_SIDE;
+                of[j] = (j < na_f) ? 0 : PAL_COLORS;
+            }
+            for (int j = 0; j < nb; j++) {
+                rb[j] = (j < na_b ? idx_a : idx_b) + sec_b[j] * LEDS_PER_SIDE;
+                ob[j] = (j < na_b) ? 0 : PAL_COLORS;
+            }
+            for (int i = 0; i < LEDS_PER_SIDE; i++) {
+                int kr = gain_r[i], kg = gain_g[i], kb = gain_b[i];
+                pixel_sum += samplePix8(rf, wts_f, of, nf, i, sat, kr, kg, kb, dst_f + i * 4);
+                pixel_sum += samplePix8(rb, wts_b, ob, nb, i, sat, kr, kg, kb, dst_b - i * 4);
+            }
+        } else {
+            const uint16_t* rf[ANG_TAPS_BLEND];
+            const uint16_t* rb[ANG_TAPS_BLEND];
+            for (int j = 0; j < nf; j++)
+                rf[j] = frame + (j < na_f ? 0 : d_next) + sec_f[j] * LEDS_PER_SIDE;
+            for (int j = 0; j < nb; j++)
+                rb[j] = frame + (j < na_b ? 0 : d_next) + sec_b[j] * LEDS_PER_SIDE;
+            for (int i = 0; i < LEDS_PER_SIDE; i++) {
+                int kr = gain_r[i], kg = gain_g[i], kb = gain_b[i];
+                pixel_sum += samplePix565(rf, wts_f, nf, i, sat, kr, kg, kb, dst_f + i * 4);
+                pixel_sum += samplePix565(rb, wts_b, nb, i, sat, kr, kg, kb, dst_b - i * 4);
+            }
         }
     }
 
