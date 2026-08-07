@@ -151,6 +151,17 @@ volatile uint32_t               global_render_fill_us = 0;    // время сб
 volatile uint8_t                global_effective_brightness = 8;
 RTC_DATA_ATTR volatile float    rpm_render_on  = RPM_RENDER_ON;
 RTC_DATA_ATTR volatile float    rpm_render_off = RPM_RENDER_OFF;
+
+// Единая оценка оборотов для автомата питания и для отрисовки. Молчание
+// датчиков учитывается наравне с последним измеренным периодом: без этого
+// оценка «залипала» бы на последнем значении после остановки колеса.
+// Раньше loop() считал так, а renderingTask брал голый rotation_period —
+// две разные оценки одного колеса расходились как раз на пороге.
+static inline float rpmEstimate(uint32_t period_us, uint32_t silence_us) {
+    if (period_us == 0 || silence_us >= 3000000UL) return 0.0f;
+    uint32_t eff = (silence_us > period_us) ? silence_us : period_us;
+    return 60000000.0f / (float)eff;
+}
 uint8_t lut_tone5[32];
 uint8_t lut_tone6[64];
 
@@ -847,6 +858,10 @@ void renderingTask(void* pvParameters) {
     int  sectors_drawn = 0;
     bool arm_reverse_seen = global_arm_reverse;
 
+    // Момент последнего гашения и минимальная пауза до повторного розжига.
+    static const uint32_t RENDER_RESUME_HOLD_MS = 600;
+    uint32_t render_pause_ms = 0;
+
     while (true) {
         // Ждём нового события Холла максимум 500 мс.
         xSemaphoreTake(hallSemaphore, pdMS_TO_TICKS(500));
@@ -990,6 +1005,11 @@ void renderingTask(void* pvParameters) {
             ota_in_progress || frame_loading) {
             if (rendering_active) {
                 rendering_active = false;
+                // render_pause_ms здесь НЕ трогаем: это не дребезг у порога, а
+                // намеренная пауза (загрузка файла, Stop, OTA). Задерживать
+                // розжиг после неё значило бы добавлять чёрную паузу к каждой
+                // смене файла в слайдшоу.
+                //
                 // Пауза на загрузку файла — штатная и частая (слайдшоу),
                 // в лог её не пишем, иначе он забьётся.
                 if (!frame_loading) webLog("[PWR] Rendering stopped");
@@ -1012,13 +1032,16 @@ void renderingTask(void* pvParameters) {
         // отрисовки renderingTask вытесняет loop(), и картинка «доживала» бы
         // до момента, когда до автомата питания дойдут руки. Гистерезис 20 RPM:
         // старт на RPM_RENDER_ON, продолжение работы — до RPM_RENDER_OFF.
-        float rpm_now = (rev > 0) ? 60000000.0f / (float)rev : 0.0f;
+        uint32_t age_us = (uint32_t)(micros() - anchor_t);
+        // Та же оценка, что и в автомате питания: иначе на пороге две задачи
+        // принимали разные решения об одном и том же колесе.
+        float rpm_now = rpmEstimate(rev, age_us);
         float rpm_thr = rendering_active ? rpm_render_off : rpm_render_on;
 
-        uint32_t age_us = (uint32_t)(micros() - anchor_t);
         if (!anchor_ok || rev == 0 || rpm_now < rpm_thr || age_us > age_limit) {
             if (rendering_active) {
                 rendering_active = false;
+                render_pause_ms  = millis();
                 webLog("[PWR] Rotation lost, rendering paused");
                 blankAllLEDs_DMA();
                 global_abl_rms              = 0.0f;
@@ -1036,6 +1059,12 @@ void renderingTask(void* pvParameters) {
             continue;
         }
         if (!rendering_active) {
+            // Не зажигаемся сразу после гашения. Оценка оборотов строится по
+            // последнему измеренному обороту и на замедляющемся колесе
+            // завышена: одно свежее событие Холла могло на миг перекинуть её
+            // обратно за порог старта, и лента вспыхивала на оборот-другой.
+            // Пауза короче времени раскрутки, так что старту не мешает.
+            if ((uint32_t)(millis() - render_pause_ms) < RENDER_RESUME_HOLD_MS) continue;
             rendering_active = true;
             webLog("[PWR] Rendering started");
         }
@@ -1679,11 +1708,7 @@ void loop() {
 
     // Обороты: если событий давно не было — период фактически не меньше времени
     // молчания, поэтому RPM падает плавно, а не держится на старом значении.
-    float rpm = 0.0f;
-    if (rev_period > 0 && hall_age_us < 3000000UL) {
-        uint32_t eff = (hall_age_us > rev_period) ? hall_age_us : rev_period;
-        rpm = 60000000.0f / (float)eff;
-    }
+    float rpm = rpmEstimate(rev_period, hall_age_us);
 
     // --- Обработка запроса Play из Web UI ---
     // Датчики Холла обесточены, поэтому вращения ждать нельзя — питание
@@ -1732,16 +1757,40 @@ void loop() {
     // любое → PWR_OFF      : нет вращения дольше 3 с либо Stop из Web UI
     bool content_ready = newFrameReady && !force_stop_display && !ota_in_progress;
 
+    // Порог должен держаться столько подряд, и не раньше этого срока после
+    // гашения — иначе автомат дребезжит на границе.
+    // Держать дольше оборота на пороге старта (500 мс при 120 об/мин): иначе
+    // одного «свежего» события хватало бы, чтобы условие выполнилось.
+    static const uint32_t RPM_UP_HOLD_MS      = 700;
+    static const uint32_t RPM_RELIGHT_LOCK_MS = 1500;
+    static uint32_t rpm_above_since = 0;   // с какого момента обороты выше порога старта
+    static uint32_t spindown_ms     = 0;   // когда лента погасла из-за падения оборотов
+
     if (!content_ready) {
         if (power_state != PWR_OFF) applyPowerState(PWR_OFF);
     } else {
         switch (power_state) {
             case PWR_OFF:
+                spindown_ms = 0;                    // блокировка розжига больше не нужна
                 if (vibration || play_pending) applyPowerState(PWR_SPINUP);
                 break;
 
             case PWR_SPINUP:
+                // Возврат к полной отрисовке должен быть УСТОЙЧИВЫМ. Одного
+                // гистерезиса по оборотам мало: в PWR_SPINUP запитан ОДИН датчик
+                // Холла вместо шести, поэтому обороты здесь измеряются раз в
+                // оборот, а не шесть раз, и оценка ведёт себя иначе, чем в
+                // PWR_FULL. На замедляющемся колесе этого хватало, чтобы лента,
+                // уже погаснув, снова вспыхнула на оборот-другой.
                 if (rpm >= rpm_render_on) {
+                    if (rpm_above_since == 0) rpm_above_since = now_ms;
+                } else {
+                    rpm_above_since = 0;
+                }
+                if (rpm_above_since != 0 &&
+                    (now_ms - rpm_above_since) >= RPM_UP_HOLD_MS &&
+                    (spindown_ms == 0 || (now_ms - spindown_ms) >= RPM_RELIGHT_LOCK_MS)) {
+                    rpm_above_since = 0;
                     applyPowerState(PWR_FULL);
                 } else if (hall_age_us > 3000000UL &&
                            (now_ms - last_play_ms)      > 10000 &&
@@ -1752,7 +1801,13 @@ void loop() {
                 break;
 
             case PWR_FULL:
-                if (rpm < rpm_render_off) applyPowerState(PWR_SPINUP);
+                if (rpm < rpm_render_off) {
+                    // Запоминаем момент гашения: раньше этого времени лента не
+                    // зажжётся, даже если оценка оборотов на миг подскочит.
+                    spindown_ms     = now_ms;
+                    rpm_above_since = 0;
+                    applyPowerState(PWR_SPINUP);
+                }
                 break;
         }
     }
