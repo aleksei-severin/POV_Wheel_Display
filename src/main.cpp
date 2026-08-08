@@ -148,7 +148,9 @@ String                     pendingFilePath;
 RTC_DATA_ATTR bool     slideshowActive    = false;
 RTC_DATA_ATTR uint32_t slideInterval      = 10000; // мс между сменами (по умолчанию 10 с)
 uint32_t slideLastSwitch    = 0;
-int      slideCurrentIndex  = -1;    // индекс текущего файла в savedFiles (-1 = не запущен)
+// В RTC: после пробуждения слайдшоу обязано продолжиться с той картинки, на
+// которой остановилось, а не начать список заново.
+RTC_DATA_ATTR int slideCurrentIndex = -1;   // индекс в savedFiles (-1 = не запущен)
 
 RTC_DATA_ATTR volatile float global_gamma         = 2.5f;
 RTC_DATA_ATTR volatile float global_saturation    = 1.5f;
@@ -161,6 +163,7 @@ RTC_DATA_ATTR volatile bool     global_arm_reverse  = false; // порядок �
 RTC_DATA_ATTR volatile float    global_abl_limit    = 100.0f; // ABL: 0–100 %, 100 = без ограничения
 RTC_DATA_ATTR volatile float    batt_abl_cap        = 100.0f; // аварийный потолок от защиты батареи
 RTC_DATA_ATTR volatile bool     batt_cutoff         = false;  // отрисовка запрещена по разряду
+RTC_DATA_ATTR volatile bool     batt_trickle_mode   = false;  // спим, пока идёт предзаряд
 volatile float                  global_abl_rms      = 0.0f;  // RMS загрузка тока 0.0–1.0
 volatile float                  global_render_span    = 0.0f; // угол между обновлениями ленты, °
 volatile uint32_t               global_render_fill_us = 0;    // время сборки кадра, мкс
@@ -1364,15 +1367,20 @@ static uint32_t readMilliVoltsAvg(uint8_t pin, uint8_t samples) {
 // стоят около 5 % заряда. Поэтому линейная шкала врала сама по себе, а без
 // компенсации просадки точность в этой зоне недостижима в принципе.
 //
-// НОЛЬ ШКАЛЫ — ЭТО ПОРОГ ОТКЛЮЧЕНИЯ (2.8 В), А НЕ 3.27 В, как было раньше.
+// НОЛЬ ШКАЛЫ — ЭТО ДНО ЯЧЕЙКИ (ЭДС 2.8 В), А НЕ 3.27 В, как было раньше.
 // Именно отсюда бралась жалоба «на 3.6 В показывало 16 %, на 3.5 В — уже 4 %,
 // а дисплей работает ещё долго»: весь участок 3.27…2.80 В, которым мы
 // реально пользуемся, шкала считала нулём.
 //
+// Порог гашения (BATT_PROT_OFF_MV) с нулём шкалы намеренно не совпадает: он
+// задан по напряжению на КЛЕММАХ и стоит выше, потому что под нагрузкой оно
+// проваливается ниже ЭДС. В момент срабатывания защиты шкала принудительно
+// показывает ноль — см. конец updateBatterySoc().
+//
 // Хвост ниже 3.6 В намеренно получает больше шкалы, чем ему причитается по
-// чистому заряду: ниже 3.0 В защита режет ток до 5 %, ток падает на порядок,
-// и времени на этом участке уходит несоразмерно много. Шкала предсказывает
-// остаток ВРЕМЕНИ до гашения, а не остаток ампер-часов.
+// чистому заряду: у нижнего порога защита режет ток до 5 %, ток падает на
+// порядок, и времени на этом участке уходит несоразмерно много. Шкала
+// предсказывает остаток ВРЕМЕНИ до гашения, а не остаток ампер-часов.
 //
 // Верх и середина почти не сдвинулись (3.85 В — 56 % вместо 55 %), так что
 // привычные показания на заряженной батарее остались теми же. Подстраивать
@@ -1627,6 +1635,10 @@ static void setHallMask(uint8_t mask) {
 
 // Переключение ступеней питания. Вызывать ТОЛЬКО из loop().
 static void applyPowerState(PowerState target) {
+    // Пока подключён USB, силовая часть не поднимается ни по какому поводу.
+    // Страховка на будущее: решение принимает автомат в loop(), но включение
+    // DCDC на кабеле — ошибка слишком дорогая, чтобы опираться на одну проверку.
+    if (target != PWR_OFF && pwr_cache.usb) return;
     if (target == power_state) return;
 
     switch (target) {
@@ -1707,6 +1719,27 @@ static void enterDeepSleep() {
     gpio_hold_en((gpio_num_t)PIN_EN_DCDC_REST);
     gpio_deep_sleep_hold_en();
 
+    esp_deep_sleep_start();
+}
+
+// Сон на время предзаряда. Отдельно от enterDeepSleep() намеренно:
+// тот сбрасывает настройки и калибровку во флеш, а сюда мы возвращаемся раз в
+// минуту часами подряд и ничего не меняем — писать во флеш на каждом
+// цикле значило бы жечь его ресурс ни за что.
+//
+// Пробуждение по таймеру И по вибрации: таймер — чтобы замерить
+// напряжение, вибрация — чтобы у человека был способ добудиться до
+// веб-интерфейса, пока батарея восстанавливается.
+static void enterTrickleSleep(uint32_t seconds) {
+    digitalWrite(PIN_EN_DCDC_REST, LOW);
+    digitalWrite(PIN_EN_DCDC_ARM1, LOW);
+    gpio_hold_en((gpio_num_t)PIN_EN_DCDC_ARM1);
+    gpio_hold_en((gpio_num_t)PIN_EN_DCDC_REST);
+    gpio_deep_sleep_hold_en();
+
+    if (digitalRead(PIN_VIBRATION) == LOW) esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_VIBRATION, 1);
+    else                                   esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_VIBRATION, 0);
+    esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
     esp_deep_sleep_start();
 }
 
@@ -1834,7 +1867,28 @@ void setup() {
         enterDeepSleep();
     }
 
-    webLogf("[SYS] Initializing... (VUSB %lu mV)", (unsigned long)vusb_mv);
+    // Зарядник в предзаряде даёт 100 мА — ровно столько же съедает работающий
+    // Wi-Fi, и ячейка не растёт. Спим, пока не выберется. Пробуждение по
+    // вибрации и перезагрузка по OTA дают окно доступа: иначе до устройства
+    // с севшей батареей вообще не добраться.
+    uint32_t vbat_mv = (uint32_t)(readMilliVoltsAvg(PIN_ADC_VBAT, 8) * ADC_DIVIDER_RATIO);
+    if (usb_present && wakeup_reason != ESP_SLEEP_WAKEUP_EXT0 && reset_reason != ESP_RST_SW) {
+        uint32_t thr = batt_trickle_mode ? BATT_TRICKLE_EXIT_MV : BATT_TRICKLE_MV;
+        if (vbat_mv < thr) {
+            batt_trickle_mode = true;
+            webLogf("[BATT] %lu mV on USB: trickle charge, sleeping %us so the 100 mA goes to the cell",
+                    (unsigned long)vbat_mv, (unsigned)BATT_TRICKLE_WAKE_S);
+            enterTrickleSleep(BATT_TRICKLE_WAKE_S);
+        }
+        if (batt_trickle_mode) {
+            batt_trickle_mode = false;
+            webLogf("[BATT] %lu mV: recovered, back to normal charging", (unsigned long)vbat_mv);
+        }
+    }
+    if (!usb_present) batt_trickle_mode = false;
+
+    webLogf("[SYS] Initializing... (VUSB %lu mV, VBAT %lu mV)",
+            (unsigned long)vusb_mv, (unsigned long)vbat_mv);
 
     if (psramFound()) {
         frameBuffer = (uint8_t*)ps_malloc(FRAME_SIZE);
@@ -1932,6 +1986,11 @@ void setup() {
     }
     attachInterrupt(digitalPinToInterrupt(PIN_VIBRATION), vibrationInterruptHandler, CHANGE);
 
+    // Замеряем питание ДО первого прохода loop(): автомат смотрит на
+    // pwr_cache.usb, и без этого первую секунду он считал бы, что кабеля нет,
+    // и успел бы поднять DCDC по тряске или автозапуску.
+    updatePowerTelemetry();
+
     // Открываем сервер только после полной инициализации.
     server.begin();
     webLog("[NET] HTTP server started");
@@ -1988,28 +2047,38 @@ void loop() {
         last_play_ms   = now_ms;
         last_motion_ms = now_ms;
         play_pending   = true;
+        // Файл загрузится, но лента не загорится — иначе это выглядит как отказ.
+        if (pwr_cache.usb) webLog("[PWR] Play ignored while on USB: unplug to run");
     }
 
     // --- Слайдшоу: автоматическая смена файлов по таймеру ---
-    // Пауза слайдшоу при отсутствии вращения: не переключаем файлы и не обновляем
-    // last_web_activity_time — это позволяет устройству уйти в sleep если нет активности.
-    bool rotation_present = (hall_age_us < 3000000UL);
-    if (slideshowActive && savedFiles.size() > 0 &&
-        (slideCurrentIndex < 0 ||
-         (rotation_present && (now_ms - slideLastSwitch >= slideInterval)))) {
-        slideLastSwitch = now_ms;
-        slideCurrentIndex = (slideCurrentIndex + 1) % (int)savedFiles.size();
-        String nextFile = savedFiles[slideCurrentIndex];
-        pendingFilePath = "/" + nextFile;
-        // Не пишем в NVS прямо здесь: запись во флеш заморозила бы рендер.
-        // Уйдёт на диск при остановке колеса или перед deep sleep.
-        pending_last_file = nextFile;
-        force_stop_display = false;
-        request_play_flag = true;
-        xSemaphoreGive(fileLoaderSemaphore);
-        last_web_activity_time = now_ms; // предотвращаем засыпание во время активного слайдшоу
-        webLogf("[DISP] Slideshow: %s (%d/%d)", nextFile.c_str(),
-                slideCurrentIndex + 1, (int)savedFiles.size());
+    // Отсчёт идёт только пока лента РЕАЛЬНО СВЕТИТСЯ. Наличие вращения тут не
+    // годится: колесо может крутиться ниже порога отрисовки, и картинки
+    // сменялись бы вхолостую.
+    //
+    // Пока показа нет, выдержку не просто игнорируем, а ДЕРЖИМ на нуле. Иначе за
+    // время стоянки набегает вся выдержка целиком, и при первом же обороте
+    // слайдшоу мгновенно перескакивает через ту картинку, на которой
+    // остановились, — а продолжиться должно именно с неё.
+    if (slideshowActive && savedFiles.size() > 0) {
+        if (!rendering_active && slideCurrentIndex >= 0) {
+            slideLastSwitch = now_ms;
+        } else if (slideCurrentIndex < 0 ||
+                   (now_ms - slideLastSwitch) >= slideInterval) {
+            slideLastSwitch = now_ms;
+            slideCurrentIndex = (slideCurrentIndex + 1) % (int)savedFiles.size();
+            String nextFile = savedFiles[slideCurrentIndex];
+            pendingFilePath = "/" + nextFile;
+            // Не пишем в NVS прямо здесь: запись во флеш заморозила бы рендер.
+            // Уйдёт на диск при остановке колеса или перед deep sleep.
+            pending_last_file = nextFile;
+            force_stop_display = false;
+            request_play_flag = true;
+            xSemaphoreGive(fileLoaderSemaphore);
+            last_web_activity_time = now_ms; // не засыпаем во время активного слайдшоу
+            webLogf("[DISP] Slideshow: %s (%d/%d)", nextFile.c_str(),
+                    slideCurrentIndex + 1, (int)savedFiles.size());
+        }
     }
 
     // --- Диагностика пропусков датчиков ---
@@ -2062,8 +2131,16 @@ void loop() {
     static uint32_t rpm_below_since = 0;   // и ниже порога гашения
     static uint32_t spindown_ms     = 0;   // когда лента погасла из-за падения оборотов
 
-    if (!content_ready) {
-        if (power_state != PWR_OFF) applyPowerState(PWR_OFF);
+    // На кабеле колесо физически не крутится, так что мерить нечего — и
+    // поднимать DCDC № 1 ради датчика Холла не просто бесполезно, а вредно.
+    // IP2312U ниже 3 В уходит в предзаряд и даёт всего 100 мА; лишнее потребление
+    // съедает этот ток целиком, и севшая батарея так и не выбирается выше 3 В —
+    // зарядка встаёт насовсем.
+    if (!content_ready || pwr_cache.usb) {
+        if (power_state != PWR_OFF) {
+            if (pwr_cache.usb) webLog("[PWR] USB connected, arms off until unplugged");
+            applyPowerState(PWR_OFF);
+        }
     } else {
         switch (power_state) {
             case PWR_OFF:
@@ -2161,10 +2238,28 @@ void loop() {
         }
     }
 
+    // Севшая батарея на кабеле: уходим спать, чтобы предзарядный ток шёл в
+    // ячейку, а не в Wi-Fi. Ждём 30 с тишины в вебе: пока человек смотрит
+    // страницу, выдёргивать у него связь невежливо.
+    if (pwr_cache.usb && !ota_in_progress && power_state == PWR_OFF &&
+        pwr_cache.vbat_mv > 0 && pwr_cache.vbat_mv < BATT_TRICKLE_MV &&
+        time_since_web_activity_ms > 30000) {
+        batt_trickle_mode = true;
+        webLogf("[BATT] %d mV on USB: trickle charge, sleeping %us so the 100 mA goes to the cell",
+                (int)pwr_cache.vbat_mv, (unsigned)BATT_TRICKLE_WAKE_S);
+        delay(200);                     // даём строке уйти в Serial
+        enterTrickleSleep(BATT_TRICKLE_WAKE_S);
+    }
+
     if (power_state == PWR_OFF && hall_age_us > 60000000UL &&
         time_since_web_activity_ms > 60000 && time_since_motion_ms > 60000) {
         if (pwr_cache.usb) {
-            last_hall_time = now_us;
+            // Сдвигаем метку ПОДТВЕРЖДЁННОЙ АКТИВНОСТИ, а не метку события Холла.
+            // Раньше здесь писалось last_hall_time, и это была ложь про вращение:
+            // возраст события Холла обнулялся, слайдшоу видело «колесо крутится»
+            // и раз в минуту перелистывало файл на неподвижном колесе, стоящем
+            // на зарядке. Метку вращения имеет право двигать только ISR.
+            last_motion_ms = now_ms;
             webLog("[SYS] USB connected, sleep cancelled");
         } else {
             webLogf("[SYS] Idle >60s (web: %lus), sleeping...",

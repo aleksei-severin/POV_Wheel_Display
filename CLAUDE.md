@@ -121,6 +121,8 @@ Per-sensor mechanical/threshold spread would otherwise inject a phase jump 6× p
 - RPM < `RPM_RENDER_OFF` (100) → back to `PWR_SPINUP` (20 RPM hysteresis)
 - No rotation > 3 s → `PWR_OFF`; 60 s of no web/rotation/power activity → deep sleep (wake by vibration sensor only)
 
+**While USB is connected, neither DCDC comes up at all — the FSM is pinned to `PWR_OFF`.** On a cable the wheel physically cannot turn, so there is nothing to measure, and raising DCDC 1 just for Hall 1 is worse than useless: the IP2312U drops to trickle charging below 3 V and supplies only 100 mA, which the extra draw eats outright. A flat cell then never climbs back over 3 V and charging stalls indefinitely. `applyPowerState()` refuses any non-`PWR_OFF` target while `pwr_cache.usb` as a second line of defence, and `setup()` samples power telemetry before the first `loop()` pass so the very first iteration already knows the cable is in.
+
 `renderingTask` enforces the same RPM thresholds itself. It must — while rendering it preempts `loop()` (prio 1), so relying on `loop()` alone would leave the image running below threshold.
 
 ### Wall Clock
@@ -130,6 +132,25 @@ The clock lives in **newlib system time**, not in an `epoch + millis()` pair. Sy
 `_currentEpoch()` rejects anything before 2023 as "never set", so if the restore ever fails the behaviour degrades to exactly what it was: `??:??:??` in the log and a bare dial until a browser connects. The browser re-syncs from `_logPoll()` whenever the device reports time 0 or drifts more than 5 s, so a power cut fixes itself as soon as any tab is open. Accuracy between syncs is that of the internal RTC RC oscillator — expect drift of seconds per hour of sleep, not milliseconds.
 
 `_time_tz_offset` stays in RTC memory (so local time shows immediately after a wake) but is range-checked on read: it now drives a clock face, not just log lines.
+
+### Slideshow
+
+The interval only runs while `rendering_active` — while the strip is actually lit. Rotation alone is not the right gate: the wheel can turn below the render threshold, and pictures would cycle with nothing on screen.
+
+While paused, `slideLastSwitch` is **held at the current moment** rather than simply not being checked. Letting it sit still would bank the whole interval during the stop, and the first revolution would then skip straight past the picture the wheel stopped on — the one it is supposed to resume from. `slideCurrentIndex` lives in RTC memory for the same reason, so a deep sleep does not restart the list from the top.
+
+**Nothing outside the Hall ISR may write `last_hall_time`.** The sleep-cancel path used to set it to "now" when USB was connected, as a way of resetting the idle timer. That was a lie about rotation: it zeroed the event age once a minute, the slideshow's rotation check saw a spinning wheel and advanced a file on a device sitting motionless on the charger. Idle timers belong to `last_motion_ms`.
+
+### Trickle-Charge Recovery
+
+Below 3 V the IP2312U drops to trickle charging at **100 mA** — which is almost exactly what an ESP32-S3 draws with Wi-Fi up (the always-on softAP keeps the receiver listening; the datasheet RX figure is 95–100 mA). Nothing reaches the cell, the voltage never climbs past 3 V, and charging deadlocks: escaping trickle mode requires a voltage the charger can never deliver.
+
+The only fix is to remove the load entirely for the duration. Below `BATT_TRICKLE_MV` on USB the device deep-sleeps for `BATT_TRICKLE_WAKE_S`, wakes purely to read the ADC, and sleeps again — ~10 µA asleep and a few hundred ms at ~45 mA per wake, so the duty cycle costs well under 1 mA and the charger's whole 100 mA goes into the cell.
+
+- **`enterTrickleSleep()` is deliberately separate from `enterDeepSleep()`**: the latter flushes settings and Hall calibration to NVS, and this path returns once a minute for hours. Writing flash every cycle would burn its endurance for nothing.
+- **Wide hysteresis** (`BATT_TRICKLE_MV` 3050 → `BATT_TRICKLE_EXIT_MV` 3200). The wake-up measurement is unloaded; bringing Wi-Fi back up drops the terminal voltage, and without the margin the device would fall straight back into trickle.
+- **Two escape hatches, because a recovering device is unreachable.** A vibration wake (EXT0) and an OTA software reset both skip the check, so shaking the wheel gets you a web window; `loop()` re-enters the sleep after 30 s of web silence, so browsing keeps it awake for as long as you need. Charging pauses while you do that — unavoidable, since access *is* the load.
+- `batt_trickle_mode` lives in RTC memory: the flag must survive the sleep it causes.
 
 ### Battery State of Charge
 
@@ -141,7 +162,7 @@ OCV = Vbat + BATT_BASE_SAG_MV (if DCDC on) + abl_rms · batt_sag_k − BATT_CHG_
 
 Load current is never measured: `global_abl_rms` is *by construction* the normalised current draw (frame fill × bri/31), so only mV-of-sag-per-unit-RMS is needed. That coefficient **self-calibrates** — SoC cannot change in the instant rendering starts, so the whole voltage step against the last idle reading is sag. The idle reference expires after 120 s, past which real discharge would contaminate it. Output is slew-limited to 1 %/s so residual model error is absorbed smoothly rather than as a jump. `chg == 2` (charger reports done) pins it to 100 %.
 
-**Zero on the scale is the 2.8 V shutdown, not 3.27 V.** That was the whole of the "shows 16 % at 3.6 V, 4 % at 3.5 V, and then runs for ages" complaint: the 3.27–2.80 V stretch the wheel actually uses was being reported as 0 %. The tail below 3.6 V is also given deliberately more of the scale than pure coulomb counting would allow, because the forced power limit below 3.0 V cuts current by roughly an order of magnitude and stretches that stretch of runtime — the gauge predicts *time* left, not amp-hours. Top and middle are untouched (3.85 V is 56 % against 55 % before), so readings on a charged pack look the same as they always did.
+**Zero on the scale is the cell's floor — 2.8 V of OCV — not 3.27 V.** (The shutdown threshold deliberately sits higher and is measured on the terminals; `soc` is pinned to 0 when it fires.) That was the whole of the "shows 16 % at 3.6 V, 4 % at 3.5 V, and then runs for ages" complaint: the 3.27–2.80 V stretch the wheel actually uses was being reported as 0 %. The tail below 3.6 V is also given deliberately more of the scale than pure coulomb counting would allow, because the forced power limit at the lower threshold cuts current by roughly an order of magnitude and stretches that stretch of runtime — the gauge predicts *time* left, not amp-hours. Top and middle are untouched (3.85 V is 56 % against 55 % before), so readings on a charged pack look the same as they always did.
 
 `ocv` and `sag` are exposed in `/battery` for calibration: `ocv` should stay put when the display switches on, and `sag` shows where self-calibration settled. Retuning `BATT_OCV_MV[]`/`BATT_OCV_PCT[]` against a real pack is done through `ocv`.
 
@@ -151,8 +172,8 @@ Two stages, both on **terminal** voltage — that is what the BMS watches (it cu
 
 | Vbat | action |
 |---|---|
-| < 3.00 V | `batt_abl_cap` forced to 5 % |
-| < 2.80 V | `batt_cutoff` latched, `force_stop_display` set, power FSM drops to `PWR_OFF` |
+| < 3.20 V | `batt_abl_cap` forced to 5 % |
+| < 3.00 V | `batt_cutoff` latched, `force_stop_display` set, power FSM drops to `PWR_OFF` |
 
 - **`batt_abl_cap` is separate from `global_abl_limit` on purpose.** The user's limit lives in NVS and must survive a flat battery; the renderer takes `min()` of the two, and the protection never writes the stored setting.
 - **Release only happens when the charger is connected.** Any voltage-based release oscillates: drop the current, the sag disappears, the voltage springs back, the protection lets go, and round it goes — brightness pulsing or a blinking display instead of an honest "battery is flat". Both flags live in RTC memory so a vibration wake cannot light a dead cell.

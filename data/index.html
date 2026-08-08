@@ -1857,7 +1857,7 @@ const previewCtx = previewCanvas.getContext('2d', {willReadFrequently: true});
 // командой uploadfs, поэтому «поправил, а не изменилось» почти всегда означает,
 // что в браузере старая версия. Метка рядом с именем устройства позволяет
 // проверить это за секунду, не гадая. Увеличивать при каждом изменении файла.
-const UI_BUILD = 'ui 15';
+const UI_BUILD = 'ui 17';
 
 // ===================== ТЕМА =====================
 // Тёмная по умолчанию (устройство катают вечером), но на солнце экран телефона
@@ -3055,9 +3055,16 @@ function _voltToPct(mv) {
 
 function updateBatteryStatus() {
     return fetch('/battery').then(r => r.json()).then(d => {
-        // Десятых вольта достаточно: сотые — это шум АЦП и просадка под нагрузкой
-        document.getElementById('batV').textContent = (d.vbat/1000).toFixed(1);
-        document.getElementById('usbV').textContent = (d.vusb/1000).toFixed(1);
+        // Это НЕОБРАБОТАННОЕ напряжение на клеммах, а не пересчёт из процентов:
+        // проценты считаются от восстановленной ЭДС (поле ocv), и путать две
+        // величины нельзя — под нагрузкой они расходятся на сотни милливольт.
+        //
+        // Сотые доли вольта, а не десятые: пороги защиты стоят на 3.20 и 3.00 В,
+        // и на шкале в десятых 3.24 и 3.15 выглядят одинаково — подход к порогу
+        // становится не виден. Просадка под нагрузкой здесь не помеха, а ровно
+        // то, что нужно показывать: именно её и видит защита.
+        document.getElementById('batV').textContent = (d.vbat/1000).toFixed(2);
+        document.getElementById('usbV').textContent = (d.vusb/1000).toFixed(2);
 
         const pct = (d.soc !== undefined) ? d.soc : _voltToPct(d.vbat);
         const el  = document.getElementById('batPct');
