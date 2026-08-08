@@ -120,6 +120,7 @@ Per-sensor mechanical/threshold spread would otherwise inject a phase jump 6× p
 - RPM ≥ `RPM_RENDER_ON` (120) → `PWR_FULL`
 - RPM < `RPM_RENDER_OFF` (100) → back to `PWR_SPINUP` (20 RPM hysteresis)
 - No rotation > 3 s → `PWR_OFF`; 60 s of no web/rotation/power activity → deep sleep (wake by vibration sensor only)
+- **A connected USB cable does not postpone that sleep**, and must not. While charging, an awake ESP32 eats ~100 mA of what the charger would otherwise put into the cell — in trickle mode that is the charger's entire output. Once the IP2312U reports "charged" and stops driving current, the same 100 mA comes *out of the battery*: the pack discharges to the recharge threshold, charges again, and cycles pointlessly. Asleep the board draws ~10 µA and interferes with neither. An open browser tab keeps it awake by itself through `last_web_activity_time`, so uploading files on the charger still works.
 
 **While USB is connected, neither DCDC comes up at all — the FSM is pinned to `PWR_OFF`.** On a cable the wheel physically cannot turn, so there is nothing to measure, and raising DCDC 1 just for Hall 1 is worse than useless: the IP2312U drops to trickle charging below 3 V and supplies only 100 mA, which the extra draw eats outright. A flat cell then never climbs back over 3 V and charging stalls indefinitely. `applyPowerState()` refuses any non-`PWR_OFF` target while `pwr_cache.usb` as a second line of defence, and `setup()` samples power telemetry before the first `loop()` pass so the very first iteration already knows the cable is in.
 
