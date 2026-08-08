@@ -1857,7 +1857,7 @@ const previewCtx = previewCanvas.getContext('2d', {willReadFrequently: true});
 // командой uploadfs, поэтому «поправил, а не изменилось» почти всегда означает,
 // что в браузере старая версия. Метка рядом с именем устройства позволяет
 // проверить это за секунду, не гадая. Увеличивать при каждом изменении файла.
-const UI_BUILD = 'ui 17';
+const UI_BUILD = 'ui 18';
 
 // ===================== ТЕМА =====================
 // Тёмная по умолчанию (устройство катают вечером), но на солнце экран телефона
@@ -3172,10 +3172,15 @@ function _fetchTimeout(url, opts, ms) {
 
 // Синхронизация времени: отправляем UTC epoch + смещение часового пояса браузера.
 // Возвращает true если POST был успешно отправлен (сервер исправил ?????... метки).
-async function _syncTime(deviceNow) {
+async function _syncTime(deviceNow, deviceTz) {
     const browserNow = Math.floor(Date.now() / 1000);
     const tzOffset = -new Date().getTimezoneOffset() * 60;
-    if (deviceNow === 0 || Math.abs(browserNow - deviceNow) > 5) {
+    // Пояс сверяем ОТДЕЛЬНО от часов. Раньше он уезжал только вместе с
+    // поправкой времени, а время теперь переживает и сон, и перезагрузку:
+    // стоило один раз синхронизироваться с неверным поясом — и исправить его
+    // было нечем, ведь UTC совпадает и условие ниже не срабатывало никогда.
+    const tzWrong = (typeof deviceTz === 'number' && deviceTz !== tzOffset);
+    if (deviceNow === 0 || Math.abs(browserNow - deviceNow) > 5 || tzWrong) {
         try {
             await _fetchTimeout(
                 `/settime?t=${browserNow}&tz=${tzOffset}`,
@@ -3210,7 +3215,7 @@ async function _logPoll() {
         // Перезагружаем все строки с нуля, заменяя "?..." метки на правильные.
         // Специальные строки (разделитель рестарта) сохраняем.
         const firstSync = (d.now === 0 || d.now === undefined);
-        const synced = await _syncTime(d.now || 0);
+        const synced = await _syncTime(d.now || 0, d.tz);
         if (firstSync && synced) {
             const specials = _logLines.filter(l => l.special);
             _logLines = specials;

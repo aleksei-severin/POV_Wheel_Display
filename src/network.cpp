@@ -1158,7 +1158,14 @@ void setupNetwork() {
             _time_millis_base = millis();
         }
         if (request->hasParam("tz")) {
-            _time_tz_offset = (int32_t)request->getParam("tz")->value().toInt();
+            int32_t tz = (int32_t)request->getParam("tz")->value().toInt();
+            if (tz != _time_tz_offset) {
+                _time_tz_offset = tz;
+                // Пишем в лог: перепутанный пояс иначе никак не отличить от
+                // неверно идущих часов — на экране и то и другое выглядит
+                // одинаково, просто время «не то».
+                webLogf("[SYS] Timezone set to UTC%+.1f h", (double)tz / 3600.0);
+            }
         }
         // Ретроспективно проставляем метки строкам записанным до синхронизации (??)
         portENTER_CRITICAL(&_log_mux);
@@ -1196,8 +1203,8 @@ void setupNetwork() {
         size_t pos = 0;
         // Заголовок
         pos += snprintf(buf + pos, BUF_CAP - pos,
-            "{\"total\":%lu,\"now\":%lu,\"lines\":[",
-            (unsigned long)total, (unsigned long)_currentEpoch());
+            "{\"total\":%lu,\"now\":%lu,\"tz\":%ld,\"lines\":[",
+            (unsigned long)total, (unsigned long)_currentEpoch(), (long)_tzOffset());
 
         bool first = true;
         for (uint32_t i = from; i < total; i++) {

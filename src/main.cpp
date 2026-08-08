@@ -1633,6 +1633,26 @@ static void setHallMask(uint8_t mask) {
     interrupts();
 }
 
+// Подаёт питание на шину светодиодов и гасит их как можно раньше.
+//
+// SK9822 включаются со СЛУЧАЙНЫМ содержимым PWM-регистров: пока в них не
+// приедет первый кадр, диоды светят чем попало. Паузы «на стабилизацию питания»
+// с последующим одиночным гашением мало — все эти миллисекунды луч уже горит, и
+// при пробуждении по вибрации, когда колесо неподвижно, это видно как вспышка
+// случайных цветов.
+//
+// Меньше, чем время подъёма шины плюс две посылки по SPI (~1.7 мс на 20 МГц),
+// окно не сделать в принципе: SK9822 защёлкивает данные только по приходу
+// СЛЕДУЮЩЕГО старт-фрейма, поэтому одного кадра нулей не хватает. Пауза перед
+// первой посылкой нужна, чтобы не гнать данные в чипы с ещё не поднявшимся
+// питанием; дальше шлём нули подряд — какая-то из посылок обязательно ляжет уже
+// на готовые чипы, и ждать «с запасом» больше не требуется.
+static void powerRailUpAndBlank(uint8_t en_pin) {
+    digitalWrite(en_pin, HIGH);
+    delay(2);                       // TPS631000 выходит на режим быстрее
+    for (int i = 0; i < 3; i++) blankAllLEDs_DMA();
+}
+
 // Переключение ступеней питания. Вызывать ТОЛЬКО из loop().
 static void applyPowerState(PowerState target) {
     // Пока подключён USB, силовая часть не поднимается ни по какому поводу.
@@ -1671,12 +1691,10 @@ static void applyPowerState(PowerState target) {
                 webLog("[PWR] RPM low, arms 2-6 off");
             } else {
                 // Просыпаемся: включаем только первый луч и его датчик Холла
-                last_dcdc_on_time = millis();  // до delay — иначе now_ms < last_dcdc_on_time
-                digitalWrite(PIN_EN_DCDC_ARM1, HIGH);
+                last_dcdc_on_time = millis();  // до пауз — иначе now_ms < last_dcdc_on_time
                 peripherals_active = true;
                 power_state = PWR_SPINUP;
-                delay(5);                      // ждём стабилизации питания SK9822
-                blankAllLEDs_DMA();
+                powerRailUpAndBlank(PIN_EN_DCDC_ARM1);
                 setHallMask(0x01);
                 webLog("[PWR] Arm 1 on, measuring RPM");
             }
@@ -1686,10 +1704,8 @@ static void applyPowerState(PowerState target) {
             // Колесо реально раскрутилось — это подтверждённая активность
             last_dcdc_on_time = millis();
             last_motion_ms    = last_dcdc_on_time;
-            digitalWrite(PIN_EN_DCDC_REST, HIGH);
             peripherals_active = true;
-            delay(5);                          // ждём стабилизации питания лучей 2–6
-            blankAllLEDs_DMA();
+            powerRailUpAndBlank(PIN_EN_DCDC_REST);
             setHallMask((uint8_t)((1u << HALL_COUNT) - 1));
             power_state = PWR_FULL;
             webLog("[PWR] All arms on, rendering enabled");

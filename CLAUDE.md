@@ -190,6 +190,8 @@ Two stages, both on **terminal** voltage — that is what the BMS watches (it cu
 
 `hall_rev_skips` counts rejected measurements and `loop()` logs `[HALL] Sensor N missed the magnet` at most once per 5 s. A sensor that keeps appearing there is a mechanical problem — magnet gap on that arm — not a firmware one.
 
+**SK9822s power up with random PWM register contents**, so every rail that comes up lights its arm with garbage until a frame reaches it. `powerRailUpAndBlank()` therefore waits only as long as the TPS631000 needs and then sends blank frames back to back instead of waiting "with margin" and blanking once. The floor is the rail rise time plus two SPI frames (~1.7 ms at 20 MHz) — the part latches only on the *next* start frame, so one frame of zeros is never enough. This is most visible on a vibration wake, where the wheel is stationary and the flash is not smeared by rotation.
+
 `setHallMask()` must be called on every power transition: it clears the timestamps of sensors that were unpowered, otherwise their first post-power-up event yields a bogus "revolution period".
 
 ### Procedural Effects
