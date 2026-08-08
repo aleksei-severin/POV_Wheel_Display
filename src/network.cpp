@@ -27,6 +27,12 @@ static bool uploadFailed = false;
 // картинки. Второй запрос не трогает состояние и получает 409.
 static AsyncWebServerRequest *uploadOwner = nullptr;
 static uint32_t uploadLastChunkMs = 0;
+// Сколько тела реально принято и сколько ожидается. Отдаётся в /upload_progress:
+// xhr.upload.progress в браузере считает байты, отданные СОКЕТУ, а не дошедшие
+// до устройства, и на телефоне буфер проглатывает тело целиком — полоса прыгает
+// на 100 % задолго до конца передачи. Здесь цифры честные.
+static volatile uint32_t uploadRxBytes    = 0;
+static volatile uint32_t uploadTotalBytes = 0;
 // Если от владельца давно не было куска — считаем передачу мёртвой (клиент
 // исчез без TCP disconnect) и отдаём слот новому запросу.
 #define UPLOAD_OWNER_TIMEOUT_MS  5000
@@ -762,6 +768,15 @@ void setupNetwork() {
         free(jsonBuf);
     });
 
+    // GET /upload_progress — сколько тела текущей загрузки реально дошло.
+    // Фоновый опрос во время заливки, таймер активности не трогает.
+    server.on("/upload_progress", HTTP_GET, [](AsyncWebServerRequest *request){
+        char buf[64];
+        snprintf(buf, sizeof(buf), "{\"rx\":%lu,\"total\":%lu}",
+                 (unsigned long)uploadRxBytes, (unsigned long)uploadTotalBytes);
+        request->send(200, "application/json", buf);
+    });
+
     server.on("/fs_info", HTTP_GET, [](AsyncWebServerRequest *request){
         size_t total = LittleFS.totalBytes();
         size_t used  = LittleFS.usedBytes();
@@ -964,6 +979,8 @@ void setupNetwork() {
             }
             uploadOwner  = request;
             uploadFailed = false;
+            uploadRxBytes    = 0;
+            uploadTotalBytes = (uint32_t)total;
             // Если предыдущая загрузка не завершилась корректно — убираем мусор
             if (uploadFile) {
                 String badPath = uploadFile.path();
@@ -1017,8 +1034,10 @@ void setupNetwork() {
             if (uploadFailed) {
                 uploadFile.close();
                 LittleFS.remove(filepath);
+                uploadTotalBytes = 0;      // полоса прогресса больше не актуальна
                 return;
             }
+            uploadRxBytes = (uint32_t)(index + len);
         }
         if (index + len == total && uploadFile) {
             // Размер обязан совпасть с заявленным Content-Length.

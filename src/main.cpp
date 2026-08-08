@@ -2221,6 +2221,17 @@ void loop() {
     uint32_t time_since_web_activity_ms = now_ms - last_web_activity_time;
     uint32_t time_since_motion_ms       = now_ms - last_motion_ms;
 
+    //
+    // Пока к нашей точке доступа кто-то подключён, порог простоя заметно выше.
+    // Браузер молчит по вполне рабочим причинам: конвертация GIF в полярный
+    // формат — синхронный цикл, на длинном ролике он держит поток десятки
+    // секунд, а на телефоне таймеры замирают, стоит погаснуть экрану. Минуты
+    // тишины не хватало, и устройство засыпало ровно посреди подготовки файлов
+    // к заливке. Бодрствовать бесконечно тоже нельзя — отсюда порог конечный,
+    // просто щедрый: связь при этом уже установлена, и лишние минуты работы
+    // стоят куда меньше, чем потерянная посреди загрузки анимация.
+    const uint32_t idle_limit_ms = (WiFi.softAPgetStationNum() > 0) ? 300000UL : 60000UL;
+
     // Обратный отсчёт до сна: лог каждые 10 секунд + уведомление при сбросе таймера.
     {
         static uint32_t last_activity_snap = 0;
@@ -2228,7 +2239,8 @@ void loop() {
         static int      last_logged_tick   = -1;
 
         uint32_t web_age_s    = time_since_web_activity_ms / 1000;
-        uint32_t hall_age_s   = (hall_age_us == UINT32_MAX) ? 60 : (hall_age_us / 1000000);
+        uint32_t hall_age_s   = (hall_age_us == UINT32_MAX) ? (idle_limit_ms / 1000)
+                                                          : (hall_age_us / 1000000);
         uint32_t motion_age_s = time_since_motion_ms / 1000;
 
         uint32_t min_age_s = web_age_s;
@@ -2245,11 +2257,12 @@ void loop() {
             last_logged_tick = -1;
         }
 
-        if (min_age_s >= 10 && min_age_s < 60) {
+        uint32_t limit_s = idle_limit_ms / 1000;
+        if (min_age_s >= 10 && min_age_s < limit_s) {
             int tick = (int)(min_age_s / 10) * 10;
             if (tick != last_logged_tick) {
                 last_logged_tick = tick;
-                webLogf("[NET] Idle, sleep in %ds", 60 - tick);
+                webLogf("[NET] Idle, sleep in %ds", (int)limit_s - tick);
             }
         }
     }
@@ -2281,8 +2294,9 @@ void loop() {
     // last_web_activity_time, так что заливать файлы и смотреть телеметрию на
     // зарядке по-прежнему можно сколько угодно.
     if (power_state == PWR_OFF && !ota_in_progress && hall_age_us > 60000000UL &&
-        time_since_web_activity_ms > 60000 && time_since_motion_ms > 60000) {
-        webLogf("[SYS] Idle >60s (web: %lus%s), sleeping...",
+        time_since_web_activity_ms > idle_limit_ms && time_since_motion_ms > idle_limit_ms) {
+        webLogf("[SYS] Idle >%lus (web: %lus%s), sleeping...",
+                (unsigned long)(idle_limit_ms / 1000),
                 (unsigned long)(time_since_web_activity_ms / 1000),
                 pwr_cache.usb ? ", on USB" : "");
         // Ждём минимум 3 поллинга браузера (интервал 2с) — лог об уходе в сон

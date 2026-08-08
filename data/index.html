@@ -1404,7 +1404,7 @@ function toPolarBuffer(srcCanvas, ss) {
 }
 
 // Render all GIF frames to polar buffers
-function renderGIFFrames(gif, fit) {
+async function renderGIFFrames(gif, fit, onProgress) {
     const canvas = document.createElement('canvas');
     canvas.width = gif.width; canvas.height = gif.height;
     const ctx = canvas.getContext('2d', {willReadFrequently: true});
@@ -1449,6 +1449,16 @@ function renderGIFFrames(gif, fit) {
         // Кадров в GIF много — берём 2×2 подвыборки вместо 3×3, иначе конвертация
         // длинной анимации в браузере затягивается на десятки секунд.
         frames.push({ delay: f.delay, data: toPolarBuffer(work, 2) });
+
+        // Уступаем поток. Цикл синхронный, а на кадр уходит полярная выборка
+        // плюс median cut — на длинном GIF это десятки секунд, и всё это время
+        // браузер не отправляет НИ ОДНОГО запроса. Устройство видит тишину и
+        // засыпает по таймауту простоя ровно посреди подготовки файлов.
+        // Заодно оживает индикатор прогресса, который иначе стоял бы колом.
+        if ((i & 3) === 3) {
+            if (onProgress) onProgress(i + 1, gif.frames.length);
+            await new Promise(r => setTimeout(r, 0));
+        }
     }
     return frames;
 }
@@ -1857,7 +1867,7 @@ const previewCtx = previewCanvas.getContext('2d', {willReadFrequently: true});
 // командой uploadfs, поэтому «поправил, а не изменилось» почти всегда означает,
 // что в браузере старая версия. Метка рядом с именем устройства позволяет
 // проверить это за секунду, не гадая. Увеличивать при каждом изменении файла.
-const UI_BUILD = 'ui 18';
+const UI_BUILD = 'ui 20';
 
 // ===================== ТЕМА =====================
 // Тёмная по умолчанию (устройство катают вечером), но на солнце экран телефона
@@ -2259,7 +2269,10 @@ async function _convertFile(file, label) {
         const gif = new MinimalGIF(ab);
         gif.parse();
         await loadDevLimits(true);
-        const frames = renderGIFFrames(gif, fit);
+        const frames = await renderGIFFrames(gif, fit, (done, total) => {
+            setStatus('uploadStatus',
+                `${tag} — converting ${done}/${total} frames (${(done * 100 / total).toFixed(0)}%)`, '');
+        });
         const kept = _capFrames(frames, tag);
         const buf = packANI6(kept.map(f => f.data), kept[0].delay || 100);
         return { buf, fileName, frameCount: kept.length };
@@ -2303,22 +2316,43 @@ async function _uploadBuffer(buf, fileName, label) {
     return new Promise(resolve => {
         const xhr = new XMLHttpRequest();
         xhr.open('POST', `/upload?name=${encodeURIComponent(fileName)}`);
+
+        let fromDevice = false;   // устройство отвечает на /upload_progress
+        const show = (loaded, total) => {
+            const p = total ? (loaded / total * 100) : 0;
+            progBar.style.width = p.toFixed(1) + '%';
+            setStatus('uploadStatus',
+                `${label} — ${p.toFixed(0)}%  ·  ${(loaded/1024).toFixed(1)} / ${(total/1024).toFixed(1)} kB`, '');
+        };
+
+        // xhr.upload.progress считает байты, отданные СОКЕТУ, а не принятые
+        // устройством. На телефоне буфер проглатывает тело целиком, и полоса
+        // прыгает с нуля на 100 % задолго до конца передачи; на десктопе буфер
+        // меньше, поэтому там она движется и всё выглядит правдоподобно.
+        // Поэтому спрашиваем прогресс у самого устройства, а этот обработчик
+        // оставляем запасным — для прошивки, где эндпоинта ещё нет.
         xhr.upload.addEventListener('progress', e => {
-            if (e.lengthComputable) {
-                const p = e.loaded / e.total * 100;
-                progBar.style.width = p.toFixed(1) + '%';
-                setStatus('uploadStatus',
-                    `${label} — ${p.toFixed(0)}%  ·  ${(e.loaded/1024).toFixed(1)} / ${(e.total/1024).toFixed(1)} kB`, '');
-            }
+            if (!fromDevice && e.lengthComputable) show(e.loaded, e.total);
         });
-        xhr.onload = () => {
+
+        const poll = setInterval(() => {
+            _fetchTimeout('/upload_progress', {}, 2000)
+                .then(r => r.ok ? r.json() : null)
+                .then(d => {
+                    if (!d || typeof d.total !== 'number' || d.total <= 0) return;
+                    fromDevice = true;
+                    show(d.rx, d.total);
+                })
+                .catch(() => {});   // один пропущенный опрос ничего не значит
+        }, 400);
+
+        const finish = code => {
+            clearInterval(poll);
             progWrap.style.display = 'none';
-            resolve(xhr.status);
+            resolve(code);
         };
-        xhr.onerror = () => {
-            progWrap.style.display = 'none';
-            resolve(0);
-        };
+        xhr.onload  = () => finish(xhr.status);
+        xhr.onerror = () => finish(0);
         xhr.send(buf);
     });
 }

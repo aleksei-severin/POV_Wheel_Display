@@ -120,6 +120,7 @@ Per-sensor mechanical/threshold spread would otherwise inject a phase jump 6× p
 - RPM ≥ `RPM_RENDER_ON` (120) → `PWR_FULL`
 - RPM < `RPM_RENDER_OFF` (100) → back to `PWR_SPINUP` (20 RPM hysteresis)
 - No rotation > 3 s → `PWR_OFF`; 60 s of no web/rotation/power activity → deep sleep (wake by vibration sensor only)
+- **While a client is associated with the softAP the idle limit is 5 minutes, not 60 s.** A browser can legitimately go quiet: GIF→polar conversion is a synchronous loop that holds the JS thread for tens of seconds on a long clip, and a phone freezes its timers the moment the screen locks. One minute of silence expired mid-upload, and the device slept out from under the user. `renderGIFFrames()` also yields every few frames now so polling survives the conversion — that is the actual cure; the longer window is the safety net for a locked screen.
 - **A connected USB cable does not postpone that sleep**, and must not. While charging, an awake ESP32 eats ~100 mA of what the charger would otherwise put into the cell — in trickle mode that is the charger's entire output. Once the IP2312U reports "charged" and stops driving current, the same 100 mA comes *out of the battery*: the pack discharges to the recharge threshold, charges again, and cycles pointlessly. Asleep the board draws ~10 µA and interferes with neither. An open browser tab keeps it awake by itself through `last_web_activity_time`, so uploading files on the charger still works.
 
 **While USB is connected, neither DCDC comes up at all — the FSM is pinned to `PWR_OFF`.** On a cable the wheel physically cannot turn, so there is nothing to measure, and raising DCDC 1 just for Hall 1 is worse than useless: the IP2312U drops to trickle charging below 3 V and supplies only 100 mA, which the extra draw eats outright. A flat cell then never climbs back over 3 V and charging stalls indefinitely. `applyPowerState()` refuses any non-`PWR_OFF` target while `pwr_cache.usb` as a second line of defence, and `setup()` samples power telemetry before the first `loop()` pass so the very first iteration already knows the cable is in.
@@ -133,6 +134,10 @@ The clock lives in **newlib system time**, not in an `epoch + millis()` pair. Sy
 `_currentEpoch()` rejects anything before 2023 as "never set", so if the restore ever fails the behaviour degrades to exactly what it was: `??:??:??` in the log and a bare dial until a browser connects. The browser re-syncs from `_logPoll()` whenever the device reports time 0 or drifts more than 5 s, so a power cut fixes itself as soon as any tab is open. Accuracy between syncs is that of the internal RTC RC oscillator — expect drift of seconds per hour of sleep, not milliseconds.
 
 `_time_tz_offset` stays in RTC memory (so local time shows immediately after a wake) but is range-checked on read: it now drives a clock face, not just log lines.
+
+### Upload Progress
+
+`xhr.upload.progress` counts bytes handed to the **socket**, not bytes the device received. A phone's send buffer swallows a whole animation at once, so the bar jumped straight to 100 % while the transfer was still running; desktops have smaller buffers and happened to look right. The browser therefore polls `/upload_progress` every 400 ms and drives the bar from the device's own byte count, keeping the XHR event only as a fallback for firmware without the endpoint.
 
 ### Slideshow
 
@@ -234,6 +239,7 @@ GET  /fs_info           # JSON: {total,used,free,psram_free,frame_size}  (psram_
 GET  /album             # Slideshow control (action=start|stop&delay=ms)
 GET  /logs?since=N      # Incremental web log
 POST /settime?t=&tz=    # Browser clock sync for log timestamps
+GET  /upload_progress   # JSON: {rx,total} — bytes of the current upload actually received
 POST /upload            # Multipart upload of .bin file to LittleFS
 ```
 
