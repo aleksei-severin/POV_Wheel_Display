@@ -1,9 +1,27 @@
 # POV Wheel Display - custom partition table (16MB flash)
-# app0/app1: 2MB each (~2x current firmware size of ~935KB)
-# littlefs:  12224KB for animations storage
+#
+# NOTE: ASCII only in this file. PlatformIO's own size check re-reads it with the
+# system codepage (not UTF-8) and dies on anything else; the rationale in Russian
+# lives in CLAUDE.md instead.
+#
+# app0/app1: 1472KB each. Firmware is ~920KB, so ~550KB of headroom - about sixty
+#            additions the size of the whole effects module (that one cost 9KB).
+#            Two slots are mandatory: OTA writes into the inactive one.
+# littlefs:  13312KB = exactly 13.00 MB so the web UI reads "13.0 MB" - it counts
+#            in binary megabytes, and 12.94MB used to show up as 12.9.
+#
+# The last 64KB of flash is deliberately left unallocated. App partitions must
+# start on a 64KB boundary, and exactly 13.00MB of storage only works out with
+# 1472KB slots. Handing the remainder to one slot would make them unequal: the
+# build would check the firmware against the larger one and OTA would then fail
+# writing into the smaller.
+#
+# WARNING: changing this table is a USB-only operation (OTA does not touch the
+# partition table) and it erases littlefs - the partition moves. Settings in nvs
+# survive: its offset and size are unchanged.
 # Name,     Type, SubType,  Offset,   Size
 nvs,        data, nvs,      0x9000,   0x5000,
 otadata,    data, ota,      0xe000,   0x2000,
-app0,       app,  ota_0,    0x10000,  0x200000,
-app1,       app,  ota_1,    0x210000, 0x200000,
-spiffs,     data, spiffs,   0x410000, 0xBF0000,
+app0,       app,  ota_0,    0x10000,  0x170000,
+app1,       app,  ota_1,    0x180000, 0x170000,
+spiffs,     data, spiffs,   0x2F0000, 0xD00000,

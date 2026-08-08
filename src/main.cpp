@@ -159,6 +159,8 @@ RTC_DATA_ATTR volatile float global_b_gain        = 100.0f;
 RTC_DATA_ATTR volatile uint16_t wheel_circumference = 2355;
 RTC_DATA_ATTR volatile bool     global_arm_reverse  = false; // порядок лучей в цепочке
 RTC_DATA_ATTR volatile float    global_abl_limit    = 100.0f; // ABL: 0–100 %, 100 = без ограничения
+RTC_DATA_ATTR volatile float    batt_abl_cap        = 100.0f; // аварийный потолок от защиты батареи
+RTC_DATA_ATTR volatile bool     batt_cutoff         = false;  // отрисовка запрещена по разряду
 volatile float                  global_abl_rms      = 0.0f;  // RMS загрузка тока 0.0–1.0
 volatile float                  global_render_span    = 0.0f; // угол между обновлениями ленты, °
 volatile uint32_t               global_render_fill_us = 0;    // время сборки кадра, мкс
@@ -892,7 +894,10 @@ static void fillSectorIntoBuffer(uint8_t* buf, uint8_t buf_idx, float sector0, f
     }
 
     uint8_t bri_level = global_brightness & 0x1F; // 0–31
+    // Защита батареи только ОПУСКАЕТ потолок, но не трогает настройку
+    // пользователя: та живёт в NVS и переживёт разряд.
     float   abl       = global_abl_limit;          // 0–100 %
+    if (batt_abl_cap < abl) abl = batt_abl_cap;
     float   arm_step  = global_arm_reverse ? -(float)ARM_STEP_DEG : (float)ARM_STEP_DEG;
 
     // pixel_sum копится прямо здесь: отдельный проход по 528 диодам ради суммы
@@ -1354,17 +1359,31 @@ static uint32_t readMilliVoltsAvg(uint8_t pin, uint8_t samples) {
 // =====================================================================
 //                        ЗАРЯД БАТАРЕИ
 // =====================================================================
-// Кривая разряда LiPo 1S: ЭДС (мВ) → заряд (%).
-// Середина крайне пологая — 3.73…3.87 В это весь диапазон 20…60 %, то есть
-// 20 мВ стоят 6 % заряда. Поэтому линейная шкала 3.0…4.2 В врала сама по себе,
-// а без компенсации просадки точность в этой зоне недостижима в принципе.
+// Кривая разряда: ЭДС (мВ) → заряд (%).
+// Середина крайне пологая — 3.73…3.88 В это половина шкалы, то есть 20 мВ
+// стоят около 5 % заряда. Поэтому линейная шкала врала сама по себе, а без
+// компенсации просадки точность в этой зоне недостижима в принципе.
+//
+// НОЛЬ ШКАЛЫ — ЭТО ПОРОГ ОТКЛЮЧЕНИЯ (2.8 В), А НЕ 3.27 В, как было раньше.
+// Именно отсюда бралась жалоба «на 3.6 В показывало 16 %, на 3.5 В — уже 4 %,
+// а дисплей работает ещё долго»: весь участок 3.27…2.80 В, которым мы
+// реально пользуемся, шкала считала нулём.
+//
+// Хвост ниже 3.6 В намеренно получает больше шкалы, чем ему причитается по
+// чистому заряду: ниже 3.0 В защита режет ток до 5 %, ток падает на порядок,
+// и времени на этом участке уходит несоразмерно много. Шкала предсказывает
+// остаток ВРЕМЕНИ до гашения, а не остаток ампер-часов.
+//
+// Верх и середина почти не сдвинулись (3.85 В — 56 % вместо 55 %), так что
+// привычные показания на заряженной батарее остались теми же. Подстраивать
+// таблицу под свою ячейку удобно по полю ocv в /battery.
 static const uint16_t BATT_OCV_MV[] = {
-    3270, 3610, 3690, 3710, 3730, 3750, 3770, 3790, 3800, 3820, 3840,
-    3850, 3870, 3910, 3950, 3980, 4020, 4080, 4110, 4150, 4200
+    2800, 2950, 3100, 3250, 3350, 3450, 3550, 3620, 3670, 3700, 3730, 3760,
+    3790, 3820, 3850, 3880, 3920, 3960, 4010, 4060, 4110, 4160, 4200
 };
 static const uint8_t BATT_OCV_PCT[] = {
-       0,    5,   10,   15,   20,   25,   30,   35,   40,   45,   50,
-      55,   60,   65,   70,   75,   80,   85,   90,   95,  100
+       0,    2,    4,    7,   10,   14,   18,   22,   26,   30,   35,   40,
+      45,   50,   56,   62,   68,   74,   81,   88,   94,   98,  100
 };
 
 static uint8_t battSocFromOcv(int32_t mv) {
@@ -1460,7 +1479,64 @@ static void updateBatterySoc(uint32_t vbat_mv, bool usb_ok, uint8_t chg) {
     else if (target > pwr_cache.soc)   pwr_cache.soc++;
     else if (target < pwr_cache.soc)   pwr_cache.soc--;
 
+    // Защита сработала — шкала обязана показать ноль. Отсечка стоит по
+    // напряжению на клеммах, а проценты — по ЭДС, и без этого в момент
+    // гашения на экране оставалось бы процентов пять.
+    if (batt_cutoff) pwr_cache.soc = 0;
+
     pwr_cache.ocv_mv = (int16_t)batt_ocv_filt;
+}
+
+// Защита от глубокого разряда. Два рубежа: сначала режем ток диодов,
+// потом гасим совсем. Считаем по напряжению НА КЛЕММАХ: именно его видит
+// BMS, и именно оно уходит вниз под нагрузкой. Считать по восстановленной
+// ЭДС здесь было бы ошибкой: мы бы проспали просадку и довели ячейку до
+// аварийного отключения защитой.
+//
+// Снятие только по заряднику, и это принципиально. Любой порог снятия по
+// напряжению даёт автоколебания: стоит сбросить ток, просадка исчезает,
+// напряжение отскакивает вверх, защита снимается — и всё по кругу, то есть
+// мигание или пульсация яркости вместо честного «батарея села».
+static void updateBatteryProtection(uint32_t vbat_mv, bool usb_ok) {
+    static uint8_t abl_hits = 0, off_hits = 0;
+
+    if (usb_ok) {
+        // На заряднике пороги бессмысленны: напряжение поднято зарядным
+        // током, а питание в любом случае идёт не только от ячейки.
+        abl_hits = off_hits = 0;
+        if (batt_cutoff) {
+            batt_cutoff = false;
+            webLog("[BATT] Charger connected, display re-enabled");
+        }
+        if (batt_abl_cap < 100.0f) {
+            batt_abl_cap = 100.0f;
+            webLog("[BATT] Charger connected, power limit restored");
+        }
+        return;
+    }
+
+    if (vbat_mv < BATT_PROT_OFF_MV) {
+        if (off_hits < 255) off_hits++;
+        if (off_hits >= BATT_PROT_HITS && !batt_cutoff) {
+            batt_cutoff        = true;
+            force_stop_display = true;   // чтобы веб показал остановку, а не «играет»
+            webLogf("[BATT] %lu mV: display off, cell is empty (BMS cuts at 2700 mV)",
+                    (unsigned long)vbat_mv);
+        }
+    } else {
+        off_hits = 0;
+    }
+
+    if (vbat_mv < BATT_PROT_ABL_MV) {
+        if (abl_hits < 255) abl_hits++;
+        if (abl_hits >= BATT_PROT_HITS && batt_abl_cap > (float)BATT_PROT_ABL_PCT) {
+            batt_abl_cap = (float)BATT_PROT_ABL_PCT;
+            webLogf("[BATT] %lu mV: power limit forced to %u%% to stretch the tail",
+                    (unsigned long)vbat_mv, (unsigned)BATT_PROT_ABL_PCT);
+        }
+    } else {
+        abl_hits = 0;
+    }
 }
 
 // Обновляет кеш батареи/USB. Вызывается из loop() раз в секунду.
@@ -1479,6 +1555,8 @@ static void updatePowerTelemetry() {
     pwr_cache.usb     = usb_ok;
     pwr_cache.chg     = chg;
 
+    // Защита раньше шкалы: если она сработала, шкала тут же покажет ноль.
+    updateBatteryProtection(vbat, usb_ok);
     updateBatterySoc(vbat, usb_ok, chg);
 }
 
@@ -1783,13 +1861,15 @@ void setup() {
         char buf[240];
         snprintf(buf, sizeof(buf),
             "{\"vbat\":%d,\"vusb\":%d,\"chg\":%u,\"usb\":%s,\"connected\":%s"
-            ",\"soc\":%u,\"ocv\":%d,\"sag\":%d,\"rise\":%u}",
+            ",\"soc\":%u,\"ocv\":%d,\"sag\":%d,\"rise\":%u"
+            ",\"abl_cap\":%.0f,\"cutoff\":%s}",
             (int)pwr_cache.vbat_mv, (int)pwr_cache.vusb_mv,
             (unsigned)pwr_cache.chg,
             pwr_cache.usb ? "true" : "false",
             pwr_cache.usb ? "true" : "false",
             (unsigned)pwr_cache.soc, (int)pwr_cache.ocv_mv,
-            (int)batt_sag_k, (unsigned)batt_chg_rise
+            (int)batt_sag_k, (unsigned)batt_chg_rise,
+            (float)batt_abl_cap, batt_cutoff ? "true" : "false"
         );
         request->send(200, "application/json", buf);
     });
@@ -1963,7 +2043,10 @@ void loop() {
     // PWR_SPINUP → PWR_FULL: обороты достигли RPM_RENDER_ON
     // PWR_FULL → PWR_SPINUP: обороты упали ниже RPM_RENDER_OFF (гистерезис 20 RPM)
     // любое → PWR_OFF      : нет вращения дольше 3 с либо Stop из Web UI
-    bool content_ready = newFrameReady && !force_stop_display && !ota_in_progress;
+    // batt_cutoff — защёлка, а не мгновенное условие: она же блокирует и
+    // повторный Play из веба, и розжиг после пробуждения от тряски.
+    bool content_ready = newFrameReady && !force_stop_display && !ota_in_progress &&
+                         !batt_cutoff;
 
     // Порог должен держаться столько подряд, и не раньше этого срока после
     // гашения — иначе автомат дребезжит на границе.

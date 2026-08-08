@@ -208,7 +208,14 @@ html[data-theme="light"] .btn-ok.active { --btn-fg: #fff; }
 .volts > div { display: flex; flex-direction: column; line-height: 1.2; min-width: 0; }
 .volts .stat-k { margin-bottom: 4px; }
 .volts b { font-size: 20px; font-weight: 700; letter-spacing: -.01em; white-space: nowrap; }
-.volts .badge { margin-left: auto; flex: 0 0 auto; }
+/* Бейджи стоят колонкой у правого края: состояние заряда — на строке подписей
+   BATTERY/USB, предупреждение защиты — на строке самих напряжений. Раньше оба
+   лежали прямо в этом ряду наравне с блоками напряжений, и длинная надпись про
+   разряд выдавливала состояние заряда влево, на цифры. */
+.volts .badges { margin-left: auto; align-items: flex-end; gap: 4px; flex: 0 1 auto; }
+.volts .badges .badge { white-space: normal; text-align: right; }
+/* Блоки с напряжениями не сжимаем — уступать место должна колонка бейджей. */
+.volts > div:not(.badges) { flex: 0 0 auto; }
 
 /* Управление воспроизведением: интервал и обе кнопки строго в одну строку.
    Подпись кнопки слайдшоу не меняется при включении (меняется только значок
@@ -429,6 +436,7 @@ input[type="range"].b-slider::-moz-range-progress { background: var(--c); }
 .badge-ok    { background: var(--ok-soft);     color: var(--ok);     border-color: color-mix(in srgb, var(--ok) 30%, transparent); }
 .badge-acc   { background: var(--accent-soft); color: var(--accent); border-color: color-mix(in srgb, var(--accent) 30%, transparent); }
 .badge-warn  { background: var(--warn-soft);   color: var(--warn);   border-color: color-mix(in srgb, var(--warn) 30%, transparent); }
+.badge-danger{ background: var(--danger-soft); color: var(--danger); border-color: color-mix(in srgb, var(--danger) 30%, transparent); }
 
 /* =========================== Загрузка =========================== */
 .upload-zone {
@@ -698,7 +706,12 @@ details.help .help-body b { color: var(--text-2); }
           <div class="stat-k">USB</div>
           <b class="mono"><span id="usbV">--</span>V</b>
         </div>
-        <span class="badge" id="chgStat">--</span>
+        <div class="badges">
+          <span class="badge" id="chgStat">--</span>
+          <!-- Появляется только когда защита от разряда вмешалась: без этого
+               погасшая лента и урезанная яркость выглядят как поломка. -->
+          <span class="badge" id="battProt" style="display:none"></span>
+        </div>
       </div>
     </div>
 
@@ -1844,7 +1857,7 @@ const previewCtx = previewCanvas.getContext('2d', {willReadFrequently: true});
 // командой uploadfs, поэтому «поправил, а не изменилось» почти всегда означает,
 // что в браузере старая версия. Метка рядом с именем устройства позволяет
 // проверить это за секунду, не гадая. Увеличивать при каждом изменении файла.
-const UI_BUILD = 'ui 12';
+const UI_BUILD = 'ui 15';
 
 // ===================== ТЕМА =====================
 // Тёмная по умолчанию (устройство катают вечером), но на солнце экран телефона
@@ -2618,7 +2631,7 @@ function loadFSInfo() {
         document.getElementById('fsPct').textContent   =
             `${mb(d.free)} MB free of ${mb(d.total)} MB`;
         // Длину анимации ограничивает не флеш, а PSRAM: кадры играются из
-        // оперативной памяти целиком. Флеша 12 МБ, PSRAM всего 8 — без этого
+        // оперативной памяти целиком. Флеша 13 МБ, PSRAM всего 8 — без этого
         // пояснения свободное место на диске читается как предел длины ролика.
         const sub = document.getElementById('fsSub');
         if (typeof d.psram_free === 'number' && d.psram_free > 0 && d.frame_size) {
@@ -3063,6 +3076,22 @@ function updateBatteryStatus() {
             const el = document.getElementById('chgStat');
             el.textContent = entry ? entry[0] : '--';
             el.className   = entry ? entry[1] : 'badge';
+        }
+
+        // Защита от глубокого разряда. Оба её состояния снаружи выглядят как
+        // неисправность — лента либо тусклая, либо не горит вовсе, — поэтому
+        // причину надо назвать прямо, а не оставлять только в логе.
+        const prot = document.getElementById('battProt');
+        if (d.cutoff) {
+            prot.textContent = 'Empty — display off until charged';
+            prot.className   = 'badge badge-danger';
+            prot.style.display = '';
+        } else if (typeof d.abl_cap === 'number' && d.abl_cap < 100) {
+            prot.textContent = `Low — power limited to ${d.abl_cap}%`;
+            prot.className   = 'badge badge-warn';
+            prot.style.display = '';
+        } else {
+            prot.style.display = 'none';
         }
     });
     // Нет .catch() — ошибка пробрасывается в _pollBattery для остановки цепочки
