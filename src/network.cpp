@@ -495,6 +495,68 @@ void loadFrameFromFile(String path) {
     }
 }
 
+// --- Поиск сетей ---
+// Сканирование БЛОКИРУЮЩЕЕ и живёт в сетевой задаче, а не асинхронное из
+// обработчика HTTP. Асинхронный вариант молча не заводился: пока STA пытается
+// подключиться к сохранённой сети — а она пытается непрерывно, если сети рядом
+// нет, — esp_wifi_scan_start отвечает ошибкой состояния, Arduino возвращает −2, и
+// снаружи это выглядело как «сетей не найдено».
+//
+// Результат копируем в своё хранилище сразу: так ответ не зависит от того,
+// когда драйвер освободит свой список.
+#define SCAN_MAX 24
+struct ScanNet { char ssid[33]; int8_t rssi; bool open; };
+static ScanNet scan_nets[SCAN_MAX];
+static volatile uint8_t scan_count   = 0;
+static volatile bool    scan_busy    = false;   // поиск идёт прямо сейчас
+static volatile bool    scan_request = false;   // обработчик попросил начать
+static volatile int8_t  scan_error   = 0;       // <0 — код ошибки последнего поиска
+
+static void wifiScanRun() {
+    scan_busy = true;
+    bool was_connected = (WiFi.status() == WL_CONNECTED);
+    // Незавершённая попытка подключения блокирует сканирование — прерываем её
+    // на время поиска. УЖЕ подключённую сеть не трогаем: возможно, через неё
+    // открыта сама эта страница.
+    if (!was_connected) WiFi.disconnect(false, false);
+
+    int n = WiFi.scanNetworks(false, false);
+
+    uint8_t cnt = 0;
+    if (n > 0) {
+        for (int i = 0; i < n && cnt < SCAN_MAX; i++) {
+            String ss = WiFi.SSID(i);
+            if (ss.length() == 0) continue;              // скрытые не показываем
+            int8_t rssi = (int8_t)WiFi.RSSI(i);
+            int dup = -1;
+            for (uint8_t j = 0; j < cnt; j++) if (ss == scan_nets[j].ssid) { dup = j; break; }
+            if (dup >= 0) {                              // меш: оставляем самую сильную точку
+                if (rssi > scan_nets[dup].rssi) scan_nets[dup].rssi = rssi;
+                continue;
+            }
+            ScanNet& d = scan_nets[cnt++];
+            strncpy(d.ssid, ss.c_str(), sizeof(d.ssid) - 1);
+            d.ssid[sizeof(d.ssid) - 1] = '\0';
+            d.rssi = rssi;
+            d.open = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+        }
+        // Сортировка по уровню сигнала, вставками: список короткий.
+        for (uint8_t a = 1; a < cnt; a++) {
+            ScanNet v = scan_nets[a];
+            int b = (int)a - 1;
+            while (b >= 0 && scan_nets[b].rssi < v.rssi) { scan_nets[b + 1] = scan_nets[b]; b--; }
+            scan_nets[b + 1] = v;
+        }
+    }
+    WiFi.scanDelete();
+
+    scan_count = cnt;
+    scan_error = (n < 0) ? (int8_t)n : 0;
+    if (!was_connected && staSsid.length()) WiFi.begin(staSsid.c_str(), staPass.c_str());
+    webLogf("[NET] Scan: driver returned %d, listed %u", n, (unsigned)cnt);
+    scan_busy = false;
+}
+
 void setupNetwork() {
     prefs.begin("pov_config", false);
 
@@ -565,6 +627,10 @@ void setupNetwork() {
     last_reconnect_attempt = millis();
 
     MDNS.begin(hostName.c_str());
+    // Запись сервиса, а не только имя хоста. Без неё колесо резолвится по
+    // <hostName>.local, но не появляется в сетевых сканерах — а ими как раз и
+    // ищут устройство, когда доступа к роутеру нет и адрес взять неоткуда.
+    MDNS.addService("http", "tcp", 80);
 
     // --- WEB SERVER ---
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
@@ -1071,6 +1137,47 @@ void setupNetwork() {
         request->send(200, "application/json", buf);
     });
 
+    // GET /wifi_scan[?start=1] — список видимых сетей из кэша (см. wifiScanRun).
+    // Обработчик только ставит заявку и отдаёт готовое — сам поиск идёт
+    // в сетевой задаче, где ему можно блокироваться на несколько секунд.
+    server.on("/wifi_scan", HTTP_GET, [](AsyncWebServerRequest *request){
+        last_web_activity_time = millis();
+        if (request->hasParam("start") && request->getParam("start")->value() == "1") {
+            if (!scan_busy) scan_request = true;
+            request->send(200, "application/json", "{\"scanning\":true}");
+            return;
+        }
+        if (scan_busy || scan_request) {
+            request->send(200, "application/json", "{\"scanning\":true}");
+            return;
+        }
+
+        const size_t CAP = 96 + (size_t)SCAN_MAX * 112;
+        char* buf = (char*)malloc(CAP);
+        if (!buf) { request->send(500, "text/plain", "OOM"); return; }
+        size_t pos = (size_t)snprintf(buf, CAP, "{\"scanning\":false,\"err\":%d,\"nets\":[",
+                                      (int)scan_error);
+        uint8_t cnt = scan_count;
+        for (uint8_t a = 0; a < cnt; a++) {
+            if (a && pos < CAP - 1) buf[pos++] = ',';
+            pos += (size_t)snprintf(buf + pos, CAP - pos, "{\"ssid\":\"");
+            // Экранирование обязательно: в имени чужой сети может оказаться
+            // кавычка или обратный слэш, и ответ перестанет быть JSON.
+            for (const char* c = scan_nets[a].ssid; *c && pos < CAP - 16; c++) {
+                if ((uint8_t)*c < 0x20) continue;
+                if (*c == '"' || *c == '\\') buf[pos++] = '\\';
+                buf[pos++] = *c;
+            }
+            pos += (size_t)snprintf(buf + pos, CAP - pos, "\",\"rssi\":%d,\"open\":%s}",
+                                    (int)scan_nets[a].rssi,
+                                    scan_nets[a].open ? "true" : "false");
+        }
+        if (pos < CAP - 3) { buf[pos++] = ']'; buf[pos++] = '}'; }
+        buf[pos] = '\0';
+        request->send(200, "application/json", buf);
+        free(buf);
+    });
+
     // GET /wifi_set?ap=&ssid=&pass= — сохранить и применить.
     // Запись в NVS здесь прямая, не отложенная: смена сети и так рвёт
     // соединение, пользователь может тут же выключить питание, и настройка
@@ -1342,6 +1449,13 @@ void loopNetwork() {
     ArduinoOTA.handle();
     ElegantOTA.loop();
 
+    // Поиск сетей блокирует эту задачу на пару секунд — именно поэтому он здесь,
+    // а не в обработчике HTTP: там это остановило бы весь веб-сервер.
+    if (scan_request && !scan_busy) {
+        scan_request = false;
+        wifiScanRun();
+    }
+
     // --- Мониторинг и переподключение к домашней сети WiFi ---
     if (initial_connect_done) {
         wl_status_t sta_status = WiFi.status();
@@ -1359,7 +1473,10 @@ void loopNetwork() {
         }
 
         // Периодическая попытка переподключения каждые 30 секунд
-        if (sta_status != WL_CONNECTED && now_ms - last_reconnect_attempt > 30000) {
+        // Во время поиска сетей не лезем в радио: WiFi.begin() оборвёт
+        // сканирование, и браузер никогда не дождётся списка.
+        if (sta_status != WL_CONNECTED && now_ms - last_reconnect_attempt > 30000 &&
+            !scan_busy && !scan_request) {
             last_reconnect_attempt = now_ms;
             webLog("[NET] WiFi reconnecting...");
             WiFi.begin(staSsid.c_str(), staPass.c_str());

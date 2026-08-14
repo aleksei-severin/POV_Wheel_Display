@@ -438,6 +438,22 @@ input[type="range"].b-slider::-moz-range-progress { background: var(--c); }
 .badge-warn  { background: var(--warn-soft);   color: var(--warn);   border-color: color-mix(in srgb, var(--warn) 30%, transparent); }
 .badge-danger{ background: var(--danger-soft); color: var(--danger); border-color: color-mix(in srgb, var(--danger) 30%, transparent); }
 
+/* Найденные сети. max-height со скроллом: в городе список бывает на два
+   десятка строк, и без ограничения он выдавливает пароль за пределы экрана. */
+.scan-list { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; max-height: 210px; overflow-y: auto; }
+.scan-list:empty { display: none; }
+.scan-row {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  padding: 8px 10px; border-radius: 10px; cursor: pointer; font: inherit; text-align: left;
+  background: var(--surface-2); color: var(--text-1); border: 1px solid var(--border-soft);
+}
+.scan-row:hover  { border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+.scan-row.active { background: var(--accent-soft); border-color: var(--accent); }
+.scan-ssid { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.scan-row.active .scan-ssid { color: var(--accent); font-weight: 650; }
+.scan-meta { flex: 0 0 auto; font-size: 12px; color: var(--text-3); font-variant-numeric: tabular-nums; }
+.scan-note { font-size: 12px; color: var(--text-3); padding: 6px 2px; }
+
 /* =========================== Загрузка =========================== */
 .upload-zone {
   position: relative; display: block; width: 100%;
@@ -974,11 +990,17 @@ details.help .help-body b { color: var(--text-2); }
       <p class="card-note">Optional. When it is in range the device joins it, so you can reach the page without leaving your own Wi-Fi.</p>
 
       <div class="ctl">
-        <div class="ctl-head"><span class="ctl-name">Network name (SSID)</span></div>
+        <div class="ctl-head">
+          <span class="ctl-name">Network name (SSID)</span>
+          <button class="btn btn-sm" id="wifiScanBtn" onclick="wifiScan()">⟳ Scan</button>
+        </div>
         <span class="field" style="width:100%">
           <input type="text" id="staSsid" maxlength="32" placeholder="Home Wi-Fi"
                  autocapitalize="off" autocorrect="off" spellcheck="false" style="flex:1;width:auto;text-align:left">
         </span>
+        <div class="scan-list" id="wifiList"></div>
+        <p class="ctl-hint">The wheel has one radio, so a scan takes it away from the hotspot for a few seconds —
+           this page may stall while it runs. Pick a network from the list, then type its password below.</p>
       </div>
 
       <div class="ctl">
@@ -1867,7 +1889,7 @@ const previewCtx = previewCanvas.getContext('2d', {willReadFrequently: true});
 // командой uploadfs, поэтому «поправил, а не изменилось» почти всегда означает,
 // что в браузере старая версия. Метка рядом с именем устройства позволяет
 // проверить это за секунду, не гадая. Увеличивать при каждом изменении файла.
-const UI_BUILD = 'ui 20';
+const UI_BUILD = 'ui 22';
 
 // ===================== ТЕМА =====================
 // Тёмная по умолчанию (устройство катают вечером), но на солнце экран телефона
@@ -3000,6 +3022,88 @@ document.getElementById('rpmOff').addEventListener('keydown', e => {
 });
 
 // ===================== СЕТЕВЫЕ НАСТРОЙКИ =====================
+// ===================== ПОИСК СЕТЕЙ =====================
+// Уровень сигнала столбиками: −55 дБм и выше — уверенно, ниже −80 — на грани.
+function _rssiBars(rssi) {
+    const n = rssi >= -55 ? 4 : rssi >= -67 ? 3 : rssi >= -78 ? 2 : 1;
+    return '▁▃▅█'.slice(0, n).padEnd(4, ' ');
+}
+
+function _wifiMark(ssid) {
+    for (const row of document.querySelectorAll('#wifiList .scan-row')) {
+        row.classList.toggle('active', row.dataset.ssid === ssid);
+    }
+}
+
+function _wifiRender(nets) {
+    const box = document.getElementById('wifiList');
+    box.innerHTML = '';
+    if (!nets.length) {
+        box.innerHTML = '<div class="scan-note">Nothing found. Move closer and scan again.</div>';
+        return;
+    }
+    for (const n of nets) {
+        const row = document.createElement('button');
+        row.className = 'scan-row';
+        row.dataset.ssid = n.ssid;
+        row.onclick = () => {
+            document.getElementById('staSsid').value = n.ssid;
+            // Пароль чистим: он относился к прежней сети, и оставлять его —
+            // верный способ сохранить чужой ключ под новым именем.
+            const pw = document.getElementById('staPass');
+            pw.value = '';
+            pw.focus();
+            _wifiMark(n.ssid);
+        };
+        const nm = document.createElement('span');
+        nm.className = 'scan-ssid';
+        nm.textContent = n.ssid;
+        const meta = document.createElement('span');
+        meta.className = 'scan-meta';
+        meta.textContent = `${_rssiBars(n.rssi)} ${n.rssi}${n.open ? '' : ' 🔒'}`;
+        row.append(nm, meta);
+        box.appendChild(row);
+    }
+    _wifiMark(document.getElementById('staSsid').value);
+}
+
+async function wifiScan() {
+    const btn = document.getElementById('wifiScanBtn');
+    const box = document.getElementById('wifiList');
+    if (btn.disabled) return;
+    btn.disabled = true;
+    box.innerHTML = '<div class="scan-note">Scanning…</div>';
+    try {
+        await _fetchTimeout('/wifi_scan?start=1', {}, 5000);
+        // Пока радио перебирает каналы, точка доступа не отвечает, и часть
+        // опросов просто не дойдёт. Пропущенный ответ — не ошибка, ждём дальше.
+        for (let i = 0; i < 20; i++) {
+            await new Promise(r => setTimeout(r, 700));
+            let d = null;
+            try {
+                const r = await _fetchTimeout('/wifi_scan', {}, 3000);
+                if (r.ok) d = await r.json();
+            } catch (e) { continue; }
+            if (d && d.scanning === false) {
+                // Пустой список и сорвавшийся поиск — разные вещи, и лечатся
+                // они по-разному. Раньше оба показывались как «ничего нет».
+                if (d.err) {
+                    box.innerHTML =
+                        `<div class="scan-note">The radio refused to scan (code ${d.err}). Try again in a moment.</div>`;
+                } else {
+                    _wifiRender(d.nets || []);
+                }
+                return;
+            }
+        }
+        box.innerHTML = '<div class="scan-note">Scan timed out. Try again.</div>';
+    } catch (e) {
+        box.innerHTML = '<div class="scan-note">Scan failed — the device did not answer.</div>';
+    } finally {
+        btn.disabled = false;
+    }
+}
+
 function loadWifi() {
     return _fetchTimeout('/wifi', {}, 5000).then(r => r.json()).then(d => {
         const set = (id, v) => { const e = document.getElementById(id); if (e) e.value = v; };
@@ -3013,6 +3117,9 @@ function loadWifi() {
         st.textContent = d.sta ? 'Connected' : 'Not connected';
         st.className   = 'badge ' + (d.sta ? 'badge-ok' : '');
         document.getElementById('staIp').textContent = d.sta ? (d.ip || '--') : '--';
+        // Список могли уже отсканировать — подсветку сохранённой сети надо
+        // восстановить, иначе после перезагрузки страницы непонятно, что выбрано.
+        _wifiMark(d.ssid || '');
     }).catch(() => toast('Cannot read network settings', 'err'));
 }
 

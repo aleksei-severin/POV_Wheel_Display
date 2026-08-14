@@ -237,6 +237,7 @@ GET  /effect?id=N       # Procedural effect: 0 = off, 1..6 = EffectId. &speed_re
 GET  /preview?file=X    # First frame (FRAME_SIZE bytes) for browser-side thumbnail
 GET  /fs_info           # JSON: {total,used,free,psram_free,frame_size}  (psram_free = largest free PSRAM block; frame_size = FRAME_STRIDE_PAL, what a new upload will cost)
 GET  /album             # Slideshow control (action=start|stop&delay=ms)
+GET  /wifi_scan[?start=1]  # Async scan for visible networks: start=1 begins one, plain GET reports {scanning,nets}
 GET  /logs?since=N      # Incremental web log
 POST /settime?t=&tz=    # Browser clock sync for log timestamps
 GET  /upload_progress   # JSON: {rx,total} — bytes of the current upload actually received
@@ -275,6 +276,9 @@ ALS-PT19 photodiode with a 12 kΩ load on `PIN_ADC_LIGHT` (IO9), sampled every 1
 
 ## Important Caveats
 
+- **The network scan is blocking and runs in `networkTask`, not in the HTTP handler.** The async form silently never started: while the STA is trying to reach the stored network — which it does continuously when that network is out of range — `esp_wifi_scan_start` fails with a state error, Arduino returns −2, and the empty result read as "no networks found". `wifiScanRun()` therefore calls `WiFi.disconnect()` first **when not connected**, scans blocking, and copies the results into its own storage so the reply does not depend on when the driver frees its list. An established connection is left alone — the page may well be served over it.
+- **`/wifi_scan` reports the driver's return code as `err`.** A failed scan and a genuinely empty neighbourhood need different responses from the user, and collapsing both into an empty list is what made the original bug invisible.
+- Scanning still takes the radio away from the softAP for a few seconds, so the browser tolerates missed polls rather than treating them as failure, and `loopNetwork()` holds off its 30 s reconnect while a scan is pending.
 - **WiFi credentials** are hardcoded in [src/network.cpp](src/network.cpp). The device always creates its own AP hotspot (`pov-wheel-XXXX`) regardless of STA connection status.
 - **No floating point in ISRs** — Xtensa does not save FPU context for interrupt handlers. `hallInterruptHandler` is integer-only; all ω/α math happens in `renderingTask`.
 - **Use `spi_device_queue_trans` + `spi_device_get_trans_result`, never `spi_device_polling_start`** — polling holds a global spinlock for ~433 µs and starves lwIP and the watchdog.
