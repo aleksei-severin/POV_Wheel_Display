@@ -1,5 +1,6 @@
 #include "network.h"
 #include "effects.h"
+#include "povble.h"
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
@@ -45,17 +46,12 @@ String staPass;
 String currentDisplayFile = "";   // Имя файла, загруженного в frameBuffer
 // Имя, которое нужно записать в NVS как последний воспроизведённый. Запись
 // откладывается до момента, когда лента уже погашена (см. loadFrameFromFile).
-static String pendingPlayFile = "";
+String pendingPlayFile = "";
 
-// Счётчик версии состояния: инкрементируется при любом изменении (настройки,
-// файлы, воспроизведение). Клиенты сравнивают с последней известной версией
-// и обновляют UI при расхождении — синхронизация нескольких браузеров.
-static uint32_t state_version = 0;
-
-// Отдельный счётчик версии списка файлов: инкрементируется только при
-// upload/delete/play — НЕ при изменении настроек. Браузер обновляет список
-// (и запускает загрузку превью) только когда этот счётчик меняется.
-static uint32_t file_version = 0;
+// Счётчики версий состояния и списка файлов определены в povble.cpp
+// (pov_state_version / pov_file_version): теперь их дёргает и BLE, а веб
+// может быть вообще не поднят. Смысл прежний — клиент сравнивает версию с
+// последней известной и обновляет UI только при расхождении.
 
 // ===================== WEB LOG BUFFER =====================
 // Кольцевой буфер в RTC SLOW RAM — переживает deep sleep.
@@ -557,11 +553,85 @@ static void wifiScanRun() {
     scan_busy = false;
 }
 
-void setupNetwork() {
+// =====================================================================
+//  Мостики для BLE: часы и лог
+//
+//  Кольцо лога и база времени — static в этом файле и обязаны такими остаться:
+//  они лежат в RTC-памяти и переживают сон, а второй точки записи у них быть
+//  не должно. Поэтому BLE не лезет к ним напрямую, а зовёт эти две функции.
+// =====================================================================
+
+// Синхронизация часов с телефона — то же, что делал POST /settime.
+void povSetTime(uint32_t epoch, int32_t tz) {
+    if (epoch >= TIME_VALID_FROM) {
+        // Системные часы newlib: дальше их держит счётчик RTC, и время
+        // переживёт и глубокий сон, и перезагрузку по OTA.
+        struct timeval tv = { .tv_sec = (time_t)epoch, .tv_usec = 0 };
+        settimeofday(&tv, nullptr);
+        _time_epoch_base  = epoch;
+        _time_millis_base = millis();
+    }
+    // Пояс правится независимо от часов: приложение шлёт его и тогда, когда
+    // время уже верное, а пользователь пересёк границу поясов.
+    if (tz >= -50400 && tz <= 50400 && tz != _time_tz_offset) {
+        _time_tz_offset = tz;
+        webLogf("[SYS] Timezone set to UTC%+.1f h", (double)tz / 3600.0);
+    }
+    // Строки, записанные до синхронизации, получают наконец настоящие метки.
+    portENTER_CRITICAL(&_log_mux);
+    _retroFillTimestamps();
+    portEXIT_CRITICAL(&_log_mux);
+}
+
+// Лог для приложения: [u32 next][строки, разделённые \n].
+// В отличие от /logs — без JSON: экранировать нечего, а каждый лишний байт
+// в ответе BLE стоит round-trip'а. Возвращает длину готового ответа.
+uint32_t povBuildLogs(uint8_t* out, size_t cap, uint32_t since) {
+    if (!out || cap < 8) return 0;
+
+    portENTER_CRITICAL(&_log_mux);
+    uint32_t total = _log_total;
+    portEXIT_CRITICAL(&_log_mux);
+
+    // Кольцо на WEB_LOG_COUNT строк: всё, что старше, уже затёрто. Клиент,
+    // помолчавший дольше, получит не дырку в нумерации, а последние строки —
+    // и заново синхронизируется по возвращённому next.
+    uint32_t from = since;
+    if (from > total) from = 0;                                  // счётчик уехал назад: перезагрузка
+    if (total - from > WEB_LOG_COUNT) from = total - WEB_LOG_COUNT;
+
+    size_t pos = 4;
+    for (uint32_t i = from; i < total; i++) {
+        const char* ln = _log_buf[i % WEB_LOG_COUNT];
+        size_t      n  = strnlen(ln, WEB_LOG_LINE);
+        if (pos + n + 1 > cap) {
+            // Не влезло — отдаём то, что собрали, и говорим, на чём встали:
+            // остаток приедет следующим запросом, а не потеряется.
+            total = i;
+            break;
+        }
+        memcpy(out + pos, ln, n);
+        pos += n;
+        out[pos++] = '\n';
+    }
+    memcpy(out, &total, 4);
+    return (uint32_t)pos;
+}
+
+// =====================================================================
+//  Хранилище и опознание устройства — то, что нужно ВСЕГДА
+//
+//  Раньше всё это лежало в начале setupNetwork(), и вместе с Wi-Fi отвалилось
+//  бы целиком: NVS не открыт — значит нет ни настроек, ни калибровки датчиков,
+//  ни имени последнего файла. Wi-Fi по умолчанию больше не поднимается, а
+//  prefs и имя устройства нужны и BLE, и логу, и автозапуску анимации.
+//  Поэтому вызывается безусловно, а радио — отдельно и по требованию.
+// =====================================================================
+void setupStorage() {
     prefs.begin("pov_config", false);
 
     uint8_t mac[6];
-    WiFi.macAddress(mac);
+    WiFi.macAddress(mac);   // читает eFuse, радио для этого поднимать не нужно
     char nameBuf[24];
 
     // hostName — имя для mDNS и OTA. В нём остаются только буквы, цифры и дефис:
@@ -578,6 +648,24 @@ void setupNetwork() {
     staSsid = prefs.getString("sta_ssid", HOTSPOT_SSID);
     staPass = prefs.getString("sta_pass", HOTSPOT_PASS);
     if (apSsid.length() == 0) apSsid = apDefaultSsid;
+}
+
+// =====================================================================
+//  Подъём Wi-Fi. ПО УМОЛЧАНИЮ НЕ ВЫЗЫВАЕТСЯ.
+//
+//  Основной транспорт теперь BLE, и приёмник точки доступа, включённый
+//  постоянно, стоил бы тех же ~100 мА, ради которых всё и затевалось. Wi-Fi
+//  поднимается только по команде OP_WIFI из приложения — чтобы прошиться по
+//  воздуху из PlatformIO или открыть старую веб-страницу. На следующей
+//  перезагрузке он снова выключен: флаг нарочно не сохраняется в NVS.
+//
+//  Блокирует вызывающую задачу до десяти секунд на ожидании STA, поэтому
+//  зовётся из loop(), а не из колбэка ATT: задача хоста NimBLE, стоящая
+//  десять секунд, — это разрыв соединения по супервизии.
+// =====================================================================
+void setupNetwork() {
+    if (wifi_enabled) return;   // повторный OP_WIFI не должен вешать вторую точку
+    wifi_enabled = true;
 
     WiFi.mode(WIFI_AP_STA);
 
@@ -718,7 +806,7 @@ void setupNetwork() {
         // Записывать здесь нельзя — стирание флеша заморозит renderingTask.
         // Просто помечаем: loop() сбросит настройки, когда отрисовка не идёт.
         settings_dirty = true;
-        state_version++;
+        pov_state_version++;
         request->send(200, "text/plain", "OK");
     });
 
@@ -756,7 +844,7 @@ void setupNetwork() {
             curf, (unsigned)(force_stop_display ? 0 : 1),
             (float)rpm_render_on, (float)rpm_render_off,
             (unsigned)effect_id, (unsigned)effect_speed_red,
-            (unsigned long)state_version, (unsigned long)file_version
+            (unsigned long)pov_state_version, (unsigned long)pov_file_version
         );
         request->send(200, "application/json", buf);
     });
@@ -876,11 +964,11 @@ void setupNetwork() {
             pendingFilePath = "/" + fname;
             request_play_flag = true;
             xSemaphoreGive(fileLoaderSemaphore);
-            // file_version НЕ трогаем: список файлов от воспроизведения не
+            // pov_file_version НЕ трогаем: список файлов от воспроизведения не
             // меняется, а его перезагрузка заставляла браузер снова дёргать
             // /list — то есть читать флеш — ровно в тот момент, когда рендер
             // только-только ожил после загрузки кадров.
-            state_version++;
+            pov_state_version++;
             webLogf("[DISP] Play: %s", fname.c_str());
             request->send(200, "text/plain", "Playing");
         }
@@ -897,7 +985,7 @@ void setupNetwork() {
             xSemaphoreGive(fileLoaderSemaphore);
             settings_dirty = true;
         }
-        state_version++;
+        pov_state_version++;
         webLog("[DISP] Stop");
         request->send(200, "text/plain", "Stopped");
     });
@@ -932,7 +1020,7 @@ void setupNetwork() {
             pending_effect = (int8_t)id;
             xSemaphoreGive(fileLoaderSemaphore);
             settings_dirty = true;
-            state_version++;
+            pov_state_version++;
         }
         request->send(200, "text/plain", "OK");
     });
@@ -964,13 +1052,13 @@ void setupNetwork() {
                 slideCurrentIndex = -1;  // loop() немедленно запустит первый файл
                 slideLastSwitch   = 0;
                 settings_dirty    = true;
-                state_version++;
+                pov_state_version++;
                 webLogf("[DISP] Slideshow start, interval %lus", (unsigned long)(slideInterval / 1000));
                 request->send(200, "text/plain", "OK");
             } else if (action == "stop") {
                 slideshowActive = false;
                 settings_dirty  = true;
-                state_version++;
+                pov_state_version++;
                 webLog("[DISP] Slideshow stop");
                 request->send(200, "text/plain", "OK");
             } else {
@@ -997,8 +1085,8 @@ void setupNetwork() {
                 webLogf("[WARN] Closed open upload before delete: %s", path.c_str());
             }
             LittleFS.remove(path);
-            state_version++;
-            file_version++;
+            pov_state_version++;
+            pov_file_version++;
             request->send(200, "text/plain", "Deleted");
         }
     });
@@ -1030,7 +1118,7 @@ void setupNetwork() {
             request->send(507, "text/plain", "Write failed (out of space?)");
             return;
         }
-        state_version++;
+        pov_state_version++;
         request->send(200, "text/plain", "OK");
     }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
         last_web_activity_time = millis();
@@ -1116,7 +1204,7 @@ void setupNetwork() {
                 uploadFailed = true;
                 return;
             }
-            file_version++;
+            pov_file_version++;
         }
     });
 
@@ -1433,19 +1521,27 @@ void setupNetwork() {
 
     ElegantOTA.begin(&server);
     ElegantOTA.onStart(safeOTAShutdown);
-    // server.begin() намеренно НЕ вызывается здесь.
-    // AsyncTCP начинает принимать соединения сразу после begin(),
-    // и браузер, открытый до загрузки устройства, немедленно шлёт запросы
-    // пока setup() ещё не завершился (LittleFS, /battery endpoint и т.д.).
-    // Задача AsyncTCP зависает ожидая lwIP → Task WDT через 5с → перезагрузка.
-    // server.begin() вызывается из setup() после полной инициализации.
 
     ArduinoOTA.setHostname(hostName.c_str());
     ArduinoOTA.onStart(safeOTAShutdown);
     ArduinoOTA.begin();
+
+    // Раньше server.begin() звался из setup(): AsyncTCP принимает соединения
+    // сразу, и браузер, открытый до загрузки устройства, успевал постучаться
+    // в недоделанный setup() — задача AsyncTCP вставала на lwIP и ловила WDT.
+    // Теперь этой гонки нет по построению: Wi-Fi поднимается по команде из
+    // приложения, то есть заведомо после того, как setup() отработал.
+    server.begin();
+    webLogf("[NET] Wi-Fi up, HTTP server started (AP %s)", apSsid.c_str());
+    pov_state_version++;
 }
 
 void loopNetwork() {
+    // Пока радио не поднято, обслуживать нечего: ни OTA, ни переподключения,
+    // ни сканирования. Проверка первой строкой, а не флагом у каждого блока, —
+    // networkTask крутится каждые 5 мс и в BLE-режиме должен стоить ровно ничего.
+    if (!wifi_enabled) return;
+
     ArduinoOTA.handle();
     ElegantOTA.loop();
 

@@ -217,10 +217,94 @@ Frames can come from a generator instead of a file — that is the only way `Spe
 | File | Role |
 |------|------|
 | [src/main.cpp](src/main.cpp) | Setup, main loop, Hall/rotor tracking, rendering, power FSM, ADC telemetry, deep sleep |
-| [src/network.cpp](src/network.cpp) | WiFi (AP+STA), AsyncWebServer, file upload/playback, OTA, mDNS, web log |
+| [src/povble.cpp](src/povble.cpp) | **BLE GATT control — the default transport.** Command dispatch, telemetry, upload with inflate, OTA |
+| [src/network.cpp](src/network.cpp) | WiFi (AP+STA), AsyncWebServer, file upload/playback, OTA, mDNS, web log — **opt-in, off at boot** |
 | [src/effects.cpp](src/effects.cpp) | Procedural effects: generator task, frame buffers, the six effects |
 | [include/config.h](include/config.h) | Pin map, display geometry, RPM thresholds, globals |
+| [include/povble.h](include/povble.h) | BLE protocol: opcodes, packed structs. Mirrored byte-for-byte by `android/…/ble/Proto.kt` |
 | [data/index.html](data/index.html) | Web UI served from LittleFS (also does image→polar conversion in-browser) |
+| [android/](android/) | Android app (Kotlin/Compose). The primary UI; see `android/README.md` |
+
+### BLE Transport (default), Wi-Fi (opt-in)
+
+**The wheel advertises over BLE at boot and does not start Wi-Fi at all.** Three
+reasons, all about the phone rather than the code:
+
+1. The softAP has no route to the internet, and Android hands the whole handset's
+   data over to it on connect — mobile data dies while you use the wheel.
+2. A phone has one STA interface, so **two wheels cannot be reached at once**.
+   Outdoors there is no shared home network to fall back on. BLE holds as many
+   links as you like, which is what a bike with two wheels actually needs.
+3. An AP's receiver is on continuously and costs ~100 mA — the same current the
+   IP2312U delivers in trickle mode, and a large fraction of the display budget.
+   BLE wakes only on the connection interval.
+
+Wi-Fi is **not removed**, only deferred. `OP_WIFI` sets `pending_wifi_on`, and
+`loop()` raises the radio — but only while `power_state == PWR_OFF`. Bringing it
+up blocks for up to 10 s waiting on the STA, and during that stall `loop()` runs
+neither the power FSM nor the battery protection; freezing the discharge cutoff
+on a spinning wheel is not worth the convenience. Wi-Fi is what you enable to
+flash from PlatformIO, i.e. on a stationary wheel. **The flag is deliberately not
+persisted** — the next boot is BLE-only again.
+
+- `setupNetwork()` was split. **`setupStorage()` runs unconditionally** and holds
+  the one `prefs.begin()` in the project plus the MAC-derived `hostName`/AP SSID.
+  Skipping it would silently revert every setting, the Hall calibration and the
+  autoplay file to defaults on each boot — `Preferences` getters return the
+  default on a closed handle rather than failing. `WiFi.macAddress()` is safe
+  there: with the driver in `WIFI_MODE_NULL` it falls back to `esp_read_mac()`,
+  so the name is identical to the one BLE derives and existing wheels keep it.
+- `loopNetwork()` early-returns unless `wifi_enabled`, and `networkTask` is not
+  even created until the radio comes up.
+- `server.begin()` moved into `setupNetwork()`. The old comment about AsyncTCP
+  accepting a request mid-`setup()` no longer applies: by the time `OP_WIFI`
+  arrives, `setup()` has long returned.
+
+**Protocol.** Binary, not JSON — one ATT payload is 244…514 bytes and spending it
+on field names buys an extra round trip per exchange. Five characteristics: CMD
+(write), RSP (notify), DATA (write-no-response), FLOW (notify), TELE (notify).
+Large replies (file list, preview, log) are staged on the device and pulled by
+offset with `OP_FRAG`, so a lost fragment cannot pass unnoticed.
+
+**Upload speed** is why the format is what it is. The phone deflates the file and
+the device inflates it with `tinfl_decompress` **from ROM** (`0x40000828`) — free
+in flash terms, and 3–5× on palette indices, which multiplies the effective rate
+by the same factor. On top: MTU 517, write-without-response, LE 2M PHY, DLE 251,
+7.5–15 ms interval, and a credit window instead of an ack per packet. CRC32 over
+the *decompressed* bytes is checked before the file is kept.
+
+**Flash is written by a separate task, never by the ATT callback.** Erasing a
+page takes tens of milliseconds; the NimBLE host task stalling that long drops
+the link on supervision timeout. The callback only copies into a PSRAM ring.
+Three constraints on that writer, each learned the hard way:
+
+- **`vTaskDelay(1)` every chunk is mandatory.** It sits on Core 0 at priority 1;
+  IDLE0 is priority 0 and — unlike IDLE1 — is still watched by the Task WDT.
+  With deflate at 3–5× the ring does not empty for minutes at a time, so without
+  the yield IDLE0 starves and the board panics mid-upload.
+- **`WRITE_CHUNK_MAX` (4096) caps one `write()`.** The ring hands out up to 64 KB
+  otherwise, and a flash write that long disables the instruction cache on both
+  cores and parks `renderingTask` — the same reason `loadFrameFromFile()` chunks.
+- **A stall watchdog (`XFER_STALL_MS`) aborts an abandoned transfer.** A phone
+  that goes quiet without disconnecting used to leave `xfer_mode` set forever:
+  the file stayed open, `OP_UP_BEGIN` answered `ST_BUSY` for good, and `bleLoop()`
+  suppressed telemetry for the duration — the wheel looked dead.
+
+`OP_OTA_BEGIN` calls the same `safeOTAShutdown()` the web path uses. Raising
+`ota_in_progress` is not equivalent: that function also drains the DMA
+transaction, blanks the strip, drops both DCDC rails and **unmounts LittleFS** —
+without which the image is written over a mounted filesystem and takes the
+animation library with it.
+
+`bleConnected()` feeds the idle timer the same way an associated softAP station
+used to: a connected phone gets the generous 5-minute window, because converting
+a long clip on the handset is minutes of legitimate silence.
+
+**NimBLE-Arduino is pinned to `~1.4.3` and that is load-bearing.** 2.x changed
+every callback signature (`onWrite` gained `NimBLEConnInfo&`, `onConnect`/
+`onDisconnect` lost `ble_gap_conn_desc*`), so the code does not merely warn under
+2.x — it stops overriding anything. `CONFIG_BT_NIMBLE_TASK_STACK_SIZE=6144`
+because `sendRsp()` puts a 520-byte buffer on the host task's stack.
 
 ### Web API Endpoints
 
