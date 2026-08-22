@@ -190,10 +190,12 @@ data class Tele(
     val effect: Int = 0, val play: Boolean = false, val slideshow: Boolean = false,
     val framesTotal: Int = 0, val wifi: Boolean = false,
     val stateVer: Long = 0, val fileVer: Long = 0, val epoch: Long = 0,
-    val file: String = ""
+    val file: String = "",
+    /** Интервал слайдшоу на устройстве, секунды. */
+    val slideSecs: Int = 10
 ) {
     companion object {
-        const val SIZE = 80
+        const val SIZE = 82
         fun parse(a: ByteArray): Tele {
             val p = Proto.wrap(a)
             val rpm = (p.short.toInt() and 0xFFFF) / 10f
@@ -225,9 +227,10 @@ data class Tele(
             val fv = p.int.toLong() and 0xFFFFFFFFL
             val ep = p.int.toLong() and 0xFFFFFFFFL
             val file = Proto.readStr(p, 32)
+            val slideSecs = p.short.toInt() and 0xFFFF
             return Tele(rpm, dir, pwr, step, fill, kmh, vbat, vusb, ocv, sag, rise,
                 soc, chg, usb, lux, bri, eb, rms, cap, cut, eff, play, slide, ft, wifi,
-                sv, fv, ep, file)
+                sv, fv, ep, file, slideSecs)
         }
     }
 }

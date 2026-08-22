@@ -1,7 +1,18 @@
+import com.android.build.api.variant.impl.VariantOutputImpl
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
+
+// Отметка времени сборки — она же уходит в имя APK. Берётся один раз на
+// конфигурацию, чтобы все выходы одной сборки назывались одинаково.
+// Импорты обязательны: в скрипте Kotlin DSL идентификатор java занят
+// расширением Gradle для Java-плагина, и java.time.* оттуда не разрешается.
+val buildStamp: String = LocalDateTime.now()
+    .format(DateTimeFormatter.ofPattern("yyyy-MM-dd-HH-mm"))
 
 android {
     namespace = "com.povwheel.app"
@@ -29,6 +40,24 @@ android {
     buildFeatures { compose = true }
     composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
     packaging { resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" } }
+}
+
+// Имя APK с датой и временем сборки: app-release-2026-08-22-17-49.apk.
+// Иначе на телефоне и в папке загрузок лежит десяток одинаковых
+// «app-release.apk», и понять, какой из них свежий, можно только по дате
+// файла — которая теряется при первой же пересылке.
+//
+// Побочный эффект намеренный: имя меняется каждую сборку, поэтому упаковка
+// никогда не считается UP-TO-DATE и APK создаётся заново даже когда код не
+// менялся. Так и нужно — файл со штампом обязан существовать под своим именем.
+androidComponents {
+    onVariants { variant ->
+        variant.outputs.forEach { output ->
+            (output as? VariantOutputImpl)?.outputFileName?.set(
+                "app-" + variant.name + "-" + buildStamp + ".apk"
+            )
+        }
+    }
 }
 
 dependencies {

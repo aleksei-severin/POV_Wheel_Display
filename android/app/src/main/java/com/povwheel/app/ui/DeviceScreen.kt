@@ -5,7 +5,10 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.snapping.rememberSnapFlingBehavior
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -21,6 +24,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -222,7 +226,30 @@ private fun LibraryTab(vm: WheelVm, tele: Tele) {
     val connected by vm.connected.collectAsState()
     val mirror by vm.mirrorAll.collectAsState()
     var confirmDelete by remember { mutableStateOf<String?>(null) }
-    var albumSecs by remember { mutableStateOf(10) }
+    // Значение с устройства — источник истины. Пока оно не приехало (интервал 0),
+    // держим последнее показанное: иначе регулятор дёргался бы на каждом пакете
+    // телеметрии, приходящем раз в полсекунды.
+    var albumSecs by rememberSaveable { mutableStateOf(10) }
+    var albumTouched by rememberSaveable { mutableStateOf(false) }
+    // Сменили колесо — снова слушаем устройство, а не помним чужую цифру.
+    // У каждого колеса свой интервал, и показывать здесь настройку соседнего
+    // тем вреднее, что она применяется сразу: первое же касание навязало бы её.
+    val currentWheel by vm.current.collectAsState()
+    LaunchedEffect(currentWheel) { albumTouched = false }
+    LaunchedEffect(tele.slideSecs, albumTouched) {
+        if (tele.slideSecs in 1..300 && !albumTouched) albumSecs = tele.slideSecs
+    }
+
+    // Интервал применяется СРАЗУ, без стоп/старта. Устройство при уже идущем
+    // слайдшоу меняет только интервал и не трогает текущий индекс (OP_ALBUM),
+    // так что картинка на ободе от этого не перескакивает.
+    // Задержка — чтобы прокрутка колеса не сыпала командой на каждое деление.
+    LaunchedEffect(albumSecs, tele.slideshow) {
+        if (albumTouched && tele.slideshow) {
+            kotlinx.coroutines.delay(350)
+            vm.album(true, albumSecs * 1000)
+        }
+    }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp)) {
 
@@ -244,20 +271,31 @@ private fun LibraryTab(vm: WheelVm, tele: Tele) {
             Column(Modifier.padding(12.dp)) {
                 Text("Slideshow", fontWeight = FontWeight.SemiBold)
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Each file for ", style = MaterialTheme.typography.bodySmall)
-                    OutlinedTextField(
-                        value = albumSecs.toString(),
-                        onValueChange = { albumSecs = it.toIntOrNull()?.coerceIn(1, 99) ?: albumSecs },
-                        modifier = Modifier.width(84.dp),
-                        singleLine = true
+                    Text("Each file for", style = MaterialTheme.typography.bodySmall)
+                    Spacer(Modifier.weight(1f))
+                    Text(
+                        albumSecs.toString() + " s",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold
                     )
-                    Text(" s", style = MaterialTheme.typography.bodySmall)
                     Spacer(Modifier.weight(1f))
                     Button(onClick = {
                         if (tele.slideshow) { vm.album(false, 0); vm.say("Slideshow stopped") }
-                        else { vm.album(true, albumSecs * 1000); vm.say("Slideshow started") }
+                        else {
+                            albumTouched = true
+                            vm.album(true, albumSecs * 1000)
+                            vm.say("Slideshow started")
+                        }
                     }) { Text(if (tele.slideshow) "⏹ Stop" else "⏩ Start") }
                 }
+                Spacer(Modifier.height(4.dp))
+                SecondsWheel(albumSecs) { albumTouched = true; albumSecs = it }
+                Text(
+                    if (tele.slideshow) "Applies straight away — no need to stop and start."
+                    else "Scroll to pick, or use the arrows.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
         }
 
@@ -728,6 +766,89 @@ private fun Badge2(text: String, color: Color?) {
  * только когда палец отпустили. Слать по BLE каждое промежуточное значение
  * значило бы выстроить десятки записей в очередь за одним движением.
  */
+// Секунды слайдшоу: 1…300, столько же принимает устройство (OP_ALBUM зажимает
+// 1000…300000 мс). Прокручиваемая лента с прилипанием плюс стрелки.
+private val ALBUM_SECS = (1..300).toList()
+
+/**
+ * Выбор интервала прокруткой.
+ *
+ * Было поле ввода, и оно вело себя откровенно плохо: значением ленты служило
+ * `albumSecs.toString()`, а `onValueChange` при неразобранном тексте возвращал
+ * ПРЕЖНЕЕ число. Стереть содержимое поля поэтому было нельзя — на экране тут же
+ * снова появлялась старая цифра, и следующая набранная приписывалась к ней:
+ * из «1» и нажатой «5» получалось «15». Здесь набирать нечего в принципе, так
+ * что и ломаться нечему.
+ */
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+@Composable
+private fun SecondsWheel(value: Int, onChange: (Int) -> Unit) {
+    val itemW = 54.dp
+    val density = LocalDensity.current
+    val idx = (value - 1).coerceIn(0, ALBUM_SECS.lastIndex)
+    val state = rememberLazyListState(initialFirstVisibleItemIndex = idx)
+    val fling = rememberSnapFlingBehavior(lazyListState = state)
+
+    // Значение изменили снаружи (стрелки, ответ устройства) — доводим ленту.
+    LaunchedEffect(value) {
+        if (!state.isScrollInProgress && state.firstVisibleItemIndex != idx) {
+            state.animateScrollToItem(idx)
+        }
+    }
+
+    // Прокрутка остановилась — сообщаем, на чём именно.
+    LaunchedEffect(state) {
+        snapshotFlow { state.isScrollInProgress }.collect { moving ->
+            if (!moving) {
+                val half = with(density) { itemW.toPx() } / 2f
+                val i = state.firstVisibleItemIndex +
+                        if (state.firstVisibleItemScrollOffset > half) 1 else 0
+                ALBUM_SECS.getOrNull(i.coerceIn(0, ALBUM_SECS.lastIndex))
+                    ?.let { if (it != value) onChange(it) }
+            }
+        }
+    }
+
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        TextButton(
+            onClick = { onChange((value - 1).coerceAtLeast(1)) },
+            enabled = value > 1
+        ) { Text("−", fontSize = 20.sp) }
+
+        BoxWithConstraints(Modifier.weight(1f)) {
+            // Симметричные поля делают прилипание к началу видимой области
+            // прилипанием к центру — отдельная математика центрирования не нужна.
+            val side = ((maxWidth - itemW) / 2).coerceAtLeast(0.dp)
+            LazyRow(
+                state = state,
+                flingBehavior = fling,
+                contentPadding = PaddingValues(horizontal = side),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                items(ALBUM_SECS.size) { i ->
+                    val v = ALBUM_SECS[i]
+                    val sel = v == value
+                    Box(Modifier.width(itemW), contentAlignment = Alignment.Center) {
+                        Text(
+                            v.toString(),
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = if (sel) 20.sp else 15.sp,
+                            fontWeight = if (sel) FontWeight.Bold else FontWeight.Normal,
+                            color = if (sel) MaterialTheme.colorScheme.primary
+                                    else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+        }
+
+        TextButton(
+            onClick = { onChange((value + 1).coerceAtMost(300)) },
+            enabled = value < 300
+        ) { Text("+", fontSize = 20.sp) }
+    }
+}
+
 @Composable
 private fun SliderRow(
     label: String, valueText: String,

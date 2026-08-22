@@ -48,7 +48,7 @@
 // ---------------------------------------------------------------------
 static_assert(sizeof(PovHello)    == 48, "PovHello != Hello.SIZE в Proto.kt");
 static_assert(sizeof(PovSettings) == 26, "PovSettings != Settings.SIZE в Proto.kt");
-static_assert(sizeof(PovTele)     == 80, "PovTele != Tele.SIZE в Proto.kt");
+static_assert(sizeof(PovTele)     == 82, "PovTele != Tele.SIZE в Proto.kt");
 static_assert(sizeof(PovFsInfo)   == 20, "PovFsInfo != FsInfo.SIZE в Proto.kt");
 static_assert(sizeof(PovUpBegin)  == 14, "PovUpBegin != заголовок заливки в BleClient.kt");
 static_assert(sizeof(PovUpReady)  ==  6, "PovUpReady != UpReady.parse в Proto.kt");
@@ -648,6 +648,7 @@ static void fillTele(PovTele* t) {
     const char* cf = currentDisplayFile.c_str();
     if (*cf == '/') cf++;
     strncpy(t->file, cf, sizeof(t->file) - 1);
+    t->slide_secs = (uint16_t)(slideInterval / 1000);
 }
 
 // ---------------------------------------------------------------------
