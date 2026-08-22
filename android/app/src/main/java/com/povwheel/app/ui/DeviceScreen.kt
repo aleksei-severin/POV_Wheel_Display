@@ -5,10 +5,12 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.snapping.rememberSnapFlingBehavior
+import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.draggable
+import androidx.compose.foundation.gestures.rememberDraggableState
 import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -24,11 +26,16 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.sp
 import com.povwheel.app.WheelVm
 import com.povwheel.app.ble.DevFile
@@ -38,7 +45,7 @@ import com.povwheel.app.ble.Tele
 import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
 
-private val TABS = listOf("Library", "Display", "Calibration", "Effects", "Log")
+private val TABS = listOf("Library", "Display", "Tuning", "Effects", "Log")
 
 @Composable
 fun DeviceScreen(vm: WheelVm) {
@@ -67,7 +74,7 @@ fun DeviceScreen(vm: WheelVm) {
             when (tab) {
                 0 -> LibraryTab(vm, tele)
                 1 -> DisplayTab(vm, tele)
-                2 -> CalibrationTab(vm)
+                2 -> TuningTab(vm)
                 3 -> EffectsTab(vm, tele)
                 else -> LogTab(vm)
             }
@@ -273,12 +280,6 @@ private fun LibraryTab(vm: WheelVm, tele: Tele) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("Each file for", style = MaterialTheme.typography.bodySmall)
                     Spacer(Modifier.weight(1f))
-                    Text(
-                        albumSecs.toString() + " s",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                    Spacer(Modifier.weight(1f))
                     Button(onClick = {
                         if (tele.slideshow) { vm.album(false, 0); vm.say("Slideshow stopped") }
                         else {
@@ -289,13 +290,20 @@ private fun LibraryTab(vm: WheelVm, tele: Tele) {
                     }) { Text(if (tele.slideshow) "⏹ Stop" else "⏩ Start") }
                 }
                 Spacer(Modifier.height(4.dp))
-                SecondsWheel(albumSecs) { albumTouched = true; albumSecs = it }
-                Text(
-                    if (tele.slideshow) "Applies straight away — no need to stop and start."
-                    else "Scroll to pick, or use the arrows.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                NumberSpinner(
+                    value = albumSecs,
+                    range = 1..300,
+                    suffix = " s",
+                    modifier = Modifier.fillMaxWidth(),
+                    onChange = { albumTouched = true; albumSecs = it }
                 )
+                if (tele.slideshow) {
+                    Text(
+                        "Applies straight away — no need to stop and start.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
         }
 
@@ -444,7 +452,8 @@ private fun DisplayTab(vm: WheelVm, tele: Tele) {
             "Minimum brightness", s.bmin.toString() + " / 31",
             s.bmin.toFloat(), 1f, 31f, 30,
             onChange = { vm.settings.value = s.copy(bmin = it.roundToInt().coerceAtMost(s.bmax)) },
-            onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() }
+            onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() },
+            reverseFill = true
         )
         SliderRow(
             "Maximum brightness", s.bmax.toString() + " / 31",
@@ -476,10 +485,16 @@ private fun DisplayTab(vm: WheelVm, tele: Tele) {
 
         Divider(Modifier.padding(vertical = 14.dp))
 
-        SliderRow(
-            "Magnet position", s.angle.toString() + "°",
-            s.angle.toFloat(), 0f, 360f, 360,
-            onChange = { vm.settings.value = s.copy(angle = it.roundToInt()) },
+        // Спиннер, а не ползунок: на 360 положениях один пиксель дорожки стоит
+        // больше градуса, и попасть пальцем в нужный было делом случая, тогда
+        // как «поставить картинку ровно» — это правка на единицы градусов.
+        Text("Magnet position", style = MaterialTheme.typography.bodyMedium)
+        NumberSpinner(
+            value = s.angle,
+            range = 0..360,
+            suffix = "°",
+            modifier = Modifier.fillMaxWidth(),
+            onChange = { vm.settings.value = s.copy(angle = it) },
             onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() }
         )
         Text("Use to stand the animation upright.",
@@ -559,10 +574,10 @@ private fun DisplayTab(vm: WheelVm, tele: Tele) {
     }
 }
 
-// --------------------------------------------------------------- Калибровка
+// ------------------------------------------------------------------ Tuning
 
 @Composable
-private fun CalibrationTab(vm: WheelVm) {
+private fun TuningTab(vm: WheelVm) {
     val s by vm.settings.collectAsState()
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(14.dp)) {
         Text("Colour", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
@@ -766,85 +781,110 @@ private fun Badge2(text: String, color: Color?) {
  * только когда палец отпустили. Слать по BLE каждое промежуточное значение
  * значило бы выстроить десятки записей в очередь за одним движением.
  */
-// Секунды слайдшоу: 1…300, столько же принимает устройство (OP_ALBUM зажимает
-// 1000…300000 мс). Прокручиваемая лента с прилипанием плюс стрелки.
-private val ALBUM_SECS = (1..300).toList()
-
 /**
- * Выбор интервала прокруткой.
+ * Число, которое крутят прямо на нём самом.
  *
- * Было поле ввода, и оно вело себя откровенно плохо: значением ленты служило
- * `albumSecs.toString()`, а `onValueChange` при неразобранном тексте возвращал
- * ПРЕЖНЕЕ число. Стереть содержимое поля поэтому было нельзя — на экране тут же
- * снова появлялась старая цифра, и следующая набранная приписывалась к ней:
- * из «1» и нажатой «5» получалось «15». Здесь набирать нечего в принципе, так
- * что и ломаться нечему.
+ * Слева «−», справа «+», между ними текущее значение: горизонтальным
+ * перетаскиванием оно листается, нажатием — превращается в поле ввода.
+ * Ленты соседних цифр по бокам нет намеренно: она занимала половину карточки,
+ * а показывала то, что и так очевидно.
+ *
+ * Ввод с клавиатуры держит СВОЙ текст, пока идёт правка, и применяет его лишь
+ * по «готово» или по потере фокуса. Это принципиально: раньше полем управляло
+ * само число, и любой неразобранный текст откатывался к прежнему значению —
+ * стереть содержимое было нельзя, а набранная следом цифра приписывалась к
+ * старой, превращая «1» и «5» в «15». Здесь пустое поле — законное
+ * промежуточное состояние, и ничего за спиной пользователя не дописывается.
  */
-@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-private fun SecondsWheel(value: Int, onChange: (Int) -> Unit) {
-    val itemW = 54.dp
+private fun NumberSpinner(
+    value: Int,
+    range: IntRange,
+    suffix: String = "",
+    modifier: Modifier = Modifier,
+    onChange: (Int) -> Unit,
+    onCommit: () -> Unit = {}
+) {
+    var editing by remember { mutableStateOf(false) }
+    var text by remember { mutableStateOf("") }
+    val focus = remember { FocusRequester() }
     val density = LocalDensity.current
-    val idx = (value - 1).coerceIn(0, ALBUM_SECS.lastIndex)
-    val state = rememberLazyListState(initialFirstVisibleItemIndex = idx)
-    val fling = rememberSnapFlingBehavior(lazyListState = state)
 
-    // Значение изменили снаружи (стрелки, ответ устройства) — доводим ленту.
-    LaunchedEffect(value) {
-        if (!state.isScrollInProgress && state.firstVisibleItemIndex != idx) {
-            state.animateScrollToItem(idx)
-        }
+    fun clamp(v: Int) = v.coerceIn(range.first, range.last)
+
+    fun commitText() {
+        val v = text.trim().toIntOrNull()
+        if (v != null) { onChange(clamp(v)); onCommit() }   // мусор и пустое — просто откат
+        editing = false
     }
 
-    // Прокрутка остановилась — сообщаем, на чём именно.
-    LaunchedEffect(state) {
-        snapshotFlow { state.isScrollInProgress }.collect { moving ->
-            if (!moving) {
-                val half = with(density) { itemW.toPx() } / 2f
-                val i = state.firstVisibleItemIndex +
-                        if (state.firstVisibleItemScrollOffset > half) 1 else 0
-                ALBUM_SECS.getOrNull(i.coerceIn(0, ALBUM_SECS.lastIndex))
-                    ?.let { if (it != value) onChange(it) }
-            }
-        }
-    }
-
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        TextButton(
-            onClick = { onChange((value - 1).coerceAtLeast(1)) },
-            enabled = value > 1
+    Row(modifier, verticalAlignment = Alignment.CenterVertically) {
+        FilledTonalButton(
+            onClick = { onChange(clamp(value - 1)); onCommit() },
+            enabled = value > range.first,
+            contentPadding = PaddingValues(0.dp),
+            modifier = Modifier.size(44.dp)
         ) { Text("−", fontSize = 20.sp) }
 
-        BoxWithConstraints(Modifier.weight(1f)) {
-            // Симметричные поля делают прилипание к началу видимой области
-            // прилипанием к центру — отдельная математика центрирования не нужна.
-            val side = ((maxWidth - itemW) / 2).coerceAtLeast(0.dp)
-            LazyRow(
-                state = state,
-                flingBehavior = fling,
-                contentPadding = PaddingValues(horizontal = side),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                items(ALBUM_SECS.size) { i ->
-                    val v = ALBUM_SECS[i]
-                    val sel = v == value
-                    Box(Modifier.width(itemW), contentAlignment = Alignment.Center) {
-                        Text(
-                            v.toString(),
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = if (sel) 20.sp else 15.sp,
-                            fontWeight = if (sel) FontWeight.Bold else FontWeight.Normal,
-                            color = if (sel) MaterialTheme.colorScheme.primary
-                                    else MaterialTheme.colorScheme.onSurfaceVariant
+        Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+            if (editing) {
+                // Поле только что появилось и фокуса ещё не получало, а
+                // onFocusChanged срабатывает и на «не в фокусе» при первой же
+                // компоновке. Без этого флага правка закрывалась бы в тот же
+                // кадр, в котором открылась, и набрать не удалось бы ничего.
+                var everFocused by remember { mutableStateOf(false) }
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { t -> text = t.filter { it.isDigit() || it == '-' }.take(4) },
+                    singleLine = true,
+                    modifier = Modifier.width(130.dp).focusRequester(focus)
+                        .onFocusChanged {
+                            if (it.isFocused) everFocused = true
+                            else if (everFocused && editing) commitText()
+                        },
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.Number, imeAction = ImeAction.Done
+                    ),
+                    keyboardActions = KeyboardActions(onDone = { commitText() })
+                )
+                LaunchedEffect(Unit) { focus.requestFocus() }
+            } else {
+                // Шаг перетаскивания. 8 dp на единицу — мелкие правки берутся
+                // пальцем, а до дальнего конца шкалы всё равно быстрее добраться
+                // вводом с клавиатуры, чем протаскиванием.
+                val stepPx = with(density) { 8.dp.toPx() }
+                // Считаем от значения на момент НАЧАЛА жеста и от общего
+                // пройденного расстояния. Прибавлять по единице на каждый шаг
+                // внутри обработчика нельзя: value меняется только с
+                // перекомпоновкой, поэтому три шага за кадр давали бы
+                // (value + 1) трижды — то есть всё те же +1.
+                var acc by remember { mutableStateOf(0f) }
+                var base by remember { mutableStateOf(value) }
+                Text(
+                    value.toString() + suffix,
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier
+                        .clickable { text = value.toString(); editing = true }
+                        .draggable(
+                            orientation = Orientation.Horizontal,
+                            state = rememberDraggableState { d ->
+                                acc += d
+                                onChange(clamp(base + (acc / stepPx).toInt()))
+                            },
+                            onDragStarted = { base = value; acc = 0f },
+                            onDragStopped = { acc = 0f; onCommit() }
                         )
-                    }
-                }
+                        .padding(horizontal = 14.dp, vertical = 6.dp)
+                )
             }
         }
 
-        TextButton(
-            onClick = { onChange((value + 1).coerceAtMost(300)) },
-            enabled = value < 300
+        FilledTonalButton(
+            onClick = { onChange(clamp(value + 1)); onCommit() },
+            enabled = value < range.last,
+            contentPadding = PaddingValues(0.dp),
+            modifier = Modifier.size(44.dp)
         ) { Text("+", fontSize = 20.sp) }
     }
 }
@@ -853,19 +893,41 @@ private fun SecondsWheel(value: Int, onChange: (Int) -> Unit) {
 private fun SliderRow(
     label: String, valueText: String,
     value: Float, min: Float, max: Float, steps: Int,
-    onChange: (Float) -> Unit, onCommit: () -> Unit
+    onChange: (Float) -> Unit, onCommit: () -> Unit,
+    /**
+     * Закрашивать дорожку СПРАВА от ползунка, а не слева.
+     *
+     * Для нижнего порога это не украшение, а смысл: закрашенное — то, чем
+     * регулятор распоряжается. «Минимальная яркость 10» означает, что рабочий
+     * диапазон — от десяти и выше, и подсвечена должна быть именно эта часть
+     * шкалы. Заливка слева читалась ровно наоборот: будто ограничение
+     * действует снизу доверху и чем больше значение, тем больше «занято».
+     */
+    reverseFill: Boolean = false
 ) {
     Column(Modifier.padding(vertical = 4.dp)) {
         Row {
             Text(label, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
             Text(valueText, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
         }
+        // Направление заливки меняется ПОДМЕНОЙ РОЛЕЙ ЦВЕТОВ, а не своей
+        // отрисовкой дорожки: стандартная дорожка и так красит две половины
+        // этими двумя цветами, поэтому засечки, отключённое состояние и тема
+        // остаются штатными и переписывать нечего.
+        val colors = if (!reverseFill) SliderDefaults.colors()
+                     else SliderDefaults.colors(
+                         activeTrackColor   = MaterialTheme.colorScheme.surfaceVariant,
+                         activeTickColor    = MaterialTheme.colorScheme.onSurfaceVariant,
+                         inactiveTrackColor = MaterialTheme.colorScheme.primary,
+                         inactiveTickColor  = MaterialTheme.colorScheme.onPrimary
+                     )
         Slider(
             value = value.coerceIn(min, max),
             onValueChange = onChange,
             onValueChangeFinished = onCommit,
             valueRange = min..max,
-            steps = (steps - 1).coerceAtLeast(0)
+            steps = (steps - 1).coerceAtLeast(0),
+            colors = colors
         )
     }
 }
