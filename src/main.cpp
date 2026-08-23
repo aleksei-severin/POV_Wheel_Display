@@ -1023,6 +1023,10 @@ void renderingTask(void* pvParameters) {
     bool     anchor_ok  = false;
 
     // Предыдущее измерение средней скорости (для оценки ускорения)
+    bool     alpha_ok   = false;   // фильтр α уже наполнен
+    float    phase_err_max = 0.0f; // максимальная невязка ФАПЧ за окно диагностики
+    uint32_t phase_dbg_ms  = 0;
+    float    lead_min = 1e9f, lead_max = 0.0f;   // размах упреждения, мкс
     float    w_avg_prev = 0.0f;
     uint32_t t_mid_prev = 0;
     bool     w_prev_ok  = false;
@@ -1093,10 +1097,25 @@ void renderingTask(void* pvParameters) {
                         float a = (w_avg - w_avg_prev) / dt_mid;
                         // Ограничиваем: поправка за оборот не более 30°
                         float lim = 60.0f / ((float)ev_rev * (float)ev_rev);
-                        rotor_alpha = constrain(a, -lim, lim);
+                        a = constrain(a, -lim, lim);
+                        // Сглаживаем адаптивно: см. HALL_ALPHA_K в config.h.
+                        // Сырая оценка — разность двух шумных ω, делённая на
+                        // короткий интервал, и в rotor_omega она возвращается
+                        // умноженной на интервал втрое больший, так что на ровном
+                        // ходу фильтр нужен. Но постоянный медленный фильтр съедал
+                        // и настоящее ускорение — а ради него шесть датчиков и
+                        // стоят. Поэтому меру расхождения считаем в понятных
+                        // единицах (градусы поправки за оборот) и на переходном
+                        // режиме фильтр открываем.
+                        float da = fabsf(a - rotor_alpha) * (float)ev_rev * (float)ev_rev;
+                        float ka = (da > HALL_ALPHA_FAST_DEG) ? HALL_ALPHA_K_FAST
+                                                              : HALL_ALPHA_K;
+                        if (alpha_ok) rotor_alpha += (a - rotor_alpha) * ka;
+                        else          { rotor_alpha = a; alpha_ok = true; }
                     }
                 } else {
                     rotor_alpha = 0.0f;
+                    alpha_ok    = false;
                 }
                 w_avg_prev = w_avg;
                 t_mid_prev = t_mid;
@@ -1157,7 +1176,17 @@ void renderingTask(void* pvParameters) {
                     while (err <= -180.0f) err += 360.0f;
                     // Большая невязка — не разброс датчиков, а потеря синхронизации:
                     // захватываем фазу жёстко, чтобы не ползти к ней целый оборот.
-                    anchor_deg = (fabsf(err) > 10.0f) ? meas : (pred + err * HALL_PLL_K);
+                    // Размах невязки — прямая мера дрожания фазы: именно на
+                    // столько модель расходится с датчиками. Копим максимум,
+                    // печатаем раз в 10 с (см. ниже): без этого числа спорить
+                    // о стабильности картинки можно только на глаз.
+                    float ea = fabsf(err);
+                    if (ea < 30.0f && ea > phase_err_max) phase_err_max = ea;
+                    // Три режима: мягкая подтяжка на ровном ходу, резче при
+                    // систематической невязке разгона, жёсткий захват при
+                    // потере синхронизации.
+                    float kp = (ea > HALL_PLL_ERR_FAST) ? HALL_PLL_K_FAST : HALL_PLL_K;
+                    anchor_deg = (ea > 10.0f) ? meas : (pred + err * kp);
                 } else {
                     anchor_deg = meas;
                 }
@@ -1169,6 +1198,34 @@ void renderingTask(void* pvParameters) {
 
                 anchor_t  = ev_t;
                 anchor_ok = true;
+            }
+
+            // Диагностика фазы. Раз в 10 с при живой отрисовке: готова ли
+            // калибровка (от неё зависит, цепляемся мы за шесть датчиков или
+            // за один, а это разница в шесть раз по накоплению ошибки), какова
+            // невязка и к чему сошлись поправки датчиков.
+            uint32_t now_dbg = millis();
+            if (rendering_active && (uint32_t)(now_dbg - phase_dbg_ms) > 10000) {
+                phase_dbg_ms = now_dbg;
+                webLogf("[HALL] cal=%d err=%.1f off %.1f %.1f %.1f %.1f %.1f",
+                        hall_cal_ready ? 1 : 0, (double)phase_err_max,
+                        (double)rtc_hall_cal[1], (double)rtc_hall_cal[2],
+                        (double)rtc_hall_cal[3], (double)rtc_hall_cal[4],
+                        (double)rtc_hall_cal[5]);
+                // Разброс упреждения в градусах — прямая мера того, насколько
+                // гуляет картинка из-за таймингов вывода, а не из-за фазы.
+                float jit = (lead_max > lead_min)
+                          ? (lead_max - lead_min) * fabsf(rotor_omega) : 0.0f;
+                // aT2 — поправка за оборот от ускорения, в градусах: сколько
+                // именно доигрывает член ½·α·Δt². На ровном ходу около нуля, на
+                // разгоне и торможении растёт — по нему и видно, работает ли
+                // компенсация вообще.
+                float aT2 = rotor_alpha * (float)ev_rev * (float)ev_rev;
+                webLogf("[HALL] lead %.0f..%.0f = %.2f deg, fill %.0f show %.0f aT2 %.1f",
+                        (double)lead_min, (double)lead_max, (double)jit,
+                        (double)fill_us, (double)show_us, (double)aT2);
+                phase_err_max = 0.0f;
+                lead_min = 1e9f; lead_max = 0.0f;
             }
         }
 
@@ -1226,6 +1283,7 @@ void renderingTask(void* pvParameters) {
             // иначе после остановки колеса alpha считалась бы по разрыву в секундах.
             anchor_ok   = false;
             w_prev_ok   = false;
+            alpha_ok    = false;
             rotor_alpha = 0.0f;
             rotor_omega = 0.0f;
             continue;
@@ -1272,7 +1330,28 @@ void renderingTask(void* pvParameters) {
             // чаще раза на градус. Теперь шаг мельче: угол дробный, и промежуточные
             // положения дают ленте реальное преимущество. Оценка идёт по «сырому»
             // углу ротора — он монотонен, в отличие от угла на момент показа.
-            if (psi_valid) {
+            // --- Сколько шине осталось отдавать текущий кадр ---
+            // Считаем ДО проверки темпа: от этого зависит, есть ли вообще смысл
+            // ждать.
+            float bus_busy = 0.0f;
+            if (tx_pending) {
+                float since = (float)(uint32_t)(now - tx_start_us);
+                if (since < dma_frame_us) bus_busy = dma_frame_us - since;
+            }
+
+            // --- Темп обновления ---
+            // Ждать поворота на ANGLE_MIN_STEP имеет смысл только когда шина уже
+            // свободна. Пока она занята дольше, чем мы будем заполнять буфер,
+            // откладывать расчёт нечем: мы всё равно упрёмся в неё, а вот МОМЕНТ
+            // расчёта уплывает на случайную величину — и вместе с ним упреждение.
+            //
+            // Именно это и качало картинку на ободе. start_in = max(fill, bus_busy)
+            // перескакивал между fill_us и целым кадром в зависимости от того, на
+            // какой фазе передачи цикл дошёл до этой точки: замерено 525…872 мкс
+            // размаха, то есть 0.8° на ободе при стабильном якоре (невязка ФАПЧ
+            // была при этом всего 0.3°). Начиная расчёт сразу после постановки
+            // кадра в очередь, мы каждый раз оказываемся в одной и той же фазе.
+            if (psi_valid && bus_busy <= fill_us) {
                 float adv = fabsf(psi - last_psi);
                 if (adv < ANGLE_MIN_STEP) {
                     // Ждать долго — уступаем такт планировщику, иначе loop()
@@ -1286,13 +1365,14 @@ void renderingTask(void* pvParameters) {
             // --- Момент, к которому считаем угол ---
             // Кадр загорится, когда уйдёт по SPI, и будет гореть до следующего
             // обновления. Целимся в середину этого интервала.
-            float bus_busy = 0.0f;
-            if (tx_pending) {
-                float since = (float)(uint32_t)(now - tx_start_us);
-                if (since < dma_frame_us) bus_busy = dma_frame_us - since;
-            }
             float start_in = (fill_us > bus_busy) ? fill_us : bus_busy;  // когда уйдёт наш кадр
             float dtf      = dt0 + start_in + dma_frame_us + show_us * 0.5f;
+
+            // Упреждение целиком, без dt0: именно оно, а не якорь, переводит
+            // джиттер таймингов в градусы на ободе. Копим размах за окно.
+            float lead = dtf - dt0;
+            if (lead < lead_min) lead_min = lead;
+            if (lead > lead_max) lead_max = lead;
 
             float base = anchor_deg + rotor_omega * dtf + 0.5f * rotor_alpha * dtf * dtf
                        + (float)global_angle_offset;
@@ -1312,7 +1392,16 @@ void renderingTask(void* pvParameters) {
             uint8_t  idle = 1 - active;
             uint32_t t_fill0 = micros();
             fillSectorIntoBuffer(dma_buf[idle], idle, base, span);
-            fill_us = (float)(uint32_t)(micros() - t_fill0);
+            // Сглаживаем так же, как show_us. Здесь это не измерение факта, а
+            // ПРОГНОЗ времени заполнения следующего буфера, и он входит прямо в
+            // упреждение: угол сдвигается на rotor_omega * fill_us. Сырое
+            // значение прыгает от кадра к кадру — блендинг двух кадров даёт до
+            // восьми тапов вместо четырёх, смена байта яркости переписывает все
+            // 528 ячеек, — и каждый такой скачок уезжал прямо в положение
+            // картинки на ободе.
+            float fill_now = (float)(uint32_t)(micros() - t_fill0);
+            if (fill_now > 20000.0f) fill_now = 20000.0f;
+            fill_us += (fill_now - fill_us) * 0.25f;
             render_in_fill = false;
             sectors_drawn++;
 
