@@ -6,9 +6,10 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.gestures.draggable
 import androidx.compose.foundation.gestures.rememberDraggableState
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.layout.*
@@ -29,11 +30,13 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.sp
@@ -88,13 +91,22 @@ fun DeviceScreen(vm: WheelVm) {
 @Composable
 private fun Header(vm: WheelVm, tele: Tele, link: Link) {
     val client = vm.currentClient()
+    // Имя берём из общего списка, а НЕ из client.hello. hello — снимок,
+    // сделанный при подключении: он не меняется от переименования, да и
+    // Compose за ним не следит (обычное @Volatile-поле, не State). Поэтому
+    // после Rename заголовок так и показывал старое POV-xxxx, хотя строка в
+    // списке колёс обновлялась сразу.
+    val wheels by vm.wheels.collectAsState()
+    val curAddr by vm.current.collectAsState()
+    val title = wheels.firstOrNull { it.address == curAddr }?.name
+        ?: client?.hello?.name ?: "POV Wheel"
     Row(
         Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         TextButton(onClick = { vm.current.value = null }) { Text("‹ Wheels") }
         Column(Modifier.weight(1f)) {
-            Text(client?.hello?.name ?: "POV Wheel", fontWeight = FontWeight.Bold)
+            Text(title, fontWeight = FontWeight.Bold)
             Text(
                 (if (link == Link.Ready) "Online" else "Offline") +
                     (client?.hello?.fw?.let { "  ·  " + it } ?: ""),
@@ -761,23 +773,59 @@ private fun LogTab(vm: WheelVm) {
     LaunchedEffect(Unit) {
         while (true) { vm.pollLog(); delay(2000) }
     }
+    val listState = rememberLazyListState()
+    val clipboard = LocalClipboardManager.current
+
+    // «Прилипание» к концу: доматываем сами только пока пользователь и так
+    // внизу. Иначе новая строка каждые две секунды вырывала бы список из рук у
+    // того, кто отлистал вверх что-то прочитать.
+    var stick by remember { mutableStateOf(true) }
+    LaunchedEffect(listState) {
+        snapshotFlow {
+            val info = listState.layoutInfo
+            val last = info.visibleItemsInfo.lastOrNull()?.index ?: -1
+            info.totalItemsCount == 0 || last >= info.totalItemsCount - 2
+        }.collect { stick = it }
+    }
+    LaunchedEffect(lines.size, stick) {
+        if (stick && lines.isNotEmpty()) listState.animateScrollToItem(lines.lastIndex)
+    }
+
     Column(Modifier.fillMaxSize().padding(12.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("Device log", fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
             Text(lines.size.toString() + " lines", style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
+            // Выделение пальцем достаёт только то, что на экране, — так устроен
+            // SelectionContainer поверх ленивого списка. Для «прислать весь лог»
+            // нужна кнопка, и она надёжнее любого жеста.
+            TextButton(
+                onClick = {
+                    clipboard.setText(AnnotatedString(lines.joinToString("\n")))
+                    vm.say("Log copied (" + lines.size + " lines)")
+                },
+                enabled = lines.isNotEmpty()
+            ) { Text("Copy") }
             TextButton(onClick = { vm.clearLogView() }) { Text("✕ Clear") }
         }
         Card(Modifier.fillMaxSize()) {
-            LazyColumn(Modifier.padding(8.dp)) {
-                items(lines) { l ->
-                    Text(
-                        l,
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 11.sp,
-                        color = logColor(l),
-                        modifier = Modifier.horizontalScroll(rememberScrollState())
-                    )
+            // SelectionContainer — то, чего не хватало: без него Text в Compose
+            // не выделяется вообще, ни долгим нажатием, ни как-либо ещё.
+            SelectionContainer {
+                LazyColumn(state = listState, modifier = Modifier.padding(8.dp)) {
+                    items(lines) { l ->
+                        Text(
+                            l,
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.sp,
+                            color = logColor(l),
+                            // Перенос вместо горизонтальной прокрутки у каждой
+                            // строки: своя прокрутка перехватывала жест и мешала
+                            // тянуть выделение, а строка целиком на экране всё
+                            // равно удобнее, чем возить её пальцем вбок.
+                            softWrap = true
+                        )
+                    }
                 }
             }
         }
