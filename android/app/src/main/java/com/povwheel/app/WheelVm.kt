@@ -10,6 +10,8 @@ import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
+import android.graphics.Bitmap
+import android.net.Uri
 import android.os.ParcelUuid
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -20,6 +22,9 @@ import com.povwheel.app.ble.Link
 import com.povwheel.app.ble.PreviewFrame
 import com.povwheel.app.ble.Proto
 import com.povwheel.app.ble.Settings
+import com.povwheel.app.convert.Ani6
+import com.povwheel.app.convert.Converter
+import com.povwheel.app.convert.Fit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -543,6 +548,216 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    // =================================================================
+    //  Панель заливки
+    //
+    //  Состояние и сама работа живут ЗДЕСЬ, а не в composable. Раньше и то и
+    //  другое сидело в UploadPanel, а корутина запускалась из
+    //  rememberCoroutineScope(), привязанного к композиции. Стоило уйти с
+    //  вкладки Library — панель покидала композицию, scope отменялся, и
+    //  многоминутная конвертация с заливкой обрывались на середине. Причём
+    //  именно тогда, когда уйти естественнее всего: заливка длинного ролика
+    //  идёт минуты, и смотреть всё это время в одну вкладку незачем.
+    //
+    //  viewModelScope живёт, пока жив экран устройства, поэтому переключение
+    //  вкладок и поворот экрана заливку больше не трогают.
+    // =================================================================
+    val upUris     = MutableStateFlow<List<Uri>>(emptyList())
+    val upPoster   = MutableStateFlow<Bitmap?>(null)
+    val upStatus   = MutableStateFlow("Waiting for a file…")
+    val upKind     = MutableStateFlow(0)       // 0 обычный, 1 успех, 2 ошибка
+    val upProgress = MutableStateFlow(-1f)
+    val upBusy     = MutableStateFlow(false)
+    val upFit      = MutableStateFlow(Fit.CROP)
+    val upFps      = MutableStateFlow(10)
+    val upLength   = MutableStateFlow(10.0)
+    val upIsVideo  = MutableStateFlow(false)
+    val upSrcDur   = MutableStateFlow(0.0)   // длительность исходного ролика, с
+
+    private val converter by lazy { Converter(ctx) }
+
+    /** Выбрали файлы — определяем тип и готовим миниатюру. */
+    fun onFilesPicked(picked: List<Uri>) {
+        if (picked.isEmpty()) return
+        upUris.value = picked
+        upSrcDur.value = 0.0
+        viewModelScope.launch {
+            val first = picked.first()
+            val kind = withContext(Dispatchers.IO) {
+                val sniff = try {
+                    if (converter.mimeOf(first).startsWith("video/")) null
+                    else converter.readBytes(first)
+                } catch (e: Exception) { null }
+                converter.kindOf(first, sniff)
+            }
+            upIsVideo.value = kind == Converter.Kind.VIDEO
+            if (upIsVideo.value) {
+                val dur = withContext(Dispatchers.IO) { converter.videoDurationSec(first) }
+                upSrcDur.value = dur
+                val cap = fsInfo.value.maxFrames.toDouble() / upFps.value
+                upLength.value = maxOf(0.5, minOf(if (dur > 0) dur else cap, cap))
+            }
+            upPoster.value = withContext(Dispatchers.Default) {
+                converter.posterOf(first, upFit.value, 216)
+            }
+            upStatus.value = if (picked.size > 1) picked.size.toString() + " files selected. Press Upload."
+                             else converter.displayName(first) + " ready. Press Upload."
+            upKind.value = 1
+        }
+    }
+
+    /** Смена кадрирования — перерисовываем миниатюру, как это делал веб. */
+    fun setFit(f: Int) {
+        upFit.value = f
+        val u = upUris.value.firstOrNull() ?: return
+        viewModelScope.launch {
+            upPoster.value = withContext(Dispatchers.Default) { converter.posterOf(u, f, 216) }
+        }
+    }
+
+    fun setFps(n: Int) {
+        upFps.value = n
+        // Смена fps только УКОРАЧИВАЕТ выбранную длину и никогда не удлиняет —
+        // правило то же, что в вебе.
+        val cap = fsInfo.value.maxFrames.toDouble() / n
+        if (upLength.value > cap) upLength.value = cap
+    }
+
+    fun setLength(v: Double) {
+        // coerceIn(min, max) бросает IllegalArgumentException при min > max, а
+        // потолок здесь считается из свободной памяти колеса и на забитом
+        // флеше падает ниже половины секунды.
+        val cap = fsInfo.value.maxFrames.toDouble() / upFps.value
+        upLength.value = if (cap <= 0.5) 0.5 else v.coerceIn(0.5, cap)
+    }
+
+    fun startUpload() {
+        if (upBusy.value) return
+        val list = upUris.value
+        if (list.isEmpty()) { upStatus.value = "Select a file first."; upKind.value = 2; return }
+
+        // Только колёса НА СВЯЗИ. connected — это просто снимок карты клиентов:
+        // клиент попадает туда до того, как соединение установлено, и остаётся
+        // после обрыва (нарочно, чтобы строка списка показала причину). Все
+        // прочие команды это фильтруют (см. onTargets), а заливка — нет, и в
+        // зеркальном режиме одно спящее колесо роняло весь пакет: файлы честно
+        // уезжали на живое, но считались неудачей.
+        //
+        // Адреса, а не сами объекты: авто-переподключение создаёт НОВЫЙ
+        // BleClient, и захваченная на всю пачку ссылка указывала бы на
+        // закрытый.
+        val targetAddrs = (if (mirrorAll.value) connected.value
+                           else listOfNotNull(currentClient()))
+            .filter { it.link.value == Link.Ready }
+            .map { it.address }
+        if (targetAddrs.isEmpty()) { upStatus.value = "Not connected."; upKind.value = 2; return }
+
+        // Параметры конвертации снимаем СЕЙЧАС: их регуляторы остаются
+        // доступными, и правка fps в середине пачки иначе применилась бы к
+        // части файлов, а к части нет.
+        val jobFit = upFit.value
+        val jobFps = upFps.value
+        val jobLen = upLength.value
+        val jobMaxFrames = fsInfo.value.maxFrames
+
+        // Сканирование и заливка делят одно радио: LOW_LATENCY-поиск поверх
+        // передачи отбирает у неё эфир. Экран списка колёс сам возобновит
+        // поиск, когда заливка кончится.
+        stopScan()
+
+        upBusy.value = true
+        upKind.value = 0
+        viewModelScope.launch {
+            var ok = 0
+            var fail = 0
+            for (u in list) {
+                val label = converter.displayName(u)
+                try {
+                    upStatus.value = label + " — converting…"
+                    upProgress.value = -1f
+                    val res = withContext(Dispatchers.Default) {
+                        converter.convert(
+                            u, jobFit, jobMaxFrames,
+                            Converter.VideoOpts(jobFps, jobLen),
+                            object : Converter.Progress {
+                                override fun stage(text: String) { upStatus.value = label + " — " + text }
+                                override fun frames(done: Int, total: Int) {
+                                    upStatus.value = label + " — converting " + done + "/" + total +
+                                        " frames (" + (done * 100 / maxOf(total, 1)) + "%)"
+                                    upProgress.value = done.toFloat() / maxOf(total, 1)
+                                }
+                            }
+                        )
+                    }
+                    res.warning?.let { say(it) }
+                    val crc = withContext(Dispatchers.Default) { Ani6.crc32(res.data) }
+
+                    var sentTo = 0
+                    for (addr in targetAddrs) {
+                        // Клиента ищем по адресу на каждом шаге: за время
+                        // конвертации связь могла оборваться и восстановиться
+                        // уже другим объектом.
+                        val c = client(addr)
+                        if (c == null || c.link.value != Link.Ready) continue
+                        try {
+                            val wire = withContext(Dispatchers.Default) {
+                                Ani6.encodeForWire(res.data, c.hello?.hasDeflate ?: false)
+                            }
+                            val ratio = res.data.size.toDouble() / maxOf(wire.bytes.size, 1)
+                            val started = System.currentTimeMillis()
+                            c.upload(res.fileName, wire.bytes, res.data.size, crc, wire.compressed) { p ->
+                                upProgress.value = p.sent.toFloat() / maxOf(p.totalWire, 1L)
+                                val kb = p.sent / 1024
+                                val tot = p.totalWire / 1024
+                                val secs = (System.currentTimeMillis() - started) / 1000.0
+                                val rate = if (secs > 0.4) (p.sent / 1024.0 / secs) else 0.0
+                                upStatus.value = label + " — " +
+                                    (p.sent * 100 / maxOf(p.totalWire, 1L)) + "%  ·  " +
+                                    kb + " / " + tot + " kB" +
+                                    (if (wire.compressed) String.format("  ·  x%.1f smaller", ratio) else "") +
+                                    (if (rate > 0) String.format("  ·  %.0f kB/s", rate) else "")
+                            }
+                            sentTo++
+                        } catch (e: kotlinx.coroutines.CancellationException) {
+                            throw e
+                        } catch (e: Throwable) {
+                            // Неудача на одном колесе не должна отменять успех
+                            // на остальных и не делает файл непринятым.
+                            say((c.hello?.name ?: addr) + ": " + (e.message ?: "upload failed"))
+                        }
+                    }
+                    if (sentTo > 0) ok++ else fail++
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    // Отмену пробрасываем: иначе цикл продолжал бы крутиться
+                    // после смерти scope, дописывая в мёртвые соединения.
+                    throw e
+                } catch (e: Throwable) {
+                    // Throwable, а не Exception: длинная анимация — это 8 МБ
+                    // исходника плюс столько же под сжатый поток, и
+                    // OutOfMemoryError здесь вполне достижим. Он наследуется от
+                    // Error, мимо catch(Exception) проходил насквозь и ронял
+                    // приложение вместо сообщения об ошибке.
+                    fail++
+                    val why = e.message?.takeIf { it.isNotBlank() } ?: e::class.java.simpleName
+                    upStatus.value = label + " — failed: " + why
+                    upKind.value = 2
+                }
+            }
+            upProgress.value = -1f
+            upBusy.value = false
+            if (fail == 0) {
+                upStatus.value = if (ok == 1) "Uploaded." else ok.toString() + " files uploaded."
+                upKind.value = 1
+                upUris.value = emptyList()
+                upPoster.value = null
+            } else {
+                upStatus.value = ok.toString() + " uploaded, " + fail + " failed."
+                upKind.value = 2
+            }
+            refreshFiles()
+        }
+    }
+
     fun refreshFiles() {
         val c = currentClient() ?: return
         viewModelScope.launch {
@@ -706,8 +921,22 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
 
     // -------------------------------------------------------------------- лог
 
+    /**
+     * Номер самой первой строки, лежащей сейчас в [logLines]. Нужен экрану как
+     * устойчивый ключ элементов списка: буфер обрезается сверху, поэтому индекс
+     * одной и той же строки со временем уменьшается, и без ключа LazyColumn
+     * держится за номер позиции — отчего прокрученный вверх лог уезжал вперёд
+     * на каждом опросе.
+     */
+    val logFirstIdx = MutableStateFlow(0L)
+
+    /** Опрос уже в полёте. Без этого медленный ответ дублировал бы строки. */
+    private var logBusy = false
+
     fun pollLog() {
         val c = currentClient() ?: return
+        if (logBusy) return
+        logBusy = true
         viewModelScope.launch {
             try {
                 val (total, lines) = c.logs(logTotal)
@@ -717,14 +946,25 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                     logTotal = 0
                 }
                 if (lines.isNotEmpty()) {
-                    logLines.value = (logLines.value + lines).takeLast(400)
+                    val merged = logLines.value + lines
+                    val capped = merged.takeLast(400)
+                    logFirstIdx.value += (merged.size - capped.size)
+                    logLines.value = capped
                     logTotal = total
                 }
-            } catch (_: Exception) {}
+            } catch (_: Exception) {
+            } finally {
+                logBusy = false
+            }
         }
     }
 
-    fun clearLogView() { logLines.value = emptyList() }
+    fun clearLogView() {
+        // Ключи обязаны остаться уникальными и после очистки: сдвигаем базу на
+        // выброшенное, иначе новые строки получили бы номера уже показанных.
+        logFirstIdx.value += logLines.value.size
+        logLines.value = emptyList()
+    }
 
     override fun onCleared() {
         stopScan()

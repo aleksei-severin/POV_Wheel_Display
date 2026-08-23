@@ -1,6 +1,5 @@
 package com.povwheel.app.ui
 
-import android.graphics.Bitmap
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
@@ -17,19 +16,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.povwheel.app.WheelVm
-import com.povwheel.app.convert.Ani6
-import com.povwheel.app.convert.Converter
 import com.povwheel.app.convert.Fit
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 
 // Потолок выбора за раз. Фотопикер требует не меньше двух, а больше
@@ -46,61 +39,27 @@ private const val MAX_PICK = 30
  */
 @Composable
 fun UploadPanel(vm: WheelVm) {
-    val ctx = LocalContext.current
-    val scope = rememberCoroutineScope()
-    val view = LocalView.current
     val fs by vm.fsInfo.collectAsState()
-    val connected by vm.connected.collectAsState()
-    val mirror by vm.mirrorAll.collectAsState()
 
-    var uris by remember { mutableStateOf<List<Uri>>(emptyList()) }
-    var poster by remember { mutableStateOf<Bitmap?>(null) }
-    var status by remember { mutableStateOf("Waiting for a file…") }
-    var statusKind by remember { mutableStateOf(0) }        // 0 обычный, 1 успех, 2 ошибка
-    var progress by remember { mutableStateOf(-1f) }
-    var busy by remember { mutableStateOf(false) }
+    // Всё состояние панели живёт во ViewModel. В самой панели его держать
+    // нельзя: уход на другую вкладку выкидывает её из композиции, и вместе с
+    // ней умирали и выбор файлов, и прогресс, и — главное — сама корутина
+    // заливки. См. комментарий у upUris в WheelVm.
+    val uris by vm.upUris.collectAsState()
+    val poster by vm.upPoster.collectAsState()
+    val status by vm.upStatus.collectAsState()
+    val statusKind by vm.upKind.collectAsState()
+    val progress by vm.upProgress.collectAsState()
+    val busy by vm.upBusy.collectAsState()
+    val fitMode by vm.upFit.collectAsState()
+    val fps by vm.upFps.collectAsState()
+    val lengthSec by vm.upLength.collectAsState()
+    val isVideo by vm.upIsVideo.collectAsState()
+    val srcDuration by vm.upSrcDur.collectAsState()
 
-    var fitMode by remember { mutableStateOf(Fit.CROP) }
-    var fps by remember { mutableStateOf(10) }
-    var lengthSec by remember { mutableStateOf(10.0) }
-    var isVideo by remember { mutableStateOf(false) }
-    var srcDuration by remember { mutableStateOf(0.0) }
-
-    val converter = remember { Converter(ctx) }
-
-    // Долгая конвертация плюс передача на мегабайты переживает таймаут экрана,
-    // а погасший экран подвесил бы очередь BLE на середине файла.
-    DisposableEffect(busy) {
-        view.keepScreenOn = busy
-        onDispose { view.keepScreenOn = false }
-    }
 
     // Разбор выбранного — общий для галереи и файлового менеджера.
-    val onPicked: (List<Uri>) -> Unit = { picked ->
-        if (picked.isNotEmpty()) {
-            uris = picked
-            scope.launch {
-                val first = picked.first()
-                val kind = withContext(Dispatchers.IO) {
-                    val sniff = try {
-                        if (converter.mimeOf(first).startsWith("video/")) null
-                        else converter.readBytes(first)
-                    } catch (e: Exception) { null }
-                    converter.kindOf(first, sniff)
-                }
-                isVideo = kind == Converter.Kind.VIDEO
-                if (isVideo) {
-                    srcDuration = withContext(Dispatchers.IO) { converter.videoDurationSec(first) }
-                    val cap = fs.maxFrames.toDouble() / fps
-                    lengthSec = maxOf(0.5, minOf(if (srcDuration > 0) srcDuration else cap, cap))
-                }
-                poster = withContext(Dispatchers.Default) { converter.posterOf(first, fitMode, 216) }
-                status = if (picked.size > 1) picked.size.toString() + " files selected. Press Upload."
-                         else converter.displayName(first) + " ready. Press Upload."
-                statusKind = 1
-            }
-        }
-    }
+    val onPicked: (List<Uri>) -> Unit = { picked -> vm.onFilesPicked(picked) }
 
     /**
      * Системный выбор медиа — та самая галерея, а не файловый менеджер.
@@ -127,11 +86,6 @@ fun UploadPanel(vm: WheelVm) {
         ActivityResultContracts.OpenMultipleDocuments()
     ) { picked -> onPicked(picked ?: emptyList()) }
 
-    // Перерисовываем миниатюру при смене режима кадрирования — как в вебе.
-    LaunchedEffect(fitMode) {
-        val u = uris.firstOrNull() ?: return@LaunchedEffect
-        poster = withContext(Dispatchers.Default) { converter.posterOf(u, fitMode, 216) }
-    }
 
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(14.dp)) {
@@ -183,9 +137,9 @@ fun UploadPanel(vm: WheelVm) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("Framing", style = MaterialTheme.typography.bodySmall,
                         modifier = Modifier.padding(end = 8.dp))
-                    FilterChip(fitMode == Fit.CROP, { fitMode = Fit.CROP }, { Text("Crop") })
+                    FilterChip(fitMode == Fit.CROP, { vm.setFit(Fit.CROP) }, { Text("Crop") })
                     Spacer(Modifier.width(6.dp))
-                    FilterChip(fitMode == Fit.FIT, { fitMode = Fit.FIT }, { Text("Fit") })
+                    FilterChip(fitMode == Fit.FIT, { vm.setFit(Fit.FIT) }, { Text("Fit") })
                 }
 
                 if (isVideo) {
@@ -194,13 +148,7 @@ fun UploadPanel(vm: WheelVm) {
                         Text("FPS", style = MaterialTheme.typography.bodySmall,
                             modifier = Modifier.padding(end = 8.dp))
                         listOf(5, 10, 15).forEach { f ->
-                            FilterChip(fps == f, {
-                                fps = f
-                                // Смена fps только УКОРАЧИВАЕТ выбранную длину и
-                                // никогда не удлиняет — правило то же, что в вебе.
-                                val cap = fs.maxFrames.toDouble() / f
-                                if (lengthSec > cap) lengthSec = cap
-                            }, { Text(f.toString()) })
+                            FilterChip(fps == f, { vm.setFps(f) }, { Text(f.toString()) })
                             Spacer(Modifier.width(6.dp))
                         }
                     }
@@ -212,7 +160,7 @@ fun UploadPanel(vm: WheelVm) {
                             value = String.format("%.1f", lengthSec),
                             onValueChange = {
                                 val v = it.replace(',', '.').toDoubleOrNull()
-                                if (v != null) lengthSec = v.coerceIn(0.5, fs.maxFrames.toDouble() / fps)
+                                if (v != null) vm.setLength(v)
                             },
                             modifier = Modifier.width(110.dp),
                             singleLine = true,
@@ -252,89 +200,7 @@ fun UploadPanel(vm: WheelVm) {
 
             Spacer(Modifier.height(10.dp))
             Button(
-                onClick = {
-                    val list = uris
-                    if (list.isEmpty()) { status = "Select a file first."; statusKind = 2; return@Button }
-                    val targets = if (mirror) connected else listOfNotNull(vm.currentClient())
-                    if (targets.isEmpty()) { status = "Not connected."; statusKind = 2; return@Button }
-
-                    busy = true
-                    statusKind = 0
-                    scope.launch {
-                        var ok = 0
-                        var fail = 0
-                        for (u in list) {
-                            val label = converter.displayName(u)
-                            try {
-                                status = label + " — converting…"
-                                progress = -1f
-                                val res = withContext(Dispatchers.Default) {
-                                    converter.convert(
-                                        u, fitMode, fs.maxFrames,
-                                        Converter.VideoOpts(fps, lengthSec),
-                                        object : Converter.Progress {
-                                            override fun stage(text: String) { status = label + " — " + text }
-                                            override fun frames(done: Int, total: Int) {
-                                                status = label + " — converting " + done + "/" + total +
-                                                        " frames (" + (done * 100 / maxOf(total, 1)) + "%)"
-                                                progress = done.toFloat() / maxOf(total, 1)
-                                            }
-                                        }
-                                    )
-                                }
-                                res.warning?.let { vm.say(it) }
-
-                                val crc = withContext(Dispatchers.Default) { Ani6.crc32(res.data) }
-
-                                for (c in targets) {
-                                    val wire = withContext(Dispatchers.Default) {
-                                        Ani6.encodeForWire(res.data, c.hello?.hasDeflate ?: false)
-                                    }
-                                    val ratio = res.data.size.toDouble() / maxOf(wire.bytes.size, 1)
-                                    val started = System.currentTimeMillis()
-                                    c.upload(res.fileName, wire.bytes, res.data.size, crc, wire.compressed) { p ->
-                                        progress = p.sent.toFloat() / maxOf(p.totalWire, 1L)
-                                        val kb = p.sent / 1024
-                                        val tot = p.totalWire / 1024
-                                        val secs = (System.currentTimeMillis() - started) / 1000.0
-                                        val rate = if (secs > 0.4) (p.sent / 1024.0 / secs) else 0.0
-                                        status = label + " — " +
-                                            (p.sent * 100 / maxOf(p.totalWire, 1L)) + "%  ·  " +
-                                            kb + " / " + tot + " kB" +
-                                            (if (wire.compressed) String.format("  ·  x%.1f smaller", ratio) else "") +
-                                            (if (rate > 0) String.format("  ·  %.0f kB/s", rate) else "")
-                                    }
-                                }
-                                ok++
-                            } catch (e: Throwable) {
-                                // Throwable, а не Exception: длинная анимация —
-                                // это 8 МБ исходника плюс столько же под
-                                // сжатый поток, и OutOfMemoryError здесь вполне
-                                // достижим. Он наследуется от Error, мимо
-                                // catch(Exception) проходил насквозь и ронял
-                                // приложение — с застрявшим busy и незаснувшим
-                                // экраном вместо сообщения об ошибке.
-                                fail++
-                                val why = e.message?.takeIf { it.isNotBlank() }
-                                    ?: e::class.java.simpleName
-                                status = label + " — failed: " + why
-                                statusKind = 2
-                            }
-                        }
-                        progress = -1f
-                        busy = false
-                        if (fail == 0) {
-                            status = if (ok == 1) "Uploaded." else ok.toString() + " files uploaded."
-                            statusKind = 1
-                            uris = emptyList()
-                            poster = null
-                        } else {
-                            status = ok.toString() + " uploaded, " + fail + " failed."
-                            statusKind = 2
-                        }
-                        vm.refreshFiles()
-                    }
-                },
+                onClick = { vm.startUpload() },
                 enabled = !busy,
                 modifier = Modifier.fillMaxWidth()
             ) { Text(if (busy) "Working…" else "↑ Convert & upload") }

@@ -39,6 +39,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -62,6 +63,22 @@ class MainActivity : ComponentActivity() {
                         vm.toast.value = null
                     }
                 }
+                // Экран держим включённым, пока идёт долгая передача, и делаем
+                // это ЗДЕСЬ — выше всех экранов. Заливка живёт во ViewModel и
+                // переживает и смену вкладки, и возврат к списку колёс; будь
+                // этот эффект внутри экрана устройства, он снялся бы ровно
+                // тогда, когда нужнее всего. Погасший экран подвешивает очередь
+                // BLE на середине файла, и устройство обрывает передачу по
+                // своему сторожу молчания.
+                val upBusy by vm.upBusy.collectAsState()
+                val fw by vm.fwProgress.collectAsState()
+                val view = LocalView.current
+                val keepAwake = upBusy || fw != null
+                DisposableEffect(keepAwake) {
+                    view.keepScreenOn = keepAwake
+                    onDispose { view.keepScreenOn = false }
+                }
+
                 Scaffold(snackbarHost = { SnackbarHost(snack) }) { pad ->
                     Column(Modifier.fillMaxSize().padding(pad)) {
                         Gate(vm)

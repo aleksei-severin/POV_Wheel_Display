@@ -6,6 +6,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.gestures.draggable
@@ -14,7 +15,7 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -32,7 +33,6 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -547,12 +547,15 @@ private fun DisplayTab(vm: WheelVm, tele: Tele) {
         Spacer(Modifier.height(6.dp))
         run {
             val addr by vm.current.collectAsState()
-            // Начальное значение — из HELLO, а дальше поле живёт само и
-            // сбрасывается только при смене колеса: перечитывать его чаще
-            // значило бы затирать то, что человек в этот момент набирает.
-            var draft by rememberSaveable(addr) {
-                mutableStateOf(vm.currentClient()?.hello?.name ?: "")
-            }
+            val wheels by vm.wheels.collectAsState()
+            // Начальное значение — из общего списка колёс, а НЕ из HELLO.
+            // HELLO снимается при подключении и переименование его не трогает,
+            // так что поле показывало старое имя, стоило уйти с вкладки и
+            // вернуться. Дальше поле живёт само и сбрасывается только при смене
+            // колеса: перечитывать чаще значило бы затирать набранное.
+            val seed = wheels.firstOrNull { it.address == addr }?.name
+                ?: vm.currentClient()?.hello?.name ?: ""
+            var draft by rememberSaveable(addr) { mutableStateOf(seed) }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 OutlinedTextField(
                     value = draft,
@@ -775,19 +778,47 @@ private fun LogTab(vm: WheelVm) {
     }
     val listState = rememberLazyListState()
     val clipboard = LocalClipboardManager.current
+    val logBase by vm.logFirstIdx.collectAsState()
 
     // «Прилипание» к концу: доматываем сами только пока пользователь и так
     // внизу. Иначе новая строка каждые две секунды вырывала бы список из рук у
     // того, кто отлистал вверх что-то прочитать.
     var stick by remember { mutableStateOf(true) }
+
+    // Палец лёг на список — сразу перестаём тянуть его вниз, не дожидаясь конца
+    // жеста: бороться с рукой пользователя нельзя.
     LaunchedEffect(listState) {
-        snapshotFlow {
-            val info = listState.layoutInfo
-            val last = info.visibleItemsInfo.lastOrNull()?.index ?: -1
-            info.totalItemsCount == 0 || last >= info.totalItemsCount - 2
-        }.collect { stick = it }
+        listState.interactionSource.interactions.collect { i ->
+            if (i is DragInteraction.Start) stick = false
+        }
     }
-    LaunchedEffect(lines.size, stick) {
+
+    // Решение принимаем ТОЛЬКО когда прокрутка уже остановилась.
+    //
+    // Первая версия пересчитывала stick непрерывно из layoutInfo — то есть из
+    // того самого, что меняет наша же анимация, — и держала stick ключом
+    // эффекта, который эту анимацию запускает. Получалась замкнутая петля:
+    // /logs отдаёт строки пачкой, после вставки пачки последний элемент уже
+    // не виден, stick тут же становился false, эффект перезапускался, отменяя
+    // едва начавшуюся прокрутку, и залипал навсегда. Здесь обратной связи нет:
+    // пока список стоит, stick не трогается вовсе.
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.isScrollInProgress }.collect { moving ->
+            if (!moving) {
+                val info = listState.layoutInfo
+                val last = info.visibleItemsInfo.lastOrNull()?.index ?: -1
+                stick = info.totalItemsCount == 0 || last >= info.totalItemsCount - 1
+            }
+        }
+    }
+
+    // Ключ — САМ список, а не его длина. Буфер обрезан четырьмя сотнями строк,
+    // и в установившемся режиме — то есть в любой сессии длиннее пары минут,
+    // ровно когда автопрокрутка и нужна — длина навсегда остаётся 400, а
+    // содержимое меняется каждый опрос. По длине эффект не перезапускался бы
+    // больше никогда. Сравнение списков структурное, так что новые строки дают
+    // новый ключ, а пустой ответ — нет.
+    LaunchedEffect(lines) {
         if (stick && lines.isNotEmpty()) listState.animateScrollToItem(lines.lastIndex)
     }
 
@@ -813,7 +844,7 @@ private fun LogTab(vm: WheelVm) {
             // не выделяется вообще, ни долгим нажатием, ни как-либо ещё.
             SelectionContainer {
                 LazyColumn(state = listState, modifier = Modifier.padding(8.dp)) {
-                    items(lines) { l ->
+                    itemsIndexed(lines, key = { i, _ -> logBase + i }) { _, l ->
                         Text(
                             l,
                             fontFamily = FontFamily.Monospace,
