@@ -1761,6 +1761,173 @@ static void enterTrickleSleep(uint32_t seconds) {
 }
 
 // =====================================================================
+//  ТРАНСПОРТНЫЙ РЕЖИМ
+//
+//  Программное выключение: держим IO0 полторы секунды — колесо гасит ленту волной
+//  к центру и уходит в глубокий сон. Обратно только тем же способом.
+//
+//  Отличие от обычного сна по простою ровно одно, и оно всё решает: вибродатчик
+//  как источник пробуждения НЕ подключается. Обычный сон будит любая тряска, а
+//  в сумке или на багажнике колесо трясётся непрерывно — оно просыпалось бы,
+//  ждало минуту простоя, засыпало и так по кругу, пока не сядет батарея. Здесь
+//  единственный источник — кнопка, и ток покоя честные ~10 мкА.
+//
+//  Флаг живёт в RTC-памяти: он обязан пережить тот самый сон, который вызывает.
+//  Полное обесточивание его теряет — и это правильный аварийный выход: колесо
+//  со снятой батареей включается как обычно.
+// =====================================================================
+RTC_DATA_ATTR static bool transport_mode = false;
+
+// Что показывало колесо до выключения. force_stop_display живёт в RTC-памяти и
+// переживает сон, а гасить ленту перед транспортным сном приходится именно им —
+// значит без этой пары колесо просыпалось бы всегда «остановленным», и
+// анимация, слайдшоу или эффект после включения молчали бы до ручного Play.
+RTC_DATA_ATTR static bool xport_saved_stop = false;
+
+// Волна по радиусу на всех шести лучах сразу, синим.
+//   outward = false — гаснет от обода к центру (уход в сон);
+//   outward = true  — разгорается от центра к ободу (пробуждение).
+//
+// Кадры пишутся прямо в DMA-буфер и уходят синхронно: renderingTask к этому
+// моменту уже не работает (уход) либо ещё не создана (пробуждение), так что
+// делить с ней буфер не с кем.
+static void transportWipe(bool outward) {
+    if (!dma_tx_buffer || !sk9822_spi || !dmaMutex) return;
+
+    const uint8_t bri = 0xE0 | (XPORT_ANIM_BRI & 0x1F);
+    uint8_t* led = dma_tx_buffer + 4;
+
+    spi_transaction_t t = {};
+    t.length    = SK9822_BUF_SIZE * 8;
+    t.tx_buffer = dma_tx_buffer;
+
+    xSemaphoreTake(dmaMutex, portMAX_DELAY);
+
+    // Гоним по реальному времени, а не по числу кадров: посылка SK9822 занимает
+    // около 0.9 мс, и фиксированный шаг задержки растянул бы 200 мс до 240.
+    uint32_t t0 = millis();
+    for (;;) {
+        uint32_t el = millis() - t0;
+        if (el > XPORT_ANIM_MS) break;
+        float p = (float)el / (float)XPORT_ANIM_MS;          // 0…1
+        // Положение фронта в диодах. Индекс 0 — центр, 43 — обод (см. таблицу
+        // радиальных коэффициентов: r_mm = LED_R_INNER_MM + i * step).
+        float edge = outward ? (LEDS_PER_SIDE * p)
+                             : (LEDS_PER_SIDE * (1.0f - p));
+
+        for (int i = 0; i < LEDS_PER_SIDE; i++) {
+            // Край размывается на один диод. Без этого 44 ступеньки читаются
+            // как рябь, а просили именно плавное угасание.
+            float v = edge - (float)i;
+            int   b = (v >= 1.0f) ? 255 : (v <= 0.0f ? 0 : (int)(v * 255.0f + 0.5f));
+            for (int ray = 0; ray < NUM_ARMS; ray++) {
+                uint8_t* f = led + (ray * LEDS_PER_ARM + i) * 4;                    // лицевая
+                uint8_t* k = led + (ray * LEDS_PER_ARM + LEDS_PER_ARM - 1 - i) * 4; // тыльная
+                f[0] = bri; f[1] = (uint8_t)b; f[2] = 0; f[3] = 0;   // порядок: bri, B, G, R
+                k[0] = bri; k[1] = (uint8_t)b; k[2] = 0; k[3] = 0;
+            }
+        }
+        spi_device_transmit(sk9822_spi, &t);
+        delay(2);
+    }
+    // Кеш байта яркости принадлежит буферу 0 — тому самому, в который писали.
+    buf_bri_cache[0] = bri;
+    xSemaphoreGive(dmaMutex);
+
+    blankAllLEDs_DMA();   // на пробуждении это и есть обещанное «потом гаснет»
+}
+
+// Поднять оба DCDC ради анимации и снять их обратно.
+// На кабеле это осознанное исключение из правила «на USB силовая не поднимается
+// никогда»: правило защищает предзаряд от ПОСТОЯННЫХ ~100 мА, а здесь двести
+// миллисекунд один раз, после которых всё и так обесточивается.
+static void transportShowWave(bool outward) {
+    gpio_hold_dis((gpio_num_t)PIN_EN_DCDC_ARM1);
+    gpio_hold_dis((gpio_num_t)PIN_EN_DCDC_REST);
+    powerRailUpAndBlank(PIN_EN_DCDC_ARM1);
+    powerRailUpAndBlank(PIN_EN_DCDC_REST);
+    peripherals_active = true;
+    transportWipe(outward);
+    digitalWrite(PIN_EN_DCDC_REST, LOW);
+    digitalWrite(PIN_EN_DCDC_ARM1, LOW);
+    peripherals_active = false;
+}
+
+// Уложить чип спать так, чтобы поднять его могла только кнопка.
+// Без записи во флеш: сюда возвращаются и с неподтверждённого пробуждения,
+// когда кнопку отпустили раньше срока, а это может повторяться часто.
+static void transportSleepArm() {
+    transport_mode = true;
+
+    // Дождаться отпускания кнопки — иначе сна не будет вовсе.
+    // Пробуждение по EXT0 идёт по УРОВНЮ, а не по фронту: засыпая с уже
+    // прижатой к земле кнопкой, чип проснулся бы в ту же миллисекунду, и
+    // выключение выглядело бы как мгновенное включение обратно.
+    // Требуем устойчивый HIGH: механическая кнопка при отпускании дребезжит.
+    uint32_t t0 = millis(), high_ms = 0;
+    while (millis() - t0 < 30000) {
+        if (digitalRead(PIN_BUTTON) == HIGH) {
+            high_ms += 5;
+            if (high_ms >= 50) break;
+        } else {
+            high_ms = 0;
+        }
+        delay(5);
+    }
+
+    digitalWrite(PIN_EN_DCDC_REST, LOW);
+    digitalWrite(PIN_EN_DCDC_ARM1, LOW);
+    gpio_hold_en((gpio_num_t)PIN_EN_DCDC_ARM1);
+    gpio_hold_en((gpio_num_t)PIN_EN_DCDC_REST);
+    gpio_deep_sleep_hold_en();
+
+    // Единственный источник пробуждения — кнопка, замкнутая на землю.
+    // Вибродатчик здесь НЕ подключается: в этом вся суть режима.
+    esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_BUTTON, 0);
+    esp_deep_sleep_start();
+}
+
+// Полный уход в транспортный режим из рабочего состояния.
+static void enterTransportSleep() {
+    webLog("[XPORT] Button held: shutting down for transport");
+    // Останавливаем отрисовку и ЖДЁМ. Флагов мало: renderingTask могла уже
+    // поставить транзакцию в очередь SPI, и своя посылка поверх неё — это
+    // гонка за шину. Пауза та же, что в safeOTAShutdown(), и по той же причине.
+    xport_saved_stop   = force_stop_display;   // чем продолжить после включения
+    force_stop_display = true;
+    newFrameReady      = false;
+    power_state        = PWR_OFF;   // условие выхода из цикла отрисовки
+    delay(200);
+
+    for (int i = 0; i < HALL_COUNT; i++) detachInterrupt(digitalPinToInterrupt(HALL_PIN[i]));
+    detachInterrupt(digitalPinToInterrupt(PIN_VIBRATION));
+
+    transportShowWave(false);     // волна к центру
+
+    // Настройки и калибровку сбрасываем во флеш — это осознанное выключение,
+    // а не сон по простою, и возвращаться сюда часто мы не собираемся.
+    flushLastFile();
+    flushSettings();
+    saveHallCalibration();
+
+    transportSleepArm();
+}
+
+// Проверка удержания кнопки после пробуждения из транспортного режима.
+// EXT0 будит по УРОВНЮ, то есть по любому касанию кнопки; настоящий выход —
+// только удержание, поэтому подтверждаем его здесь и при неудаче засыпаем
+// обратно, ничего не включая.
+static bool transportConfirmWake() {
+    uint32_t held = 0;
+    while (digitalRead(PIN_BUTTON) == LOW) {
+        delay(XPORT_WAKE_POLL_MS);
+        held += XPORT_WAKE_POLL_MS;
+        if (held >= XPORT_HOLD_MS) return true;
+    }
+    return false;
+}
+
+// =====================================================================
 //                          ЗАДАЧИ
 // =====================================================================
 
@@ -1886,8 +2053,25 @@ void setup() {
     esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
     esp_reset_reason_t       reset_reason  = esp_reset_reason();
 
+    // --- Транспортный режим: разбираемся ДО всего остального ---
+    // Проверка стоит здесь, а не ниже, потому что при неподтверждённом
+    // пробуждении (кнопку задели, а не удержали) мы обязаны уснуть обратно
+    // немедленно и ничего при этом не инициализировать: смысл режима в том,
+    // чтобы такие пробуждения стоили доли миллиампер-секунды.
+    bool xport_wake = false;
+    if (transport_mode) {
+        if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0 && transportConfirmWake()) {
+            transport_mode     = false;
+            force_stop_display = xport_saved_stop;   // ровно то, что играло до выключения
+            xport_wake         = true;   // волну покажем, когда поднимется SPI
+        } else {
+            transportSleepArm();        // не возвращается
+        }
+    }
+
     if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
-        webLog("[SYS] Wakeup: vibration (IO15)");
+        webLog(xport_wake ? "[XPORT] Wakeup: button held, waking up"
+                          : "[SYS] Wakeup: vibration (IO15)");
     } else if (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED) {
         const char* rr_str = "unknown";
         switch (reset_reason) {
@@ -1997,6 +2181,10 @@ void setup() {
     initSK9822_DMA();
     blankAllLEDs_DMA();
 
+    // Волна от центра к ободу — подтверждение, что колесо проснулось.
+    // Здесь, а не раньше: до initSK9822_DMA() слать в ленту нечем.
+    if (xport_wake) transportShowWave(true);
+
     hallSemaphore       = xSemaphoreCreateBinary();
     fileLoaderSemaphore = xSemaphoreCreateBinary();
 
@@ -2012,6 +2200,11 @@ void setup() {
         effect_id = EFF_NONE;               // effectsStart сам выставит и проверит PSRAM
         if (effectsStart(want)) {
             webLogf("[EFF] Autostart: %s", effectName(want));
+            // Питание первого луча поднимаем и для эффекта тоже. Раньше это
+            // делалось только для файла, и после сна колесо с живым эффектом
+            // стояло тёмным до первой тряски: обороты никто не мерил, а значит
+            // и порог розжига не проверялся.
+            if (!force_stop_display) request_play_flag = true;
         } else {
             webLog("[EFF] Autostart failed, no PSRAM");
         }
@@ -2022,7 +2215,10 @@ void setup() {
             webLogf("[DISP] Autoplay: %s", last_file.c_str());
         }
         loadFrameFromFile("/" + last_file);
-        request_play_flag = true;   // loop() поднимет питание первого луча
+        // Только если показ вообще разрешён: после Stop флаг переживает сон
+        // в RTC-памяти, и поднимать ради него лучи значило бы жечь их вхолостую
+        // все три секунды до возврата в PWR_OFF.
+        if (!force_stop_display) request_play_flag = true;
     } else if (slideshowActive) {
         webLog("[DISP] Slideshow resume: waiting for first file load");
     }
@@ -2401,6 +2597,32 @@ void loop() {
         if (!net_task_started) {
             net_task_started = true;
             xTaskCreatePinnedToCore(networkTask, "network", 4096, NULL, 3, NULL, 0);
+        }
+    }
+
+    // --- Кнопка IO0: удержание = уход в транспортный режим ---
+    // Считаем непрерывное удержание; отпустили — счётчик обнуляется. Другой
+    // функции у этой кнопки нет, так что коротким нажатием ничего не ломаем.
+    {
+        static uint32_t btn_down_ms = 0;
+        // Пока кнопку не отпустили хотя бы раз, удержание не считаем.
+        // Выход из транспортного режима — это то же удержание кнопки, и
+        // сразу после него мы попадаем сюда с ЕЩЁ НАЖАТОЙ кнопкой: без этого
+        // флага человек, замешкавшийся отпустить, выключал бы колесо обратно
+        // ровно тем же движением, которым только что включил.
+        static bool btn_armed = false;
+        bool down = (digitalRead(PIN_BUTTON) == LOW);
+        if (!btn_armed) {
+            if (!down) btn_armed = true;
+            btn_down_ms = 0;
+        } else if (down) {
+            if (btn_down_ms == 0) btn_down_ms = now_ms;
+            else if (now_ms - btn_down_ms >= XPORT_HOLD_MS) {
+                btn_down_ms = 0;
+                enterTransportSleep();   // не возвращается
+            }
+        } else {
+            btn_down_ms = 0;
         }
     }
 

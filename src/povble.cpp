@@ -655,6 +655,42 @@ static void fillTele(PovTele* t) {
 //  Проверка имени файла. Правила те же, что у браузерного buildFileName():
 //  LittleFS в arduino-esp32 держит имя не длиннее 31 байта, и только ASCII.
 // ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
+//  Имя устройства
+//
+//  По умолчанию POV-xxxx по двум младшим байтам MAC — этим колёса и
+//  различались. Когда их два на одном велосипеде, толку от таких имён мало:
+//  какое из «POV-0c68» и «POV-1a44» переднее, на глаз не скажешь. Поэтому имя
+//  можно задать своё и хранится оно в NVS.
+// ---------------------------------------------------------------------
+static String ble_name;                       // то, чем представляемся сейчас
+static String ble_name_pending;               // ждёт записи в NVS
+static volatile bool ble_name_dirty = false;
+
+// Заводское имя из MAC. Wi-Fi MAC, а не BT: по нему уже названы существующие
+// колёса, и менять их опознавательный хвост незачем.
+static String bleDefaultName() {
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    char nm[16];
+    snprintf(nm, sizeof(nm), "POV-%02x%02x", mac[4], mac[5]);
+    return String(nm);
+}
+
+// Разрешены латиница, цифры, дефис и подчёркивание. Не вкусовщина: имя уезжает
+// в рекламный пакет и в PovHello.name как ASCII, и один символ обязан быть
+// одним байтом — иначе кириллица молча обрежется посередине буквы.
+static bool bleNameOk(const String& n) {
+    if (n.length() == 0 || n.length() > POV_NAME_MAX) return false;
+    for (size_t i = 0; i < n.length(); i++) {
+        char c = n[i];
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '-' || c == '_';
+        if (!ok) return false;
+    }
+    return true;
+}
+
 static bool nameOk(const String& n) {
     if (n.length() == 0 || n.length() > 31) return false;
     if (!n.endsWith(".bin")) return false;
@@ -695,7 +731,9 @@ static void handleCmd(const uint8_t* d, size_t n) {
         h.mtu           = peer_mtu;
         h.features      = POV_FEAT_DEFLATE | POV_FEAT_OTA | POV_FEAT_PREVIEW | POV_FEAT_WIFI;
         h.uptime_s      = millis() / 1000;
-        strncpy(h.name, hostName.c_str(), sizeof(h.name) - 1);
+        // Именно видимое имя: приложение подписывает им строку списка, и
+        // расходиться с тем, что пришло в рекламе, оно не должно.
+        strncpy(h.name, ble_name.c_str(), sizeof(h.name) - 1);
         strncpy(h.fw, __DATE__, sizeof(h.fw) - 1);
         sendRsp(op, seq, ST_OK, &h, sizeof(h));
         break;
@@ -724,6 +762,31 @@ static void handleCmd(const uint8_t* d, size_t n) {
         buildFileList();
         stageRsp(op, seq);
         break;
+
+    case OP_SETNAME: {
+        if (!pn) { sendRsp(op, seq, ST_BAD_ARG); break; }
+        String nn((const char*)pl, pn);
+        nn.trim();
+        if (!bleNameOk(nn)) { sendRsp(op, seq, ST_BAD_ARG); break; }
+
+        ble_name = nn;
+        // GAP-имя меняется сразу, реклама — тоже, но увидит её телефон только
+        // при следующем сканировании: пока он подключён, рекламы просто нет.
+        NimBLEDevice::setDeviceName(ble_name.c_str());
+        NimBLEDevice::getAdvertising()->setName(ble_name.c_str());
+
+        // В NVS пишем НЕ ЗДЕСЬ. Стирание страницы флеша гасит кеш команд на
+        // обоих ядрах и морозит renderingTask на десятки миллисекунд; если в
+        // этот момент колесо крутится, по ободу проедет мусор. Откладываем до
+        // остановки — тем же приёмом, что и last_file с настройками.
+        ble_name_pending = ble_name;
+        ble_name_dirty   = true;
+
+        pov_state_version++;
+        webLogf("[BLE] Renamed to %s", ble_name.c_str());
+        sendRsp(op, seq, ST_OK);
+        break;
+    }
 
     case OP_FRAG: {
         if (pn < 6) { sendRsp(op, seq, ST_BAD_ARG); break; }
@@ -1145,18 +1208,19 @@ bool bleSetup() {
         return false;
     }
 
-    // Имя в адвертайзинге короткое: пакет 31 байт, и 128-битный UUID сервиса
-    // занимает из них 18. "POV-xxxx" + флаги + UUID укладываются ровно.
-    // Берём MAC Wi-Fi, а не BT: по нему уже названы существующие колёса
-    // (pov-wheel-XXXX), и менять их опознавательный хвост из-за перехода на BLE
-    // значило бы, что старое устройство в приложении выглядит новым.
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    char nm[16];
-    snprintf(nm, sizeof(nm), "POV-%02x%02x", mac[4], mac[5]);
+    // Имя пользователя, если оно задано, иначе заводское из MAC.
+    ble_name = prefs.getString("ble_name", "");
+    if (!bleNameOk(ble_name)) ble_name = bleDefaultName();
+    const char* nm = ble_name.c_str();
+
     // hostName раньше задавался в setupNetwork(); теперь Wi-Fi может не
-    // подниматься вовсе, а имя нужно и BLE, и логу.
+    // подниматься вовсе, а имя нужно и BLE, и логу. Оно НАМЕРЕННО остаётся
+    // MAC-производным и переименованию не поддаётся: на нём висят mDNS и
+    // цели OTA в platformio.ini, и менять его вместе с видимым именем значило
+    // бы тихо ломать `pio run -e wheel_3 --target upload`.
     if (hostName.length() == 0) {
+        uint8_t mac[6];
+        esp_read_mac(mac, ESP_MAC_WIFI_STA);
         char hn[24];
         snprintf(hn, sizeof(hn), "pov-wheel-%02x%02x", mac[4], mac[5]);
         hostName = String(hn);
@@ -1206,6 +1270,14 @@ bool bleSetup() {
 //  Телеметрия раз в 500 мс
 // ---------------------------------------------------------------------
 void bleLoop() {
+    // Отложенная запись имени: только когда лента заведомо не светится.
+    // Условие то же, что у отложенного сброса настроек в loop().
+    if (ble_name_dirty && power_state != PWR_FULL) {
+        ble_name_dirty = false;
+        prefs.putString("ble_name", ble_name_pending);
+        webLogf("[BLE] Name saved: %s", ble_name_pending.c_str());
+    }
+
     if (!chTele || !connected) return;
     static uint32_t last = 0;
     uint32_t now = millis();

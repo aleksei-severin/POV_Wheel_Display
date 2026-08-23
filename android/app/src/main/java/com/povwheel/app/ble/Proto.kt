@@ -49,6 +49,16 @@ object Proto {
     const val OP_WIFI      = 0x16
     const val OP_SLEEP     = 0x17
     const val OP_FRAG      = 0x18
+    const val OP_SETNAME   = 0x19
+
+    /**
+     * Предел имени — столько же, сколько держит PovHello.name вместе с
+     * завершающим нулём. Только ASCII: имя уезжает в рекламный пакет побайтно,
+     * и кириллица там обрежется посреди буквы.
+     */
+    const val NAME_MAX = 19
+    fun nameOk(n: String) = n.isNotEmpty() && n.length <= NAME_MAX &&
+        n.all { it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' || it == '-' || it == '_' }
 
     const val ST_OK = 0   // остальные коды см. PovStatus в прошивке
 

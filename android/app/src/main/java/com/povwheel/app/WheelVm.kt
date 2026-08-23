@@ -583,6 +583,41 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     fun effect(id: Int) = onTargets { it.effect(id) }
     fun speedRed(kmh: Int) = onTargets { it.setSpeedRed(kmh) }
     fun album(start: Boolean, ms: Int) = onTargets { it.album(start, ms) }
+    /**
+     * Переименовать ТЕКУЩЕЕ колесо. Намеренно мимо onTargets: зеркалирование
+     * здесь бессмысленно — два колеса с одинаковым именем ровно та задача,
+     * которую переименование и решает.
+     */
+    fun renameCurrent(name: String, onDone: (String) -> Unit) {
+        val c = currentClient()
+        val addr = current.value
+        if (c == null || addr == null) { say("Not connected"); return }
+        if (!Proto.nameOk(name)) {
+            onDone("Latin letters, digits, - and _ only, up to " + Proto.NAME_MAX)
+            return
+        }
+        viewModelScope.launch {
+            try {
+                c.setName(name)
+                // Локальный кеш правим сами: пока телефон подключён, колесо
+                // рекламы не шлёт, и нового имени из эфира взяться неоткуда.
+                nameCache.remove(addr)
+                rememberName(addr, name)
+                // И в списке найденных тоже: строку колеса rebuildWheels()
+                // подписывает именем из результатов сканирования, а подключённое
+                // колесо рекламы не шлёт — новое имя оттуда не приедет до самого
+                // отключения, и переименование выглядело бы как не сработавшее.
+                found.value = found.value.map {
+                    if (it.address == addr) it.copy(name = name) else it
+                }
+                rebuildWheels()
+                onDone("Renamed to " + name)
+            } catch (e: Exception) {
+                onDone("Rename failed: " + (e.message ?: "unknown"))
+            }
+        }
+    }
+
     fun reboot() = onTargets { it.reboot() }
     fun wifi(on: Boolean) = onTargets { it.wifi(on) }
 

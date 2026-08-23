@@ -127,6 +127,64 @@ Per-sensor mechanical/threshold spread would otherwise inject a phase jump 6× p
 
 `renderingTask` enforces the same RPM thresholds itself. It must — while rendering it preempts `loop()` (prio 1), so relying on `loop()` alone would leave the image running below threshold.
 
+### Transport Mode (software off)
+
+Holding **IO0 for 1.5 s** shuts the wheel down; the same hold brings it back. The
+whole point is the one line that differs from `enterDeepSleep()`: **the vibration
+sensor is not armed as a wake source at all.** Ordinary idle sleep is woken by any
+shake, and in a bag or on a rack the wheel shakes continuously — it woke, waited
+out its idle minute, slept, and repeated until the cell was flat. Here the only
+wake source is the button, so the quiescent draw is the honest ~10 µA.
+
+- `transport_mode` lives in RTC memory: it has to survive the very sleep it
+  causes. A full power cut loses it, which is the correct escape hatch — a wheel
+  with the battery reconnected boots normally.
+- **EXT0 wakes on a level, not an edge**, so two things follow. `transportSleepArm()`
+  waits for the button to be released (50 ms of steady HIGH, the switch bounces)
+  before sleeping, or the chip would wake in the same millisecond. And any brush
+  of the button wakes the chip, so `transportConfirmWake()` re-checks the hold
+  before anything is initialised; an unconfirmed wake goes straight back to sleep
+  without touching flash, which is what keeps a stray press costing microamps.
+- **`loop()` will not count a hold until the button has been released once.**
+  Coming out of transport mode *is* a press of the same length, and control reaches `loop()` with
+  the button still down — without that latch, hesitating to let go would switch the
+  wheel back off with the very gesture that just switched it on.
+- `enterTransportSleep()` waits **200 ms** after raising `force_stop_display`,
+  the same pause `safeOTAShutdown()` uses and for the same reason: flags alone do
+  not undo a transaction `renderingTask` has already queued on the SPI bus.
+- The blue radial wipe (`transportWipe()`, `XPORT_ANIM_MS` 500 ms, current field
+  capped at `XPORT_ANIM_BRI` 9/31 ≈ 30 %) runs with **both DCDC rails up even on
+  USB**. That is a deliberate exception to the never-power-the-rails-on-USB rule:
+  that rule guards trickle charging against a *sustained* ~100 mA, and this is
+  half a second once, after which everything powers down anyway.
+- LED index 0 is the **hub** and 43 the rim (`r_mm = LED_R_INNER_MM + i·step`), so
+  the shutdown wipe runs the edge downward and the wake wipe upward. The soft
+  one-LED edge is not decoration: 44 hard steps read as flicker.
+
+**Waking resumes whatever was playing** — file, slideshow or effect — on both
+paths, vibration and button. Nothing new was needed for the vibration path: the
+effect, the slideshow flag and its interval live in NVS settings, `last_file` in
+NVS, and `slideshowActive` additionally in RTC, so `setup()` already restored
+them. Transport mode broke it, though: `force_stop_display` is `RTC_DATA_ATTR`
+and therefore survives sleep, and blanking the strip before the wipe is done with
+exactly that flag — so the wheel came back permanently "stopped". `xport_saved_stop`
+carries the pre-shutdown value across and restores it on a confirmed wake, which
+also preserves the opposite case: a wheel switched off after Stop stays stopped.
+
+`request_play_flag` is now also raised for an autostarted **effect**, not just a
+file, and in both cases only while `!force_stop_display`. Without it a wheel that
+slept with a live effect stood dark until someone shook it — nothing was measuring
+RPM, so the render threshold was never tested; with it, raising the rails for a
+display that Stop has disabled no longer burns the arms for the three seconds it
+takes to fall back to `PWR_OFF`.
+
+**IO0 is a strapping pin, and that is the one thing to verify on hardware.**
+GPIO0 low at reset selects download boot on ESP32-S3. Whether a deep-sleep wake
+re-samples strapping is not settled by the local headers; if the wheel ever fails
+to wake, that is the reason, and the fallback is a timer wake polling the button
+(~1.5 mA average — far worse than 10 µA, still far better than waking on every
+bump).
+
 ### Wall Clock
 
 The clock lives in **newlib system time**, not in an `epoch + millis()` pair. System time is anchored to the RTC counter, which keeps running through deep sleep and through a software reset, and ESP-IDF restores it at startup (`esp_set_time_from_rtc`). The old pair could not: `millis()` restarts at zero in a new session, so the time was lost on *every* sleep — which is every 60 s of inactivity, making the Clock effect useless.

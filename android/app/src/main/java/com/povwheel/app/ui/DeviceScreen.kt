@@ -40,6 +40,7 @@ import androidx.compose.ui.unit.sp
 import com.povwheel.app.WheelVm
 import com.povwheel.app.ble.DevFile
 import com.povwheel.app.ble.Link
+import com.povwheel.app.ble.Proto
 import com.povwheel.app.ble.Settings
 import com.povwheel.app.ble.Tele
 import kotlinx.coroutines.delay
@@ -519,6 +520,48 @@ private fun DisplayTab(vm: WheelVm, tele: Tele) {
                     val n = s.copy(armReverse = if (it) 1 else 0)
                     vm.pushSettings(n); vm.saveSettings()
                 }
+            )
+        }
+
+        Divider(Modifier.padding(vertical = 14.dp))
+
+        Text("Name", fontWeight = FontWeight.SemiBold)
+        Text(
+            "What this wheel is called in the device list. Two wheels on one bike " +
+                "are both \"POV-xxxx\" out of the box, and which is which is anyone's guess.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(Modifier.height(6.dp))
+        run {
+            val addr by vm.current.collectAsState()
+            // Начальное значение — из HELLO, а дальше поле живёт само и
+            // сбрасывается только при смене колеса: перечитывать его чаще
+            // значило бы затирать то, что человек в этот момент набирает.
+            var draft by rememberSaveable(addr) {
+                mutableStateOf(vm.currentClient()?.hello?.name ?: "")
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = { draft = it.take(Proto.NAME_MAX) },
+                    singleLine = true,
+                    label = { Text("Display name") },
+                    isError = draft.isNotEmpty() && !Proto.nameOk(draft),
+                    modifier = Modifier.weight(1f)
+                )
+                Spacer(Modifier.width(8.dp))
+                Button(
+                    onClick = { vm.renameCurrent(draft.trim()) { vm.say(it) } },
+                    enabled = Proto.nameOk(draft.trim())
+                ) { Text("Rename") }
+            }
+            Text(
+                "Latin letters, digits, - and _ , up to " + Proto.NAME_MAX + " characters. " +
+                    "Takes effect at once; the phone may keep showing the old name until " +
+                    "it scans again. The mDNS/OTA hostname is unchanged.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
 
