@@ -818,7 +818,6 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         play(name)
     }
     fun effect(id: Int) = onTargets { it.effect(id) }
-    fun speedRed(kmh: Int) = onTargets { it.setSpeedRed(kmh) }
     fun album(start: Boolean, ms: Int) = onTargets { it.album(start, ms) }
     /**
      * Переименовать ТЕКУЩЕЕ колесо. Намеренно мимо onTargets: зеркалирование

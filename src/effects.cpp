@@ -7,7 +7,7 @@
 
 volatile uint8_t  effect_id        = EFF_NONE;
 volatile int8_t   pending_effect   = -1;
-volatile uint16_t effect_speed_red = 40;     // км/ч, при которых шрифт красный
+volatile uint16_t effect_speed_red = 45;     // км/ч, при которых шрифт красный (регулятора в UI нет)
 
 // Пара буферов кадра. Выделяются при запуске эффекта и освобождаются при
 // остановке: длинной анимации нужен весь PSRAM, держать 62 кБ «на всякий

@@ -516,116 +516,90 @@ private fun DisplayTab(vm: WheelVm, tele: Tele) {
     val s by vm.settings.collectAsState()
     var colourOpen by rememberSaveable { mutableStateOf(false) }
     var confirmOff by remember { mutableStateOf(false) }
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(14.dp)) {
+    val fw by vm.fwProgress.collectAsState()
+    val fwPicker = rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.OpenDocument()
+    ) { uri -> if (uri != null) vm.updateFirmware(uri) { vm.say(it) } }
 
-        Text("Brightness", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-        Text(
-            "The device dims itself in the dark and brightens in daylight. " +
-                "You set the range it is allowed to use.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-        Spacer(Modifier.height(10.dp))
+    // Каждый блок — своя карточка, как у эффектов и файлов; горизонтальных
+    // линий-разделителей больше нет.
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp)) {
 
-        SliderRow(
-            "Minimum brightness", s.bmin.toString() + " / 31",
-            s.bmin.toFloat(), 1f, 31f, 30,
-            onChange = { vm.settings.value = s.copy(bmin = it.roundToInt().coerceAtMost(s.bmax)) },
-            onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() },
-            reverseFill = true
-        )
-        SliderRow(
-            "Maximum brightness", s.bmax.toString() + " / 31",
-            s.bmax.toFloat(), 1f, 31f, 30,
-            onChange = { vm.settings.value = s.copy(bmax = it.roundToInt().coerceAtLeast(s.bmin)) },
-            onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() }
-        )
-        Text(
-            "Right now the wheel runs at " + tele.effBri + " (of 31), ambient light " +
-                tele.lux + " lx.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
+        SettingCard { AutoBrightnessRange(vm, s, tele) }
 
-        Divider(Modifier.padding(vertical = 14.dp))
-
-        // Спиннер, а не ползунок: на 360 положениях один пиксель дорожки стоит
-        // больше градуса, и попасть пальцем в нужный было делом случая, тогда
-        // как «поставить картинку ровно» — это правка на единицы градусов.
-        Text("Magnet position", style = MaterialTheme.typography.bodyMedium)
-        NumberSpinner(
-            value = s.angle,
-            range = 0..360,
-            suffix = "°",
-            modifier = Modifier.fillMaxWidth(),
-            onChange = { vm.settings.value = s.copy(angle = it) },
-            onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() }
-        )
-        Text("Use to stand the animation upright.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant)
-
-        Divider(Modifier.padding(vertical = 14.dp))
+        SettingCard {
+            // Спиннер, а не ползунок: на 360 положениях один пиксель дорожки
+            // стоит больше градуса, а «поставить картинку ровно» — это правка
+            // на единицы градусов.
+            Text("Magnet position", style = MaterialTheme.typography.bodyMedium)
+            NumberSpinner(
+                value = s.angle,
+                range = 0..360,
+                suffix = "°",
+                modifier = Modifier.fillMaxWidth(),
+                onChange = { vm.settings.value = s.copy(angle = it) },
+                onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() }
+            )
+            Text("Use to stand the animation upright.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
 
         // Настройки цвета жили в отдельном меню Tuning; теперь они здесь, но
         // спрятаны под тап по заголовку — полдюжины ползунков незачем держать
         // перед глазами.
-        Row(
-            Modifier.fillMaxWidth()
-                .clip(RoundedCornerShape(6.dp))
-                .clickable { colourOpen = !colourOpen }
-                .padding(vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text("Colour", style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-            Text(if (colourOpen) "▾" else "▸",
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        if (colourOpen) {
-            Spacer(Modifier.height(4.dp))
-            ColourControls(vm)
-        }
-
-        Divider(Modifier.padding(vertical = 14.dp))
-
-        Text("Maintenance", fontWeight = FontWeight.SemiBold)
-        Spacer(Modifier.height(6.dp))
-
-        val fw by vm.fwProgress.collectAsState()
-        val fwPicker = rememberLauncherForActivityResult(
-            androidx.activity.result.contract.ActivityResultContracts.OpenDocument()
-        ) { uri -> if (uri != null) vm.updateFirmware(uri) { vm.say(it) } }
-
-        // Четыре кнопки в один ряд: делят ширину поровну, подписи короткие.
-        // «Power off» — уход в транспортный режим: колесо гаснет и до удержания
-        // кнопки не проснётся ни по тряске, ни по BLE.
-        Row(
-            Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            MaintBtn("Power off", fw == null, danger = true) { confirmOff = true }
-            MaintBtn("Reboot", fw == null) { vm.reboot() }
-            MaintBtn("Wi-Fi", fw == null) {
-                vm.wifi(true); vm.say("Wi-Fi is coming up for OTA")
+        SettingCard {
+            Row(
+                Modifier.fillMaxWidth()
+                    .clip(RoundedCornerShape(6.dp))
+                    .clickable { colourOpen = !colourOpen }
+                    .padding(vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Colour", style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                Text(if (colourOpen) "▾" else "▸",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            MaintBtn("Firmware", fw == null) {
-                fwPicker.launch(arrayOf("application/octet-stream", "*/*"))
+            if (colourOpen) {
+                Spacer(Modifier.height(4.dp))
+                ColourControls(vm)
             }
         }
 
-        if (fw != null) {
+        SettingCard {
+            Text("Maintenance", fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(8.dp))
-            LinearProgressIndicator(progress = { fw ?: 0f }, modifier = Modifier.fillMaxWidth())
-            Text(
-                "Sending firmware — " + ((fw ?: 0f) * 100).toInt() + "%. " +
-                    "Keep the phone near the wheel; it reboots by itself when done.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+            // Четыре кнопки в один ряд: делят ширину поровну, подписи короткие.
+            // «Power off» — уход в транспортный режим: колесо гаснет и до
+            // удержания кнопки не проснётся ни по тряске, ни по BLE.
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                MaintBtn("Power off", fw == null, danger = true) { confirmOff = true }
+                MaintBtn("Reboot", fw == null) { vm.reboot() }
+                MaintBtn("Wi-Fi", fw == null) {
+                    vm.wifi(true); vm.say("Wi-Fi is coming up for OTA")
+                }
+                MaintBtn("Firmware", fw == null) {
+                    fwPicker.launch(arrayOf("application/octet-stream", "*/*"))
+                }
+            }
+            if (fw != null) {
+                Spacer(Modifier.height(8.dp))
+                LinearProgressIndicator(progress = { fw ?: 0f }, modifier = Modifier.fillMaxWidth())
+                Text(
+                    "Sending firmware — " + ((fw ?: 0f) * 100).toInt() + "%. " +
+                        "Keep the phone near the wheel; it reboots by itself when done.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
         }
-        Spacer(Modifier.height(24.dp))
+
+        Spacer(Modifier.height(12.dp))
     }
 
     if (confirmOff) {
@@ -646,6 +620,65 @@ private fun DisplayTab(vm: WheelVm, tele: Tele) {
             },
             dismissButton = { TextButton(onClick = { confirmOff = false }) { Text("Cancel") } }
         )
+    }
+}
+
+/** Блок настроек в своей карточке — рамка вместо линии-разделителя. */
+@Composable
+private fun SettingCard(content: @Composable ColumnScope.() -> Unit) {
+    Card(Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
+        Column(Modifier.padding(14.dp), content = content)
+    }
+}
+
+/**
+ * Диапазон авто-яркости одним слайдером с двумя бегунками вместо двух
+ * отдельных. Оранжевая метка на той же шкале — текущая яркость
+ * (`global_effective_brightness`) по нынешней освещённости.
+ */
+@Composable
+private fun AutoBrightnessRange(vm: WheelVm, s: Settings, tele: Tele) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text("Auto Brightness Range", style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.weight(1f))
+        Text(s.bmin.toString() + "–" + s.bmax + " / 31",
+            style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.SemiBold)
+    }
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        // Дорожка слайдера отбита от краёв на радиус бегунка — метку считаем
+        // в тех же границах, иначе она разъедется с делениями.
+        val inset = 10.dp
+        val lo = s.bmin.coerceAtMost(s.bmax)
+        val hi = s.bmax.coerceAtLeast(s.bmin)
+        RangeSlider(
+            modifier = Modifier.fillMaxWidth(),
+            value = lo.toFloat()..hi.toFloat(),
+            onValueChange = { r ->
+                val a = r.start.roundToInt().coerceIn(1, 31)
+                val b = r.endInclusive.roundToInt().coerceIn(1, 31)
+                vm.settings.value = s.copy(
+                    bmin = a.coerceAtMost(b),
+                    bmax = b.coerceAtLeast(a)
+                )
+            },
+            onValueChangeFinished = { vm.pushSettings(vm.settings.value); vm.saveSettings() },
+            valueRange = 1f..31f,
+            steps = 29
+        )
+        // Оранжевая метка — только когда лента реально светит: на выключенном
+        // дисплее eff_bri == 0, и метка у левого края читалась бы как «яркость 1».
+        if (tele.effBri in 1..31) {
+            val frac = ((tele.effBri - 1f) / 30f).coerceIn(0f, 1f)
+            Box(
+                Modifier
+                    .align(Alignment.CenterStart)
+                    .padding(start = inset)
+                    .offset(x = (maxWidth - inset * 2) * frac - 1.5.dp)
+                    .width(3.dp)
+                    .height(22.dp)
+                    .background(Warn, RoundedCornerShape(2.dp))
+            )
+        }
     }
 }
 
@@ -699,7 +732,10 @@ private fun ColourControls(vm: WheelVm) {
             onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() })
         Hint("A few percent is usually enough — large values swallow detail at both ends.")
 
-        Divider(Modifier.padding(vertical = 12.dp))
+        Spacer(Modifier.height(6.dp))
+        Text("White balance", style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.height(4.dp))
 
         SliderRow("Red", (s.rgX10 / 10).toString() + "%",
             (s.rgX10 / 10).toFloat(), 0f, 100f, 20,
@@ -736,7 +772,7 @@ private fun ColourControls(vm: WheelVm) {
 private data class Eff(val id: Int, val icon: String, val name: String, val desc: String)
 
 private val EFFECTS = listOf(
-    Eff(1, "🏁", "Speed", "Current speed in km/h — green at a crawl, red at the limit you set below."),
+    Eff(1, "🏁", "Speed", "Current speed in km/h — green at a crawl, fully red from 45 km/h up."),
     Eff(2, "🔥", "Fire", "Flames rise from the hub and flicker out at the rim."),
     Eff(3, "🌈", "Rainbow", "A spectrum spiral turning against the wheel."),
     Eff(4, "🌀", "Plasma", "Four sine waves interfering — never quite repeats."),
@@ -746,19 +782,9 @@ private val EFFECTS = listOf(
 
 @Composable
 private fun EffectsTab(vm: WheelVm, tele: Tele) {
-    var red by remember { mutableStateOf(40) }
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(14.dp)) {
-        Text("Effects", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-        Text(
-            "These frames are computed on the wheel instead of being read from a file — " +
-                "which is the only way Speed can follow the wheel as you ride. Starting " +
-                "one hands the animation memory back; press Stop, or play any file, to " +
-                "return to the library.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-        Spacer(Modifier.height(10.dp))
-
+    // Только сами эффекты. Тап по карточке запускает; вернуться в библиотеку —
+    // кнопкой ■ Stop в шапке карточки DISPLAY или запуском любого файла.
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp)) {
         EFFECTS.forEach { e ->
             val active = tele.effect == e.id
             Card(
@@ -781,23 +807,7 @@ private fun EffectsTab(vm: WheelVm, tele: Tele) {
                 }
             }
         }
-
-        Spacer(Modifier.height(6.dp))
-        SliderRow("Speed — fully red at", red.toString() + " km/h",
-            red.toFloat(), 5f, 120f, 115,
-            onChange = { red = it.roundToInt() },
-            onCommit = { vm.speedRed(red) })
-        Hint("The digits run from green at a standstill to fully red at this speed. " +
-             "Revolutions become km/h through the wheel circumference — tap the km/h " +
-             "readout above to set it.")
-
-        Spacer(Modifier.height(10.dp))
-        Button(
-            onClick = { vm.effect(0); vm.say("Effects stopped") },
-            modifier = Modifier.fillMaxWidth(),
-            colors = ButtonDefaults.buttonColors(containerColor = Danger)
-        ) { Text("■ Stop effects") }
-        Spacer(Modifier.height(24.dp))
+        Spacer(Modifier.height(16.dp))
     }
 }
 
@@ -1048,41 +1058,19 @@ private fun NumberSpinner(
 private fun SliderRow(
     label: String, valueText: String,
     value: Float, min: Float, max: Float, steps: Int,
-    onChange: (Float) -> Unit, onCommit: () -> Unit,
-    /**
-     * Закрашивать дорожку СПРАВА от ползунка, а не слева.
-     *
-     * Для нижнего порога это не украшение, а смысл: закрашенное — то, чем
-     * регулятор распоряжается. «Минимальная яркость 10» означает, что рабочий
-     * диапазон — от десяти и выше, и подсвечена должна быть именно эта часть
-     * шкалы. Заливка слева читалась ровно наоборот: будто ограничение
-     * действует снизу доверху и чем больше значение, тем больше «занято».
-     */
-    reverseFill: Boolean = false
+    onChange: (Float) -> Unit, onCommit: () -> Unit
 ) {
     Column(Modifier.padding(vertical = 4.dp)) {
         Row {
             Text(label, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
             Text(valueText, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
         }
-        // Направление заливки меняется ПОДМЕНОЙ РОЛЕЙ ЦВЕТОВ, а не своей
-        // отрисовкой дорожки: стандартная дорожка и так красит две половины
-        // этими двумя цветами, поэтому засечки, отключённое состояние и тема
-        // остаются штатными и переписывать нечего.
-        val colors = if (!reverseFill) SliderDefaults.colors()
-                     else SliderDefaults.colors(
-                         activeTrackColor   = MaterialTheme.colorScheme.surfaceVariant,
-                         activeTickColor    = MaterialTheme.colorScheme.onSurfaceVariant,
-                         inactiveTrackColor = MaterialTheme.colorScheme.primary,
-                         inactiveTickColor  = MaterialTheme.colorScheme.onPrimary
-                     )
         Slider(
             value = value.coerceIn(min, max),
             onValueChange = onChange,
             onValueChangeFinished = onCommit,
             valueRange = min..max,
-            steps = (steps - 1).coerceAtLeast(0),
-            colors = colors
+            steps = (steps - 1).coerceAtLeast(0)
         )
     }
 }

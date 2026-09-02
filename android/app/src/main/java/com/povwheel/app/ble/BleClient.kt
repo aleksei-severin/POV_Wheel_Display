@@ -446,15 +446,15 @@ class BleClient(
     suspend fun play(name: String) { request(Proto.OP_PLAY, name.toByteArray(Charsets.US_ASCII)) }
     suspend fun delete(name: String) { request(Proto.OP_DELETE, name.toByteArray(Charsets.US_ASCII)) }
 
-    suspend fun effect(id: Int) { request(Proto.OP_EFFECT, byteArrayOf(id.toByte())) }
-
-    suspend fun setSpeedRed(kmh: Int) {
-        // 0xFF означает «эффект не трогать». Отправить обратно текущий id значило
-        // бы запустить его заново, а запуск ждёт, пока рендер отпустит буфер
-        // кадра, — на это время лента гаснет.
+    /**
+     * Запуск процедурного эффекта. Точка покраснения Speed зашита на 45 км/ч —
+     * регулятора в интерфейсе больше нет, а значение на устройстве могло
+     * остаться другим от старой прошивки.
+     */
+    suspend fun effect(id: Int) {
         val b = Proto.buf(3)
-        b.put(0xFF.toByte())
-        b.putShort(kmh.toShort())
+        b.put(id.toByte())
+        b.putShort(45.toShort())   // км/ч красной зоны Speed
         request(Proto.OP_EFFECT, b.array())
     }
 
