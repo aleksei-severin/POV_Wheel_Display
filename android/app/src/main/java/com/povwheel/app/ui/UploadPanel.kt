@@ -143,18 +143,19 @@ fun UploadPanel(vm: WheelVm) {
                     FilterChip(fitMode == Fit.FIT, { vm.setFit(Fit.FIT) }, { Text("Fit") })
                 }
 
-                // Зеркалить заднюю сторону колеса. Выключено по умолчанию: спереди
-                // и сзади горят те же пиксели (сзади картинка читается зеркально).
+                // Зеркалить заднюю сторону колеса — кнопка-чип, как Crop/Fit:
+                // подсвечивается во включённом состоянии. Выключено по умолчанию,
+                // тогда сзади картинка читается зеркально.
                 Spacer(Modifier.height(4.dp))
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable(enabled = !busy) { vm.setBackMirror(!mirror) }
-                ) {
-                    Checkbox(checked = mirror, onCheckedChange = { vm.setBackMirror(it) }, enabled = !busy)
-                    Text("Mirror back face — readable from both sides",
-                        style = MaterialTheme.typography.bodySmall)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Mirror", style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(end = 8.dp))
+                    FilterChip(
+                        selected = mirror,
+                        onClick = { vm.setBackMirror(!mirror) },
+                        label = { Text("Back face") },
+                        enabled = !busy
+                    )
                 }
 
                 if (isVideo) {

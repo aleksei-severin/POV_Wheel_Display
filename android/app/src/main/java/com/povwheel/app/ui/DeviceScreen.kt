@@ -194,11 +194,13 @@ private fun Hero(vm: WheelVm, tele: Tele) {
     var showRpm by remember { mutableStateOf(false) }
     val settings by vm.settings.collectAsState()
 
+    // IntrinsicSize.Min + fillMaxHeight — обе карточки одной высоты, по более
+    // высокой из двух.
     Row(
-        Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+        Modifier.fillMaxWidth().height(IntrinsicSize.Min).padding(horizontal = 12.dp),
         horizontalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        Card(Modifier.weight(1f)) {
+        Card(Modifier.weight(1f).fillMaxHeight()) {
             Column(Modifier.padding(12.dp)) {
                 Label("DISPLAY")
                 Row(verticalAlignment = Alignment.Bottom) {
@@ -231,7 +233,7 @@ private fun Hero(vm: WheelVm, tele: Tele) {
             }
         }
 
-        Card(Modifier.weight(1f)) {
+        Card(Modifier.weight(1f).fillMaxHeight()) {
             Column(Modifier.padding(12.dp)) {
                 Label("BATTERY")
                 Row(verticalAlignment = Alignment.Bottom) {
@@ -336,10 +338,6 @@ private fun LibraryTab(vm: WheelVm, tele: Tele) {
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp)) {
 
-        UploadPanel(vm)
-
-        Spacer(Modifier.height(12.dp))
-
         if (connected.size > 1) {
             Card(Modifier.fillMaxWidth()) {
                 Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -416,6 +414,12 @@ private fun LibraryTab(vm: WheelVm, tele: Tele) {
         }
 
         Spacer(Modifier.height(14.dp))
+
+        // «Add animation» переехал сюда, под список: сперва библиотека, потом
+        // то, чем её пополняют.
+        UploadPanel(vm)
+
+        Spacer(Modifier.height(12.dp))
 
         // Индикатор хранилища. Флеш ограничивает, сколько файлов влезет; PSRAM —
         // какой длины может быть одна анимация, ведь играет она целиком из ОЗУ.
@@ -528,21 +532,27 @@ private fun DisplayTab(vm: WheelVm, tele: Tele) {
         SettingCard { AutoBrightnessRange(vm, s, tele) }
 
         SettingCard {
+            // Спиннер справа, а не под заголовком, — так блок ниже по высоте.
             // Спиннер, а не ползунок: на 360 положениях один пиксель дорожки
             // стоит больше градуса, а «поставить картинку ровно» — это правка
             // на единицы градусов.
-            Text("Magnet position", style = MaterialTheme.typography.bodyMedium)
-            NumberSpinner(
-                value = s.angle,
-                range = 0..360,
-                suffix = "°",
-                modifier = Modifier.fillMaxWidth(),
-                onChange = { vm.settings.value = s.copy(angle = it) },
-                onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() }
-            )
-            Text("Use to stand the animation upright.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Magnet position", style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold)
+                    Text("Stands the animation upright.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                NumberSpinner(
+                    value = s.angle,
+                    range = 0..360,
+                    suffix = "°",
+                    modifier = Modifier.width(176.dp),
+                    onChange = { vm.settings.value = s.copy(angle = it) },
+                    onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() }
+                )
+            }
         }
 
         // Настройки цвета жили в отдельном меню Tuning; теперь они здесь, но
@@ -639,8 +649,8 @@ private fun SettingCard(content: @Composable ColumnScope.() -> Unit) {
 @Composable
 private fun AutoBrightnessRange(vm: WheelVm, s: Settings, tele: Tele) {
     Row(verticalAlignment = Alignment.CenterVertically) {
-        Text("Auto Brightness Range", style = MaterialTheme.typography.bodyMedium,
-            modifier = Modifier.weight(1f))
+        Text("Auto Brightness Range", style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
         Text(s.bmin.toString() + "–" + s.bmax + " / 31",
             style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.SemiBold)
     }
@@ -1002,7 +1012,7 @@ private fun NumberSpinner(
                     value = text,
                     onValueChange = { t -> text = t.filter { it.isDigit() || it == '-' }.take(4) },
                     singleLine = true,
-                    modifier = Modifier.width(130.dp).focusRequester(focus)
+                    modifier = Modifier.width(104.dp).focusRequester(focus)
                         .onFocusChanged {
                             if (it.isFocused) everFocused = true
                             else if (everFocused && editing) commitText()
@@ -1040,7 +1050,7 @@ private fun NumberSpinner(
                             onDragStarted = { base = value; acc = 0f },
                             onDragStopped = { acc = 0f; onCommit() }
                         )
-                        .padding(horizontal = 14.dp, vertical = 6.dp)
+                        .padding(horizontal = 8.dp, vertical = 6.dp)
                 )
             }
         }
