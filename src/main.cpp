@@ -30,6 +30,10 @@ uint8_t* frameBuffer = nullptr;
 // с буфером в loadFrameFromFile.
 volatile uint8_t  frame_fmt   = FRAME_FMT_565;
 volatile uint32_t palette_gen = 1;
+// По умолчанию заднюю сторону НЕ зеркалим — спереди и сзади горят те же пиксели.
+// Значение выставляют loadFrameFromFile() (из флага в заголовке ANI6) и
+// effectsStart() (true только для Speed и Clock).
+volatile bool     mirror_back_face = false;
 
 // Глобальные переменные для поддержки GIF анимаций
 uint32_t currentFrameIndex = 0;
@@ -911,10 +915,22 @@ static void fillSectorIntoBuffer(uint8_t* buf, uint8_t buf_idx, float sector0, f
     for (int ray = 0; ray < NUM_ARMS; ray++) {
         float bf = fmodf(sector0 + (float)ray * arm_step, 360.0f);
         if (bf < 0.0f) bf += 360.0f;
-        // Обратная сторона луча видна с другой стороны колеса — зеркалим картинку.
-        // bf ∈ [0,360) → bb ∈ (180,540], хватает одной проверки.
-        float bb = 540.0f - bf;
-        if (bb >= 360.0f) bb -= 360.0f;
+        // Зеркальный угол для той стороны луча, которую видно с обратного бока
+        // колеса: отражение 540°−bf гасит переворот «взгляда с изнанки», и текст
+        // читается одинаково с обеих сторон. bf ∈ [0,360) → одной проверки хватает.
+        float bm = 540.0f - bf;
+        if (bm >= 360.0f) bm -= 360.0f;
+
+        // mirror_back_face:
+        //   false → обе стороны берут bf: горят те же пиксели, изнанка читается
+        //     зеркально (то, что нужно симметричной картинке/логотипу).
+        //   true  → сторона диодов 0–43 берёт зеркальный bm, сторона 44–87 (та,
+        //     что «со стороны первого диода») — прямой bf. Так текст Speed/Clock
+        //     и анимации с галочкой читается с обеих сторон колеса.
+        //     На этом железе изнанка — это набор диодов 0–43; если текст выходит
+        //     зеркально с не той стороны, поменять bf и bm местами ниже.
+        float a_f = bf, a_b = bf;
+        if (mirror_back_face) a_f = bm;
 
         uint8_t* dst_f = led_ptr + (ray * LEDS_PER_ARM) * 4;                      // LED 0–43
         uint8_t* dst_b = led_ptr + (ray * LEDS_PER_ARM + LEDS_PER_ARM - 1) * 4;   // LED 87–44
@@ -924,8 +940,8 @@ static void fillSectorIntoBuffer(uint8_t* buf, uint8_t buf_idx, float sector0, f
         // выносится из цикла по диодам.
         int sec_f[ANG_TAPS_BLEND], wts_f[ANG_TAPS_BLEND], na_f;
         int sec_b[ANG_TAPS_BLEND], wts_b[ANG_TAPS_BLEND], na_b;
-        int nf = boxWeightsSecBlend(bf, span, alpha256, sec_f, wts_f, &na_f);
-        int nb = boxWeightsSecBlend(bb, span, alpha256, sec_b, wts_b, &na_b);
+        int nf = boxWeightsSecBlend(a_f, span, alpha256, sec_f, wts_f, &na_f);
+        int nb = boxWeightsSecBlend(a_b, span, alpha256, sec_b, wts_b, &na_b);
 
         if (pal) {
             const uint8_t* rf[ANG_TAPS_BLEND]; int of[ANG_TAPS_BLEND];

@@ -610,6 +610,10 @@ bool effectsStart(uint8_t id) {
     frameDelay        = 0;
     currentFrameIndex = 0;
     frame_fmt         = FRAME_FMT_565;
+    // Speed и Clock рисуют текст, его надо читать с обеих сторон колеса —
+    // fillSectorIntoBuffer() зеркалит для этого дальнюю сторону луча (см. там).
+    // Fire/Rainbow/Plasma/Ripples читать нечего — им обе стороны одинаковы.
+    mirror_back_face  = (id == EFF_SPEED || id == EFF_CLOCK);
     frameBuffer       = eff_buf[0];
     palette_gen++;
     if (oldBuf) free(oldBuf);

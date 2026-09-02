@@ -346,6 +346,7 @@ void loadFrameFromFile(String path) {
     uint32_t  newTotalFrames = 1;
     uint16_t  newFrameDelay  = 100;
     uint8_t   newFmt         = FRAME_FMT_565;
+    bool      newMirrorBack  = false;   // по умолчанию заднюю сторону не зеркалим
 
     size_t fileSize = f.size();
 
@@ -359,8 +360,18 @@ void loadFrameFromFile(String path) {
     bool anim888 = (memcmp(magic, "ANIM", 4) == 0);
 
     if (animpal || anim565 || anim888) {
-        f.read((uint8_t*)&newTotalFrames, 2);
+        uint16_t hdrCount = 0;
+        f.read((uint8_t*)&hdrCount,       2);
         f.read((uint8_t*)&newFrameDelay,  2);
+
+        // Старший бит поля «число кадров» в заголовке ANI6 — флаг «зеркалить
+        // заднюю сторону луча». Реальное число кадров упирается в размер
+        // раздела LittleFS (13 МБ / 16608 ≈ 820 кадров на всё) и в PSRAM
+        // (~480), поэтому биты выше 10-го в этом поле физически всегда нули —
+        // место под флаг безопасно. Для legacy-форматов (ANI5/ANIM) флага нет,
+        // маску всё равно применяем: их счётчик заведомо мал.
+        newMirrorBack  = animpal && (hdrCount & 0x8000u);
+        newTotalFrames = hdrCount & 0x7FFFu;
 
         // Палитровый кадр ложится в PSRAM как есть, RGB888 разворачивается в
         // RGB565 — поэтому размер на диске и размер в памяти считаются отдельно.
@@ -467,6 +478,7 @@ void loadFrameFromFile(String path) {
     frameDelay        = newFrameDelay;
     currentFrameIndex = 0;
     frame_fmt         = newFmt;
+    mirror_back_face  = newMirrorBack;   // публикуется в том же погашенном окне
     frameBuffer       = newBuf;
     // Развёрнутая палитра относится к прежнему буферу: номер кадра после
     // загрузки снова 0, и без этого рендер принял бы старый разворот за свой.
@@ -899,7 +911,8 @@ void setupNetwork() {
                     file.read(hdr, 6);
                     if (hdr[0]=='A' && hdr[1]=='N' && hdr[2]=='I' &&
                         (hdr[3]=='6' || hdr[3]=='5' || hdr[3]=='M')) {
-                        frames = hdr[4] | (hdr[5] << 8);
+                        // Бит 15 — флаг зеркала задней стороны, не часть счётчика.
+                        frames = (hdr[4] | (hdr[5] << 8)) & 0x7FFF;
                     }
                 }
                 if (!first && pos < LIST_CAP - 1) jsonBuf[pos++] = ',';

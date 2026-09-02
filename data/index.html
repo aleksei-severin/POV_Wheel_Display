@@ -493,6 +493,10 @@ input[type="range"].b-slider::-moz-range-progress { background: var(--c); }
   grid-column: 1 / -1; font-size: 12px; color: var(--text-3); margin-top: 2px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
+.mirror-opt { display: none; align-items: center; gap: 8px; margin-top: 10px;
+  font-size: 12.5px; color: var(--text-2); cursor: pointer; }
+.mirror-opt.show { display: flex; }
+.mirror-opt input { width: 16px; height: 16px; margin: 0; cursor: pointer; flex: 0 0 auto; }
 
 .status-bar {
   margin-top: 12px; padding: 10px 12px; border-radius: 12px;
@@ -785,6 +789,14 @@ details.help .help-body b { color: var(--text-2); }
           <input type="number" id="vidLen" min="0.5" step="0.5" value="10" onchange="onOptsChange()"><span class="unit">s</span></span>
         <div class="opt-note" id="vidBudget"></div>
       </div>
+
+      <!-- Зеркалить заднюю сторону колеса. Выключено по умолчанию: спереди и
+           сзади горят те же пиксели (сзади изображение читается зеркально).
+           Включить, если нужно, чтобы текст читался с обеих сторон. -->
+      <label class="mirror-opt" id="mirrorOpt">
+        <input type="checkbox" id="mirrorBack">
+        <span>Mirror back face — readable from both sides</span>
+      </label>
 
       <div class="upload-queue-label" id="uploadQueue"></div>
       <div class="status-bar" id="uploadStatus">Waiting for a file…</div>
@@ -1795,8 +1807,8 @@ function maxFramesForDevice() {
     if (_devLimits && _devLimits.fsFree) {
         byFs = Math.floor((_devLimits.fsFree - FS_RESERVE - HDR) / FRAME_STRIDE);
     }
-    // Счётчик кадров в заголовке ANI6 — uint16.
-    return Math.max(1, Math.min(byPsram, byFs, 65535));
+    // Счётчик кадров в заголовке ANI6 — 15 бит (бит 15 занят флагом зеркала).
+    return Math.max(1, Math.min(byPsram, byFs, 32767));
 }
 
 // ---- UI параметров видео ----
@@ -2129,6 +2141,7 @@ document.getElementById('fileInput').addEventListener('change', function(e) {
     const opts = document.getElementById('videoOpts');
     opts.classList.add('show');
     opts.classList.toggle('vid', _selectedIsVideo);
+    document.getElementById('mirrorOpt').classList.add('show');
     document.getElementById('vidBudget').textContent = '';
 
     _showDropThumb(first);
@@ -2187,6 +2200,12 @@ function _fitMode() {
     return el ? el.value : 'crop';
 }
 
+// Галочка «зеркалить заднюю сторону» из панели загрузки
+function _mirrorBack() {
+    const el = document.getElementById('mirrorBack');
+    return !!(el && el.checked);
+}
+
 // ===================== UPLOAD =====================
 
 // LittleFS на Arduino-ESP32: name_max = 31 байт (без ведущего '/').
@@ -2221,10 +2240,14 @@ function buildFileName(prefix, rawBase) {
 // Заголовок носит и одиночная картинка (кол-во кадров = 1). Раньше статичный
 // кадр писался вообще без заголовка и опознавался по размеру файла — с
 // появлением второго формата такое опознание перестало быть однозначным.
-function packANI6(frames, delayMs) {
+function packANI6(frames, delayMs, mirrorBack) {
     const buf = new Uint8Array(8 + frames.length * FRAME_STRIDE);
     buf[0] = 65; buf[1] = 78; buf[2] = 73; buf[3] = 54;   // "ANI6" (ANI5 = RGB565, ANIM = RGB888)
-    buf[4] = frames.length & 0xFF; buf[5] = (frames.length >> 8) & 0xFF;
+    // Бит 15 поля «число кадров» — флаг «зеркалить заднюю сторону луча».
+    // Кадров физически не бывает больше ~820 (размер раздела LittleFS), поэтому
+    // старшие биты этого поля всегда свободны. Прошивка маскирует их обратно.
+    const cnt = (frames.length & 0x7FFF) | (mirrorBack ? 0x8000 : 0);
+    buf[4] = cnt & 0xFF; buf[5] = (cnt >> 8) & 0xFF;
     const dd = Math.max(1, Math.min(65535, delayMs | 0));
     buf[6] = dd & 0xFF; buf[7] = (dd >> 8) & 0xFF;
     let off = 8;
@@ -2248,6 +2271,7 @@ async function _convertFile(file, label) {
     const isGif  = !isVid && file.name.toLowerCase().endsWith('.gif');
     const isWebp = !isVid && !isGif && isWebPFile(file);
     const fit    = _fitMode();
+    const mirror = _mirrorBack();
     const tag    = label || file.name;
 
     // Анимированный WebP определяется только по содержимому, поэтому читаем
@@ -2270,7 +2294,7 @@ async function _convertFile(file, label) {
                 `${tag} — decoding ${done}/${total} frames (${(done * 100 / total).toFixed(0)}%)`, '');
         });
         const kept = _capFrames(frames, tag);
-        return { buf: packANI6(kept, delayMs), fileName, frameCount: kept.length };
+        return { buf: packANI6(kept, delayMs, mirror), fileName, frameCount: kept.length };
     }
 
     if (isVid) {
@@ -2283,7 +2307,7 @@ async function _convertFile(file, label) {
         });
         // Задержка кадра в заголовке — целые миллисекунды, uint16.
         const delay = Math.max(1, Math.round(1000 / o.fps));
-        return { buf: packANI6(frames, delay), fileName, frameCount: frames.length };
+        return { buf: packANI6(frames, delay, mirror), fileName, frameCount: frames.length };
     }
 
     if (isGif) {
@@ -2296,7 +2320,7 @@ async function _convertFile(file, label) {
                 `${tag} — converting ${done}/${total} frames (${(done * 100 / total).toFixed(0)}%)`, '');
         });
         const kept = _capFrames(frames, tag);
-        const buf = packANI6(kept.map(f => f.data), kept[0].delay || 100);
+        const buf = packANI6(kept.map(f => f.data), kept[0].delay || 100, mirror);
         return { buf, fileName, frameCount: kept.length };
     } else {
         const dataUrl = await new Promise((res, rej) => {
@@ -2322,7 +2346,7 @@ async function _convertFile(file, label) {
         drawSquare(img, ctx, SRC_SIZE_IMG, _fitMode());
         // Одиночная картинка — тот же ANI6 из одного кадра: отдельного
         // безголового формата больше нет.
-        return { buf: packANI6([toPolarBuffer(oc, 3)], 100), fileName };
+        return { buf: packANI6([toPolarBuffer(oc, 3)], 100, mirror), fileName };
     }
 }
 

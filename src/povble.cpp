@@ -947,7 +947,10 @@ static void handleCmd(const uint8_t* d, size_t n) {
         uint32_t byFs = (i.free > FS_RESERVE + HDR) ? (i.free - FS_RESERVE - HDR) / FRAME_STRIDE_PAL : 1;
         uint32_t mx = byPs < byFs ? byPs : byFs;
         if (mx < 1) mx = 1;
-        if (mx > 65535) mx = 65535;
+        // Верхний предел — 15 бит: бит 15 поля «число кадров» в заголовке ANI6
+        // занят флагом зеркала задней стороны. Физически PSRAM всё равно режет
+        // раньше (~480), клап тут — только страховка.
+        if (mx > 32767) mx = 32767;
         i.max_frames = (uint16_t)mx;
         sendRsp(op, seq, ST_OK, &i, sizeof(i));
         break;

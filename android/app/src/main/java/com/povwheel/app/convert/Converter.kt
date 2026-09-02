@@ -76,6 +76,7 @@ class Converter(private val context: Context) {
         fitMode: Int,
         maxFrames: Int,
         vid: VideoOpts,
+        mirrorBack: Boolean,
         prog: Progress
     ): Result {
         val name = displayName(uri)
@@ -97,15 +98,15 @@ class Converter(private val context: Context) {
         val nr = Ani6.buildFileName(prefix, rawBase, (System.currentTimeMillis() % 100000).toInt())
 
         return when (kind) {
-            Kind.IMAGE -> convertStill(bytes ?: readBytes(uri), fitMode, nr, prog)
-            Kind.GIF -> convertGif(readBytes(uri), fitMode, maxFrames, nr, prog)
-            Kind.WEBP_ANIM -> convertWebP(bytes!!, fitMode, maxFrames, nr, prog)
-            Kind.VIDEO -> convertVideo(uri, fitMode, maxFrames, vid, nr, prog)
+            Kind.IMAGE -> convertStill(bytes ?: readBytes(uri), fitMode, mirrorBack, nr, prog)
+            Kind.GIF -> convertGif(readBytes(uri), fitMode, maxFrames, mirrorBack, nr, prog)
+            Kind.WEBP_ANIM -> convertWebP(bytes!!, fitMode, maxFrames, mirrorBack, nr, prog)
+            Kind.VIDEO -> convertVideo(uri, fitMode, maxFrames, vid, mirrorBack, nr, prog)
         }
     }
 
     private fun convertStill(
-        raw: ByteArray, fitMode: Int, nr: Ani6.NameResult, prog: Progress
+        raw: ByteArray, fitMode: Int, mirrorBack: Boolean, nr: Ani6.NameResult, prog: Progress
     ): Result {
         prog.stage("converting…")
         var src = BitmapFactory.decodeByteArray(raw, 0, raw.size)
@@ -116,7 +117,7 @@ class Converter(private val context: Context) {
         src.recycle()
         // Одиночная картинка — тот же ANI6 из одного кадра: отдельного
         // безголового формата больше нет.
-        val out = Ani6.allocate(1, 100)
+        val out = Ani6.allocate(1, 100, mirrorBack)
         // ss = 3 для статичной: кадр один, лишние отсчёты ничего не стоят.
         PolarSampler().frameInto(work, 3, Quantizer(), out, Ani6.frameOffset(0))
         work.recycle()
@@ -125,7 +126,8 @@ class Converter(private val context: Context) {
     }
 
     private fun convertGif(
-        raw: ByteArray, fitMode: Int, maxFrames: Int, nr: Ani6.NameResult, prog: Progress
+        raw: ByteArray, fitMode: Int, maxFrames: Int, mirrorBack: Boolean,
+        nr: Ani6.NameResult, prog: Progress
     ): Result {
         val gif = GifDecoder(raw)
         gif.parse()
@@ -136,7 +138,7 @@ class Converter(private val context: Context) {
             warning = gif.frames.size.toString() + " frames trimmed to " + total + " (device memory)"
         }
         val delay = gif.frames[0].delay.coerceAtLeast(1)
-        val out = Ani6.allocate(total, delay)
+        val out = Ani6.allocate(total, delay, mirrorBack)
 
         val canvasW = maxOf(gif.width, 1)
         val canvasH = maxOf(gif.height, 1)
@@ -211,7 +213,8 @@ class Converter(private val context: Context) {
     }
 
     private fun convertWebP(
-        raw: ByteArray, fitMode: Int, maxFrames: Int, nr: Ani6.NameResult, prog: Progress
+        raw: ByteArray, fitMode: Int, maxFrames: Int, mirrorBack: Boolean,
+        nr: Ani6.NameResult, prog: Progress
     ): Result {
         val anim = WebP.parse(raw) ?: throw IllegalStateException("not an animated WebP")
         val total = minOf(anim.frames.size, maxFrames)
@@ -224,7 +227,7 @@ class Converter(private val context: Context) {
         // 100 мс; без этой подмены анимация уехала бы на 1 мс/кадр.
         val d0 = anim.frames[0].dur
         val delay = (if (d0 == 0) 100 else d0).coerceAtLeast(1)
-        val out = Ani6.allocate(total, delay)
+        val out = Ani6.allocate(total, delay, mirrorBack)
 
         val canvas = Bitmap.createBitmap(anim.w, anim.h, Bitmap.Config.ARGB_8888)
         val cv = android.graphics.Canvas(canvas)
@@ -264,7 +267,7 @@ class Converter(private val context: Context) {
     }
 
     private fun convertVideo(
-        uri: Uri, fitMode: Int, maxFrames: Int, vid: VideoOpts,
+        uri: Uri, fitMode: Int, maxFrames: Int, vid: VideoOpts, mirrorBack: Boolean,
         nr: Ani6.NameResult, prog: Progress
     ): Result {
         val mmr = MediaMetadataRetriever()
@@ -282,7 +285,7 @@ class Converter(private val context: Context) {
             val n = maxOf(1, minOf((len * vid.fps).roundToInt(), maxFrames))
             // Задержка кадра в заголовке — целые миллисекунды, uint16.
             val delay = maxOf(1, (1000.0 / vid.fps).roundToInt())
-            val out = Ani6.allocate(n, delay)
+            val out = Ani6.allocate(n, delay, mirrorBack)
 
             val work = Bitmaps.square(Geom.SRC_SIZE_VID)
             val sampler = PolarSampler()

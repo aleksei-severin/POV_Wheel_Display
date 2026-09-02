@@ -571,6 +571,10 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     val upFit      = MutableStateFlow(Fit.CROP)
     val upFps      = MutableStateFlow(10)
     val upLength   = MutableStateFlow(10.0)
+    // Зеркалить заднюю сторону колеса. Выключено по умолчанию: спереди и сзади
+    // горят те же пиксели. Включить — чтобы текст читался с обеих сторон.
+    // (Не путать с mirrorAll — то про рассылку команд на все колёса.)
+    val upBackMirror = MutableStateFlow(false)
     val upIsVideo  = MutableStateFlow(false)
     val upSrcDur   = MutableStateFlow(0.0)   // длительность исходного ролика, с
 
@@ -615,6 +619,8 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    fun setBackMirror(v: Boolean) { upBackMirror.value = v }
+
     fun setFps(n: Int) {
         upFps.value = n
         // Смена fps только УКОРАЧИВАЕТ выбранную длину и никогда не удлиняет —
@@ -658,6 +664,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         val jobFit = upFit.value
         val jobFps = upFps.value
         val jobLen = upLength.value
+        val jobMirror = upBackMirror.value
         val jobMaxFrames = fsInfo.value.maxFrames
 
         // Сканирование и заливка делят одно радио: LOW_LATENCY-поиск поверх
@@ -679,6 +686,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                         converter.convert(
                             u, jobFit, jobMaxFrames,
                             Converter.VideoOpts(jobFps, jobLen),
+                            jobMirror,
                             object : Converter.Progress {
                                 override fun stage(text: String) { upStatus.value = label + " — " + text }
                                 override fun frames(done: Int, total: Int) {

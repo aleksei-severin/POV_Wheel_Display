@@ -54,6 +54,7 @@ fun UploadPanel(vm: WheelVm) {
     val fitMode by vm.upFit.collectAsState()
     val fps by vm.upFps.collectAsState()
     val lengthSec by vm.upLength.collectAsState()
+    val mirror by vm.upBackMirror.collectAsState()
     val isVideo by vm.upIsVideo.collectAsState()
     val srcDuration by vm.upSrcDur.collectAsState()
 
@@ -140,6 +141,20 @@ fun UploadPanel(vm: WheelVm) {
                     FilterChip(fitMode == Fit.CROP, { vm.setFit(Fit.CROP) }, { Text("Crop") })
                     Spacer(Modifier.width(6.dp))
                     FilterChip(fitMode == Fit.FIT, { vm.setFit(Fit.FIT) }, { Text("Fit") })
+                }
+
+                // Зеркалить заднюю сторону колеса. Выключено по умолчанию: спереди
+                // и сзади горят те же пиксели (сзади картинка читается зеркально).
+                Spacer(Modifier.height(4.dp))
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(enabled = !busy) { vm.setBackMirror(!mirror) }
+                ) {
+                    Checkbox(checked = mirror, onCheckedChange = { vm.setBackMirror(it) }, enabled = !busy)
+                    Text("Mirror back face — readable from both sides",
+                        style = MaterialTheme.typography.bodySmall)
                 }
 
                 if (isVideo) {
