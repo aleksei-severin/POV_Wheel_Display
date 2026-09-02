@@ -143,6 +143,13 @@ shake, and in a bag or on a rack the wheel shakes continuously — it woke, wait
 out its idle minute, slept, and repeated until the cell was flat. Here the only
 wake source is the button, so the quiescent draw is the honest ~10 µA.
 
+**`OP_POWEROFF` (BLE) reaches the same `enterTransportSleep()`** — the phone's
+*Power off* button. The command only raises `pending_transport_off`; `loop()` runs
+the shutdown, because `enterTransportSleep()` writes flash and drives the SPI wipe
+and the NimBLE host task must do neither. There is deliberately **no wake over
+BLE** to match: once off, only a button hold brings it back, so a wheel powered
+off from a phone that then walks away stays off.
+
 - `transport_mode` lives in RTC memory: it has to survive the very sleep it
   causes. A full power cut loses it, which is the correct escape hatch — a wheel
   with the battery reconnected boots normally.

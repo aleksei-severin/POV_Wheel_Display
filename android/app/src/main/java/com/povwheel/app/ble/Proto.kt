@@ -50,6 +50,7 @@ object Proto {
     const val OP_SLEEP     = 0x17
     const val OP_FRAG      = 0x18
     const val OP_SETNAME   = 0x19
+    const val OP_POWEROFF  = 0x1A   // транспортный режим — будит только удержание кнопки
 
     /**
      * Предел имени — столько же, сколько держит PovHello.name вместе с

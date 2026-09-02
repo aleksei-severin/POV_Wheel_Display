@@ -39,6 +39,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.sp
 import com.povwheel.app.WheelVm
 import com.povwheel.app.ble.DevFile
@@ -49,7 +50,10 @@ import com.povwheel.app.ble.Tele
 import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
 
-private val TABS = listOf("Library", "Display", "Tuning", "Effects", "Log")
+// Меню Tuning больше нет: его настройки переехали в Display, под сворачиваемую
+// секцию «Colour». Четыре коротких имени умещаются в ширину экрана, поэтому
+// TabRow с равными долями вместо прокручиваемого ScrollableTabRow.
+private val TABS = listOf("Library", "Display", "Effects", "Log")
 
 @Composable
 fun DeviceScreen(vm: WheelVm) {
@@ -65,10 +69,10 @@ fun DeviceScreen(vm: WheelVm) {
     var tab by rememberSaveable { mutableStateOf(0) }
 
     Column(Modifier.fillMaxSize()) {
-        Header(vm, tele, link)
+        Header(vm, link)
         Hero(vm, tele)
 
-        ScrollableTabRow(selectedTabIndex = tab, edgePadding = 12.dp) {
+        TabRow(selectedTabIndex = tab) {
             TABS.forEachIndexed { i, t ->
                 Tab(selected = tab == i, onClick = { tab = i }, text = { Text(t) })
             }
@@ -78,8 +82,7 @@ fun DeviceScreen(vm: WheelVm) {
             when (tab) {
                 0 -> LibraryTab(vm, tele)
                 1 -> DisplayTab(vm, tele)
-                2 -> TuningTab(vm)
-                3 -> EffectsTab(vm, tele)
+                2 -> EffectsTab(vm, tele)
                 else -> LogTab(vm)
             }
         }
@@ -89,7 +92,7 @@ fun DeviceScreen(vm: WheelVm) {
 // ------------------------------------------------------------------- обвязка
 
 @Composable
-private fun Header(vm: WheelVm, tele: Tele, link: Link) {
+private fun Header(vm: WheelVm, link: Link) {
     val client = vm.currentClient()
     // Имя берём из общего списка, а НЕ из client.hello. hello — снимок,
     // сделанный при подключении: он не меняется от переименования, да и
@@ -100,25 +103,89 @@ private fun Header(vm: WheelVm, tele: Tele, link: Link) {
     val curAddr by vm.current.collectAsState()
     val title = wheels.firstOrNull { it.address == curAddr }?.name
         ?: client?.hello?.name ?: "POV Wheel"
+
+    var renaming by remember { mutableStateOf(false) }
+
+    // Одна строка: «‹ Wheels», имя (оно же кнопка переименования) и статус
+    // связи справа — там, где раньше была светящаяся точка. Дату сборки убрали,
+    // высоту шапки — до одной строки.
     Row(
-        Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
+        Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 2.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        TextButton(onClick = { vm.current.value = null }) { Text("‹ Wheels") }
-        Column(Modifier.weight(1f)) {
-            Text(title, fontWeight = FontWeight.Bold)
-            Text(
-                (if (link == Link.Ready) "Online" else "Offline") +
-                    (client?.hello?.fw?.let { "  ·  " + it } ?: ""),
-                style = MaterialTheme.typography.bodySmall,
-                color = if (link == Link.Ready) Ok else Danger
-            )
-        }
-        Box(
-            Modifier.size(10.dp).clip(CircleShape)
-                .background(if (link == Link.Ready) Ok else Danger)
+        TextButton(
+            onClick = { vm.current.value = null },
+            contentPadding = PaddingValues(horizontal = 8.dp)
+        ) { Text("‹ Wheels") }
+
+        // Тап по имени открывает переименование — отдельной строки «Name» в
+        // Display больше нет.
+        Text(
+            title,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier
+                .weight(1f)
+                .clip(RoundedCornerShape(6.dp))
+                .clickable { renaming = true }
+                .padding(horizontal = 6.dp, vertical = 6.dp)
+        )
+
+        Text(
+            if (link == Link.Ready) "Online" else "Offline",
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = FontWeight.SemiBold,
+            color = if (link == Link.Ready) Ok else Danger,
+            modifier = Modifier.padding(end = 10.dp)
         )
     }
+
+    if (renaming) {
+        RenameDialog(
+            current = title,
+            onDismiss = { renaming = false },
+            onSave = { name -> vm.renameCurrent(name) { vm.say(it) }; renaming = false }
+        )
+    }
+}
+
+@Composable
+private fun RenameDialog(current: String, onDismiss: () -> Unit, onSave: (String) -> Unit) {
+    var draft by remember { mutableStateOf(current) }
+    val ok = Proto.nameOk(draft.trim())
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Rename wheel") },
+        text = {
+            Column {
+                Text(
+                    "What this wheel is called in the device list. Two wheels on one " +
+                        "bike are both \"POV-xxxx\" out of the box, and which is which is " +
+                        "anyone's guess.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Spacer(Modifier.height(10.dp))
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = { draft = it.take(Proto.NAME_MAX) },
+                    singleLine = true,
+                    isError = draft.isNotEmpty() && !ok,
+                    label = { Text("Display name") }
+                )
+                Text(
+                    "Latin letters, digits, - and _ , up to " + Proto.NAME_MAX + " characters. " +
+                        "Takes effect at once. The mDNS/OTA hostname is unchanged.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(enabled = ok, onClick = { onSave(draft.trim()) }) { Text("Rename") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
 }
 
 @Composable
@@ -150,10 +217,6 @@ private fun Hero(vm: WheelVm, tele: Tele) {
                         modifier = Modifier.clickable { showRpm = true }
                     )
                     Text(" rpm", style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-                if (tele.rpm > 0f && tele.dir < 0) {
-                    Text("· reverse", style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 Spacer(Modifier.height(8.dp))
@@ -287,12 +350,21 @@ private fun LibraryTab(vm: WheelVm, tele: Tele) {
             Spacer(Modifier.height(12.dp))
         }
 
+        // Компактно: заголовок, а под ним одна строка — слева кнопка
+        // старт/стоп, справа регулятор задержки. Интервал по-прежнему
+        // применяется сразу (см. LaunchedEffect выше), поэтому подсказку об
+        // этом убрали.
         Card(Modifier.fillMaxWidth()) {
-            Column(Modifier.padding(12.dp)) {
-                Text("Slideshow", fontWeight = FontWeight.SemiBold)
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Each file for", style = MaterialTheme.typography.bodySmall)
-                    Spacer(Modifier.weight(1f))
+            Column(
+                Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text("Slideshow", fontWeight = FontWeight.SemiBold,
+                    style = MaterialTheme.typography.bodyMedium)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
                     Button(onClick = {
                         if (tele.slideshow) { vm.album(false, 0); vm.say("Slideshow stopped") }
                         else {
@@ -301,20 +373,12 @@ private fun LibraryTab(vm: WheelVm, tele: Tele) {
                             vm.say("Slideshow started")
                         }
                     }) { Text(if (tele.slideshow) "⏹ Stop" else "⏩ Start") }
-                }
-                Spacer(Modifier.height(4.dp))
-                NumberSpinner(
-                    value = albumSecs,
-                    range = 1..300,
-                    suffix = " s",
-                    modifier = Modifier.fillMaxWidth(),
-                    onChange = { albumTouched = true; albumSecs = it }
-                )
-                if (tele.slideshow) {
-                    Text(
-                        "Applies straight away — no need to stop and start.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    NumberSpinner(
+                        value = albumSecs,
+                        range = 1..300,
+                        suffix = " s",
+                        modifier = Modifier.weight(1f),
+                        onChange = { albumTouched = true; albumSecs = it }
                     )
                 }
             }
@@ -450,6 +514,8 @@ private fun fmtSize(b: Long): String =
 @Composable
 private fun DisplayTab(vm: WheelVm, tele: Tele) {
     val s by vm.settings.collectAsState()
+    var colourOpen by rememberSaveable { mutableStateOf(false) }
+    var confirmOff by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(14.dp)) {
 
         Text("Brightness", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
@@ -483,21 +549,6 @@ private fun DisplayTab(vm: WheelVm, tele: Tele) {
 
         Divider(Modifier.padding(vertical = 14.dp))
 
-        SliderRow(
-            "Power limit", (s.ablX10 / 10).toString() + "%   (now drawing " + tele.ablRms + "%)",
-            (s.ablX10 / 10).toFloat(), 0f, 100f, 100,
-            onChange = { vm.settings.value = s.copy(ablX10 = (it.roundToInt() * 10)) },
-            onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() }
-        )
-        Text(
-            "Caps how much current all 528 LEDs may draw together. Lower it to make " +
-                "the battery last longer.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-
-        Divider(Modifier.padding(vertical = 14.dp))
-
         // Спиннер, а не ползунок: на 360 положениях один пиксель дорожки стоит
         // больше градуса, и попасть пальцем в нужный было делом случая, тогда
         // как «поставить картинку ровно» — это правка на единицы градусов.
@@ -516,68 +567,25 @@ private fun DisplayTab(vm: WheelVm, tele: Tele) {
 
         Divider(Modifier.padding(vertical = 14.dp))
 
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Text("Arm order — flip", fontWeight = FontWeight.SemiBold)
-                Text(
-                    "If the image breaks into shuffled 60° wedges, turn this on. " +
-                        "Changing it resets the Hall sensor calibration.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-            Switch(
-                checked = s.armReverse != 0,
-                onCheckedChange = {
-                    val n = s.copy(armReverse = if (it) 1 else 0)
-                    vm.pushSettings(n); vm.saveSettings()
-                }
-            )
+        // Настройки цвета жили в отдельном меню Tuning; теперь они здесь, но
+        // спрятаны под тап по заголовку — полдюжины ползунков незачем держать
+        // перед глазами.
+        Row(
+            Modifier.fillMaxWidth()
+                .clip(RoundedCornerShape(6.dp))
+                .clickable { colourOpen = !colourOpen }
+                .padding(vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("Colour", style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+            Text(if (colourOpen) "▾" else "▸",
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-
-        Divider(Modifier.padding(vertical = 14.dp))
-
-        Text("Name", fontWeight = FontWeight.SemiBold)
-        Text(
-            "What this wheel is called in the device list. Two wheels on one bike " +
-                "are both \"POV-xxxx\" out of the box, and which is which is anyone's guess.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-        Spacer(Modifier.height(6.dp))
-        run {
-            val addr by vm.current.collectAsState()
-            val wheels by vm.wheels.collectAsState()
-            // Начальное значение — из общего списка колёс, а НЕ из HELLO.
-            // HELLO снимается при подключении и переименование его не трогает,
-            // так что поле показывало старое имя, стоило уйти с вкладки и
-            // вернуться. Дальше поле живёт само и сбрасывается только при смене
-            // колеса: перечитывать чаще значило бы затирать набранное.
-            val seed = wheels.firstOrNull { it.address == addr }?.name
-                ?: vm.currentClient()?.hello?.name ?: ""
-            var draft by rememberSaveable(addr) { mutableStateOf(seed) }
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                OutlinedTextField(
-                    value = draft,
-                    onValueChange = { draft = it.take(Proto.NAME_MAX) },
-                    singleLine = true,
-                    label = { Text("Display name") },
-                    isError = draft.isNotEmpty() && !Proto.nameOk(draft),
-                    modifier = Modifier.weight(1f)
-                )
-                Spacer(Modifier.width(8.dp))
-                Button(
-                    onClick = { vm.renameCurrent(draft.trim()) { vm.say(it) } },
-                    enabled = Proto.nameOk(draft.trim())
-                ) { Text("Rename") }
-            }
-            Text(
-                "Latin letters, digits, - and _ , up to " + Proto.NAME_MAX + " characters. " +
-                    "Takes effect at once; the phone may keep showing the old name until " +
-                    "it scans again. The mDNS/OTA hostname is unchanged.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+        if (colourOpen) {
+            Spacer(Modifier.height(4.dp))
+            ColourControls(vm)
         }
 
         Divider(Modifier.padding(vertical = 14.dp))
@@ -590,16 +598,21 @@ private fun DisplayTab(vm: WheelVm, tele: Tele) {
             androidx.activity.result.contract.ActivityResultContracts.OpenDocument()
         ) { uri -> if (uri != null) vm.updateFirmware(uri) { vm.say(it) } }
 
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = { vm.reboot() }, enabled = fw == null) { Text("Reboot") }
-            OutlinedButton(
-                onClick = { vm.wifi(true); vm.say("Wi-Fi is coming up for OTA") },
-                enabled = fw == null
-            ) { Text("Wi-Fi on") }
-            OutlinedButton(
-                onClick = { fwPicker.launch(arrayOf("application/octet-stream", "*/*")) },
-                enabled = fw == null
-            ) { Text("Update firmware") }
+        // Четыре кнопки в один ряд: делят ширину поровну, подписи короткие.
+        // «Power off» — уход в транспортный режим: колесо гаснет и до удержания
+        // кнопки не проснётся ни по тряске, ни по BLE.
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            MaintBtn("Power off", fw == null, danger = true) { confirmOff = true }
+            MaintBtn("Reboot", fw == null) { vm.reboot() }
+            MaintBtn("Wi-Fi", fw == null) {
+                vm.wifi(true); vm.say("Wi-Fi is coming up for OTA")
+            }
+            MaintBtn("Firmware", fw == null) {
+                fwPicker.launch(arrayOf("application/octet-stream", "*/*"))
+            }
         }
 
         if (fw != null) {
@@ -611,34 +624,55 @@ private fun DisplayTab(vm: WheelVm, tele: Tele) {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-        } else {
-            Text(
-                "Firmware goes over the same BLE link as animations — pick the " +
-                    "firmware.bin your build produced. The wheel checks CRC32 before " +
-                    "it switches over, so a corrupted transfer is refused, not installed.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
         }
-        Spacer(Modifier.height(10.dp))
-        Text(
-            "Wi-Fi stays off unless you ask for it — that is what keeps the phone on " +
-                "mobile data and the wheel off a 100 mA receiver. Turn it on only to " +
-                "flash firmware from PlatformIO; it goes away again on the next boot.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
         Spacer(Modifier.height(24.dp))
+    }
+
+    if (confirmOff) {
+        AlertDialog(
+            onDismissRequest = { confirmOff = false },
+            title = { Text("Power off the wheel?") },
+            text = {
+                Text(
+                    "The wheel shuts down and will not wake on a shake or over " +
+                        "Bluetooth — only by holding its button for about 1.5 s."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmOff = false
+                    vm.powerOff(); vm.say("Powering off")
+                }) { Text("Power off") }
+            },
+            dismissButton = { TextButton(onClick = { confirmOff = false }) { Text("Cancel") } }
+        )
     }
 }
 
-// ------------------------------------------------------------------ Tuning
+@Composable
+private fun RowScope.MaintBtn(
+    label: String, enabled: Boolean, danger: Boolean = false, onClick: () -> Unit
+) {
+    OutlinedButton(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = Modifier.weight(1f),
+        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp),
+        colors = if (danger)
+            ButtonDefaults.outlinedButtonColors(contentColor = Danger)
+        else ButtonDefaults.outlinedButtonColors()
+    ) {
+        Text(label, style = MaterialTheme.typography.labelMedium, maxLines = 1, softWrap = false)
+    }
+}
+
+// ------------------------------------------------------------------ Colour
+// Бывшее меню Tuning: сворачивается под заголовком «Colour» в Display.
 
 @Composable
-private fun TuningTab(vm: WheelVm) {
+private fun ColourControls(vm: WheelVm) {
     val s by vm.settings.collectAsState()
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(14.dp)) {
-        Text("Colour", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+    Column {
         Text(
             "Gamma, saturation and contrast shape the picture; R/G/B set the white " +
                 "balance of the LEDs.",
@@ -694,7 +728,6 @@ private fun TuningTab(vm: WheelVm) {
             },
             modifier = Modifier.fillMaxWidth()
         ) { Text("↺ Restore defaults") }
-        Spacer(Modifier.height(24.dp))
     }
 }
 

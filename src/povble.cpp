@@ -70,6 +70,11 @@ extern String pendingPlayFile;
 // задачу почти на десять секунд, и задаче хоста NimBLE там делать нечего.
 volatile bool pending_wifi_on = false;
 
+// Заявка на транспортный режим (OP_POWEROFF). Исполняет loop():
+// enterTransportSleep() гасит ленту через SPI, сбрасывает настройки и
+// калибровку во флеш и уходит в сон, из которого будит только удержание кнопки.
+volatile bool pending_transport_off = false;
+
 // ---------------------------------------------------------------------
 //  CRC32 (полином 0xEDB88320, отражённый) — тот же, что java.util.zip.CRC32.
 //  Своя реализация, а не esp_rom_crc32_le: у ромовой неочевидная трактовка
@@ -1121,6 +1126,17 @@ static void handleCmd(const uint8_t* d, size_t n) {
         sendRsp(op, seq, ST_OK);
         vTaskDelay(pdMS_TO_TICKS(300));
         ESP.restart();
+        break;
+
+    case OP_POWEROFF:
+        sendRsp(op, seq, ST_OK);
+        // Транспортный режим. Саму работу делает loop() —
+        // enterTransportSleep() гасит ленту, сбрасывает настройки и калибровку
+        // во флеш и уходит в сон, из которого будит только удержание кнопки.
+        // Здесь нельзя: стирание флеша заморозит задачу хоста NimBLE и оборвёт
+        // связь по супервизии соединения.
+        webLog("[BLE] Power off requested (transport mode)");
+        pending_transport_off = true;
         break;
 
     case OP_SLEEP:

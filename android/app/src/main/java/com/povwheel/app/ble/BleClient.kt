@@ -436,6 +436,13 @@ class BleClient(
     suspend fun save() { request(Proto.OP_SAVE) }
     suspend fun stop() { request(Proto.OP_STOP) }
     suspend fun reboot() { request(Proto.OP_REBOOT) }
+
+    /**
+     * Выключение в транспортный режим: колесо гасит ленту, сбрасывает настройки
+     * во флеш и уходит в сон, из которого его поднимет только удержание кнопки.
+     * Сразу после ответа связь оборвётся — так и задумано.
+     */
+    suspend fun powerOff() { request(Proto.OP_POWEROFF, timeoutMs = 4000) }
     suspend fun play(name: String) { request(Proto.OP_PLAY, name.toByteArray(Charsets.US_ASCII)) }
     suspend fun delete(name: String) { request(Proto.OP_DELETE, name.toByteArray(Charsets.US_ASCII)) }
 

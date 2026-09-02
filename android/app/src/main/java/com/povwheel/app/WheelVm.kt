@@ -516,8 +516,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                         lastState = t.stateVer
                         val got = runCatching { c.getSettings() }.getOrNull()
                         if (got != null) {
-                            settings.value = got
-                            settingsLoaded.value = true
+                            adoptSettings(got)
                         } else {
                             // Не удалось прочитать — не отмечаем как загруженные,
                             // и пробуем ещё раз на следующем витке.
@@ -538,13 +537,28 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     fun refreshAll() {
         val c = currentClient() ?: return
         viewModelScope.launch {
-            runCatching { c.getSettings() }.getOrNull()?.let {
-                settings.value = it
-                settingsLoaded.value = true
-            }
+            runCatching { c.getSettings() }.getOrNull()?.let { adoptSettings(it) }
             runCatching { files.value = c.list() }
             runCatching { fsInfo.value = c.fsInfo() }
             runCatching { c.telemetry() }
+        }
+    }
+
+    /**
+     * Принять настройки, прочитанные с колеса.
+     *
+     * Power Limit убран из интерфейса — пользователь его не трогает, — и держится
+     * на 100 %. Если на устройстве застряло меньшее значение (его мог оставить
+     * старый веб-интерфейс), чиним его один раз: иначе лента светила бы тусклее
+     * без всякого объяснения в приложении.
+     */
+    private fun adoptSettings(got: Settings) {
+        val fixed = if (got.ablX10 != 1000) got.copy(ablX10 = 1000) else got
+        settings.value = fixed
+        settingsLoaded.value = true
+        if (fixed !== got) {
+            val c = currentClient() ?: return
+            viewModelScope.launch { runCatching { c.setSettings(fixed); c.save() } }
         }
     }
 
@@ -843,6 +857,13 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
 
     fun reboot() = onTargets { it.reboot() }
     fun wifi(on: Boolean) = onTargets { it.wifi(on) }
+
+    /**
+     * Выключение в транспортный режим: колесо гаснет и до удержания кнопки уже
+     * не проснётся — ни по тряске, ни по BLE. В зеркальном режиме гасит все
+     * подключённые колёса разом, как и «Reboot».
+     */
+    fun powerOff() = onTargets { it.powerOff() }
 
     /**
      * Прошивка по BLE. Транспорт тот же, что у анимаций, но сжатия нет:
