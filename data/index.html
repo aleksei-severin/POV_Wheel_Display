@@ -880,6 +880,64 @@ details.help .help-body b { color: var(--text-2); }
       </div>
     </div>
 
+    <!-- Ручная подстройка угла каждого луча поверх авто-калибровки Холла:
+         компенсирует перекос монтажа платы со светодиодами, который
+         калибровка Холла не видит (она измеряет только положение датчика). -->
+    <div class="card" style="max-width:640px">
+      <h2>Arm trim</h2>
+      <p class="card-note">Fine per-arm angle trim on top of automatic Hall calibration. Adjust by eye (or from a photo) against a still image until the seam between arms disappears.</p>
+
+      <div class="ctl">
+        <div class="ctl-head"><span class="ctl-name">Arm 1</span><span class="ctl-val"><span id="t0Val">0.0</span>°</span></div>
+        <input type="range" id="t0Slide" min="-150" max="150" value="0"
+               oninput="document.getElementById('t0Val').textContent=(this.value/10).toFixed(1); syncSettings()">
+      </div>
+      <div class="ctl">
+        <div class="ctl-head"><span class="ctl-name">Arm 2</span><span class="ctl-val"><span id="t1Val">0.0</span>°</span></div>
+        <input type="range" id="t1Slide" min="-150" max="150" value="0"
+               oninput="document.getElementById('t1Val').textContent=(this.value/10).toFixed(1); syncSettings()">
+      </div>
+      <div class="ctl">
+        <div class="ctl-head"><span class="ctl-name">Arm 3</span><span class="ctl-val"><span id="t2Val">0.0</span>°</span></div>
+        <input type="range" id="t2Slide" min="-150" max="150" value="0"
+               oninput="document.getElementById('t2Val').textContent=(this.value/10).toFixed(1); syncSettings()">
+      </div>
+      <div class="ctl">
+        <div class="ctl-head"><span class="ctl-name">Arm 4</span><span class="ctl-val"><span id="t3Val">0.0</span>°</span></div>
+        <input type="range" id="t3Slide" min="-150" max="150" value="0"
+               oninput="document.getElementById('t3Val').textContent=(this.value/10).toFixed(1); syncSettings()">
+      </div>
+      <div class="ctl">
+        <div class="ctl-head"><span class="ctl-name">Arm 5</span><span class="ctl-val"><span id="t4Val">0.0</span>°</span></div>
+        <input type="range" id="t4Slide" min="-150" max="150" value="0"
+               oninput="document.getElementById('t4Val').textContent=(this.value/10).toFixed(1); syncSettings()">
+      </div>
+      <div class="ctl" style="margin-bottom:0">
+        <div class="ctl-head"><span class="ctl-name">Arm 6</span><span class="ctl-val"><span id="t5Val">0.0</span>°</span></div>
+        <input type="range" id="t5Slide" min="-150" max="150" value="0"
+               oninput="document.getElementById('t5Val').textContent=(this.value/10).toFixed(1); syncSettings()">
+      </div>
+    </div>
+
+    <!-- Частота SPI задаётся целым делителем 80 МГц/n (n=2..64) — драйвер
+         умеет только этот дискретный ряд, поэтому ползунок двигает n, а не
+         герцы напрямую: между соседними значениями n нет ничего достижимого. -->
+    <div class="card" style="max-width:640px">
+      <h2>SPI clock</h2>
+      <p class="card-note">Sets the angular resolution — the whole strip is re-clocked for every angular step, so a faster clock means a finer step. Only exact 80&nbsp;MHz/n rates are reachable; the slider steps through n, not MHz. The SK9822 datasheet ceiling is ~30&nbsp;MHz — going above it is unsupported by spec, useful only for testing where it actually breaks.</p>
+
+      <div class="ctl" style="margin-bottom:0">
+        <div class="ctl-head">
+          <span class="ctl-name">Clock (n = <span id="spiDivVal">4</span>)</span>
+          <span class="ctl-val"><span id="spiHzVal">20.0</span> MHz</span>
+        </div>
+        <input type="range" id="spiDivSlide" min="2" max="64" value="4"
+               oninput="_spiDivInput(this.value)"
+               onchange="_spiDivCommit(this.value)">
+        <p class="ctl-hint">Changing this briefly blanks the wheel while the SPI bus is reconfigured.</p>
+      </div>
+    </div>
+
   </div>
 </section>
 
@@ -1957,7 +2015,7 @@ const EFFECTS = [
     {id: 1, icon: '🏁', name: 'Speed',   desc: 'Current speed in km/h — green at a crawl, red at the limit you set below.'},
     {id: 2, icon: '🔥', name: 'Fire',    desc: 'Flames rise from the hub and flicker out at the rim.'},
     {id: 3, icon: '🌈', name: 'Rainbow', desc: 'A spectrum spiral turning against the wheel.'},
-    {id: 4, icon: '🌀', name: 'Plasma',  desc: 'Four sine waves interfering — never quite repeats.'},
+    {id: 4, icon: '➕', name: 'Testing', desc: 'Diagnostic cross through the hub — blue for 5 s, then each arm in its own colour for 5 s, to spot a per-arm angle offset by eye.'},
     {id: 5, icon: '💧', name: 'Ripples', desc: 'Concentric waves from the centre. Stands perfectly still.'},
     {id: 6, icon: '🕑', name: 'Clock',   desc: 'Numbered dial and three hands. Any open browser tab sets the clock; it then survives deep sleep.'},
 ];
@@ -2882,9 +2940,29 @@ function syncSettings() {
         const rg    = document.getElementById('rgSlide').value;
         const gg    = document.getElementById('ggSlide').value;
         const bg    = document.getElementById('bgSlide').value;
-        fetch(`/settings?bmin=${bmin}&bmax=${bmax}&a=${a}&g=${g}&s=${s}&co=${co}&circ=${circ}&ao=${ao}&abl=${abl}&rg=${rg}&gg=${gg}&bg=${bg}&rpm_on=${rpmOnVal}&rpm_off=${rpmOffVal}`);
+        const t0    = (document.getElementById('t0Slide').value / 10).toFixed(1);
+        const t1    = (document.getElementById('t1Slide').value / 10).toFixed(1);
+        const t2    = (document.getElementById('t2Slide').value / 10).toFixed(1);
+        const t3    = (document.getElementById('t3Slide').value / 10).toFixed(1);
+        const t4    = (document.getElementById('t4Slide').value / 10).toFixed(1);
+        const t5    = (document.getElementById('t5Slide').value / 10).toFixed(1);
+        fetch(`/settings?bmin=${bmin}&bmax=${bmax}&a=${a}&g=${g}&s=${s}&co=${co}&circ=${circ}&ao=${ao}&abl=${abl}&rg=${rg}&gg=${gg}&bg=${bg}&rpm_on=${rpmOnVal}&rpm_off=${rpmOffVal}&t0=${t0}&t1=${t1}&t2=${t2}&t3=${t3}&t4=${t4}&t5=${t5}`);
         _syncTimer = null;
     }, 50);
+}
+
+// Частота SPI — отдельным, не дебаунсенным запросом и только по отпусканию
+// ползунка (onchange, не oninput): смена делителя гасит ленту на время
+// переинициализации шины, дёргать это на каждый твик перетаскивания незачем.
+function _spiHzText(div) {
+    return (80.0 / div).toFixed(div >= 10 ? 2 : 1);
+}
+function _spiDivInput(div) {
+    document.getElementById('spiDivVal').textContent = div;
+    document.getElementById('spiHzVal').textContent = _spiHzText(div);
+}
+function _spiDivCommit(div) {
+    fetch(`/settings?spidiv=${div}`);
 }
 
 // Ползунки диапазона не должны перехлёстываться: тянем один — другой уступает.
@@ -2965,6 +3043,17 @@ function _applySettings(d) {
             el.value = d.speed_red;
             document.getElementById('effRedVal').textContent = d.speed_red + ' km/h';
         }
+    }
+    if (Array.isArray(d.trim) && d.trim.length === 6) {
+        for (let i = 0; i < 6; i++) {
+            const v = parseFloat(d.trim[i]) || 0;
+            document.getElementById('t' + i + 'Slide').value = Math.round(v * 10);
+            document.getElementById('t' + i + 'Val').textContent = v.toFixed(1);
+        }
+    }
+    if (d.spidiv !== undefined && d.spidiv > 0) {
+        document.getElementById('spiDivSlide').value = d.spidiv;
+        _spiDivInput(d.spidiv);
     }
     updateDualRange();
     refreshRanges();

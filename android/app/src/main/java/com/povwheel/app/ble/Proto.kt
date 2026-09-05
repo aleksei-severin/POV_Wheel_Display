@@ -136,7 +136,7 @@ data class Hello(
 }
 
 /**
- * Блок настроек, 26 байт, симметричный на чтение и запись.
+ * Блок настроек, 39 байт, симметричный на чтение и запись.
  *
  * Всё, что имеет побочные эффекты (эффект, слайдшоу, воспроизведение), сюда
  * намеренно не входит: такая смена ждёт, пока рендер отпустит буфер кадра,
@@ -149,7 +149,15 @@ data class Settings(
     var circ: Int = 2355, var armReverse: Int = 0,
     var ablX10: Int = 1000,
     var rgX10: Int = 1000, var ggX10: Int = 800, var bgX10: Int = 1000,
-    var rpmOn: Int = 120, var rpmOff: Int = 100
+    var rpmOn: Int = 120, var rpmOff: Int = 100,
+    // Ручная подстройка угла каждого из 6 лучей (x10, ±150 = ±15.0°) поверх
+    // авто-калибровки Холла — та видит только положение датчика, не то,
+    // насколько точно посажена сама плата со светодиодами.
+    var armTrimX10: List<Int> = List(6) { 0 },
+    // Делитель частоты SPI (f = 80 МГц/spiDiv, 2..64 → 40..1.25 МГц) — на
+    // проводе только этот дискретный ряд, слайдер в интерфейсе двигает n,
+    // а не МГц напрямую.
+    var spiDiv: Int = 4
 ) {
     fun pack(): ByteArray {
         val b = Proto.buf(SIZE)
@@ -161,11 +169,13 @@ data class Settings(
         b.putShort(ablX10.toShort())
         b.putShort(rgX10.toShort()); b.putShort(ggX10.toShort()); b.putShort(bgX10.toShort())
         b.putShort(rpmOn.toShort()); b.putShort(rpmOff.toShort())
+        for (i in 0 until 6) b.putShort((armTrimX10.getOrElse(i) { 0 }).toShort())
+        b.put(spiDiv.toByte())
         return b.array()
     }
 
     companion object {
-        const val SIZE = 26
+        const val SIZE = 39
         fun parse(a: ByteArray): Settings {
             val p = Proto.wrap(a)
             val s = Settings()
@@ -184,6 +194,8 @@ data class Settings(
             s.bgX10 = p.short.toInt() and 0xFFFF
             s.rpmOn = p.short.toInt() and 0xFFFF
             s.rpmOff = p.short.toInt() and 0xFFFF
+            s.armTrimX10 = List(6) { p.short.toInt() }
+            s.spiDiv = p.get().toInt() and 0xFF
             return s
         }
     }

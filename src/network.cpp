@@ -779,9 +779,26 @@ void setupNetwork() {
         if (request->hasParam("ao")) {
             global_arm_reverse = request->getParam("ao")->value().toInt() != 0;
         }
+        // Ручная подстройка угла отдельных лучей (t0..t5, град.) — компенсирует
+        // механический перекос платы, который калибровка Холла не видит
+        // в принципе (она измеряет только положение датчика, не платы).
+        for (int i = 0; i < NUM_ARMS; i++) {
+            char pname[4] = {'t', (char)('0' + i), '\0', '\0'};
+            if (request->hasParam(pname)) {
+                float v = request->getParam(pname)->value().toFloat();
+                if (v >= -15.0f && v <= 15.0f) global_arm_trim[i] = v;
+            }
+        }
         if (request->hasParam("abl")) {
             float v = request->getParam("abl")->value().toFloat();
             if (v >= 0.0f && v <= 100.0f) global_abl_limit = v;
+        }
+        // Делитель частоты SPI (f = 80 МГц/spidiv) — смена живой шины отложена
+        // в loop() (см. pending_spi_div): нельзя дёргать spi_bus_remove_device
+        // прямо из обработчика, пока renderingTask может ей пользоваться.
+        if (request->hasParam("spidiv")) {
+            int v = request->getParam("spidiv")->value().toInt();
+            if (v >= 2 && v <= 64 && v != global_spi_div) pending_spi_div = v;
         }
         if (request->hasParam("rg")) {
             float v = request->getParam("rg")->value().toFloat();
@@ -833,7 +850,7 @@ void setupNetwork() {
         const char* curf = currentDisplayFile.c_str();
         if (*curf == '/') curf++;
 
-        char buf[576];
+        char buf[640];
         snprintf(buf, sizeof(buf),
             "{\"bmin\":%u,\"bmax\":%u,\"angle\":%d,\"brightness\":%u,\"eff_bri\":%u"
             ",\"gamma\":%.1f,\"saturation\":%.1f,\"contrast\":%.1f"
@@ -843,6 +860,8 @@ void setupNetwork() {
             ",\"slideshow\":%s,\"file\":\"%s\",\"play\":%u"
             ",\"rpm_on\":%.0f,\"rpm_off\":%.0f"
             ",\"effect\":%u,\"speed_red\":%u"
+            ",\"trim\":[%.1f,%.1f,%.1f,%.1f,%.1f,%.1f]"
+            ",\"spidiv\":%u"
             ",\"ver\":%lu,\"fver\":%lu}",
             (unsigned)min_brightness, (unsigned)max_brightness,
             (int)global_angle_offset, (unsigned)global_brightness,
@@ -856,6 +875,9 @@ void setupNetwork() {
             curf, (unsigned)(force_stop_display ? 0 : 1),
             (float)rpm_render_on, (float)rpm_render_off,
             (unsigned)effect_id, (unsigned)effect_speed_red,
+            (double)global_arm_trim[0], (double)global_arm_trim[1], (double)global_arm_trim[2],
+            (double)global_arm_trim[3], (double)global_arm_trim[4], (double)global_arm_trim[5],
+            (unsigned)global_spi_div,
             (unsigned long)pov_state_version, (unsigned long)pov_file_version
         );
         request->send(200, "application/json", buf);

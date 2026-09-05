@@ -73,7 +73,7 @@ const char* effectName(uint8_t id) {
         case EFF_SPEED:   return "Speed";
         case EFF_FIRE:    return "Fire";
         case EFF_RAINBOW: return "Rainbow";
-        case EFF_PLASMA:  return "Plasma";
+        case EFF_TESTING: return "Testing";
         case EFF_RIPPLE:  return "Ripples";
         case EFF_CLOCK:   return "Clock";
         default:          return "Off";
@@ -112,25 +112,6 @@ static void effRainbow(uint16_t* out, uint32_t t) {
         for (int i = 0; i < LEDS_PER_SIDE; i++) {
             int r, g, b;
             hsv2rgb((uint8_t)(base + i * 3), 255, 255, r, g, b);
-            row[i] = pack565(r, g, b);
-        }
-    }
-}
-
-// --- Плазма: сумма четырёх синусов от угла и радиуса ---
-// Периоды подобраны взаимно непериодичными, иначе узор быстро «схлопывается»
-// в правильную решётку и перестаёт выглядеть живым.
-static void effPlasma(uint16_t* out, uint32_t t) {
-    int t1 = (int)(t / 30), t2 = (int)(t / 17), t3 = (int)(t / 43);
-    for (int s = 0; s < SECTORS; s++) {
-        int a = sec_hue[s];
-        uint16_t* row = out + s * LEDS_PER_SIDE;
-        for (int i = 0; i < LEDS_PER_SIDE; i++) {
-            int r6 = i * 6;
-            int v = sin8(a * 3 + t1) + sin8(r6 + t2)
-                  + sin8(a + r6 + t3) + sin8(r6 - a * 2 + t1);
-            int r, g, b;
-            hsv2rgb((uint8_t)((v >> 2) + 128), 255, 255, r, g, b);
             row[i] = pack565(r, g, b);
         }
     }
@@ -469,9 +450,10 @@ static uint32_t effPeriodMs(uint8_t id) {
     switch (id) {
         case EFF_FIRE:
         case EFF_RAINBOW:
-        case EFF_PLASMA:
         case EFF_RIPPLE:  return 40;      // 25 к/с — движение должно быть плавным
         case EFF_CLOCK:   return 100;     // секундная стрелка
+        // EFF_TESTING содержимого этого буфера не читает вообще (см.
+        // fillSectorIntoBuffer() в main.cpp) — период не важен.
         default:          return 200;     // скорость меняется медленно
     }
 }
@@ -483,9 +465,10 @@ static void renderEffect(uint8_t id, uint8_t* buf) {
         case EFF_SPEED:   effSpeed(out, t);   break;
         case EFF_FIRE:    effFire(out, t);    break;
         case EFF_RAINBOW: effRainbow(out, t); break;
-        case EFF_PLASMA:  effPlasma(out, t);  break;
         case EFF_RIPPLE:  effRipple(out, t);  break;
         case EFF_CLOCK:   effClock(out, t);   break;
+        // EFF_TESTING рисуется в main.cpp прямо по ray, минуя этот буфер —
+        // он никогда не читается, memset ниже просто держит его валидным.
         default: memset(buf, 0, FRAME_SIZE);  break;
     }
 }
@@ -612,7 +595,7 @@ bool effectsStart(uint8_t id) {
     frame_fmt         = FRAME_FMT_565;
     // Speed и Clock рисуют текст, его надо читать с обеих сторон колеса —
     // fillSectorIntoBuffer() зеркалит для этого дальнюю сторону луча (см. там).
-    // Fire/Rainbow/Plasma/Ripples читать нечего — им обе стороны одинаковы.
+    // Fire/Rainbow/Ripples и диагностический Testing — им обе стороны одинаковы.
     mirror_back_face  = (id == EFF_SPEED || id == EFF_CLOCK);
     frameBuffer       = eff_buf[0];
     palette_gen++;

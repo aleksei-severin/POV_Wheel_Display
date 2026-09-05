@@ -251,6 +251,9 @@ extern volatile uint8_t global_brightness;
 extern uint8_t min_brightness;
 extern uint8_t max_brightness;
 extern volatile int global_angle_offset;
+extern float global_arm_trim[NUM_ARMS];   // ручная подстройка угла каждого луча, град.
+extern int   global_spi_div;              // текущий делитель частоты SPI (f = 80МГц/div)
+extern volatile int pending_spi_div;      // заявка на смену делителя, 0 = нет заявки; см. loop()
 extern uint8_t* frameBuffer;
 // Формат содержимого frameBuffer (FrameFmt). Публикуется вместе с самим
 // буфером, в том же погашенном окне: рендер вычисляет по нему шаг кадра.
