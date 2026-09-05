@@ -913,7 +913,19 @@ static void fillSectorIntoBuffer(uint8_t* buf, uint8_t buf_idx, float sector0, f
     uint32_t pixel_sum = 0;
 
     for (int ray = 0; ray < NUM_ARMS; ray++) {
-        float bf = fmodf(sector0 + (float)ray * arm_step, 360.0f);
+        // rtc_hall_cal[ray] — измеренное калибровкой отклонение ЭТОГО луча от
+        // идеальной сетки ray·60° (луч 0 — опорный, его rtc_hall_cal[0] всегда 0).
+        // До этой правки поправка использовалась только для сглаживания общей
+        // фазы anchor_deg и никогда не попадала в угол, под которым рисуется
+        // сам луч: каждый луч всегда клали ровно на ray·60°, хотя калибровка
+        // прямо говорила, что его истинное положение отличается на доли
+        // градуса — до ~1° на этом железе. Результат — статический (не
+        // временной!) угловой шов на границе каждого луча, одинаковый каждый
+        // оборот и не зависящий от оборотов: ровно то, что выглядело как
+        // «подёргивание на каждом датчике Холла с резким сбросом раз в
+        // оборот». Знак минус — см. вывод в комментарии к калибровке ниже:
+        // истинное положение луча = ray·arm_step − rtc_hall_cal[ray].
+        float bf = fmodf(sector0 + (float)ray * arm_step - rtc_hall_cal[ray], 360.0f);
         if (bf < 0.0f) bf += 360.0f;
         // Зеркальный угол для той стороны луча, которую видно с обратного бока
         // колеса: отражение 540°−bf гасит переворот «взгляда с изнанки», и текст
@@ -1020,9 +1032,34 @@ static void fillSectorIntoBuffer(uint8_t* buf, uint8_t buf_idx, float sector0, f
 // только когда весь кадр уйдёт по SPI (SK9822_FRAME_US), и будут гореть до
 // следующего обновления. Без этой поправки картинка уезжала тем сильнее,
 // чем выше обороты, и «Angle Offset» приходилось бы крутить под скорость.
+// Снимок для диагностики фазы (см. renderingTask), публикуемый раз в 10 с.
+// webLog()/webLogf() пишут в RTC_DATA_ATTR-буфер (см. network.cpp) — память там
+// тактируется на порядки медленнее обычной SRAM, и один такой вызов стоит
+// порядка миллисекунды. Внутри renderingTask это лишний, самой же диагностикой
+// внесённый скачок lead раз в 10 с — измеряя стабильность, мы её портили.
+// Поэтому renderingTask только копирует цифры сюда (дёшево), а сам вывод в лог
+// делает loop() — там для лишней миллисекунды есть место.
+struct HallDiagSnapshot {
+    bool     cal_ready;
+    float    err_max;
+    float    off1, off2, off3, off4, off5;
+    float    lead_min, lead_max, jit, fill_us, show_us, aT2;
+    float    lead_hall_min, lead_hall_max; uint32_t n_hall;
+    float    lead_norm_min, lead_norm_max; uint32_t n_norm;
+    uint32_t outer_min, outer_max, outer_over100;
+};
+static HallDiagSnapshot   hall_diag_snap;
+static volatile bool      hall_diag_pending = false;
+
 void renderingTask(void* pvParameters) {
     uint8_t active     = 0;
     bool    tx_pending = false;
+    // true, если внутренний цикл прервался обычным событием Холла (переставить
+    // якорь и тут же вернуться к рендерингу). Живёт на уровне всей задачи —
+    // читается в НАЧАЛЕ следующего прохода (чтобы знать, чем вызван свежий
+    // вход в цикл), затем сбрасывается и, возможно, снова выставляется в конце
+    // ЭТОГО прохода.
+    bool    exited_for_hall = false;
 
     const float dma_frame_us = SK9822_FRAME_US;   // время передачи кадра по SPI
     uint32_t    tx_start_us  = 0;                 // когда ушла последняя транзакция
@@ -1045,12 +1082,24 @@ void renderingTask(void* pvParameters) {
     float    phase_err_max = 0.0f; // максимальная невязка ФАПЧ за окно диагностики
     uint32_t phase_dbg_ms  = 0;
     float    lead_min = 1e9f, lead_max = 0.0f;   // размах упреждения, мкс
+    // То же самое, но раздельно для «первого кадра после переанкеровки по
+    // событию Холла» и для всех остальных («обычных») кадров — проверить,
+    // действительно ли разброс lead сосредоточен именно в hall-кадрах.
+    float    lead_hall_min = 1e9f, lead_hall_max = 0.0f;
+    float    lead_norm_min = 1e9f, lead_norm_max = 0.0f;
+    uint32_t n_hall_frames = 0, n_norm_frames = 0;
     float    w_avg_prev = 0.0f;
     uint32_t t_mid_prev = 0;
     bool     w_prev_ok  = false;
 
     int  sectors_drawn = 0;
     bool arm_reverse_seen = global_arm_reverse;
+
+    // Диагностика: сколько времени занимает сам проход внешнего цикла (от
+    // возврата xSemaphoreTake до повторного входа во внутренний цикл рендера)
+    // — проверить, не здесь ли гуляет lead-hall из предыдущего замера.
+    uint32_t outer_dur_min = 0xFFFFFFFFu, outer_dur_max = 0;
+    uint32_t outer_dur_over100 = 0;   // сколько раз за окно проход был дольше 100 мкс
 
     // Момент последнего гашения и минимальная пауза до повторного розжига.
     static const uint32_t RENDER_RESUME_HOLD_MS = 600;
@@ -1059,6 +1108,7 @@ void renderingTask(void* pvParameters) {
     while (true) {
         // Ждём нового события Холла максимум 500 мс.
         xSemaphoreTake(hallSemaphore, pdMS_TO_TICKS(500));
+        uint32_t outer_t0 = micros();   // начало прохода внешнего цикла
 
         // Смена порядка лучей меняет знак arm_step — накопленная калибровка
         // датчиков в старой системе координат больше не действительна.
@@ -1223,13 +1273,8 @@ void renderingTask(void* pvParameters) {
             // за один, а это разница в шесть раз по накоплению ошибки), какова
             // невязка и к чему сошлись поправки датчиков.
             uint32_t now_dbg = millis();
-            if (rendering_active && (uint32_t)(now_dbg - phase_dbg_ms) > 10000) {
+            if (rendering_active && (uint32_t)(now_dbg - phase_dbg_ms) > 10000 && !hall_diag_pending) {
                 phase_dbg_ms = now_dbg;
-                webLogf("[HALL] cal=%d err=%.1f off %.1f %.1f %.1f %.1f %.1f",
-                        hall_cal_ready ? 1 : 0, (double)phase_err_max,
-                        (double)rtc_hall_cal[1], (double)rtc_hall_cal[2],
-                        (double)rtc_hall_cal[3], (double)rtc_hall_cal[4],
-                        (double)rtc_hall_cal[5]);
                 // Разброс упреждения в градусах — прямая мера того, насколько
                 // гуляет картинка из-за таймингов вывода, а не из-за фазы.
                 float jit = (lead_max > lead_min)
@@ -1239,11 +1284,29 @@ void renderingTask(void* pvParameters) {
                 // разгоне и торможении растёт — по нему и видно, работает ли
                 // компенсация вообще.
                 float aT2 = rotor_alpha * (float)ev_rev * (float)ev_rev;
-                webLogf("[HALL] lead %.0f..%.0f = %.2f deg, fill %.0f show %.0f aT2 %.1f",
-                        (double)lead_min, (double)lead_max, (double)jit,
-                        (double)fill_us, (double)show_us, (double)aT2);
+                // Только присваивания — быстро, в отличие от самого webLogf().
+                // Печать делает loop() (см. там), когда заметит hall_diag_pending.
+                hall_diag_snap.cal_ready = hall_cal_ready;
+                hall_diag_snap.err_max   = phase_err_max;
+                hall_diag_snap.off1 = rtc_hall_cal[1]; hall_diag_snap.off2 = rtc_hall_cal[2];
+                hall_diag_snap.off3 = rtc_hall_cal[3]; hall_diag_snap.off4 = rtc_hall_cal[4];
+                hall_diag_snap.off5 = rtc_hall_cal[5];
+                hall_diag_snap.lead_min = lead_min; hall_diag_snap.lead_max = lead_max;
+                hall_diag_snap.jit = jit; hall_diag_snap.fill_us = fill_us;
+                hall_diag_snap.show_us = show_us; hall_diag_snap.aT2 = aT2;
+                hall_diag_snap.lead_hall_min = lead_hall_min; hall_diag_snap.lead_hall_max = lead_hall_max;
+                hall_diag_snap.n_hall        = n_hall_frames;
+                hall_diag_snap.lead_norm_min = lead_norm_min; hall_diag_snap.lead_norm_max = lead_norm_max;
+                hall_diag_snap.n_norm        = n_norm_frames;
+                hall_diag_snap.outer_min = outer_dur_min; hall_diag_snap.outer_max = outer_dur_max;
+                hall_diag_snap.outer_over100 = outer_dur_over100;
+                hall_diag_pending = true;
+
                 phase_err_max = 0.0f;
                 lead_min = 1e9f; lead_max = 0.0f;
+                lead_hall_min = 1e9f; lead_hall_max = 0.0f; n_hall_frames = 0;
+                lead_norm_min = 1e9f; lead_norm_max = 0.0f; n_norm_frames = 0;
+                outer_dur_min = 0xFFFFFFFFu; outer_dur_max = 0; outer_dur_over100 = 0;
             }
         }
 
@@ -1260,6 +1323,15 @@ void renderingTask(void* pvParameters) {
                 // Пауза на загрузку файла — штатная и частая (слайдшоу),
                 // в лог её не пишем, иначе он забьётся.
                 if (!frame_loading) webLog("[PWR] Rendering stopped");
+                // Слив мог быть отложен (см. exited_for_hall выше) в расчёте на
+                // немедленное продолжение рендеринга — здесь оно не состоялось,
+                // и перед обращением к SPI напрямую транзакцию нужно забрать,
+                // иначе blankAllLEDs_DMA() столкнётся с ней в очереди драйвера.
+                if (tx_pending) {
+                    spi_transaction_t* done;
+                    spi_device_get_trans_result(sk9822_spi, &done, portMAX_DELAY);
+                    tx_pending = false;
+                }
                 blankAllLEDs_DMA();
                 global_abl_rms              = 0.0f;
                 rms_accum                   = 0.0f;
@@ -1290,6 +1362,13 @@ void renderingTask(void* pvParameters) {
                 rendering_active = false;
                 render_pause_ms  = millis();
                 webLog("[PWR] Rotation lost, rendering paused");
+                // См. комментарий у предыдущего blankAllLEDs_DMA(): слив мог быть
+                // отложен ради быстрого возврата к рендерингу.
+                if (tx_pending) {
+                    spi_transaction_t* done;
+                    spi_device_get_trans_result(sk9822_spi, &done, portMAX_DELAY);
+                    tx_pending = false;
+                }
                 blankAllLEDs_DMA();
                 global_abl_rms              = 0.0f;
                 rms_accum                   = 0.0f;
@@ -1322,8 +1401,22 @@ void renderingTask(void* pvParameters) {
         updateLUTIfNeeded();
         updateGainTablesIfNeeded();
 
+        {
+            uint32_t d = (uint32_t)(micros() - outer_t0);
+            if (d < outer_dur_min) outer_dur_min = d;
+            if (d > outer_dur_max) outer_dur_max = d;
+            if (d > 100) outer_dur_over100++;
+        }
+
         float last_psi  = 0.0f;   // угол ротора на момент последнего обновления ленты
         bool  psi_valid = false;
+        // Чем был вызван ЭТОТ свежий вход в цикл — обычным событием Холла (тогда
+        // слив транзакции внизу пропускается) или чем-то ещё? exited_for_hall
+        // хранит причину выхода ПРЕДЫДУЩЕГО прохода; читаем её здесь, для
+        // диагностики первого кадра нового прохода, и сразу сбрасываем — этот
+        // проход выставит её заново, если тоже завершится по событию Холла.
+        bool  this_entry_was_hall = exited_for_hall;
+        exited_for_hall = false;
 
         while (true) {
             if (force_stop_display || power_state != PWR_FULL || !newFrameReady ||
@@ -1333,7 +1426,7 @@ void renderingTask(void* pvParameters) {
             noInterrupts();
             bool got_new = (hall_seq != seen_seq);
             interrupts();
-            if (got_new) break;
+            if (got_new) { exited_for_hall = true; break; }
 
             uint32_t now  = micros();
             uint32_t dt_u = (uint32_t)(now - anchor_t);
@@ -1391,6 +1484,21 @@ void renderingTask(void* pvParameters) {
             float lead = dtf - dt0;
             if (lead < lead_min) lead_min = lead;
             if (lead > lead_max) lead_max = lead;
+            // Раздельная статистика: !psi_valid — это ПЕРВЫЙ кадр свежего
+            // прохода; this_entry_was_hall говорит, вызван ли этот проход
+            // обычным событием Холла. Сравнить hall- и norm-диапазоны — это и
+            // есть проверка гипотезы про сброс bus_busy на каждом датчике.
+            if (!psi_valid) {
+                if (this_entry_was_hall) {
+                    if (lead < lead_hall_min) lead_hall_min = lead;
+                    if (lead > lead_hall_max) lead_hall_max = lead;
+                    n_hall_frames++;
+                }
+            } else {
+                if (lead < lead_norm_min) lead_norm_min = lead;
+                if (lead > lead_norm_max) lead_norm_max = lead;
+                n_norm_frames++;
+            }
 
             float base = anchor_deg + rotor_omega * dtf + 0.5f * rotor_alpha * dtf * dtf
                        + (float)global_angle_offset;
@@ -1448,8 +1556,20 @@ void renderingTask(void* pvParameters) {
             psi_valid   = true;
         }
 
-        // Забираем незавершённую транзакцию
-        if (tx_pending) {
+        // Забираем незавершённую транзакцию — но НЕ для обычного события Холла:
+        // там мы тут же возвращаемся в тот же цикл рендеринга, и tx_pending
+        // корректно разберёт его собственная логика (ждать перед queue_trans).
+        // Раньше слив здесь принудительно обнулял bus_busy перед первым же
+        // кадром после каждой перестановки якоря: вместо «шина ещё занята
+        // ~F мкс» (как во всех остальных кадрах, посчитанных сразу после
+        // постановки в очередь) внезапно получалось «шина свободна», и
+        // start_in = max(fill_us, 0) = fill_us — систематически ~300 мкс
+        // меньше обычного. Шесть раз за оборот, по разу на каждый датчик —
+        // ровно то дрожание на ободе, что было измерено (лог: lead-разброс
+        // ~0.7° при исправной ФАПЧ, err=0.1°). Слив остаётся для остальных
+        // причин выхода (смена состояния питания, загрузка кадра, OTA) —
+        // там рендеринг не возобновляется тут же и шину нужно отдать чисто.
+        if (tx_pending && !exited_for_hall) {
             spi_transaction_t* done;
             spi_device_get_trans_result(sk9822_spi, &done, portMAX_DELAY);
             tx_pending = false;
@@ -2380,6 +2500,26 @@ void loop() {
     static uint32_t last_play_ms = 0; // Время последнего запроса /play
 
     uint32_t now_ms = millis();
+
+    // --- Отложенная печать диагностики фазы (см. renderingTask) ---
+    // webLog() стоит порядка миллисекунды (RTC_DATA_ATTR-буфер) — печатаем
+    // здесь, на приоритете 1, а не внутри горячего цикла рендера.
+    if (hall_diag_pending) {
+        const HallDiagSnapshot& s = hall_diag_snap;
+        webLogf("[HALL] cal=%d err=%.1f off %.1f %.1f %.1f %.1f %.1f",
+                s.cal_ready ? 1 : 0, (double)s.err_max,
+                (double)s.off1, (double)s.off2, (double)s.off3, (double)s.off4, (double)s.off5);
+        webLogf("[HALL] lead %.0f..%.0f = %.2f deg, fill %.0f show %.0f aT2 %.1f",
+                (double)s.lead_min, (double)s.lead_max, (double)s.jit,
+                (double)s.fill_us, (double)s.show_us, (double)s.aT2);
+        webLogf("[HALL] lead-hall %.0f..%.0f n=%lu | lead-norm %.0f..%.0f n=%lu",
+                (double)s.lead_hall_min, (double)s.lead_hall_max, (unsigned long)s.n_hall,
+                (double)s.lead_norm_min, (double)s.lead_norm_max, (unsigned long)s.n_norm);
+        webLogf("[HALL] outer-pass %lu..%lu us, >100us x%lu",
+                (unsigned long)s.outer_min, (unsigned long)s.outer_max,
+                (unsigned long)s.outer_over100);
+        hall_diag_pending = false;
+    }
 
     // --- Отложенная запись настроек ---
     // Ждать выключения питания необязательно: пока колесо не раскручено до
