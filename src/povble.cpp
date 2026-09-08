@@ -47,7 +47,7 @@
 //  не собирается.
 // ---------------------------------------------------------------------
 static_assert(sizeof(PovHello)    == 48, "PovHello != Hello.SIZE в Proto.kt");
-static_assert(sizeof(PovSettings) == 39, "PovSettings != Settings.SIZE в Proto.kt");
+static_assert(sizeof(PovSettings) == 26, "PovSettings != Settings.SIZE в Proto.kt");
 static_assert(sizeof(PovTele)     == 82, "PovTele != Tele.SIZE в Proto.kt");
 static_assert(sizeof(PovFsInfo)   == 20, "PovFsInfo != FsInfo.SIZE в Proto.kt");
 static_assert(sizeof(PovUpBegin)  == 14, "PovUpBegin != заголовок заливки в BleClient.kt");
@@ -570,9 +570,6 @@ static void fillSettings(PovSettings* s) {
     s->bg_x10       = (uint16_t)lroundf(global_b_gain * 10.0f);
     s->rpm_on       = (uint16_t)lroundf(rpm_render_on);
     s->rpm_off      = (uint16_t)lroundf(rpm_render_off);
-    for (int i = 0; i < NUM_ARMS; i++)
-        s->arm_trim_x10[i] = (int16_t)lroundf(global_arm_trim[i] * 10.0f);
-    s->spi_div = (uint8_t)global_spi_div;
 }
 
 // Границы — те же, что в HTTP-обработчике /settings: расходиться двум входам
@@ -598,15 +595,6 @@ static void applySettings(const PovSettings* s) {
         rpm_render_on  = on;
         rpm_render_off = off;
     }
-    for (int i = 0; i < NUM_ARMS; i++) {
-        float t = s->arm_trim_x10[i] / 10.0f;
-        if (t >= -15.0f && t <= 15.0f) global_arm_trim[i] = t;
-    }
-    // Смена живой SPI-шины отложена в loop() (см. pending_spi_div) — как и в
-    // HTTP-обработчике /settings, дёргать spi_bus_remove_device прямо здесь,
-    // пока renderingTask мог бы ей одновременно пользоваться, нельзя.
-    if (s->spi_div >= 2 && s->spi_div <= 64 && s->spi_div != global_spi_div)
-        pending_spi_div = s->spi_div;
     // Мгновенный пересчёт яркости — как в /settings, не ждём тика датчика
     float ratio = constrain(last_lux_value / 1000.0f, 0.0f, 1.0f);
     global_brightness = (uint8_t)constrain((int)(ratio * (float)max_brightness),

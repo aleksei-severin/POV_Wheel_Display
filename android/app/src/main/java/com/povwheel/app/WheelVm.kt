@@ -112,6 +112,17 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     /** Задачи переподключения, по одной на адрес. Снимаются в disconnect(). */
     private val reconnectJobs = HashMap<String, kotlinx.coroutines.Job>()
 
+    /**
+     * Последнее известное «Положение магнита» (Settings.angle) каждого колеса,
+     * по адресу. Это механическая калибровка конкретного колеса — как и
+     * калибровка датчиков Холла: магнит на вилке у каждого колеса стоит под
+     * своим углом. В режиме зеркалирования её нельзя навязывать соседям, поэтому
+     * блок настроек уходит на не-текущие колёса с их собственным углом, а не с
+     * углом активного колеса. Заполняется при каждом чтении настроек колеса
+     * (см. [adoptSettings]); в [pushSettings] служит источником этого угла.
+     */
+    private val magnetByAddr = HashMap<String, Int>()
+
     /** Какое колесо показывает экран управления. */
     val current = MutableStateFlow<String?>(null)
 
@@ -472,6 +483,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         wantConnected.remove(addr)
         reconnectJobs.remove(addr)?.cancel()
         watchJobs.remove(addr)?.cancel()
+        magnetByAddr.remove(addr)
         clients.remove(addr)?.also { it.onLinkLost = null; it.close() }
         connected.value = clients.values.toList()
         rebuildWheels()
@@ -491,6 +503,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         watchJobs.clear()
         clients.values.forEach { it.onLinkLost = null; it.close() }
         clients.clear()
+        magnetByAddr.clear()
         connected.value = emptyList()
         current.value = null
         rebuildWheels()
@@ -556,6 +569,9 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         val fixed = if (got.ablX10 != 1000) got.copy(ablX10 = 1000) else got
         settings.value = fixed
         settingsLoaded.value = true
+        // Запоминаем положение магнита этого колеса, чтобы зеркалирование чужих
+        // настроек его не затирало.
+        current.value?.let { magnetByAddr[it] = fixed.angle }
         if (fixed !== got) {
             val c = currentClient() ?: return
             viewModelScope.launch { runCatching { c.setSettings(fixed); c.save() } }
@@ -912,8 +928,30 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             return
         }
         settings.value = s
-        onTargets { it.setSettings(s) }
+        val cur = current.value
+        if (cur != null) magnetByAddr[cur] = s.angle
+        onTargets { c ->
+            // На активное колесо — блок как есть. На остальные (режим
+            // зеркалирования) — с их собственным «Положением магнита»: это
+            // калибровка под конкретное колесо, у соседа магнит стоит иначе.
+            val out = if (c.address == cur) s
+                      else s.copy(angle = mirrorMagnet(c, s.angle))
+            c.setSettings(out)
+        }
     }
+
+    /**
+     * «Положение магнита», которое нужно оставить не-текущему колесу при
+     * зеркалировании настроек. Берём запомненное при последнем чтении его
+     * настроек; если колесо ещё ни разу не открывали — дочитываем сейчас и
+     * запоминаем. Совсем в крайнем случае (чтение не удалось) — [fallback],
+     * то есть угол активного колеса: не идеально, но не хуже прежнего поведения.
+     */
+    private suspend fun mirrorMagnet(c: BleClient, fallback: Int): Int =
+        magnetByAddr[c.address]
+            ?: runCatching { c.getSettings().angle }.getOrNull()
+                ?.also { magnetByAddr[c.address] = it }
+            ?: fallback
 
     fun saveSettings() = onTargets { it.save() }
 

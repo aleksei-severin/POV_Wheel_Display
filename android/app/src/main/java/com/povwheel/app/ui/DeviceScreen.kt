@@ -555,10 +555,6 @@ private fun DisplayTab(vm: WheelVm, tele: Tele) {
             }
         }
 
-        SettingCard { ArmTrimControls(vm, s) }
-
-        SettingCard { SpiClockControl(vm, s) }
-
         // Настройки цвета жили в отдельном меню Tuning; теперь они здесь, но
         // спрятаны под тап по заголовку — полдюжины ползунков незачем держать
         // перед глазами.
@@ -711,67 +707,6 @@ private fun RowScope.MaintBtn(
     ) {
         Text(label, style = MaterialTheme.typography.labelMedium, maxLines = 1, softWrap = false)
     }
-}
-
-// ---------------------------------------------------------------- Arm trim
-// Ручная подстройка угла каждого луча поверх авто-калибровки Холла: та видит
-// только положение датчика (соосен центру луча), а не то, насколько точно на
-// луч посажена сама плата со светодиодами — такой перекос монтажа в принципе
-// не проявляется в моменте срабатывания датчика, автоматика его не увидит.
-
-@Composable
-private fun ArmTrimControls(vm: WheelVm, s: Settings) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Column(Modifier.weight(1f)) {
-            Text("Arm trim", style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold)
-            Text("Fixes a seam between two arms that stays the same every " +
-                    "revolution — a mounting tolerance, not a timing error.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-    }
-    Spacer(Modifier.height(6.dp))
-    for (i in 0 until 6) {
-        val v = s.armTrimX10.getOrElse(i) { 0 }
-        SliderRow("Arm ${i + 1}", String.format("%.1f°", v / 10f),
-            v.toFloat(), -150f, 150f, 300,
-            onChange = { nv ->
-                val list = s.armTrimX10.toMutableList().also {
-                    while (it.size < 6) it.add(0)
-                    it[i] = nv.roundToInt()
-                }
-                vm.settings.value = s.copy(armTrimX10 = list)
-            },
-            onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() })
-    }
-}
-
-// -------------------------------------------------------------- SPI clock
-// Частота — угловое разрешение: пока кадр идёт по шине, луч продолжает
-// поворачиваться, и весь этот угол показывается одними и теми же данными.
-// Достижим только дискретный ряд f = 80 МГц/n (n=2..64, драйвер ESP32 умеет
-// именно так) — слайдер поэтому двигает n, а не МГц: между соседними n нет
-// ничего достижимого, линейный МГц-слайдер имел бы мёртвые положения.
-
-@Composable
-private fun SpiClockControl(vm: WheelVm, s: Settings) {
-    val div = s.spiDiv.coerceIn(2, 64)
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Column(Modifier.weight(1f)) {
-            Text("SPI clock", style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold)
-            Text("Sets the angular step. Reachable rates only (80 MHz/n) — " +
-                    "briefly blanks the wheel while the bus is reconfigured. " +
-                    "SK9822 datasheet ceiling is ~30 MHz.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-    }
-    SliderRow("Clock (n = $div)", String.format("%.2f MHz", 80.0 / div),
-        div.toFloat(), 2f, 64f, 62,
-        onChange = { vm.settings.value = s.copy(spiDiv = it.roundToInt()) },
-        onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() })
 }
 
 // ------------------------------------------------------------------ Colour

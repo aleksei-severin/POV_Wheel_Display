@@ -24,17 +24,6 @@ volatile uint8_t global_brightness = 8; // единицы SK9822 (0–31)
 RTC_DATA_ATTR uint8_t min_brightness = 1;  // единицы SK9822 (1–31)
 RTC_DATA_ATTR uint8_t max_brightness = 31; // единицы SK9822 (1–31), 31 = максимум тока
 RTC_DATA_ATTR volatile int global_angle_offset = 93;
-// Ручная подстройка угла КАЖДОГО луча (град.), поверх авто-калибровки Холла
-// (rtc_hall_cal[]). Калибровка Холла измеряет только положение самого
-// ДАТЧИКА (он соосен центру луча) — она не видит и не может видеть перекос
-// монтажа платы со светодиодами относительно этой оси: такой перекос не
-// проявляется в моменте срабатывания датчика вообще. Проверено: сырые
-// измерения калибровки стабильны и малы (<1°, разброс между отдельными
-// оборотами 0.1-0.3°), а видимый на колесе шов у обода — существенно больше
-// (~2°, ~10 мм на радиусе 273 мм) — то есть это отдельный, чисто
-// механический источник, и его может скомпенсировать только ручная
-// подстройка по глазу/фото для каждого луча отдельно.
-RTC_DATA_ATTR float global_arm_trim[NUM_ARMS] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
 uint8_t* frameBuffer = nullptr;
 // Стартовый буфер — один чёрный кадр RGB565 (см. setup): формат меняется вместе
@@ -143,26 +132,10 @@ static volatile float rotor_alpha = 0.0f;  // град/мкс², знакова�
 #define SK9822_BUF_SIZE   (4 + NUM_LEDS * 4 + SK9822_END_BYTES)
 
 // Время передачи одного кадра по SPI, мкс. Это и есть шаг дискретизации угла:
-// пока кадр идёт по шине, лента показывает предыдущие данные.
-// Компиль-тайм значение — только начальное приближение (до первого вызова
-// applySpiDiv() в initSK9822_DMA()); дальше реальная длительность кадра
-// живёт в g_dma_frame_us и меняется, если пользователь подвинул ползунок
-// частоты SPI в веб-интерфейсе (см. applySpiDiv()/pending_spi_div).
+// пока кадр идёт по шине, лента показывает предыдущие данные. Частота фиксирована
+// на SK9822_SPI_HZ (n=4, ровно 20 МГц — драйвер даёт 80/4 без округления), так
+// что это точное значение, а не приближение.
 #define SK9822_FRAME_US   ((float)(SK9822_BUF_SIZE * 8) * 1000000.0f / (float)SK9822_SPI_HZ)
-
-// Делитель тактовой частоты SPI: f = 80 МГц / global_spi_div (pre=1 на всём
-// используемом диапазоне — см. комментарий у SK9822_SPI_HZ в config.h).
-// n=4 — те же 20 МГц, что раньше были зашиты в SK9822_SPI_HZ.
-RTC_DATA_ATTR int global_spi_div = 4;
-// Фактическая длительность кадра при ТЕКУЩЕМ делителе, мкс — то, что реально
-// использует renderingTask (пересчитывается в applySpiDiv()).
-volatile float g_dma_frame_us = SK9822_FRAME_US;
-// Заявка на смену делителя из /settings и её обработка в loop(): смена живой
-// SPI-шины требует remove/add устройства, а это нельзя делать, пока
-// renderingTask может ей одновременно пользоваться — поэтому, как и для
-// загрузки файла, рендер сперва аккуратно ставится на паузу.
-volatile bool spi_reconfig_pending = false;
-volatile int  pending_spi_div      = 0;   // 0 = нет заявки
 
 // RMS за текущий оборот: среднее нормированное потребление тока (0.0–1.0).
 // Считается от нередуцированного bri_level — показывает реальную нагрузку.
@@ -250,8 +223,8 @@ struct __attribute__((packed)) SettingsBlob {
     uint8_t  effect;                             // добавлены в версии 3
     uint8_t  _pad2;
     uint16_t speed_red;                          // км/ч красной зоны для эффекта Speed
-    float    arm_trim[NUM_ARMS];                 // добавлены в версии 4
-    uint8_t  spi_div;                             // добавлено в версии 5, f = 80МГц/spi_div
+    float    _rsvd_arm_trim[NUM_ARMS];           // бывшая ручная подстройка лучей (версия 4), больше не используется
+    uint8_t  _rsvd_spi_div;                      // бывший делитель частоты SPI (версия 5), больше не используется — частота фиксирована на SK9822_SPI_HZ
     uint8_t  _pad3;
 };
 static const uint16_t SETTINGS_MAGIC = 0x5056;   // 'PV'
@@ -289,8 +262,6 @@ static void fillSettingsBlob(SettingsBlob& b) {
     b.rpm_off     = rpm_render_off;
     b.effect      = effect_id;
     b.speed_red   = effect_speed_red;
-    for (int i = 0; i < NUM_ARMS; i++) b.arm_trim[i] = global_arm_trim[i];
-    b.spi_div     = (uint8_t)global_spi_div;
 }
 
 // Диапазоны проверяются и при чтении: одного magic мало, испорченный блоб не
@@ -335,13 +306,8 @@ static void loadSettingsFromNVS() {
     // проверяется только в setup(). Запоминаем, запуск — ниже по setup().
     if (b.effect > EFF_NONE && b.effect < EFF_COUNT) effect_id = b.effect;
     if (b.speed_red >= 5 && b.speed_red <= 200)      effect_speed_red = b.speed_red;
-    // Старые версии блоба (<4) не несут arm_trim — b.arm_trim[] тогда нули
-    // (весь блоб обнулён перед чтением), что и так значение по умолчанию.
-    for (int i = 0; i < NUM_ARMS; i++)
-        if (b.arm_trim[i] >= -15.0f && b.arm_trim[i] <= 15.0f) global_arm_trim[i] = b.arm_trim[i];
-    // Старые версии блоба (<5) не несут spi_div — 0 после обнуления, поэтому
-    // диапазон проверяем и оставляем компиль-тайм умолчание (n=4, 20 МГц) как есть.
-    if (b.spi_div >= 2 && b.spi_div <= 64) global_spi_div = b.spi_div;
+    // b._rsvd_arm_trim / b._rsvd_spi_div — бывшие подстройка лучей и делитель
+    // частоты SPI, больше не читаются (частота фиксирована на SK9822_SPI_HZ).
     webLog("[SYS] Settings restored from NVS");
 }
 
@@ -513,25 +479,15 @@ static void saveHallCalibration() {
 //                         SK9822 / DMA
 // =====================================================================
 
-// Применяет делитель n (f = 80 МГц/n, pre=1 — см. комментарий у SK9822_SPI_HZ
-// в config.h) к уже поднятой SPI-шине: удаляет старое устройство (если было) и
-// добавляет заново с новой частотой — на лету поменять clock_speed_hz нельзя,
-// драйвер запоминает его только на spi_bus_add_device(). Вызывающая сторона
-// отвечает за то, чтобы в этот момент никто не пользовался sk9822_spi (см.
-// initSK9822_DMA() — вызывается до старта renderingTask — и loop(),
-// обрабатывающий pending_spi_div только когда рендер аккуратно приостановлен
-// флагом spi_reconfig_pending).
-static void applySpiDiv(int n) {
-    if (n < 2) n = 2;
-    if (n > 64) n = 64;
-
-    if (sk9822_spi) {
-        spi_bus_remove_device(sk9822_spi);
-        sk9822_spi = nullptr;
-    }
-
+// Добавляет SK9822 на уже поднятую SPI-шину с фиксированной частотой
+// SK9822_SPI_HZ (см. config.h). Частота больше не настраивается на лету:
+// f = 80 МГц/n, и при SK9822_SPI_HZ = 20 МГц драйвер даёт ровно n=4 без
+// округления. Логируем фактическую частоту и длительности фаз клока — то, во
+// что упирается длинная цепочка SK9822 (короткая фаза при нечётном n заваливает
+// фронты на лучах 2–6).
+static void initSK9822Device() {
     spi_device_interface_config_t devcfg = {};
-    devcfg.clock_speed_hz  = APB_CLK_FREQ / n;
+    devcfg.clock_speed_hz  = SK9822_SPI_HZ;
     devcfg.duty_cycle_pos  = SK9822_DUTY_POS;
     devcfg.mode            = 0;
     devcfg.spics_io_num    = -1;
@@ -539,24 +495,18 @@ static void applySpiDiv(int n) {
     devcfg.flags           = SPI_DEVICE_NO_DUMMY;
     ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &devcfg, &sk9822_spi));
 
-    // Реальная частота может отличаться от запрошенной — драйвер умеет только 80 МГц/N.
-    // Она определяет максимальную частоту обновления, а с ней и угловую чёткость.
     int actual_hz = spi_get_actual_clock(APB_CLK_FREQ, devcfg.clock_speed_hz, SK9822_DUTY_POS);
     if (actual_hz <= 0) actual_hz = devcfg.clock_speed_hz;
-    // Длительности фаз клока — то, во что упирается длинная цепочка SK9822.
-    // Делитель n восстанавливаем из фактической частоты (верно при pre = 1,
-    // а это весь рабочий диапазон 13–40 МГц); такт APB = 12.5 нс.
+    // Делитель n восстанавливаем из фактической частоты (верно при pre = 1);
+    // такт APB = 12.5 нс.
     int nn = (APB_CLK_FREQ + actual_hz / 2) / actual_hz;
     int h  = (SK9822_DUTY_POS * nn + 127) / 256;
     if (h < 1) h = 1;
 
-    g_dma_frame_us  = (float)(SK9822_BUF_SIZE * 8) * 1000000.0f / (float)actual_hz;
-    global_spi_div  = n;
-
     webLogf("[SYS] SK9822: %d kHz, duty %d/%d (%.1f/%.1f ns), %d B/frame, %.0f us",
             actual_hz / 1000, h, nn,
             h * 12.5f, (nn - h) * 12.5f,
-            (int)SK9822_BUF_SIZE, (double)g_dma_frame_us);
+            (int)SK9822_BUF_SIZE, (double)SK9822_FRAME_US);
 }
 
 void initSK9822_DMA() {
@@ -569,7 +519,7 @@ void initSK9822_DMA() {
     buscfg.max_transfer_sz = SK9822_BUF_SIZE;
 
     ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
-    applySpiDiv(global_spi_div);
+    initSK9822Device();
 
     for (int b = 0; b < 2; b++) {
         dma_buf[b] = (uint8_t*)heap_caps_malloc(SK9822_BUF_SIZE, MALLOC_CAP_DMA);
@@ -993,16 +943,8 @@ static void fillSectorIntoBuffer(uint8_t* buf, uint8_t buf_idx, float sector0, f
         // «подёргивание на каждом датчике Холла с резким сбросом раз в
         // оборот». Знак минус — см. вывод в комментарии к калибровке ниже:
         // истинное положение луча = ray·arm_step − rtc_hall_cal[ray].
-        //
-        // global_arm_trim[ray] — сверх этого, РУЧНАЯ подстройка (веб-интерфейс).
-        // Калибровка Холла видит только положение ДАТЧИКА (он соосен центру
-        // луча), а не то, насколько точно на луч посажена сама плата со
-        // светодиодами — такой перекос монтажа не проявляется в моменте
-        // срабатывания датчика вообще, поэтому автоматика его в принципе не
-        // может измерить. Знак тот же, что у rtc_hall_cal — подстройка
-        // считается в тех же «градусах смещения этого луча».
         float bf = fmodf(sector0 + (float)ray * arm_step
-                          - rtc_hall_cal[ray] - global_arm_trim[ray], 360.0f);
+                          - rtc_hall_cal[ray], 360.0f);
         if (bf < 0.0f) bf += 360.0f;
         // Зеркальный угол для той стороны луча, которую видно с обратного бока
         // колеса: отражение 540°−bf гасит переворот «взгляда с изнанки», и текст
@@ -1155,6 +1097,7 @@ struct HallDiagSnapshot {
     float    err_max;
     float    off1, off2, off3, off4, off5;
     float    lead_min, lead_max, jit, fill_us, show_us, aT2;
+    float    w_corr_pct;
     float    lead_hall_min, lead_hall_max; uint32_t n_hall;
     float    lead_norm_min, lead_norm_max; uint32_t n_norm;
     uint32_t outer_min, outer_max, outer_over100;
@@ -1175,14 +1118,11 @@ void renderingTask(void* pvParameters) {
     // ЭТОГО прохода.
     bool    exited_for_hall = false;
 
-    // Не константа: пользователь может подвинуть ползунок частоты SPI в
-    // веб-интерфейсе (см. applySpiDiv()/pending_spi_div) — обновляется раз за
-    // проход внешнего цикла, как arm_reverse_seen; чтение volatile float
-    // атомарно на этой архитектуре, мьютекс не нужен.
-    float       dma_frame_us = g_dma_frame_us;    // время передачи кадра по SPI
+    // Частота SPI фиксирована (SK9822_SPI_HZ), так что это константа.
+    const float dma_frame_us = SK9822_FRAME_US;   // время передачи кадра по SPI
     uint32_t    tx_start_us  = 0;                 // когда ушла последняя транзакция
     float       fill_us      = 200.0f;            // измеренное время заполнения буфера
-    float       show_us      = g_dma_frame_us;    // измеренный интервал между посылками
+    float       show_us      = SK9822_FRAME_US;   // измеренный интервал между посылками
 
     // Отписываем IDLE-задачу Core 1 от Task WDT: renderingTask занимает Core 1
     // почти непрерывно и IDLE не получает тиков.
@@ -1198,6 +1138,7 @@ void renderingTask(void* pvParameters) {
     // Предыдущее измерение средней скорости (для оценки ускорения)
     bool     alpha_ok   = false;   // фильтр α уже наполнен
     float    phase_err_max = 0.0f; // максимальная невязка ФАПЧ за окно диагностики
+    float    w_corr_max_pct = 0.0f; // макс. правка ω 2-м порядком ФАПЧ (HALL_PLL_KV), % от ω
     uint32_t phase_dbg_ms  = 0;
     float    lead_min = 1e9f, lead_max = 0.0f;   // размах упреждения, мкс
     // То же самое, но раздельно для «первого кадра после переанкеровки по
@@ -1250,10 +1191,6 @@ void renderingTask(void* pvParameters) {
             if (sem_dur < sem_dur_min) sem_dur_min = sem_dur;
             if (sem_dur > sem_dur_max) sem_dur_max = sem_dur;
         }
-
-        // Подхватываем частоту SPI, если её сменили в /settings — см. объявление
-        // dma_frame_us выше.
-        dma_frame_us = g_dma_frame_us;
 
         // Смена порядка лучей меняет знак arm_step — накопленная калибровка
         // датчиков в старой системе координат больше не действительна.
@@ -1407,6 +1344,36 @@ void renderingTask(void* pvParameters) {
                     // потере синхронизации.
                     float kp = (ea > HALL_PLL_ERR_FAST) ? HALL_PLL_K_FAST : HALL_PLL_K;
                     anchor_deg = (ea > 10.0f) ? meas : (pred + err * kp);
+
+                    // --- ФАПЧ 2-го порядка: подтяжка скорости (см. HALL_PLL_KV) ---
+                    // err за интервал (ev_t − старый anchor_t) — интеграл ошибки
+                    // rotor_omega по этому интервалу; сама ошибка = err/dt_pll.
+                    // Без этого rotor_omega остаётся оценкой на оборот назад, и
+                    // render множит эту ошибку на dtf (упреждение ∝ 1/такт SPI) —
+                    // ровно та раскачка тонкой линии на «ровной» скорости, что
+                    // видно эффектом Testing и сильнее на низкой частоте SPI.
+                    // Разовая правка (rotor_omega пересчитывается заново на
+                    // следующем событии), клип ±10 % — контур не раскрутить.
+                    //
+                    // Тот же гейт, что у второй СТУПЕНИ (HALL_PLL_ERR_FAST): ниже
+                    // него невязка — это шум датчиков, и правка ω только
+                    // добавила бы его в угол через dtf (та же ловушка, что у
+                    // сырого α). Выше — невязка СИСТЕМАТИЧЕСКАЯ (разгон или
+                    // запаздывающая оценка ω), и её надо убирать, а не только
+                    // крутить фазовое усиление.
+                    if (HALL_PLL_KV > 0.0f && ea > HALL_PLL_ERR_FAST && ea < 10.0f &&
+                        ev_rev >= HALL_MIN_REV_US && ev_rev <= 1500000UL) {
+                        float dt_pll = (float)(uint32_t)(ev_t - anchor_t);  // anchor_t ещё прошлый
+                        if (dt_pll > 1000.0f) {
+                            float dw    = err / dt_pll * HALL_PLL_KV;
+                            float dwmax = 0.10f * fabsf(rotor_omega);
+                            dw = constrain(dw, -dwmax, dwmax);
+                            rotor_omega += dw;
+                            float p = (fabsf(rotor_omega) > 1e-9f)
+                                    ? fabsf(dw) / fabsf(rotor_omega) * 100.0f : 0.0f;
+                            if (p > w_corr_max_pct) w_corr_max_pct = p;
+                        }
+                    }
                 } else {
                     anchor_deg = meas;
                 }
@@ -1446,6 +1413,7 @@ void renderingTask(void* pvParameters) {
                 hall_diag_snap.lead_min = lead_min; hall_diag_snap.lead_max = lead_max;
                 hall_diag_snap.jit = jit; hall_diag_snap.fill_us = fill_us;
                 hall_diag_snap.show_us = show_us; hall_diag_snap.aT2 = aT2;
+                hall_diag_snap.w_corr_pct = w_corr_max_pct;
                 hall_diag_snap.lead_hall_min = lead_hall_min; hall_diag_snap.lead_hall_max = lead_hall_max;
                 hall_diag_snap.n_hall        = n_hall_frames;
                 hall_diag_snap.lead_norm_min = lead_norm_min; hall_diag_snap.lead_norm_max = lead_norm_max;
@@ -1464,6 +1432,7 @@ void renderingTask(void* pvParameters) {
                 hall_diag_pending = true;
 
                 phase_err_max = 0.0f;
+                w_corr_max_pct = 0.0f;
                 lead_min = 1e9f; lead_max = 0.0f;
                 lead_hall_min = 1e9f; lead_hall_max = 0.0f; n_hall_frames = 0;
                 lead_norm_min = 1e9f; lead_norm_max = 0.0f; n_norm_frames = 0;
@@ -1474,7 +1443,7 @@ void renderingTask(void* pvParameters) {
 
         // --- Условия остановки отрисовки ---
         if (force_stop_display || power_state != PWR_FULL || !newFrameReady ||
-            ota_in_progress || frame_loading || spi_reconfig_pending) {
+            ota_in_progress || frame_loading) {
             if (rendering_active) {
                 rendering_active = false;
                 // render_pause_ms здесь НЕ трогаем: это не дребезг у порога, а
@@ -1582,7 +1551,7 @@ void renderingTask(void* pvParameters) {
 
         while (true) {
             if (force_stop_display || power_state != PWR_FULL || !newFrameReady ||
-                ota_in_progress || frame_loading || spi_reconfig_pending) break;
+                ota_in_progress || frame_loading) break;
 
             // Пришло новое событие Холла — выходим, чтобы переставить якорь фазы
             noInterrupts();
@@ -2671,9 +2640,9 @@ void loop() {
         webLogf("[HALL] cal=%d err=%.1f off %.1f %.1f %.1f %.1f %.1f",
                 s.cal_ready ? 1 : 0, (double)s.err_max,
                 (double)s.off1, (double)s.off2, (double)s.off3, (double)s.off4, (double)s.off5);
-        webLogf("[HALL] lead %.0f..%.0f = %.2f deg, fill %.0f show %.0f aT2 %.1f",
+        webLogf("[HALL] lead %.0f..%.0f = %.2f deg, fill %.0f show %.0f aT2 %.1f wcorr %.2f%%",
                 (double)s.lead_min, (double)s.lead_max, (double)s.jit,
-                (double)s.fill_us, (double)s.show_us, (double)s.aT2);
+                (double)s.fill_us, (double)s.show_us, (double)s.aT2, (double)s.w_corr_pct);
         webLogf("[HALL] lead-hall %.0f..%.0f n=%lu | lead-norm %.0f..%.0f n=%lu",
                 (double)s.lead_hall_min, (double)s.lead_hall_max, (unsigned long)s.n_hall,
                 (double)s.lead_norm_min, (double)s.lead_norm_max, (unsigned long)s.n_norm);
@@ -3021,24 +2990,6 @@ void loop() {
             net_task_started = true;
             xTaskCreatePinnedToCore(networkTask, "network", 4096, NULL, 3, NULL, 0);
         }
-    }
-
-    // --- Смена делителя частоты SPI (ползунок в /settings) ---
-    // Живая SPI-шина не меняет clock_speed_hz на лету — только через
-    // remove/add устройства (см. applySpiDiv()), а это нельзя делать, пока
-    // renderingTask мог бы одновременно поставить транзакцию в очередь.
-    // spi_reconfig_pending заставляет его аккуратно погаснуть и встать на
-    // паузу тем же путём, что и frame_loading; 200 мс — тот же запас, что и
-    // у safeOTAShutdown(), с которым гарантированно завершается текущая
-    // DMA-транзакция.
-    if (pending_spi_div != 0) {
-        int div = pending_spi_div;
-        pending_spi_div = 0;
-        spi_reconfig_pending = true;
-        vTaskDelay(pdMS_TO_TICKS(200));
-        applySpiDiv(div);
-        settings_dirty = true;
-        spi_reconfig_pending = false;
     }
 
     // --- Транспортный режим по BLE (OP_POWEROFF) ---
