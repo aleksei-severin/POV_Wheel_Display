@@ -270,13 +270,19 @@ class Converter(private val context: Context) {
         uri: Uri, fitMode: Int, maxFrames: Int, vid: VideoOpts, mirrorBack: Boolean,
         nr: Ani6.NameResult, prog: Progress
     ): Result {
-        // Длительность нужна лишь чтобы не просить кадров больше, чем в ролике.
+        // Длительность нужна лишь чтобы не просить кадров больше, чем в ролике;
+        // угол поворота — из MMR (в MediaExtractor он есть только с API 29).
+        // Эталонный кадр для сверки ориентации VideoFrames берёт сам — на тот же
+        // pts, что и свой кадр из декодера, поэтому их можно сравнивать в лоб.
         val durMs: Long
+        val rotation: Int
         val mmr0 = MediaMetadataRetriever()
         try {
             mmr0.setDataSource(context, uri)
             durMs = mmr0.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                 ?.toLongOrNull() ?: 0L
+            rotation = mmr0.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
+                ?.toIntOrNull() ?: 0
         } catch (e: Exception) {
             throw IllegalStateException("this phone cannot decode this video")
         } finally {
@@ -294,7 +300,7 @@ class Converter(private val context: Context) {
         // выборка+квантование идут пулом воркеров. На части телефонов кодек или
         // GL может не подняться — тогда откат на медленный, но всеядный MMR.
         try {
-            VideoFrames.decode(context, uri, out, fitMode, vid.fps, n) { done, total ->
+            VideoFrames.decode(context, uri, out, fitMode, vid.fps, n, rotation) { done, total ->
                 prog.frames(done, total)
             }
         } catch (e: kotlinx.coroutines.CancellationException) {
@@ -368,34 +374,27 @@ class Converter(private val context: Context) {
         }
     }
 
-    /** Первый кадр любого источника — для миниатюры в выборе файла. */
+    /**
+     * Первый кадр любого источника — круглой миниатюрой в выборе файла. Идёт
+     * через то же полярное преобразование, что и заливка (`DiscRender`), поэтому
+     * превью показывает ровно результат на ободе (Crop/Fit, поля, отверстие под
+     * ступицу), а не просто вписанный в круг квадрат.
+     */
     fun posterOf(uri: Uri, fitMode: Int, size: Int): Bitmap? {
         return try {
             val bytes = if (mimeOf(uri).startsWith("video/")) null else readBytes(uri)
-            when (kindOf(uri, bytes)) {
+            val src: Bitmap = when (kindOf(uri, bytes)) {
                 Kind.VIDEO -> {
                     val mmr = MediaMetadataRetriever()
                     try {
                         mmr.setDataSource(context, uri)
-                        val b = mmr.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-                        b?.let { src ->
-                            val out = Bitmaps.square(size)
-                            Bitmaps.drawSquare(src, out, fitMode)
-                            src.recycle()
-                            out
-                        }
+                        mmr.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                     } finally { try { mmr.release() } catch (_: Exception) {} }
                 }
                 Kind.WEBP_ANIM -> {
                     val anim = WebP.parse(bytes!!)!!
                     val still = WebP.stillFromFrame(bytes, anim.frames[0])
-                    val src = still?.let { BitmapFactory.decodeByteArray(it, 0, it.size) }
-                    src?.let {
-                        val out = Bitmaps.square(size)
-                        Bitmaps.drawSquare(it, out, fitMode)
-                        it.recycle()
-                        out
-                    }
+                    still?.let { BitmapFactory.decodeByteArray(it, 0, it.size) }
                 }
                 Kind.GIF -> {
                     val gif = GifDecoder(bytes!!)
@@ -403,22 +402,23 @@ class Converter(private val context: Context) {
                     val f = gif.frames.firstOrNull() ?: return null
                     val px = IntArray(maxOf(gif.width, 1) * maxOf(gif.height, 1))
                     blitFrame(px, gif.width, gif.height, f)
-                    val bmp = Bitmap.createBitmap(gif.width, gif.height, Bitmap.Config.ARGB_8888)
-                    bmp.setPixels(px, 0, gif.width, 0, 0, gif.width, gif.height)
-                    val out = Bitmaps.square(size)
-                    Bitmaps.drawSquare(bmp, out, fitMode)
-                    bmp.recycle()
-                    out
+                    Bitmap.createBitmap(gif.width, gif.height, Bitmap.Config.ARGB_8888).also {
+                        it.setPixels(px, 0, gif.width, 0, 0, gif.width, gif.height)
+                    }
                 }
                 Kind.IMAGE -> {
-                    var src = BitmapFactory.decodeByteArray(bytes!!, 0, bytes.size) ?: return null
-                    src = Bitmaps.applyExif(src, exifOrientation(bytes))
-                    val out = Bitmaps.square(size)
-                    Bitmaps.drawSquare(src, out, fitMode)
-                    src.recycle()
-                    out
+                    BitmapFactory.decodeByteArray(bytes!!, 0, bytes.size)?.let {
+                        Bitmaps.applyExif(it, exifOrientation(bytes))
+                    }
                 }
-            }
+            } ?: return null
+
+            val square = Bitmaps.square(size)
+            Bitmaps.drawSquare(src, square, fitMode)
+            src.recycle()
+            val disc = DiscRender.fromSquare(square, size)
+            square.recycle()
+            disc
         } catch (e: Exception) {
             null
         }

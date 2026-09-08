@@ -19,37 +19,38 @@ import java.nio.FloatBuffer
 /**
  * Оффскрин-приёмник кадров видеодекодера.
  *
- * Единственная задача — быстро вытащить кадр из [MediaCodec] и уменьшить его до
- * умеренного размера [outW]×[outH] (длинная сторона ~[READ_CAP]). Поворот ролика
- * и вписывание Crop/Fit делает CPU дальше по конвейеру (`Bitmaps.rotateDegrees`
- * + `Bitmaps.drawSquare`) — там та же проверенная геометрия, что у картинок и
- * GIF, и никаких сомнений в знаке поворота.
+ * Задача — быстро вытащить кадр из [MediaCodec] через внешнюю OES-текстуру и
+ * уменьшить до [outW]×[outH]. Поворот ролика и вписывание Crop/Fit делает CPU
+ * дальше по конвейеру (`Bitmaps.rotateDegrees` + `Bitmaps.drawSquare`) — та же
+ * проверенная геометрия, что у картинок и GIF.
  *
  * Уменьшение — делением вдвое (каждый шаг ровно 2:1, `GL_LINEAR` = бокс-фильтр),
- * ровно как `Bitmaps.drawSquare` делает это на CPU: без площадного усреднения
- * периферия обода превратилась бы в лесенку ещё до полярной выборки.
+ * ровно как `Bitmaps.drawSquare` на CPU: без площадного усреднения периферия
+ * обода превратилась бы в лесенку ещё до полярной выборки.
  *
- * Всё на GLES 2.0 + расширении `GL_OES_EGL_image_external` — есть на любом
- * Android. Ядро EGL/SurfaceTexture — по мотивам Grafika (Apache 2.0, Google).
+ * GLES 2.0 + `GL_OES_EGL_image_external` — есть на любом Android. Ядро
+ * EGL/SurfaceTexture — по мотивам Grafika (Apache 2.0, Google).
  *
- * ВАЖНО: все методы, кроме onFrameAvailable, вызываются из одного потока — того,
- * что создал объект (там становится текущим EGL-контекст).
+ * ВАЖНО: всё, кроме onFrameAvailable, вызывается из потока, создавшего объект
+ * (там становится текущим EGL-контекст).
  */
-internal class GlVideoScaler(private val srcW: Int, private val srcH: Int) {
+internal class GlVideoScaler(outW: Int, outH: Int) {
 
-    /** Размер кадра после уменьшения; сюда же создаётся пул Bitmap у вызывающего. */
-    val outW: Int
-    val outH: Int
+    /** Размер уменьшенного кадра; вызывающий создаёт под него пул Bitmap.
+     *  Стартовое значение — прикидка по «кодированному» размеру; уточняется
+     *  [setOutputSize] после того, как декодер сообщит фактический формат. */
+    var outW: Int = maxOf(1, outW)
+        private set
+    var outH: Int = maxOf(1, outH)
+        private set
 
-    init {
-        val big = maxOf(srcW, srcH, 1)
-        if (big > READ_CAP) {
-            outW = maxOf(1, srcW * READ_CAP / big)
-            outH = maxOf(1, srcH * READ_CAP / big)
-        } else {
-            outW = maxOf(1, srcW)
-            outH = maxOf(1, srcH)
-        }
+    fun setOutputSize(w: Int, h: Int) {
+        val nw = maxOf(1, w)
+        val nh = maxOf(1, h)
+        if (nw == outW && nh == outH) return
+        outW = nw
+        outH = nh
+        pixBuf = ByteBuffer.allocateDirect(nw * nh * 4).order(ByteOrder.nativeOrder())
     }
 
     private var eglDisplay: EGLDisplay = EGL14.EGL_NO_DISPLAY
@@ -71,17 +72,18 @@ internal class GlVideoScaler(private val srcW: Int, private val srcH: Int) {
     private val aPos2d: Int
     private val uStExt: Int
 
-    private val fbo = IntArray(2)
-    private val tex = IntArray(2)
-    private val texW = IntArray(2)
-    private val texH = IntArray(2)
+    // 2 текстуры/FBO под пинг-понг деления вдвое + 1 под финальный кадр (чтение).
+    private val fbo = IntArray(3)
+    private val tex = IntArray(3)
+    private val texW = IntArray(3)
+    private val texH = IntArray(3)
     private var fboChecked = false
 
     private val stMatrix = FloatArray(16)
 
     private val quad: FloatBuffer = floatBuf(floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f))
-    private val pixBuf: ByteBuffer =
-        ByteBuffer.allocateDirect(outW * outH * 4).order(ByteOrder.nativeOrder())
+    private var pixBuf: ByteBuffer =
+        ByteBuffer.allocateDirect(this.outW * this.outH * 4).order(ByteOrder.nativeOrder())
 
     init {
         initEgl()
@@ -98,8 +100,8 @@ internal class GlVideoScaler(private val srcW: Int, private val srcH: Int) {
         uStExt = GLES20.glGetUniformLocation(progExt, "uSt")
         aPos2d = GLES20.glGetAttribLocation(prog2d, "aPos")
 
-        GLES20.glGenFramebuffers(2, fbo, 0)
-        GLES20.glGenTextures(2, tex, 0)
+        GLES20.glGenFramebuffers(3, fbo, 0)
+        GLES20.glGenTextures(3, tex, 0)
         checkGl("init")
     }
 
@@ -118,16 +120,21 @@ internal class GlVideoScaler(private val srcW: Int, private val srcH: Int) {
         surfaceTexture.getTransformMatrix(stMatrix)
     }
 
-    /** Уменьшает текущий кадр в [dst] (ARGB_8888, ровно [outW]×[outH]). */
-    fun renderInto(dst: Bitmap) {
+    /**
+     * Уменьшает текущий кадр в [dst] ([outW]×[outH], ARGB_8888). [decW]/[decH] —
+     * фактический размер кадра на выходе декодера (может отличаться от
+     * «кодированного» из-за кропа или разворота декодером).
+     */
+    fun renderInto(dst: Bitmap, decW: Int, decH: Int) {
         // --- пасс 1: OES → tex[0] в масштабе кадра (с кэпом), матрица SurfaceTexture ---
         // stMatrix несёт вертикальный флип видеокадра, поэтому дальше по
         // конвейеру переворотов Y нет: glReadPixels + copyPixelsFromBuffer дают
-        // Bitmap правильной ориентации (тот же путь, что в Grafika).
+        // Bitmap правильной ориентации (тот же путь, что в Grafika). Размер
+        // tex[0] — ровно decW×decH из формата декодера; повороты решает CPU выше.
         val cap = 2048
-        var w = srcW
-        var h = srcH
-        val big = maxOf(w, h, 1)
+        var w = maxOf(1, decW)
+        var h = maxOf(1, decH)
+        val big = maxOf(w, h)
         if (big > cap) {
             w = maxOf(1, w * cap / big)
             h = maxOf(1, h * cap / big)
@@ -148,7 +155,7 @@ internal class GlVideoScaler(private val srcW: Int, private val srcH: Int) {
         var cw = w
         var ch = h
         while (cw / 2 >= outW && ch / 2 >= outH && cw > 2 && ch > 2) {
-            val d = 1 - src
+            val d = if (src == 0) 1 else 0
             ensureTex(d, cw / 2, ch / 2)
             bindFbo(d, cw / 2, ch / 2)
             blit2d(tex[src])
@@ -157,9 +164,9 @@ internal class GlVideoScaler(private val srcW: Int, private val srcH: Int) {
             ch /= 2
         }
 
-        // --- пасс 3: последний шаг в pbuffer outW×outH + чтение ---
-        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
-        GLES20.glViewport(0, 0, outW, outH)
+        // --- пасс 3: последний шаг в tex[2] (outW×outH) + чтение ---
+        ensureTex(2, outW, outH)
+        bindFbo(2, outW, outH)
         GLES20.glClearColor(0f, 0f, 0f, 0f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         blit2d(tex[src])
@@ -172,8 +179,8 @@ internal class GlVideoScaler(private val srcW: Int, private val srcH: Int) {
     }
 
     fun release() {
-        runCatching { GLES20.glDeleteFramebuffers(2, fbo, 0) }
-        runCatching { GLES20.glDeleteTextures(2, tex, 0) }
+        runCatching { GLES20.glDeleteFramebuffers(3, fbo, 0) }
+        runCatching { GLES20.glDeleteTextures(3, tex, 0) }
         runCatching { GLES20.glDeleteTextures(1, intArrayOf(oesTex), 0) }
         runCatching { GLES20.glDeleteProgram(progExt) }
         runCatching { GLES20.glDeleteProgram(prog2d) }
@@ -220,9 +227,10 @@ internal class GlVideoScaler(private val srcW: Int, private val srcH: Int) {
         )
         if (eglContext == EGL14.EGL_NO_CONTEXT) throw RuntimeException("eglCreateContext failed")
 
+        // Рисуем всегда в FBO, поэтому pbuffer нужен только для eglMakeCurrent.
         eglSurface = EGL14.eglCreatePbufferSurface(
             eglDisplay, cfgs[0],
-            intArrayOf(EGL14.EGL_WIDTH, outW, EGL14.EGL_HEIGHT, outH, EGL14.EGL_NONE), 0
+            intArrayOf(EGL14.EGL_WIDTH, 1, EGL14.EGL_HEIGHT, 1, EGL14.EGL_NONE), 0
         )
         if (eglSurface == EGL14.EGL_NO_SURFACE) throw RuntimeException("eglCreatePbufferSurface failed")
 
@@ -331,12 +339,6 @@ internal class GlVideoScaler(private val srcW: Int, private val srcH: Int) {
             .asFloatBuffer().apply { put(a); position(0) }
 
     private companion object {
-        // Длинная сторона обратного чтения. Дальше кадр идёт в drawSquare, тот
-        // сам доводит до 400 делением вдвое — как и на старом пути. 1440 — баланс:
-        // сглаживание обода почти как у полного 1080p, а Bitmap в пуле вчетверо
-        // легче 4K-кадра (важно: их несколько в пуле плюс буфер под поворот).
-        const val READ_CAP = 1440
-
         // Шейдеры плоской строкой без ведущих пробелов: у части драйверов
         // GLSL-препроцессор капризничает к отступу перед #extension / #.
         const val VERT_EXT =

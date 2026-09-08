@@ -4,26 +4,107 @@ import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.povwheel.app.WheelVm
 import com.povwheel.app.convert.Fit
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
+
+// Пилюля фиксированной ширины: скруглённая рамка, как у чипа. Ширина задаётся
+// снаружи и НЕ зависит от подписи — иначе «FPS 10» / «FPS 5» дёргали бы весь ряд.
+private val PILL_HEIGHT = 34.dp
+private val PILL_SHAPE = RoundedCornerShape(50)
+
+@Composable
+private fun Pill(
+    text: String,
+    width: Dp,
+    selected: Boolean = false,
+    enabled: Boolean = true,
+    onClick: () -> Unit
+) {
+    val cs = MaterialTheme.colorScheme
+    val border = if (selected) cs.primary else cs.outline
+    val fg = when {
+        !enabled -> cs.onSurface.copy(alpha = 0.38f)
+        selected -> cs.primary
+        else -> cs.onSurface
+    }
+    Surface(
+        onClick = onClick,
+        enabled = enabled,
+        shape = PILL_SHAPE,
+        color = if (selected) cs.primary.copy(alpha = 0.12f) else Color.Transparent,
+        border = BorderStroke(1.dp, if (enabled) border else border.copy(alpha = 0.38f)),
+        modifier = Modifier.width(width).height(PILL_HEIGHT)
+    ) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Text(text, style = MaterialTheme.typography.labelMedium, color = fg, maxLines = 1)
+        }
+    }
+}
+
+// Та же пилюля, но с редактируемым числом внутри (длина ролика).
+@Composable
+private fun PillField(
+    value: String,
+    width: Dp,
+    enabled: Boolean,
+    onValueChange: (String) -> Unit
+) {
+    val cs = MaterialTheme.colorScheme
+    val fg = if (enabled) cs.onSurface else cs.onSurface.copy(alpha = 0.38f)
+    Surface(
+        shape = PILL_SHAPE,
+        color = Color.Transparent,
+        border = BorderStroke(1.dp, cs.outline.copy(alpha = if (enabled) 1f else 0.38f)),
+        modifier = Modifier.width(width).height(PILL_HEIGHT)
+    ) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            BasicTextField(
+                value = value,
+                onValueChange = onValueChange,
+                enabled = enabled,
+                singleLine = true,
+                textStyle = MaterialTheme.typography.labelMedium.copy(
+                    color = fg, textAlign = TextAlign.Center
+                ),
+                cursorBrush = SolidColor(cs.primary),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                decorationBox = { inner ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(Modifier.weight(1f), contentAlignment = Alignment.Center) { inner() }
+                        Text("s", style = MaterialTheme.typography.labelMedium, color = fg)
+                    }
+                },
+                modifier = Modifier.padding(horizontal = 7.dp)
+            )
+        }
+    }
+}
 
 // Потолок выбора за раз. Фотопикер требует не меньше двух, а больше
 // нескольких десятков анимаций всё равно не поместится в PSRAM колеса.
@@ -135,54 +216,42 @@ fun UploadPanel(vm: WheelVm) {
 
             if (uris.isNotEmpty()) {
                 Spacer(Modifier.height(10.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Framing", style = MaterialTheme.typography.bodySmall,
-                        modifier = Modifier.padding(end = 8.dp))
-                    FilterChip(fitMode == Fit.CROP, { vm.setFit(Fit.CROP) }, { Text("Crop") })
-                    Spacer(Modifier.width(6.dp))
-                    FilterChip(fitMode == Fit.FIT, { vm.setFit(Fit.FIT) }, { Text("Fit") })
-                }
-
-                // Зеркалить заднюю сторону колеса — кнопка-чип, как Crop/Fit:
-                // подсвечивается во включённом состоянии. Выключено по умолчанию,
-                // тогда сзади картинка читается зеркально.
-                Spacer(Modifier.height(4.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Mirror", style = MaterialTheme.typography.bodySmall,
-                        modifier = Modifier.padding(end = 8.dp))
-                    FilterChip(
-                        selected = mirror,
-                        onClick = { vm.setBackMirror(!mirror) },
-                        label = { Text("Back face") },
-                        enabled = !busy
+                // Все переключатели — в один ряд, пилюлями фиксированной ширины:
+                // подпись меняется («Crop»/«Fit», «FPS 10»/«FPS 5»), а рамка нет,
+                // поэтому ряд не дёргается. Mirror back подсвечивается, когда вкл.
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Pill(
+                        text = if (fitMode == Fit.CROP) "Crop" else "Fit",
+                        width = 46.dp, enabled = !busy,
+                        onClick = { vm.setFit(if (fitMode == Fit.CROP) Fit.FIT else Fit.CROP) }
                     )
+                    Pill(
+                        text = "Mirror back",
+                        width = 84.dp, selected = mirror, enabled = !busy,
+                        onClick = { vm.setBackMirror(!mirror) }
+                    )
+                    if (isVideo) {
+                        Pill(
+                            text = "FPS $fps",
+                            width = 54.dp, enabled = !busy,
+                            onClick = { vm.setFps(when (fps) { 10 -> 15; 15 -> 5; else -> 10 }) }
+                        )
+                        PillField(
+                            value = String.format("%.1f", lengthSec),
+                            width = 56.dp, enabled = !busy,
+                            onValueChange = {
+                                val v = it.replace(',', '.').toDoubleOrNull()
+                                if (v != null) vm.setLength(v)
+                            }
+                        )
+                    }
                 }
 
                 if (isVideo) {
                     Spacer(Modifier.height(8.dp))
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("FPS", style = MaterialTheme.typography.bodySmall,
-                            modifier = Modifier.padding(end = 8.dp))
-                        listOf(5, 10, 15).forEach { f ->
-                            FilterChip(fps == f, { vm.setFps(f) }, { Text(f.toString()) })
-                            Spacer(Modifier.width(6.dp))
-                        }
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("Length", style = MaterialTheme.typography.bodySmall,
-                            modifier = Modifier.padding(end = 8.dp))
-                        OutlinedTextField(
-                            value = String.format("%.1f", lengthSec),
-                            onValueChange = {
-                                val v = it.replace(',', '.').toDoubleOrNull()
-                                if (v != null) vm.setLength(v)
-                            },
-                            modifier = Modifier.width(110.dp),
-                            singleLine = true,
-                            suffix = { Text("s") }
-                        )
-                    }
                     val n = (lengthSec * fps).roundToInt().coerceAtLeast(1)
                     val kb = ((8 + n.toLong() * 16608) / 1024)
                     val trimmed = n > fs.maxFrames

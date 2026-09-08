@@ -49,6 +49,9 @@ class PolarSampler {
     private val rgb = ByteArray(Geom.IDX_BYTES * 3)
     private var pixels: IntArray = IntArray(0)
 
+    /** Буфер RGB888 в порядке сектор → диод после [sample]. */
+    val rgbBuffer: ByteArray get() = rgb
+
     /** Выбирает [src] и кладёт квантованный кадр в [out] по смещению [outOff]. */
     fun frameInto(src: Bitmap, ss: Int, quant: Quantizer, out: ByteArray, outOff: Int) {
         sample(src, ss)
