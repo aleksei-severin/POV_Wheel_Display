@@ -1126,7 +1126,10 @@ class MinimalGIF {
                 let et=this.readByte();
                 if(et===0xF9){
                     this.readByte(); let gce=this.readByte();
-                    disposal=(gce>>2)&7; delay=this.readWord()*10||100;
+                    // Задержку ниже ~20 мс плееры (браузеры, Glide, декодер
+                    // Android) поднимают до 100 мс: ноль в GIF по соглашению
+                    // значит «как можно быстрее», и все свели это к 10 к/с.
+                    disposal=(gce>>2)&7; let dd=this.readWord()*10; delay=dd<20?100:dd;
                     let tc=this.readByte(); transIndex=(gce&1)?tc:-1; this.readByte();
                 } else { let l; while((l=this.readByte())!==0) this.pos+=l; }
             } else if(bt===0x2C){
@@ -1636,8 +1639,6 @@ async function extractWebPFrames(ab, fit, onProgress) {
 
     const frames = [];
     const n = anim.frames.length;
-    // ANI6 хранит одну задержку на всю анимацию — берём длительность первого кадра.
-    const delayMs = Math.max(1, anim.frames[0].dur || 100);
 
     for (let i = 0; i < n; i++) {
         const fr = anim.frames[i];
@@ -1649,23 +1650,16 @@ async function extractWebPFrames(ab, fit, onProgress) {
         cx.drawImage(bmp, fr.x, fr.y);
         if (bmp.close) bmp.close();
         drawSquare(cv, wCtx, S, fit);
-        frames.push(toPolarBuffer(work, 2));
+        // Задержку ниже ~20 мс поднимаем до 100 мс — так же, как плееры (иначе
+        // «как можно быстрее» уехало бы на 1 мс/кадр). Задержку раскладывает
+        // planAnimTiming уже после сборки всех кадров.
+        const dur = (fr.dur | 0) < 20 ? 100 : (fr.dur | 0);
+        frames.push({ delay: dur, data: toPolarBuffer(work, 2) });
         // Утилизация относится к УЖЕ показанному кадру — чистим после съёмки.
         if (fr.dispose) cx.clearRect(fr.x, fr.y, fr.w, fr.h);
         if (onProgress) onProgress(i + 1, n);
     }
-    return { frames, delayMs };
-}
-
-// Анимация целиком живёт в PSRAM устройства — что туда не влезет, оно просто не
-// сможет проиграть. Режем здесь, а не после заливки, иначе файл загрузится
-// успешно и не запустится.
-function _capFrames(frames, label) {
-    const maxF = maxFramesForDevice();
-    if (frames.length <= maxF) return frames;
-    setStatus('uploadStatus',
-        `${label} — ${frames.length} frames trimmed to ${maxF} (device memory)`, '');
-    return frames.slice(0, maxF);
+    return frames;
 }
 
 // ===================== VIDEO =====================
@@ -2371,6 +2365,55 @@ function buildFileName(prefix, rawBase) {
     return { name: safe, warning: `"${rawBase}" — ${reason}. Saving as: ${safe}` };
 }
 
+// Раскладка тайминга анимации на формат ANI6 (одна задержка на весь файл).
+//
+// Базовый шаг tick — самая частая задержка среди кадров (при равенстве меньшая).
+// Каждый кадр повторяется round(delay/tick) раз, но не меньше одного: суммарное
+// время анимации сохраняется, поток кадров остаётся равномерным. Постоянная
+// задержка (обычный случай) даёт по одному повтору — файл не меняется.
+// Если повторов набирается больше maxFrames (потолок PSRAM), шаг грубеет, а
+// затем список повторов жёстко обрезается — тогда reps.length меньше числа
+// исходных кадров, и вызвавшая сторона показывает предупреждение об обрезке.
+function planAnimTiming(delaysMs, maxFrames) {
+    const cap = Math.max(1, maxFrames | 0);
+    const d = delaysMs.map(x => Math.max(1, x | 0));
+    if (!d.length) return { tick: 100, reps: [] };
+
+    const freq = new Map();
+    for (const x of d) freq.set(x, (freq.get(x) || 0) + 1);
+    let tick = [...freq.entries()].sort((a, b) => b[1] - a[1] || a[0] - b[0])[0][0];
+
+    const repsFor = t => d.map(x => Math.max(1, Math.round(x / t)));
+    let reps = repsFor(tick);
+    // Грубеем шаг только если это реально помогает: когда кадров и так больше
+    // потолка, увеличение шага уже ничего не даёт (минимум по одному повтору) —
+    // тогда просто берём первые N кадров с исходным шагом (как прежняя обрезка).
+    if (reps.reduce((s, x) => s + x, 0) > cap && d.length < cap) {
+        const totalMs = d.reduce((s, x) => s + x, 0);
+        tick = Math.max(tick, Math.ceil(totalMs / cap));
+        reps = repsFor(tick);
+    }
+
+    // Жёсткий потолок: копим повторы, пока помещаются.
+    let acc = 0;
+    const kept = [];
+    for (let i = 0; i < reps.length; i++) {
+        if (acc + reps[i] > cap) { if (cap - acc > 0) kept.push(cap - acc); break; }
+        acc += reps[i]; kept.push(reps[i]);
+    }
+    return { tick: Math.max(1, Math.min(65535, tick)), reps: kept };
+}
+
+// Раскрывает [{delay, data}] в плоский массив кадров по плану planAnimTiming.
+// Возвращает { frames: [Uint8Array], tick, trimmed:boolean }.
+function _expandAnimFrames(items, maxFrames) {
+    const plan = planAnimTiming(items.map(f => f.delay), maxFrames);
+    const frames = [];
+    for (let i = 0; i < plan.reps.length; i++)
+        for (let k = 0; k < plan.reps[i]; k++) frames.push(items[i].data);
+    return { frames, tick: plan.tick, trimmed: plan.reps.length < items.length };
+}
+
 // Собирает файл: "ANI6" + кол-во кадров (uint16 LE) + задержка мс (uint16 LE) +
 // кадры подряд, каждый — палитра 768 байт и следом 15840 индексов.
 // frames — массив Uint8Array по FRAME_STRIDE.
@@ -2427,12 +2470,16 @@ async function _convertFile(file, label) {
 
     if (webpAnim) {
         await loadDevLimits(true);
-        const { frames, delayMs } = await extractWebPFrames(webpAb, fit, (done, total) => {
+        const items = await extractWebPFrames(webpAb, fit, (done, total) => {
             setStatus('uploadStatus',
                 `${tag} — decoding ${done}/${total} frames (${(done * 100 / total).toFixed(0)}%)`, '');
         });
-        const kept = _capFrames(frames, tag);
-        return { buf: packANI6(kept, delayMs, mirror), fileName, frameCount: kept.length };
+        // ANI6 держит одну задержку на файл: раскладываем разные задержки кадров
+        // на постоянный шаг, повторяя кадры кратно их длительности.
+        const exp = _expandAnimFrames(items, maxFramesForDevice());
+        if (exp.trimmed) setStatus('uploadStatus',
+            `${tag} — ${items.length} frames trimmed to fit device memory`, '');
+        return { buf: packANI6(exp.frames, exp.tick, mirror), fileName, frameCount: exp.frames.length };
     }
 
     if (isVid) {
@@ -2453,13 +2500,17 @@ async function _convertFile(file, label) {
         const gif = new MinimalGIF(ab);
         gif.parse();
         await loadDevLimits(true);
-        const frames = await renderGIFFrames(gif, fit, (done, total) => {
+        const items = await renderGIFFrames(gif, fit, (done, total) => {
             setStatus('uploadStatus',
                 `${tag} — converting ${done}/${total} frames (${(done * 100 / total).toFixed(0)}%)`, '');
         });
-        const kept = _capFrames(frames, tag);
-        const buf = packANI6(kept.map(f => f.data), kept[0].delay || 100, mirror);
-        return { buf, fileName, frameCount: kept.length };
+        // ANI6 держит одну задержку на файл: раскладываем разные задержки кадров
+        // на постоянный шаг, повторяя кадры кратно их длительности.
+        const exp = _expandAnimFrames(items, maxFramesForDevice());
+        if (exp.trimmed) setStatus('uploadStatus',
+            `${tag} — ${items.length} frames trimmed to fit device memory`, '');
+        const buf = packANI6(exp.frames, exp.tick, mirror);
+        return { buf, fileName, frameCount: exp.frames.length };
     } else {
         const dataUrl = await new Promise((res, rej) => {
             const r = new FileReader();

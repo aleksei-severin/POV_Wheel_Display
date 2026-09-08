@@ -69,8 +69,13 @@ class GifDecoder(private val bytes: ByteArray) {
                     readByte()
                     val gce = readByte()
                     disposal = (gce shr 2) and 7
+                    // Плееры (браузеры, Glide, системный декодер Android) поднимают
+                    // задержку ниже ~20 мс до 100 мс: ноль в GIF по соглашению
+                    // значит «как можно быстрее», и все свели это к 10 к/с. Без
+                    // этого GIF, сохранённый с 1–2 сотыми секунды на кадр, шёл бы
+                    // на колесе в разы быстрее, чем на телефоне.
                     val d = readWord() * 10
-                    delay = if (d == 0) 100 else d
+                    delay = if (d < 20) 100 else d
                     val tc = readByte()
                     transIndex = if (gce and 1 != 0) tc else -1
                     readByte()

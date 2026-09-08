@@ -27,6 +27,7 @@ import com.povwheel.app.convert.Converter
 import com.povwheel.app.convert.Fit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
@@ -592,100 +593,190 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     //  viewModelScope живёт, пока жив экран устройства, поэтому переключение
     //  вкладок и поворот экрана заливку больше не трогают.
     // =================================================================
-    val upUris     = MutableStateFlow<List<Uri>>(emptyList())
-    val upPoster   = MutableStateFlow<Bitmap?>(null)
+    /**
+     * Один выбранный для заливки файл со СВОИМИ параметрами конвертации. Пачку
+     * больше нельзя гнать под одну гребёнку: в панели у каждого превью
+     * настраивается отдельно кадрирование, зеркало задней стороны, а для видео —
+     * fps и длина.
+     */
+    data class UpItem(
+        val uri: Uri,
+        val name: String,
+        val isVideo: Boolean = false,
+        val srcDur: Double = 0.0,          // длительность исходного ролика, с
+        val fit: Int = Fit.CROP,
+        val mirror: Boolean = false,       // зеркалить заднюю сторону луча
+        val fps: Int = 10,
+        val lengthSec: Double = 10.0,
+        val lenTouched: Boolean = false,   // правил ли пользователь длину вручную
+        val poster: Bitmap? = null,        // круглое превью, null пока считается
+        val ready: Boolean = false         // тип определён и постер отрисован
+    )
+
+    val upItems    = MutableStateFlow<List<UpItem>>(emptyList())
+    val upSel      = MutableStateFlow(0)       // индекс превью, чьи настройки правит ряд пилюль
     val upStatus   = MutableStateFlow("Waiting for a file…")
     val upKind     = MutableStateFlow(0)       // 0 обычный, 1 успех, 2 ошибка
     val upProgress = MutableStateFlow(-1f)
     val upBusy     = MutableStateFlow(false)
-    val upFit      = MutableStateFlow(Fit.CROP)
-    val upFps      = MutableStateFlow(10)
-    val upLength   = MutableStateFlow(10.0)
-    // Зеркалить заднюю сторону колеса. Выключено по умолчанию: спереди и сзади
-    // горят те же пиксели. Включить — чтобы текст читался с обеих сторон.
-    // (Не путать с mirrorAll — то про рассылку команд на все колёса.)
-    val upBackMirror = MutableStateFlow(false)
-    val upIsVideo  = MutableStateFlow(false)
-    val upSrcDur   = MutableStateFlow(0.0)   // длительность исходного ролика, с
-    // Правил ли пользователь поле Length вручную. Пока не правил — длина следует
-    // за fps: потолок задаётся числом кадров в PSRAM, поэтому при 5 к/с в память
-    // влезает втрое больше секунд, чем при 15, и поле должно это показывать —
-    // и вверх, и вниз, а не залипать на самой короткой длительности.
-    private var upLenTouched = false
+
+    /** Фоновая подготовка превью. Новый выбор файлов отменяет прошлую. */
+    private var prepJob: kotlinx.coroutines.Job? = null
 
     private val converter by lazy { Converter(ctx) }
 
-    /** Выбрали файлы — определяем тип и готовим миниатюру. */
+    // Сторона квадратного постера-превью в пикселях. В сетке он показывается
+    // мелко (34…104 dp), так что больше не нужно.
+    private val POSTER_PX = 200
+
+    /** Выбрали файлы — строим пачку и запускаем фоновую подготовку превью. */
     fun onFilesPicked(picked: List<Uri>) {
         if (picked.isEmpty()) return
-        upUris.value = picked
-        upSrcDur.value = 0.0
-        upLenTouched = false        // новый файл — длину снова ведёт fps
+        prepJob?.cancel()
+        upItems.value = emptyList()
+        upSel.value = 0
+        upProgress.value = -1f
+        upStatus.value = "Reading " + picked.size + " file(s)…"
+        upKind.value = 0
         viewModelScope.launch {
-            val first = picked.first()
-            val kind = withContext(Dispatchers.IO) {
-                val sniff = try {
-                    if (converter.mimeOf(first).startsWith("video/")) null
-                    else converter.readBytes(first)
-                } catch (e: Exception) { null }
-                converter.kindOf(first, sniff)
+            val items = withContext(Dispatchers.IO) {
+                picked.map { UpItem(it, converter.displayName(it)) }
             }
-            upIsVideo.value = kind == Converter.Kind.VIDEO
-            if (upIsVideo.value) {
-                val dur = withContext(Dispatchers.IO) { converter.videoDurationSec(first) }
-                upSrcDur.value = dur
-                upLength.value = defaultLengthSec(upFps.value)
-            }
-            upPoster.value = withContext(Dispatchers.Default) {
-                converter.posterOf(first, upFit.value, 216)
-            }
-            upStatus.value = if (picked.size > 1) picked.size.toString() + " files selected. Press Upload."
-                             else converter.displayName(first) + " ready. Press Upload."
+            upItems.value = items
+            upStatus.value = if (items.size > 1) items.size.toString() + " files selected. Press Upload."
+                             else items[0].name + " ready. Press Upload."
             upKind.value = 1
+            startPrep(items.indices.toList())
         }
     }
 
-    /** Смена кадрирования — перерисовываем миниатюру, как это делал веб. */
+    /**
+     * Определяет тип и рисует круглое превью для перечисленных позиций — по
+     * одной, чтобы не грузить процессор всей пачкой сразу. Тип (видео/картинка)
+     * и длительность ролика проставляются раньше постера: ряд пилюль должен
+     * знать, показывать ли fps/длину, ещё до готовности превью.
+     */
+    private fun startPrep(indices: List<Int>) {
+        prepJob?.cancel()
+        prepJob = viewModelScope.launch {
+            for (i in indices) {
+                if (!isActive) break
+                val item0 = upItems.value.getOrNull(i) ?: continue
+                val u = item0.uri
+                if (!item0.ready) {
+                    val kind = withContext(Dispatchers.IO) {
+                        val sniff = try {
+                            if (converter.mimeOf(u).startsWith("video/")) null
+                            else converter.readBytes(u)
+                        } catch (e: Exception) { null }
+                        converter.kindOf(u, sniff)
+                    }
+                    val isVid = kind == Converter.Kind.VIDEO
+                    val dur = if (isVid) withContext(Dispatchers.IO) { converter.videoDurationSec(u) } else 0.0
+                    updateByUri(u) {
+                        it.copy(isVideo = isVid, srcDur = dur,
+                            lengthSec = if (isVid && !it.lenTouched) defaultLengthSec(it.fps, dur)
+                                        else it.lengthSec)
+                    }
+                }
+                val fit = upItems.value.firstOrNull { it.uri == u }?.fit ?: Fit.CROP
+                val poster = withContext(Dispatchers.Default) { converter.posterOf(u, fit, POSTER_PX) }
+                updateByUri(u) { it.copy(poster = poster, ready = true) }
+            }
+        }
+    }
+
+    private fun updateByUri(uri: Uri, f: (UpItem) -> UpItem) {
+        val cur = upItems.value
+        val i = cur.indexOfFirst { it.uri == uri }
+        if (i < 0) return
+        upItems.value = cur.toMutableList().also { it[i] = f(it[i]) }
+    }
+
+    private fun updateSel(f: (UpItem) -> UpItem) {
+        val cur = upItems.value
+        val i = upSel.value
+        if (i !in cur.indices) return
+        upItems.value = cur.toMutableList().also { it[i] = f(it[i]) }
+    }
+
+    fun selectUpItem(i: Int) { if (i in upItems.value.indices) upSel.value = i }
+
+    /** Убрать один файл из пачки. */
+    fun removeUpItem(i: Int) {
+        val cur = upItems.value
+        if (i !in cur.indices) return
+        val next = cur.toMutableList().also { it.removeAt(i) }
+        upItems.value = next
+        upSel.value = upSel.value.coerceIn(0, maxOf(0, next.size - 1))
+        if (next.isEmpty()) {
+            upStatus.value = "Waiting for a file…"
+            upKind.value = 0
+        }
+    }
+
+    /** Смена кадрирования выбранного файла — перерисовываем его превью. */
     fun setFit(f: Int) {
-        upFit.value = f
-        val u = upUris.value.firstOrNull() ?: return
+        updateSel { it.copy(fit = f) }
+        val u = upItems.value.getOrNull(upSel.value)?.uri ?: return
         viewModelScope.launch {
-            upPoster.value = withContext(Dispatchers.Default) { converter.posterOf(u, f, 216) }
+            val poster = withContext(Dispatchers.Default) { converter.posterOf(u, f, POSTER_PX) }
+            // Если кадрирование за это время снова сменили — отдаём ход более
+            // свежей отрисовке, а не подсовываем устаревшую.
+            updateByUri(u) { if (it.fit == f) it.copy(poster = poster) else it }
         }
     }
 
-    fun setBackMirror(v: Boolean) { upBackMirror.value = v }
+    fun setBackMirror(v: Boolean) = updateSel { it.copy(mirror = v) }
 
     /** Длина по умолчанию для данного fps: весь ролик, но не больше, чем влезает
      *  в PSRAM. Потолок — по числу кадров, поэтому в секундах он зависит от fps. */
-    private fun defaultLengthSec(fps: Int): Double {
+    private fun defaultLengthSec(fps: Int, srcDur: Double): Double {
         val cap = fsInfo.value.maxFrames.toDouble() / fps
-        val dur = upSrcDur.value
-        return maxOf(0.5, minOf(if (dur > 0) dur else cap, cap))
+        return maxOf(0.5, minOf(if (srcDur > 0) srcDur else cap, cap))
     }
 
-    fun setFps(n: Int) {
-        upFps.value = n
+    fun setFps(n: Int) = updateSel {
         val cap = fsInfo.value.maxFrames.toDouble() / n
-        // Длину руками не трогали — пересчитываем под новый fps, и вверх, и вниз.
-        // Тронутую — оставляем как есть, но ужимаем до разумного максимума
-        // (весь ролик / сколько влезает), если перестала влезать. Правило то же,
-        // что в вебе.
-        if (!upLenTouched || upLength.value > cap) upLength.value = defaultLengthSec(n)
+        // Длину руками не трогали — ведём за fps, и вверх и вниз. Тронутую
+        // оставляем, но ужимаем, если перестала влезать. Правило то же, что в вебе.
+        val len = if (!it.lenTouched || it.lengthSec > cap) defaultLengthSec(n, it.srcDur) else it.lengthSec
+        it.copy(fps = n, lengthSec = len)
     }
 
-    fun setLength(v: Double) {
-        upLenTouched = true
-        // coerceIn(min, max) бросает IllegalArgumentException при min > max, а
-        // потолок здесь считается из свободной памяти колеса и на забитом
-        // флеше падает ниже половины секунды.
-        val cap = fsInfo.value.maxFrames.toDouble() / upFps.value
-        upLength.value = if (cap <= 0.5) 0.5 else v.coerceIn(0.5, cap)
+    fun setLength(v: Double) = updateSel {
+        // coerceIn(min,max) бросает при min > max, а потолок на забитом флеше
+        // падает ниже половины секунды.
+        val cap = fsInfo.value.maxFrames.toDouble() / it.fps
+        it.copy(lengthSec = if (cap <= 0.5) 0.5 else v.coerceIn(0.5, cap), lenTouched = true)
+    }
+
+    /** Скопировать настройки выбранного файла на все остальные в пачке. */
+    fun applyUpSettingsToAll() {
+        val s = upItems.value.getOrNull(upSel.value) ?: return
+        val changedFit = ArrayList<Int>()
+        upItems.value = upItems.value.mapIndexed { i, item ->
+            if (item.fit != s.fit) changedFit.add(i)
+            val len = if (item.isVideo) {
+                val cap = fsInfo.value.maxFrames.toDouble() / s.fps
+                if (s.lengthSec > cap || cap <= 0.5) defaultLengthSec(s.fps, item.srcDur) else s.lengthSec
+            } else item.lengthSec
+            item.copy(
+                fit = s.fit, mirror = s.mirror,
+                fps = if (item.isVideo) s.fps else item.fps,
+                lengthSec = len,
+                lenTouched = if (item.isVideo) s.lenTouched else item.lenTouched
+            )
+        }
+        if (changedFit.isNotEmpty()) {
+            val pending = upItems.value.indices.filter { !upItems.value[it].ready }
+            startPrep((changedFit + pending).distinct().sorted())
+        }
     }
 
     fun startUpload() {
         if (upBusy.value) return
-        val list = upUris.value
+        val list = upItems.value
         if (list.isEmpty()) { upStatus.value = "Select a file first."; upKind.value = 2; return }
 
         // Только колёса НА СВЯЗИ. connected — это просто снимок карты клиентов:
@@ -704,13 +795,10 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             .map { it.address }
         if (targetAddrs.isEmpty()) { upStatus.value = "Not connected."; upKind.value = 2; return }
 
-        // Параметры конвертации снимаем СЕЙЧАС: их регуляторы остаются
-        // доступными, и правка fps в середине пачки иначе применилась бы к
-        // части файлов, а к части нет.
-        val jobFit = upFit.value
-        val jobFps = upFps.value
-        val jobLen = upLength.value
-        val jobMirror = upBackMirror.value
+        // Пачку снимаем целиком СЕЙЧАС. Настройки у каждого файла свои и лежат в
+        // неизменяемом UpItem, а ряд пилюль всё равно заблокирован, пока upBusy, —
+        // так что правка настроек на уже идущую заливку не влияет.
+        val jobs = list.toList()
         val jobMaxFrames = fsInfo.value.maxFrames
 
         // Сканирование и заливка делят одно радио: LOW_LATENCY-поиск поверх
@@ -723,16 +811,16 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             var ok = 0
             var fail = 0
-            for (u in list) {
-                val label = converter.displayName(u)
+            for (item in jobs) {
+                val label = item.name
                 try {
                     upStatus.value = label + " — converting…"
                     upProgress.value = -1f
                     val res = withContext(Dispatchers.Default) {
                         converter.convert(
-                            u, jobFit, jobMaxFrames,
-                            Converter.VideoOpts(jobFps, jobLen),
-                            jobMirror,
+                            item.uri, item.fit, jobMaxFrames,
+                            Converter.VideoOpts(item.fps, item.lengthSec),
+                            item.mirror,
                             object : Converter.Progress {
                                 override fun stage(text: String) { upStatus.value = label + " — " + text }
                                 override fun frames(done: Int, total: Int) {
@@ -802,8 +890,8 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             if (fail == 0) {
                 upStatus.value = if (ok == 1) "Uploaded." else ok.toString() + " files uploaded."
                 upKind.value = 1
-                upUris.value = emptyList()
-                upPoster.value = null
+                upItems.value = emptyList()
+                upSel.value = 0
             } else {
                 upStatus.value = ok.toString() + " uploaded, " + fail + " failed."
                 upKind.value = 2

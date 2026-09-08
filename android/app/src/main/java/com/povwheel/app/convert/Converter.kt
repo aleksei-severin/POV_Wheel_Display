@@ -7,6 +7,7 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.exifinterface.media.ExifInterface
+import kotlin.math.ceil
 import kotlin.math.roundToInt
 
 /**
@@ -132,13 +133,18 @@ class Converter(private val context: Context) {
         val gif = GifDecoder(raw)
         gif.parse()
         if (gif.frames.isEmpty()) throw IllegalStateException("this GIF has no frames")
-        val total = minOf(gif.frames.size, maxFrames)
+
+        // ANI6 держит одну задержку на всю анимацию. Задержки кадров GIF могут
+        // отличаться (длинная пауза, разный темп) — раскладываем их на постоянный
+        // шаг, повторяя кадры кратно их длительности (см. planAnimTiming).
+        val timing = planAnimTiming(gif.frames.map { it.delay }, maxFrames)
+        val srcUsed = timing.reps.size                    // сколько исходных кадров поместилось
+        val outFrames = timing.reps.sum()
         var warning = nr.warning
-        if (gif.frames.size > total) {
-            warning = gif.frames.size.toString() + " frames trimmed to " + total + " (device memory)"
+        if (srcUsed < gif.frames.size) {
+            warning = gif.frames.size.toString() + " frames trimmed to fit device memory"
         }
-        val delay = gif.frames[0].delay.coerceAtLeast(1)
-        val out = Ani6.allocate(total, delay, mirrorBack)
+        val out = Ani6.allocate(outFrames, timing.tick, mirrorBack)
 
         val canvasW = maxOf(gif.width, 1)
         val canvasH = maxOf(gif.height, 1)
@@ -148,7 +154,8 @@ class Converter(private val context: Context) {
         val sampler = PolarSampler()
         val quant = Quantizer()
 
-        for (i in 0 until total) {
+        var w = 0
+        for (i in 0 until srcUsed) {
             val f = gif.frames[i]
             // Метод утилизации относится к тому кадру, вместе с которым объявлен:
             // очищать нужно область ПРЕДЫДУЩЕГО кадра, если очистку просил он.
@@ -163,12 +170,70 @@ class Converter(private val context: Context) {
             Bitmaps.drawSquare(canvasBmp, work, fitMode)
             // ss = 2, как в браузере: кадров много, а 3×3 утроило бы время
             // конвертации без видимого выигрыша.
-            sampler.frameInto(work, 2, quant, out, Ani6.frameOffset(i))
-            prog.frames(i + 1, total)
+            sampler.frameInto(work, 2, quant, out, Ani6.frameOffset(w))
+            // Повторяем готовый кадр кратно его задержке — дублируем уже
+            // квантованный блок, а не пересчитываем выборку заново.
+            for (k in 1 until timing.reps[i]) {
+                System.arraycopy(out, Ani6.frameOffset(w), out, Ani6.frameOffset(w + k), Geom.FRAME_STRIDE)
+            }
+            w += timing.reps[i]
+            prog.frames(i + 1, srcUsed)
         }
         canvasBmp.recycle()
         work.recycle()
-        return Result(nr.name, out, total, warning)
+        return Result(nr.name, out, outFrames, warning)
+    }
+
+    /** Результат [planAnimTiming]: базовый шаг и число повторов на каждый кадр. */
+    private class AnimTiming(val tick: Int, val reps: IntArray)
+
+    /**
+     * Раскладка тайминга анимации на формат ANI6 (одна задержка на всю анимацию).
+     *
+     * Базовый шаг [AnimTiming.tick] — самая частая задержка среди кадров (при
+     * равенстве меньшая: безопаснее для движения). Каждый кадр повторяется
+     * `round(delay / tick)` раз, но не меньше одного: суммарное время анимации
+     * сохраняется, а поток кадров остаётся равномерным. Постоянная задержка —
+     * обычный случай — даёт по одному повтору, файл не меняется.
+     *
+     * Если повторов набирается больше [maxFrames] (потолок PSRAM), шаг грубеет, а
+     * затем список повторов жёстко обрезается по этому потолку — тогда
+     * `reps.size` меньше числа исходных кадров.
+     */
+    private fun planAnimTiming(delaysMs: List<Int>, maxFrames: Int): AnimTiming {
+        val cap = maxOf(1, maxFrames)
+        val d = IntArray(delaysMs.size) { delaysMs[it].coerceAtLeast(1) }
+        if (d.isEmpty()) return AnimTiming(100, IntArray(0))
+
+        val freq = HashMap<Int, Int>()
+        for (x in d) freq[x] = (freq[x] ?: 0) + 1
+        var tick = d[0]
+        var bestF = -1
+        for ((k, f) in freq) if (f > bestF || (f == bestF && k < tick)) { bestF = f; tick = k }
+
+        fun repsFor(t: Int) = IntArray(d.size) { (d[it].toDouble() / t).roundToInt().coerceAtLeast(1) }
+        var reps = repsFor(tick)
+        // Грубеем шаг только если это реально помогает: когда кадров и так больше
+        // потолка, увеличение шага уже ничего не даёт (минимум по одному повтору) —
+        // тогда просто берём первые N кадров с исходным шагом (прежняя обрезка).
+        if (reps.sum() > cap && d.size < cap) {
+            val totalMs = d.sumOf { it.toLong() }
+            tick = maxOf(tick, ceil(totalMs.toDouble() / cap).toInt())
+            reps = repsFor(tick)
+        }
+
+        // Жёсткий потолок: копим повторы, пока помещаются.
+        var acc = 0
+        var used = reps.size
+        for (i in reps.indices) {
+            if (acc + reps[i] > cap) {
+                reps[i] = cap - acc
+                used = if (reps[i] > 0) i + 1 else i
+                break
+            }
+            acc += reps[i]
+        }
+        return AnimTiming(tick.coerceIn(1, 65535), if (used < reps.size) reps.copyOf(used) else reps)
     }
 
     /** Наложение кадра GIF. Альфа там двоичная, так что это копирование непрозрачных точек. */
@@ -217,17 +282,20 @@ class Converter(private val context: Context) {
         nr: Ani6.NameResult, prog: Progress
     ): Result {
         val anim = WebP.parse(raw) ?: throw IllegalStateException("not an animated WebP")
-        val total = minOf(anim.frames.size, maxFrames)
+
+        // Та же раскладка тайминга, что у GIF: одна задержка на файл, кадры
+        // повторяются кратно своей длительности. Задержку ниже ~20 мс поднимаем
+        // до 100 мс — так же, как это делают плееры (иначе «как можно быстрее»
+        // уехало бы на 1 мс/кадр).
+        val perFrame = anim.frames.map { if (it.dur < 20) 100 else it.dur }
+        val timing = planAnimTiming(perFrame, maxFrames)
+        val srcUsed = timing.reps.size
+        val outFrames = timing.reps.sum()
         var warning = nr.warning
-        if (anim.frames.size > total) {
-            warning = anim.frames.size.toString() + " frames trimmed to " + total + " (device memory)"
+        if (srcUsed < anim.frames.size) {
+            warning = anim.frames.size.toString() + " frames trimmed to fit device memory"
         }
-        // ANI6 хранит одну задержку на всю анимацию — берём длительность первого
-        // кадра. Ноль означает «как можно быстрее» и в браузере подменялся на
-        // 100 мс; без этой подмены анимация уехала бы на 1 мс/кадр.
-        val d0 = anim.frames[0].dur
-        val delay = (if (d0 == 0) 100 else d0).coerceAtLeast(1)
-        val out = Ani6.allocate(total, delay, mirrorBack)
+        val out = Ani6.allocate(outFrames, timing.tick, mirrorBack)
 
         val canvas = Bitmap.createBitmap(anim.w, anim.h, Bitmap.Config.ARGB_8888)
         val cv = android.graphics.Canvas(canvas)
@@ -235,7 +303,8 @@ class Converter(private val context: Context) {
         val sampler = PolarSampler()
         val quant = Quantizer()
 
-        for (i in 0 until total) {
+        var w = 0
+        for (i in 0 until srcUsed) {
             val fr = anim.frames[i]
             val still = WebP.stillFromFrame(raw, fr)
                 ?: throw IllegalStateException("frame " + (i + 1) + " has no image data")
@@ -251,7 +320,11 @@ class Converter(private val context: Context) {
             cv.drawBitmap(bmp, fr.x.toFloat(), fr.y.toFloat(), null)
             bmp.recycle()
             Bitmaps.drawSquare(canvas, work, fitMode)
-            sampler.frameInto(work, 2, quant, out, Ani6.frameOffset(i))
+            sampler.frameInto(work, 2, quant, out, Ani6.frameOffset(w))
+            for (k in 1 until timing.reps[i]) {
+                System.arraycopy(out, Ani6.frameOffset(w), out, Ani6.frameOffset(w + k), Geom.FRAME_STRIDE)
+            }
+            w += timing.reps[i]
             // Утилизация относится к УЖЕ показанному кадру — чистим после съёмки.
             if (fr.dispose) {
                 cv.save()
@@ -259,11 +332,11 @@ class Converter(private val context: Context) {
                 cv.drawColor(0, android.graphics.PorterDuff.Mode.CLEAR)
                 cv.restore()
             }
-            prog.frames(i + 1, total)
+            prog.frames(i + 1, srcUsed)
         }
         canvas.recycle()
         work.recycle()
-        return Result(nr.name, out, total, warning)
+        return Result(nr.name, out, outFrames, warning)
     }
 
     private fun convertVideo(
