@@ -97,6 +97,22 @@ object Bitmaps {
     fun square(size: Int): Bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
 
     /**
+     * Поворот [src] на [degrees] (0/90/180/270) по часовой стрелке в готовый
+     * [dst]. Для 90/270 стороны [dst] должны быть переставлены относительно
+     * [src]. `postRotate` в Android — по часовой при положительном угле, а
+     * `MediaFormat.KEY_ROTATION` — ровно тот угол, который нужно применить для
+     * правильной ориентации, поэтому знак прямой.
+     */
+    fun rotateDegrees(src: Bitmap, dst: Bitmap, degrees: Int) {
+        val c = Canvas(dst)
+        c.drawColor(0, PorterDuff.Mode.CLEAR)
+        val m = Matrix()
+        m.postRotate(degrees.toFloat(), src.width / 2f, src.height / 2f)
+        m.postTranslate((dst.width - src.width) / 2f, (dst.height - src.height) / 2f)
+        c.drawBitmap(src, m, paint)
+    }
+
+    /**
      * Разворачивает картинку по метке EXIF. Браузер делает это сам (по
      * умолчанию image-orientation: from-image), а BitmapFactory — нет, и снимок
      * с телефона приезжал бы на колесо лежащим на боку.

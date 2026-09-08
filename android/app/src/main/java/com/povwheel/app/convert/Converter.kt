@@ -270,6 +270,47 @@ class Converter(private val context: Context) {
         uri: Uri, fitMode: Int, maxFrames: Int, vid: VideoOpts, mirrorBack: Boolean,
         nr: Ani6.NameResult, prog: Progress
     ): Result {
+        // Длительность нужна лишь чтобы не просить кадров больше, чем в ролике.
+        val durMs: Long
+        val mmr0 = MediaMetadataRetriever()
+        try {
+            mmr0.setDataSource(context, uri)
+            durMs = mmr0.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull() ?: 0L
+        } catch (e: Exception) {
+            throw IllegalStateException("this phone cannot decode this video")
+        } finally {
+            try { mmr0.release() } catch (_: Exception) {}
+        }
+
+        val dur = if (durMs > 0) durMs / 1000.0 else vid.lengthSec
+        val len = vid.lengthSec.coerceIn(0.1, maxOf(0.1, dur))
+        val n = maxOf(1, minOf((len * vid.fps).roundToInt(), maxFrames))
+        // Задержка кадра в заголовке — целые миллисекунды, uint16.
+        val delay = maxOf(1, (1000.0 / vid.fps).roundToInt())
+        val out = Ani6.allocate(n, delay, mirrorBack)
+
+        // Быстрый путь: MediaCodec гонит поток подряд, кадры уменьшает GPU,
+        // выборка+квантование идут пулом воркеров. На части телефонов кодек или
+        // GL может не подняться — тогда откат на медленный, но всеядный MMR.
+        try {
+            VideoFrames.decode(context, uri, out, fitMode, vid.fps, n) { done, total ->
+                prog.frames(done, total)
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            prog.stage("converting (compatibility mode)…")
+            convertVideoSlow(uri, out, fitMode, vid, n, prog)
+        }
+        return Result(nr.name, out, n, nr.warning)
+    }
+
+    /** Старый путь: по кадру за seek через MediaMetadataRetriever. Медленно
+     *  (~3 к/с на 1080p), зато decode делает система и работает везде. */
+    private fun convertVideoSlow(
+        uri: Uri, out: ByteArray, fitMode: Int, vid: VideoOpts, n: Int, prog: Progress
+    ) {
         val mmr = MediaMetadataRetriever()
         try {
             mmr.setDataSource(context, uri)
@@ -278,15 +319,6 @@ class Converter(private val context: Context) {
             throw IllegalStateException("this phone cannot decode this video")
         }
         try {
-            val durMs = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-                ?.toLongOrNull() ?: 0L
-            val dur = if (durMs > 0) durMs / 1000.0 else vid.lengthSec
-            val len = vid.lengthSec.coerceIn(0.1, maxOf(0.1, dur))
-            val n = maxOf(1, minOf((len * vid.fps).roundToInt(), maxFrames))
-            // Задержка кадра в заголовке — целые миллисекунды, uint16.
-            val delay = maxOf(1, (1000.0 / vid.fps).roundToInt())
-            val out = Ani6.allocate(n, delay, mirrorBack)
-
             val work = Bitmaps.square(Geom.SRC_SIZE_VID)
             val sampler = PolarSampler()
             val quant = Quantizer()
@@ -310,7 +342,6 @@ class Converter(private val context: Context) {
                 prog.frames(i + 1, n)
             }
             work.recycle()
-            return Result(nr.name, out, n, nr.warning)
         } finally {
             try { mmr.release() } catch (_: Exception) {}
         }

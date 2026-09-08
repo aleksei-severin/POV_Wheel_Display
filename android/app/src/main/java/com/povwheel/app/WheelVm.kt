@@ -607,6 +607,11 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     val upBackMirror = MutableStateFlow(false)
     val upIsVideo  = MutableStateFlow(false)
     val upSrcDur   = MutableStateFlow(0.0)   // длительность исходного ролика, с
+    // Правил ли пользователь поле Length вручную. Пока не правил — длина следует
+    // за fps: потолок задаётся числом кадров в PSRAM, поэтому при 5 к/с в память
+    // влезает втрое больше секунд, чем при 15, и поле должно это показывать —
+    // и вверх, и вниз, а не залипать на самой короткой длительности.
+    private var upLenTouched = false
 
     private val converter by lazy { Converter(ctx) }
 
@@ -615,6 +620,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         if (picked.isEmpty()) return
         upUris.value = picked
         upSrcDur.value = 0.0
+        upLenTouched = false        // новый файл — длину снова ведёт fps
         viewModelScope.launch {
             val first = picked.first()
             val kind = withContext(Dispatchers.IO) {
@@ -628,8 +634,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             if (upIsVideo.value) {
                 val dur = withContext(Dispatchers.IO) { converter.videoDurationSec(first) }
                 upSrcDur.value = dur
-                val cap = fsInfo.value.maxFrames.toDouble() / upFps.value
-                upLength.value = maxOf(0.5, minOf(if (dur > 0) dur else cap, cap))
+                upLength.value = defaultLengthSec(upFps.value)
             }
             upPoster.value = withContext(Dispatchers.Default) {
                 converter.posterOf(first, upFit.value, 216)
@@ -651,15 +656,26 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
 
     fun setBackMirror(v: Boolean) { upBackMirror.value = v }
 
+    /** Длина по умолчанию для данного fps: весь ролик, но не больше, чем влезает
+     *  в PSRAM. Потолок — по числу кадров, поэтому в секундах он зависит от fps. */
+    private fun defaultLengthSec(fps: Int): Double {
+        val cap = fsInfo.value.maxFrames.toDouble() / fps
+        val dur = upSrcDur.value
+        return maxOf(0.5, minOf(if (dur > 0) dur else cap, cap))
+    }
+
     fun setFps(n: Int) {
         upFps.value = n
-        // Смена fps только УКОРАЧИВАЕТ выбранную длину и никогда не удлиняет —
-        // правило то же, что в вебе.
         val cap = fsInfo.value.maxFrames.toDouble() / n
-        if (upLength.value > cap) upLength.value = cap
+        // Длину руками не трогали — пересчитываем под новый fps, и вверх, и вниз.
+        // Тронутую — оставляем как есть, но ужимаем до разумного максимума
+        // (весь ролик / сколько влезает), если перестала влезать. Правило то же,
+        // что в вебе.
+        if (!upLenTouched || upLength.value > cap) upLength.value = defaultLengthSec(n)
     }
 
     fun setLength(v: Double) {
+        upLenTouched = true
         // coerceIn(min, max) бросает IllegalArgumentException при min > max, а
         // потолок здесь считается из свободной памяти колеса и на забитом
         // флеше падает ниже половины секунды.
