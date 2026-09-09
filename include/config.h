@@ -333,11 +333,13 @@ extern uint32_t slideLastSwitch;                // millis() последней �
 extern std::vector<String> savedFiles;
 extern void updateFileList();
 
-// Отбор файлов для слайдшоу. Пустой список — крутить всё (прежнее поведение).
+// Отбор для слайдшоу. Список имён файлов (include/exclude) плюс битовая маска
+// эффектов, которые тоже крутятся в показе (бит N-1 = EffectId N, см. effects.h).
 // В RTC не живёт: перестраивается из NVS в setup(), как и savedFiles.
 extern std::vector<String> slideList;
 extern bool slideListInclude;   // true — slideList это то, что играем; false — то, что пропускаем
-extern void applySlideList(bool include, const std::vector<String>& names);
+extern uint8_t slideEffectMask; // биты 0..5 — эффекты 1..6 в слайдшоу; 0 — только файлы
+extern void applySlideList(bool include, const std::vector<String>& names, uint8_t effectMask);
 extern bool slideInSlideshow(const String& name);
 
 extern Preferences prefs;

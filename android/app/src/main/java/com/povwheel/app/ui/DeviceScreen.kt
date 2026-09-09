@@ -48,7 +48,7 @@ import kotlin.math.roundToInt
 // Меню Tuning больше нет: его настройки переехали в Display, под сворачиваемую
 // секцию «Colour». Четыре коротких имени умещаются в ширину экрана, поэтому
 // TabRow с равными долями вместо прокручиваемого ScrollableTabRow.
-private val TABS = listOf("Library", "Display", "Effects", "Log")
+private val TABS = listOf("Library", "Display", "Log")
 
 @Composable
 fun DeviceScreen(vm: WheelVm) {
@@ -77,7 +77,6 @@ fun DeviceScreen(vm: WheelVm) {
             when (tab) {
                 0 -> LibraryTab(vm, tele)
                 1 -> DisplayTab(vm, tele)
-                2 -> EffectsTab(vm, tele)
                 else -> LogTab(vm)
             }
         }
@@ -567,7 +566,7 @@ private fun ColourControls(vm: WheelVm) {
 
 // ------------------------------------------------------------------ Эффекты
 
-// EffectsTab и его превью живут в ui/EffectsGrid.kt.
+// Эффекты переехали в плитку Library (ui/LibraryGrid.kt); превью — ui/EffectPreviews.kt.
 
 // ---------------------------------------------------------------------- Лог
 

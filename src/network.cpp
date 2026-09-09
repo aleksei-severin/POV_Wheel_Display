@@ -1048,11 +1048,13 @@ void setupNetwork() {
                     uint32_t ms = (uint32_t)request->getParam("delay")->value().toInt();
                     if (ms >= 1000 && ms <= 300000) slideInterval = ms;
                 }
-                // Необязательный отбор файлов: ?incl=a.bin,b.bin — играть только их,
-                // ?excl=a.bin,b.bin — играть всё, кроме них. Пусто — крутить всё.
-                if (request->hasParam("incl") || request->hasParam("excl")) {
+                // Необязательный отбор: ?incl=a.bin,b.bin — играть только их,
+                // ?excl=a.bin,b.bin — всё, кроме них; ?eff=1,3,5 — какие эффекты
+                // тоже крутить (EffectId). Пусто — крутить все файлы, без эффектов.
+                if (request->hasParam("incl") || request->hasParam("excl") || request->hasParam("eff")) {
                     bool inc = request->hasParam("incl");
-                    String csv = request->getParam(inc ? "incl" : "excl")->value();
+                    String csv = request->hasParam(inc ? "incl" : "excl")
+                                 ? request->getParam(inc ? "incl" : "excl")->value() : String();
                     std::vector<String> sel;
                     int start = 0;
                     while (start < (int)csv.length()) {
@@ -1062,7 +1064,18 @@ void setupNetwork() {
                         if (nm.length()) sel.push_back(nm);
                         start = c + 1;
                     }
-                    applySlideList(inc, sel);
+                    uint8_t effMask = 0;
+                    if (request->hasParam("eff")) {
+                        String ec = request->getParam("eff")->value();
+                        int s = 0;
+                        while (s < (int)ec.length()) {
+                            int c = ec.indexOf(',', s); if (c < 0) c = ec.length();
+                            int e = ec.substring(s, c).toInt();
+                            if (e >= 1 && e <= 6) effMask |= (1 << (e - 1));
+                            s = c + 1;
+                        }
+                    }
+                    applySlideList(inc, sel, effMask);
                 }
                 if (slideshowActive) {
                     // Слайдшоу уже идёт — только обновляем интервал, не сбрасываем индекс
@@ -1072,7 +1085,7 @@ void setupNetwork() {
                     return;
                 }
                 updateFileList(); // Обновляем список файлов перед стартом
-                if (savedFiles.size() == 0) {
+                if (savedFiles.size() == 0 && slideEffectMask == 0) {
                     request->send(400, "text/plain", "No files");
                     return;
                 }

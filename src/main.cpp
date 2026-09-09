@@ -160,9 +160,10 @@ uint32_t slideLastSwitch    = 0;
 // которой остановилось, а не начать список заново.
 RTC_DATA_ATTR int slideCurrentIndex = -1;   // индекс в savedFiles (-1 = не запущен)
 
-// Отбор файлов для слайдшоу (см. applySlideList). Пустой — крутить всё.
+// Отбор для слайдшоу (см. applySlideList).
 std::vector<String> slideList;
 bool slideListInclude = false;
+uint8_t slideEffectMask = 0;                      // биты 0..5 — эффекты 1..6 в показе
 static volatile bool slide_list_dirty = false;   // нужно сбросить в NVS, когда рендер стоит
 
 RTC_DATA_ATTR volatile float global_gamma         = 2.5f;
@@ -1990,23 +1991,27 @@ static String slideListJoin() {
     return s;
 }
 
-void applySlideList(bool include, const std::vector<String>& names) {
+void applySlideList(bool include, const std::vector<String>& names, uint8_t effectMask) {
     slideList = names;
     slideListInclude = include;
+    slideEffectMask  = effectMask & 0x3F;
     slide_list_dirty = true;
     settings_dirty   = true;   // разбудить отложенный сброс в NVS в loop()
 }
 
-// Играется ли файл в текущем слайдшоу. Пустой список — да, крутим всё.
+// Играется ли файл в текущем слайдшоу.
+//   include: только имена из списка (пустой список — ни одного файла);
+//   exclude: все файлы, кроме имён из списка (пустой список — все).
 bool slideInSlideshow(const String& name) {
-    if (slideList.empty()) return true;
     bool found = std::find(slideList.begin(), slideList.end(), name) != slideList.end();
-    return slideListInclude ? found : !found;
+    if (slideListInclude) return found;
+    return slideList.empty() || !found;
 }
 
 static void loadSlideList() {
     String joined = prefs.getString("slidelist", "");
     slideListInclude = prefs.getUChar("slidelistmode", 0) != 0;
+    slideEffectMask  = prefs.getUChar("slideeffmask", 0) & 0x3F;
     slideList.clear();
     int start = 0;
     while (start < (int)joined.length()) {
@@ -2023,7 +2028,8 @@ static void flushSlideList() {
     String joined = slideListJoin();
     if (prefs.getString("slidelist", "") != joined) prefs.putString("slidelist", joined);
     uint8_t mode = slideListInclude ? 1 : 0;
-    if (prefs.getUChar("slidelistmode", 0) != mode) prefs.putUChar("slidelistmode", mode);
+    if (prefs.getUChar("slidelistmode", 0) != mode)  prefs.putUChar("slidelistmode", mode);
+    if (prefs.getUChar("slideeffmask", 0) != slideEffectMask) prefs.putUChar("slideeffmask", slideEffectMask);
     slide_list_dirty = false;
 }
 
@@ -2779,32 +2785,56 @@ void loop() {
     // время стоянки набегает вся выдержка целиком, и при первом же обороте
     // слайдшоу мгновенно перескакивает через ту картинку, на которой
     // остановились, — а продолжиться должно именно с неё.
-    if (slideshowActive && savedFiles.size() > 0) {
+    if (slideshowActive) {
+        bool due = (slideCurrentIndex < 0) || (now_ms - slideLastSwitch) >= slideInterval;
         if (!rendering_active && slideCurrentIndex >= 0) {
             slideLastSwitch = now_ms;
-        } else if (slideCurrentIndex < 0 ||
-                   (now_ms - slideLastSwitch) >= slideInterval) {
+        } else if (due) {
             slideLastSwitch = now_ms;
-            // Ищем следующий файл, входящий в отбор (applySlideList). Если ни один
-            // не подходит — оставляем текущий индекс, показ не дёргается.
-            int n = (int)savedFiles.size();
-            int cand = slideCurrentIndex;
-            for (int step = 0; step < n; step++) {
-                cand = (cand + 1 + n) % n;                 // -1 -> 0
-                if (slideInSlideshow(savedFiles[cand])) { slideCurrentIndex = cand; break; }
+            // Виртуальная последовательность показа: сперва подходящие файлы (в
+            // порядке savedFiles), затем отмеченные эффекты 1..6. Считаем её только
+            // в момент смены, а не каждый проход loop().
+            int fileCount = 0;
+            for (const String& f : savedFiles) if (slideInSlideshow(f)) fileCount++;
+            int total = fileCount + __builtin_popcount(slideEffectMask);
+            if (total > 0) {
+                int pos = ((slideCurrentIndex < 0 ? -1 : slideCurrentIndex) + 1) % total;
+                slideCurrentIndex = pos;
+
+                if (pos < fileCount) {
+                    int seen = 0, fi = 0;
+                    for (int i = 0; i < (int)savedFiles.size(); i++) {
+                        if (!slideInSlideshow(savedFiles[i])) continue;
+                        if (seen == pos) { fi = i; break; }
+                        seen++;
+                    }
+                    String nextFile = savedFiles[fi];
+                    pending_effect     = -1;
+                    pendingFilePath    = "/" + nextFile;
+                    // Не пишем в NVS прямо здесь: запись во флеш заморозила бы рендер.
+                    pending_last_file  = nextFile;
+                    force_stop_display = false;
+                    request_play_flag  = true;
+                    xSemaphoreGive(fileLoaderSemaphore);
+                    webLogf("[DISP] Slideshow: %s (%d/%d)", nextFile.c_str(), pos + 1, total);
+                } else {
+                    int ord = pos - fileCount, eid = 0, c = 0;
+                    for (int e = 1; e <= 6; e++) {
+                        if (!(slideEffectMask & (1 << (e - 1)))) continue;
+                        if (c == ord) { eid = e; break; }
+                        c++;
+                    }
+                    if (eid > 0) {
+                        pendingFilePath    = "";
+                        pending_effect     = (int8_t)eid;
+                        force_stop_display = false;
+                        request_play_flag  = true;
+                        xSemaphoreGive(fileLoaderSemaphore);
+                        webLogf("[DISP] Slideshow: effect %s (%d/%d)", effectName(eid), pos + 1, total);
+                    }
+                }
+                last_web_activity_time = now_ms;  // не засыпаем во время активного слайдшоу
             }
-            if (slideCurrentIndex < 0) slideCurrentIndex = 0;   // всё исключено — покажем первый
-            String nextFile = savedFiles[slideCurrentIndex];
-            pendingFilePath = "/" + nextFile;
-            // Не пишем в NVS прямо здесь: запись во флеш заморозила бы рендер.
-            // Уйдёт на диск при остановке колеса или перед deep sleep.
-            pending_last_file = nextFile;
-            force_stop_display = false;
-            request_play_flag = true;
-            xSemaphoreGive(fileLoaderSemaphore);
-            last_web_activity_time = now_ms; // не засыпаем во время активного слайдшоу
-            webLogf("[DISP] Slideshow: %s (%d/%d)", nextFile.c_str(),
-                    slideCurrentIndex + 1, (int)savedFiles.size());
         }
     }
 

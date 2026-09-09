@@ -1109,33 +1109,39 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
 
     private fun slideSelKey(addr: String) = "slidesel_" + addr
 
-    /** Отмеченные для слайдшоу файлы из прошлого раза (пересечённые с реально
-     *  лежащими на колесе). Ничего не сохранено или пусто — считаем, что все. */
-    fun savedSlideSelection(allNames: List<String>): Set<String> {
-        val addr = current.value ?: return allNames.toSet()
-        val raw = prefs.getString(slideSelKey(addr), null) ?: return allNames.toSet()
+    /** Токены эффектов в наборе выбранного для слайдшоу: `@e1`..`@e6`. */
+    val slideEffectTokens: List<String> = (1..6).map { "@e" + it }
+    fun isSlideEffect(token: String) = token in slideEffectTokens
+
+    /** Отмеченное для слайдшоу из прошлого раза: имена файлов (пересечённые с
+     *  реально лежащими на колесе) плюс токены эффектов. Ничего не сохранено —
+     *  все файлы, без эффектов (эффекты добавляются вручную). */
+    fun savedSlideSelection(fileNames: List<String>): Set<String> {
+        val addr = current.value ?: return fileNames.toSet()
+        val raw = prefs.getString(slideSelKey(addr), null) ?: return fileNames.toSet()
         val saved = raw.split(",").filter { it.isNotEmpty() }.toSet()
-        val keep = allNames.filter { it in saved }
-        return if (keep.isEmpty()) allNames.toSet() else keep.toSet()
+        val kept = fileNames.filter { it in saved } + slideEffectTokens.filter { it in saved }
+        return if (kept.isEmpty()) fileNames.toSet() else kept.toSet()
     }
 
-    /** Запустить слайдшоу с отмеченными [checked] из [allNames]. */
-    fun startSlideshow(delaySecs: Int, checked: Set<String>, allNames: List<String>) {
-        if (checked.isEmpty()) { say("Tick at least one animation"); return }
+    /** Запустить слайдшоу с отмеченным [checked] (имена файлов + токены эффектов). */
+    fun startSlideshow(delaySecs: Int, checked: Set<String>, fileNames: List<String>) {
+        if (checked.isEmpty()) { say("Tick at least one item"); return }
         current.value?.let {
             prefs.edit().putString(slideSelKey(it), checked.joinToString(",")).apply()
         }
-        val incl = allNames.filter { it in checked }
-        val excl = allNames.filter { it !in checked }
-        // Одна ATT-посылка — до ~20 имён; шлём тот список, что короче.
+        val effMask = slideEffectTokens.foldIndexed(0) { i, m, t -> if (t in checked) m or (1 shl i) else m }
+        val incl = fileNames.filter { it in checked }
+        val excl = fileNames.filter { it !in checked }
+        // Одна ATT-посылка — до ~20 имён файлов; шлём тот список, что короче.
         val (mode, names) = when {
-            excl.isEmpty() -> 0 to emptyList()
+            excl.isEmpty() -> 0 to emptyList()              // exclude нечего = все файлы
             incl.size <= excl.size && incl.size <= 20 -> 1 to incl
             excl.size <= 20 -> 0 to excl
-            else -> { say("Too many to select individually — showing all"); 0 to emptyList<String>() }
+            else -> { say("Too many files to pick one by one — all files shown"); 0 to emptyList<String>() }
         }
         val ms = (delaySecs * 1000).coerceIn(1000, 300000)
-        onTargets { it.album(true, ms, mode, names) }
+        onTargets { it.album(true, ms, mode, names, effMask) }
         say("Slideshow started")
     }
 

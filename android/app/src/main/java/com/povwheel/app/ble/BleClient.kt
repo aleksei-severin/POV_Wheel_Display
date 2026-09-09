@@ -461,10 +461,13 @@ class BleClient(
     /**
      * Слайдшоу. При старте [names] задаёт отбор файлов (нужен [Hello.hasAlbumSel]):
      * `null` — отбор не трогать (стоп, либо смена только интервала); пустой список —
-     * сбросить отбор, крутить всё; иначе [listMode] 0 — пропускать эти, 1 — играть
-     * только эти.
+     * сбросить отбор; иначе [listMode] 0 — пропускать эти, 1 — играть только эти.
+     * [effectMask] — биты 0..5 = эффекты 1..6 тоже в показе.
      */
-    suspend fun album(start: Boolean, delayMs: Int, listMode: Int = 0, names: List<String>? = null) {
+    suspend fun album(
+        start: Boolean, delayMs: Int,
+        listMode: Int = 0, names: List<String>? = null, effectMask: Int = 0
+    ) {
         if (!start || names == null) {
             val b = Proto.buf(5)
             b.put(if (start) 1 else 0)
@@ -473,7 +476,7 @@ class BleClient(
             return
         }
         val enc = names.map { it.toByteArray(Charsets.US_ASCII) }.filter { it.size in 1..255 }
-        var size = 8
+        var size = 9
         for (e in enc) size += 1 + e.size
         val b = Proto.buf(size)
         b.put(1)
@@ -481,6 +484,7 @@ class BleClient(
         b.put(if (listMode != 0) 1 else 0)
         b.putShort(enc.size.toShort())
         for (e in enc) { b.put(e.size.toByte()); b.put(e) }
+        b.put((effectMask and 0x3F).toByte())
         request(Proto.OP_ALBUM, b.array())
     }
 

@@ -51,32 +51,37 @@ private const val MAX_PICK = 30
 
 private enum class LibMode { NORMAL, DELETE, SLIDESHOW }
 
-// Ячейка сетки: кнопка «+», ждущий заливки файл или уже лежащий на колесе.
+// Ячейка сетки: «+», ждущий заливки файл, файл с колеса или процедурный эффект.
 private sealed interface Cell {
     object Add : Cell
     data class Pending(val item: WheelVm.UpItem, val index: Int) : Cell
     data class Stored(val file: DevFile) : Cell
+    data class Effect(val id: Int) : Cell
 }
 
 private fun cellKey(c: Cell): Any = when (c) {
     Cell.Add -> "add"
     is Cell.Pending -> "p:" + c.index          // индекс уникален даже при дублях Uri
     is Cell.Stored -> "s:" + c.file.name
+    is Cell.Effect -> "e:" + c.id
 }
 
 /**
- * Библиотека одной плиткой круглых анимированных превью, 5 в ряд.
+ * Библиотека одной плиткой круглых анимированных превью, 5 в ряд:
+ * **+**, ждущие заливки файлы, файлы с колеса, в хвосте — процедурные эффекты.
  *
- * - тап по превью — играть на колесе (зелёный ободок), длинный тап — режим
- *   удаления (чекбоксы + красная Delete внизу);
- * - кнопка **Slideshow** справа: тап — режим выбора файлов для показа (все
- *   отмечены), внизу зелёная **Start**; длинный тап — интервал; когда показ идёт,
- *   кнопка становится **Stop slideshow**;
- * - первый кружок — **+**: добавить файлы. Ждущие заливки — жёлтый ободок,
- *   у льющегося сейчас ободок сматывается по прогрессу.
+ * - тап по файлу/эффекту — играть на колесе (зелёный ободок); тап по идущему
+ *   эффекту гасит показ;
+ * - длинный тап по файлу — режим удаления (чекбоксы + красная Delete);
+ *   эффекты удалить нельзя;
+ * - кнопка **Slideshow**: тап — режим выбора (файлы отмечены, эффекты нет — их
+ *   добавляют вручную), внизу зелёная **Start**; длинный тап — интервал; идёт
+ *   показ — кнопка **Stop slideshow**;
+ * - **+**: добавить файлы. Ждущие заливки — жёлтый ободок, у льющегося сейчас
+ *   ободок сматывается по прогрессу.
  *
- * Отбор файлов для слайдшоу — фича прошивки (`Hello.hasAlbumSel`). На старом
- * колесе кнопка Slideshow просто включает/выключает показ всех файлов.
+ * Отбор для слайдшоу (файлы + маска эффектов) — фича прошивки (`Hello.hasAlbumSel`).
+ * На старом колесе кнопка Slideshow просто включает/выключает показ всех файлов.
  */
 @Composable
 internal fun LibraryTab(vm: WheelVm, tele: Tele) {
@@ -106,7 +111,9 @@ internal fun LibraryTab(vm: WheelVm, tele: Tele) {
     // Сменили колесо или библиотека уехала из-под режима — выходим из него.
     LaunchedEffect(curWheel) { mode = LibMode.NORMAL; checks = emptySet(); secsLocal = -1 }
     LaunchedEffect(mode, files) {
-        if (mode != LibMode.NORMAL) checks = checks.filterTo(HashSet()) { it in allNames }
+        // Держим только реально существующие файлы + токены эффектов (@eN).
+        if (mode != LibMode.NORMAL)
+            checks = checks.filterTo(HashSet()) { it in allNames || vm.isSlideEffect(it) }
     }
 
     val gallery = rememberLauncherForActivityResult(
@@ -125,6 +132,7 @@ internal fun LibraryTab(vm: WheelVm, tele: Tele) {
             add(Cell.Add)
             items.forEachIndexed { i, it -> add(Cell.Pending(it, i)) }
             files.forEach { add(Cell.Stored(it)) }
+            EFFECT_IDS.forEach { add(Cell.Effect(it)) }   // эффекты в хвосте плитки
         }
     }
 
@@ -149,7 +157,8 @@ internal fun LibraryTab(vm: WheelVm, tele: Tele) {
                 LibraryHeader(
                     slideshowOn = tele.slideshow,
                     selecting = mode == LibMode.SLIDESHOW,
-                    enabled = tele.slideshow || files.isNotEmpty(),
+                    // hasSel → можно сделать слайдшоу из одних эффектов, файлы не нужны.
+                    enabled = tele.slideshow || files.isNotEmpty() || hasSel,
                     onTap = {
                         when {
                             tele.slideshow -> vm.stopSlideshow()
@@ -167,16 +176,25 @@ internal fun LibraryTab(vm: WheelVm, tele: Tele) {
 
             items(cells.size, key = { cellKey(cells[it]) }) { i ->
                 val cell = cells[i]
-                val name = (cell as? Cell.Stored)?.file?.name
                 val isSelPending = (cell as? Cell.Pending)?.index == upSel
+                val playing = when (cell) {
+                    is Cell.Stored -> tele.file == cell.file.name && (tele.play || tele.slideshow)
+                    is Cell.Effect -> tele.effect == cell.id
+                    else -> false
+                }
+                val checked = when (cell) {
+                    is Cell.Stored -> cell.file.name in checks
+                    is Cell.Effect -> ("@e" + cell.id) in checks
+                    else -> false
+                }
                 LibraryCell(
                     vm = vm, cell = cell, mode = mode, upBusy = upBusy,
-                    checked = name != null && name in checks,
+                    checked = checked,
                     selectedPending = isSelPending,
                     pendingClip = if (isSelPending) upSelClip else null,
                     uploading = upCurUri != null && (cell as? Cell.Pending)?.item?.uri == upCurUri,
                     progress = upProgress,
-                    playing = name != null && tele.file == name && (tele.play || tele.slideshow),
+                    playing = playing,
                     onPickGallery = pickGallery, onPickBrowser = pickBrowser,
                     onToggleCheck = { n -> checks = if (n in checks) checks - n else checks + n },
                     onEnterDelete = { n -> mode = LibMode.DELETE; checks = setOf(n) }
@@ -210,7 +228,7 @@ internal fun LibraryTab(vm: WheelVm, tele: Tele) {
         title = { Text("Delete " + checks.size + (if (checks.size == 1) " animation?" else " animations?")) },
         confirmButton = {
             TextButton(onClick = {
-                vm.deleteMany(checks.toList())
+                vm.deleteMany(checks.filterNot { vm.isSlideEffect(it) })   // эффекты не удаляются
                 confirmDelete = false; mode = LibMode.NORMAL; checks = emptySet()
             }) { Text("Delete", color = Danger) }
         },
@@ -334,7 +352,7 @@ private fun LibraryCell(
             Modifier
                 .fillMaxSize()
                 .clip(CircleShape)
-                .background(cs.surfaceVariant)
+                .background(if (cell is Cell.Effect) Color.Black else cs.surfaceVariant)
                 .then(
                     // Пока ободок сматывается прогрессом — статичное кольцо не рисуем.
                     if (ring != null && !uploading) Modifier.border(ringW, ring, CircleShape)
@@ -348,13 +366,21 @@ private fun LibraryCell(
                             is Cell.Stored ->
                                 if (mode == LibMode.NORMAL) vm.play(cell.file.name)
                                 else onToggleCheck(cell.file.name)
+                            is Cell.Effect -> when (mode) {
+                                // тап по идущему эффекту гасит показ, по другому — запускает
+                                LibMode.NORMAL ->
+                                    if (playing) { vm.effect(0); vm.say("Display stopped") }
+                                    else { vm.effect(cell.id); vm.say(effectName(cell.id)) }
+                                LibMode.SLIDESHOW -> onToggleCheck("@e" + cell.id)
+                                LibMode.DELETE -> {}   // эффект удалить нельзя
+                            }
                         }
                     },
                     onLongClick = {
                         when (cell) {
                             is Cell.Stored -> if (mode == LibMode.NORMAL) onEnterDelete(cell.file.name)
                             is Cell.Pending -> if (mode == LibMode.NORMAL && !uploading) confirmRemove = true
-                            Cell.Add -> {}
+                            else -> {}
                         }
                     }
                 ),
@@ -382,6 +408,7 @@ private fun LibraryCell(
                         CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp,
                             color = cs.onSurfaceVariant)
                 is Cell.Stored -> StoredDisc(vm, cell.file)
+                is Cell.Effect -> EffectPreview(cell.id, Modifier.fillMaxSize())
             }
 
             if (uploading) {
@@ -400,9 +427,14 @@ private fun LibraryCell(
             }
         }
 
-        if (mode != LibMode.NORMAL && cell is Cell.Stored) {
-            CheckDot(checked, Modifier.align(Alignment.BottomEnd))
+        // Чекбоксы: файлы — в удалении и в слайдшоу; эффекты — только в слайдшоу
+        // (удалить эффект нельзя).
+        val showCheck = when (cell) {
+            is Cell.Stored -> mode != LibMode.NORMAL
+            is Cell.Effect -> mode == LibMode.SLIDESHOW
+            else -> false
         }
+        if (showCheck) CheckDot(checked, Modifier.align(Alignment.BottomEnd))
     }
 
     if (cell is Cell.Add) DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {

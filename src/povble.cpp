@@ -895,9 +895,9 @@ static void handleCmd(const uint8_t* d, size_t n) {
                 uint32_t ms; memcpy(&ms, pl + 1, 4);
                 if (ms >= 1000 && ms <= 300000) slideInterval = ms;
             }
-            // Необязательный отбор файлов (FEAT_ALBUM_SEL):
-            // [u8 mode 0=пропускать 1=играть-только][u16 count]{[u8 len][имя]}.
-            // count 0 или короткий пакет — крутить всё (прежнее поведение).
+            // Необязательный отбор (FEAT_ALBUM_SEL):
+            // [u8 mode 0=пропускать 1=играть-только][u16 count]{[u8 len][имя]}[u8 effMask].
+            // Короткий пакет — отбор не трогаем (стоп / смена только интервала).
             if (pn >= 8) {
                 bool inc = pl[5] != 0;
                 uint16_t cnt; memcpy(&cnt, pl + 6, 2);
@@ -909,7 +909,8 @@ static void handleCmd(const uint8_t* d, size_t n) {
                     sel.push_back(String((const char*)(pl + o), (unsigned int)l));
                     o += l;
                 }
-                applySlideList(inc, sel);
+                uint8_t effMask = (o < pn) ? pl[o] : 0;   // хвостовой байт маски эффектов
+                applySlideList(inc, sel, effMask);
             }
             if (slideshowActive) {         // уже идёт — интервал и отбор обновили, индекс не трогаем
                 settings_dirty = true;
@@ -917,7 +918,7 @@ static void handleCmd(const uint8_t* d, size_t n) {
                 break;
             }
             updateFileList();
-            if (savedFiles.size() == 0) { sendRsp(op, seq, ST_NOT_FOUND); break; }
+            if (savedFiles.size() == 0 && slideEffectMask == 0) { sendRsp(op, seq, ST_NOT_FOUND); break; }
             force_stop_display = false;
             slideshowActive    = true;
             slideCurrentIndex  = -1;

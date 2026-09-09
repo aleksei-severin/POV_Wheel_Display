@@ -46,9 +46,10 @@ enum PovOp : uint8_t {
     OP_DELETE      = 0x08,  // →  имя файла
     OP_EFFECT      = 0x09,  // →  [u8 id][u16 speed_red]
     OP_ALBUM       = 0x0A,  // →  [u8 action 0=stop 1=start][u32 delay_ms]
-                           //    старт может нести отбор файлов (FEAT_ALBUM_SEL):
-                           //    …[u8 mode 0=пропускать 1=играть-только][u16 n]{[u8 len][имя]}
-                           //    n=0 или короткий пакет — крутить всё (прежнее поведение)
+                           //    старт может нести отбор (FEAT_ALBUM_SEL):
+                           //    …[u8 mode 0=пропускать 1=играть-только][u16 n]{[u8 len][имя]}[u8 effMask]
+                           //    effMask: биты 0..5 — эффекты 1..6 тоже в показе
+                           //    короткий пакет — отбор не трогать (стоп / смена интервала)
     OP_TELE        = 0x0B,  // →  ничего            ←  PovTele
     OP_PREVIEW     = 0x0C,  // →  имя файла         ←  [u8 sec][u8 rad][RGB565 sec*rad]
     OP_SETTIME     = 0x0D,  // →  [u32 epoch][i32 tz_sec]
