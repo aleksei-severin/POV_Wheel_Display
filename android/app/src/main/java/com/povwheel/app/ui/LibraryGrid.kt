@@ -174,7 +174,10 @@ internal fun LibraryTab(vm: WheelVm, tele: Tele) {
                 val cell = cells[i]
                 val isSelPending = (cell as? Cell.Pending)?.index == upSel
                 val playing = when (cell) {
-                    is Cell.Stored -> tele.file == cell.file.name && (tele.play || tele.slideshow)
+                    // Идёт эффект — на ободе не файл, даже если tele.file ещё
+                    // держит имя последнего (в слайдшоу оно не сбрасывается).
+                    is Cell.Stored ->
+                        tele.effect == 0 && tele.file == cell.file.name && (tele.play || tele.slideshow)
                     is Cell.Effect -> tele.effect == cell.id
                     else -> false
                 }

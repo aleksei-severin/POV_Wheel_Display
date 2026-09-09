@@ -920,19 +920,26 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                         // уже другим объектом.
                         val c = client(addr)
                         if (c == null || c.link.value != Link.Ready) continue
+                        // Все прочие подключённые колёса — на «мягкий» линк: два
+                        // активных BLE-соединения делят радио телефона, и без
+                        // этого заливка на активное колесо шла ~20 вместо ~110 кБ/с.
+                        focusUploadLink(addr)
                         try {
                             val wire = withContext(Dispatchers.Default) {
                                 Ani6.encodeForWire(res.data, c.hello?.hasDeflate ?: false)
                             }
                             val ratio = res.data.size.toDouble() / maxOf(wire.bytes.size, 1)
                             val started = System.currentTimeMillis()
+                            // При зеркале — на какое колесо льём прямо сейчас.
+                            val toWheel = if (targetAddrs.size > 1)
+                                " → " + (c.hello?.name ?: addr) else ""
                             c.upload(res.fileName, wire.bytes, res.data.size, crc, wire.compressed) { p ->
                                 upProgress.value = p.sent.toFloat() / maxOf(p.totalWire, 1L)
                                 val kb = p.sent / 1024
                                 val tot = p.totalWire / 1024
                                 val secs = (System.currentTimeMillis() - started) / 1000.0
                                 val rate = if (secs > 0.4) (p.sent / 1024.0 / secs) else 0.0
-                                upStatus.value = label + " — " +
+                                upStatus.value = label + toWheel + " — " +
                                     (p.sent * 100 / maxOf(p.totalWire, 1L)) + "%  ·  " +
                                     kb + " / " + tot + " kB" +
                                     (if (wire.compressed) String.format("  ·  x%.1f smaller", ratio) else "") +
@@ -979,6 +986,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             upProgress.value = -1f
             upCurrentUri.value = null
             upBusy.value = false
+            restoreUploadLinks()   // все колёса обратно на быстрый линк
             if (fail == 0) {
                 val msg = if (ok == 1) "Uploaded." else ok.toString() + " files uploaded."
                 upStatus.value = msg
@@ -997,6 +1005,19 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             refreshSelClip()
             refreshFiles()
         }
+    }
+
+    /** Перед заливкой на [addr]: его линк — быстрый, все прочие подключённые —
+     *  «мягкие». Два активных BLE-соединения на один радиомодуль телефона делят
+     *  эфир, из-за чего скорость на активное колесо падала впятеро. */
+    private suspend fun focusUploadLink(addr: String?) {
+        val cs = clients.values.toList()
+        if (cs.size < 2) return
+        for (c in cs) if (c.link.value == Link.Ready) c.setLowPower(c.address != addr)
+    }
+
+    private suspend fun restoreUploadLinks() {
+        for (c in clients.values.toList()) if (c.link.value == Link.Ready) c.setLowPower(false)
     }
 
     fun refreshFiles() {

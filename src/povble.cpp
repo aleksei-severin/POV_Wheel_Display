@@ -650,7 +650,9 @@ static void fillTele(PovTele* t) {
     t->file_ver   = pov_file_version;
     time_t nowt = time(nullptr);
     t->epoch      = (nowt > 1672531200) ? (uint32_t)nowt : 0;   // до 2023 — «не задано»
-    const char* cf = currentDisplayFile.c_str();
+    // Идёт эффект — на ободе не файл. В слайдшоу currentDisplayFile держит имя
+    // последнего файла и не сбрасывается сам, поэтому гасим его здесь по effect_id.
+    const char* cf = (effect_id != EFF_NONE) ? "" : currentDisplayFile.c_str();
     if (*cf == '/') cf++;
     strncpy(t->file, cf, sizeof(t->file) - 1);
     t->slide_secs = (uint16_t)(slideInterval / 1000);

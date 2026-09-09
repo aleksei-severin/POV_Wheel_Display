@@ -58,6 +58,9 @@ class BleClient(
     val address: String get() = device.address
 
     @Volatile private var gatt: BluetoothGatt? = null
+    // Соединение сейчас в «мягком» режиме (LOW_POWER, интервал ~0.5 с). При
+    // подключении и после заливки — HIGH.
+    @Volatile private var connLowPower = false
     @Volatile private var chCmd: BluetoothGattCharacteristic? = null
     @Volatile private var chRsp: BluetoothGattCharacteristic? = null
     @Volatile private var chData: BluetoothGattCharacteristic? = null
@@ -245,6 +248,7 @@ class BleClient(
                 } catch (_: Exception) {}
             }
             g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+            connLowPower = false
             // Подписка — сама по себе запись GATT, её тоже надо выстроить в очередь.
             Thread {
                 val ok = subscribeBlocking(chRsp) &&
@@ -572,6 +576,25 @@ class BleClient(
         hdr.put(nameBytes)
         streamBody(Proto.OP_UP_BEGIN, hdr.array(), Proto.OP_UP_END,
             wire, rawSize.toLong(), onProgress)
+    }
+
+    /**
+     * Приоритет соединения. Два активных BLE-линка делят один радиомодуль
+     * телефона, и «мягкий» (LOW_POWER, интервал ~0.5 с) почти не отбирает эфир у
+     * заливки на соседнее колесо: без этого скорость на активное колесо падала
+     * с ~110 до ~20 кБ/с. [low] false — вернуть HIGH.
+     */
+    suspend fun setLowPower(low: Boolean) {
+        if (connLowPower == low) return
+        val g = gatt ?: return
+        try {
+            g.requestConnectionPriority(
+                if (low) BluetoothGatt.CONNECTION_PRIORITY_LOW_POWER
+                else BluetoothGatt.CONNECTION_PRIORITY_HIGH
+            )
+        } catch (_: Exception) { return }
+        connLowPower = low
+        kotlinx.coroutines.delay(150)   // дать параметрам соединения обновиться
     }
 
     /** Обновление прошивки. Тот же транспорт, другой приёмник на устройстве. */
