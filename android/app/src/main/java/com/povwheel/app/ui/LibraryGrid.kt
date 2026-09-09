@@ -37,6 +37,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -91,7 +92,12 @@ private fun cellKey(c: Cell): Any = when (c) {
  * чтобы всё скроллилось вместе и в одном стиле).
  */
 @Composable
-internal fun LibraryTab(vm: WheelVm, tele: Tele, extraItems: (LazyGridScope.() -> Unit)? = null) {
+internal fun LibraryTab(
+    vm: WheelVm,
+    tele: Tele,
+    leadingItems: (LazyGridScope.() -> Unit)? = null,
+    extraItems: (LazyGridScope.() -> Unit)? = null
+) {
     val files by vm.files.collectAsState()
     val fs by vm.fsInfo.collectAsState()
     val connected by vm.connected.collectAsState()
@@ -147,6 +153,8 @@ internal fun LibraryTab(vm: WheelVm, tele: Tele, extraItems: (LazyGridScope.() -
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
+            leadingItems?.invoke(this)   // окошки DISPLAY/BATTERY — скроллятся вместе с лентой
+
             if (connected.size > 1) item(key = "mirror", span = { GridItemSpan(maxLineSpan) }) {
                 Card(Modifier.fillMaxWidth()) {
                     Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -158,6 +166,8 @@ internal fun LibraryTab(vm: WheelVm, tele: Tele, extraItems: (LazyGridScope.() -
 
             item(key = "header", span = { GridItemSpan(maxLineSpan) }) {
                 LibraryHeader(
+                    freeText = if (fs.total > 0)
+                        String.format("%.1f MB free", fs.free / 1048576.0) else "",
                     slideshowOn = tele.slideshow,
                     selecting = mode == LibMode.SLIDESHOW,
                     // hasSel → можно сделать слайдшоу из одних эффектов, файлы не нужны.
@@ -209,7 +219,6 @@ internal fun LibraryTab(vm: WheelVm, tele: Tele, extraItems: (LazyGridScope.() -
                 )
             }
 
-            item(key = "storage", span = { GridItemSpan(maxLineSpan) }) { StorageCard(fs) }
             extraItems?.invoke(this)
             item(key = "tail", span = { GridItemSpan(maxLineSpan) }) { Spacer(Modifier.height(8.dp)) }
         }
@@ -255,6 +264,7 @@ internal fun LibraryTab(vm: WheelVm, tele: Tele, extraItems: (LazyGridScope.() -
 
 @Composable
 private fun LibraryHeader(
+    freeText: String,          // свободное место на флеше — справа от «Library»
     slideshowOn: Boolean,
     selecting: Boolean,
     enabled: Boolean,
@@ -273,7 +283,17 @@ private fun LibraryHeader(
             "Library",
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.SemiBold,
-            modifier = Modifier.weight(1f)
+            modifier = Modifier.alignByBaseline()
+        )
+        // Занимает весь свободный зазор и первым ужимается (…), чтобы кнопки
+        // Stop + Slideshow всегда влезли в одну строку.
+        Text(
+            freeText,
+            style = MaterialTheme.typography.bodySmall,
+            color = cs.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f).alignByBaseline()
         )
 
         // Слева от Slideshow: Stop для текущей анимации (бывшая кнопка окна DISPLAY).
@@ -284,7 +304,7 @@ private fun LibraryHeader(
                     .background(Danger.copy(alpha = 0.14f))
                     .border(1.dp, Danger, RoundedCornerShape(50))
                     .clickable(onClick = onStop)
-                    .padding(horizontal = 14.dp, vertical = 7.dp)
+                    .padding(horizontal = 12.dp, vertical = 7.dp)
             ) {
                 Text("■ Stop", style = MaterialTheme.typography.labelLarge, color = Danger)
             }
@@ -307,7 +327,7 @@ private fun LibraryHeader(
                 .background(if (slideshowOn && enabled) Danger.copy(alpha = 0.14f) else Color.Transparent)
                 .border(1.dp, border, RoundedCornerShape(50))
                 .combinedClickable(enabled = enabled, onClick = onTap, onLongClick = onLongPress)
-                .padding(horizontal = 14.dp, vertical = 7.dp)
+                .padding(horizontal = 12.dp, vertical = 7.dp)
         ) {
             Text(
                 if (slideshowOn) "■ Stop slideshow" else "Slideshow",
@@ -620,25 +640,6 @@ private fun UploadStrip(vm: WheelVm) {
                 style = MaterialTheme.typography.bodySmall,
                 fontFamily = FontFamily.Monospace, fontSize = 11.sp,
                 color = if (trimmed) Warn else MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
-    }
-}
-
-/** Индикатор хранилища — сколько места на флеше под файлы. */
-@Composable
-private fun StorageCard(fs: com.povwheel.app.ble.FsInfo) {
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(12.dp)) {
-            Text("Storage", fontWeight = FontWeight.SemiBold)
-            val totalMb = fs.total / 1048576.0
-            val freeMb = fs.free / 1048576.0
-            Text(String.format("%.1f MB free of %.1f MB", freeMb, totalMb),
-                style = MaterialTheme.typography.bodySmall)
-            Spacer(Modifier.height(6.dp))
-            LinearProgressIndicator(
-                progress = { if (fs.total > 0) (fs.used.toFloat() / fs.total) else 0f },
-                modifier = Modifier.fillMaxWidth()
             )
         }
     }

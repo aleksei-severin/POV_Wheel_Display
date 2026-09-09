@@ -1,9 +1,13 @@
 package com.povwheel.app.ui
 
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.horizontalDrag
 import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -22,7 +26,10 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
@@ -44,6 +51,7 @@ import com.povwheel.app.ble.Proto
 import com.povwheel.app.ble.Settings
 import com.povwheel.app.ble.Tele
 import kotlinx.coroutines.delay
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 // Вкладок больше нет — один экран: сверху библиотека, за ней настройки дисплея
@@ -62,10 +70,12 @@ fun DeviceScreen(vm: WheelVm) {
     val link by client.link.collectAsState()
     val tele by client.tele.collectAsState()
 
+    // Окошки DISPLAY/BATTERY уехали внутрь ленты (первым элементом сетки) —
+    // при скролле они прокручиваются вместе с содержимым, а не висят сверху.
+    // Пришпилен только Header.
     Column(Modifier.fillMaxSize()) {
         Header(vm, link)
-        Hero(vm, tele, link == Link.Ready)
-        Box(Modifier.weight(1f)) { MainContent(vm, tele) }
+        Box(Modifier.weight(1f)) { MainContent(vm, tele, link == Link.Ready) }
     }
 }
 
@@ -74,7 +84,7 @@ fun DeviceScreen(vm: WheelVm) {
  * добавленные в ту же сетку full-span элементами — всё скроллится вместе.
  */
 @Composable
-private fun MainContent(vm: WheelVm, tele: Tele) {
+private fun MainContent(vm: WheelVm, tele: Tele, online: Boolean) {
     val s by vm.settings.collectAsState()
     var colourOpen by rememberSaveable { mutableStateOf(false) }
     var confirmOff by remember { mutableStateOf(false) }
@@ -84,7 +94,12 @@ private fun MainContent(vm: WheelVm, tele: Tele) {
         androidx.activity.result.contract.ActivityResultContracts.OpenDocument()
     ) { uri -> if (uri != null) vm.updateFirmware(uri) { vm.say(it) } }
 
-    LibraryTab(vm, tele) {
+    LibraryTab(
+        vm, tele,
+        leadingItems = {
+            item(key = "hero", span = { GridItemSpan(maxLineSpan) }) { Hero(vm, tele, online) }
+        }
+    ) {
         item(key = "brightness", span = { GridItemSpan(maxLineSpan) }) {
             SettingCard { AutoBrightnessRange(vm, s, tele) }
         }
@@ -309,9 +324,10 @@ private fun Hero(vm: WheelVm, tele: Tele, online: Boolean) {
     }
 
     // Обе карточки — две строки (метка + число), вдвое ниже прежнего: кнопку
-    // Start/Stop и напряжение USB убрали.
+    // Start/Stop и напряжение USB убрали. Горизонтальные поля даёт сетка
+    // (contentPadding), своего padding у ряда нет.
     Row(
-        Modifier.fillMaxWidth().height(IntrinsicSize.Min).padding(horizontal = 12.dp),
+        Modifier.fillMaxWidth().height(IntrinsicSize.Min),
         horizontalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         Card(Modifier.weight(1f).fillMaxHeight()) {
@@ -432,20 +448,16 @@ private fun AutoBrightnessRange(vm: WheelVm, s: Settings, tele: Tele) {
         val inset = 10.dp
         val lo = s.bmin.coerceAtMost(s.bmax)
         val hi = s.bmax.coerceAtLeast(s.bmin)
-        RangeSlider(
-            modifier = Modifier.fillMaxWidth(),
-            value = lo.toFloat()..hi.toFloat(),
-            onValueChange = { r ->
-                val a = r.start.roundToInt().coerceIn(1, 31)
-                val b = r.endInclusive.roundToInt().coerceIn(1, 31)
+        StepRangeSlider(
+            lo = lo, hi = hi, valueRange = 1..31,
+            onChange = { a, b ->
                 vm.settings.value = s.copy(
                     bmin = a.coerceAtMost(b),
                     bmax = b.coerceAtLeast(a)
                 )
             },
-            onValueChangeFinished = { vm.pushSettings(vm.settings.value); vm.saveSettings() },
-            valueRange = 1f..31f,
-            steps = 29
+            onChangeFinished = { vm.pushSettings(vm.settings.value); vm.saveSettings() },
+            modifier = Modifier.fillMaxWidth()
         )
         // Оранжевая метка — только когда лента реально светит: на выключенном
         // дисплее eff_bri == 0, и метка у левого края читалась бы как «яркость 1».
@@ -460,6 +472,82 @@ private fun AutoBrightnessRange(vm: WheelVm, s: Settings, tele: Tele) {
                     .height(22.dp)
                     .background(Warn, RoundedCornerShape(2.dp))
             )
+        }
+    }
+}
+
+/**
+ * Ползунок-диапазон с двумя бегунками. В отличие от штатного `RangeSlider` не
+ * прыгает к точке касания: бегунок трогается, только если палец опустился
+ * прямо на него и повёл. Если касание не по бегунку — жест не перехватывается,
+ * и лента под ним свободно скроллится, даже когда палец пошёл по самой дорожке.
+ * Так же ведут себя ползунки в «Colour» (штатный `Slider` двигается лишь по
+ * настоящему тапу, а не по касанию-протяжке).
+ */
+@Composable
+private fun StepRangeSlider(
+    lo: Int,
+    hi: Int,
+    valueRange: IntRange,
+    onChange: (Int, Int) -> Unit,
+    onChangeFinished: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val cs = MaterialTheme.colorScheme
+    val density = LocalDensity.current
+    val thumbR = 10.dp
+    val trackH = 4.dp
+    val grab = 22.dp                    // насколько близко к центру бегунка нужно попасть
+
+    val first = valueRange.first
+    val spanV = (valueRange.last - first).coerceAtLeast(1)
+    val loS = rememberUpdatedState(lo)
+    val hiS = rememberUpdatedState(hi)
+
+    BoxWithConstraints(modifier.fillMaxWidth().height(thumbR * 2 + 12.dp)) {
+        val wPx = with(density) { maxWidth.toPx() }
+        val insetPx = with(density) { thumbR.toPx() }
+        val usable = (wPx - insetPx * 2f).coerceAtLeast(1f)
+        val grabPx = with(density) { grab.toPx() }
+
+        fun xOf(v: Int) = insetPx + usable * (v - first) / spanV
+        fun vOf(x: Float) = (first + (x - insetPx) / usable * spanV)
+            .roundToInt().coerceIn(valueRange.first, valueRange.last)
+
+        Box(
+            Modifier.matchParentSize().pointerInput(usable) {
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    val x = down.position.x
+                    val dLo = abs(x - xOf(loS.value))
+                    val dHi = abs(x - xOf(hiS.value))
+                    // Не по бегунку — выходим не трогая событие: пусть скроллится список.
+                    if (dLo > grabPx && dHi > grabPx) return@awaitEachGesture
+                    val movingLo = dLo <= dHi
+                    down.consume()
+                    var moved = false
+                    horizontalDrag(down.id) { ch ->
+                        ch.consume()
+                        moved = true
+                        val v = vOf(ch.position.x)
+                        if (movingLo) onChange(v.coerceAtMost(hiS.value), hiS.value)
+                        else onChange(loS.value, v.coerceAtLeast(loS.value))
+                    }
+                    if (moved) onChangeFinished()
+                }
+            }
+        ) {
+            Canvas(Modifier.matchParentSize()) {
+                val cy = size.height / 2f
+                val loX = insetPx + usable * (loS.value - first) / spanV
+                val hiX = insetPx + usable * (hiS.value - first) / spanV
+                val th = trackH.toPx()
+                drawLine(cs.surfaceVariant, Offset(insetPx, cy),
+                    Offset(size.width - insetPx, cy), th, StrokeCap.Round)
+                drawLine(cs.primary, Offset(loX, cy), Offset(hiX, cy), th, StrokeCap.Round)
+                drawCircle(cs.primary, thumbR.toPx(), Offset(loX, cy))
+                drawCircle(cs.primary, thumbR.toPx(), Offset(hiX, cy))
+            }
         }
     }
 }
