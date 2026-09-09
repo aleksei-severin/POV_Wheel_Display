@@ -2,7 +2,6 @@ package com.povwheel.app.ui
 
 import android.graphics.Bitmap
 import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.Orientation
@@ -27,7 +26,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
@@ -43,6 +41,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.sp
 import com.povwheel.app.WheelVm
 import com.povwheel.app.ble.DevFile
+import com.povwheel.app.convert.PreviewClip
 import com.povwheel.app.ble.Link
 import com.povwheel.app.ble.Proto
 import com.povwheel.app.ble.Settings
@@ -455,10 +454,18 @@ private fun FileRow(
     vm: WheelVm, f: DevFile, playing: Boolean, armed: Boolean,
     onArm: () -> Unit, onCancel: () -> Unit, onDelete: () -> Unit
 ) {
+    // Локальный кэш анимированного превью (кладётся при заливке). Есть — крутим
+    // его; нет — прежняя статичная миниатюра одним кадром по BLE.
+    val pv by vm.previewVersion.collectAsState()
     var thumb by remember(f.name + f.size) { mutableStateOf<Bitmap?>(null) }
-    LaunchedEffect(f.name, f.size) {
-        val p = vm.thumb(f)
-        if (p != null) thumb = WheelThumb.render(p, 96)
+    var clip by remember(f.name + f.size) { mutableStateOf<PreviewClip?>(null) }
+    LaunchedEffect(f.name, f.size, pv) {
+        val c = vm.localClip(f)
+        if (c != null) clip = c
+        else if (thumb == null) {
+            val p = vm.thumb(f)
+            if (p != null) thumb = WheelThumb.render(p, 96)
+        }
     }
 
     Card(
@@ -489,7 +496,7 @@ private fun FileRow(
                         .background(MaterialTheme.colorScheme.surfaceVariant),
                     contentAlignment = Alignment.Center
                 ) {
-                    thumb?.let { Image(it.asImageBitmap(), null, Modifier.size(48.dp).clip(CircleShape)) }
+                    AnimatedDisc(clip, thumb, Modifier.size(48.dp).clip(CircleShape))
                 }
                 Spacer(Modifier.width(12.dp))
                 Column(Modifier.weight(1f)) {

@@ -5,7 +5,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -21,7 +20,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -32,6 +30,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.povwheel.app.WheelVm
 import com.povwheel.app.convert.Fit
+import com.povwheel.app.convert.PreviewClip
 import kotlin.math.ceil
 import kotlin.math.roundToInt
 
@@ -115,7 +114,8 @@ private const val MAX_PICK = 30
 /**
  * Одно круглое превью в сетке. Кадр прогнан через то же полярное преобразование,
  * что и заливка (`DiscRender`), поэтому виден результат на ободе, а не квадрат.
- * Пока превью считается — крутилка.
+ * Пока превью считается — крутилка. У выбранной ячейки [clip] не пуст — тогда
+ * GIF/видео проигрываются, остальные показывают первый кадр.
  */
 @Composable
 private fun PosterCell(
@@ -123,6 +123,7 @@ private fun PosterCell(
     selected: Boolean,
     size: Dp,
     enabled: Boolean,
+    clip: PreviewClip? = null,
     onClick: () -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
@@ -137,8 +138,8 @@ private fun PosterCell(
         contentAlignment = Alignment.Center
     ) {
         val p = item.poster
-        if (p != null) {
-            Image(p.asImageBitmap(), null, Modifier.fillMaxSize().padding(2.dp).clip(CircleShape))
+        if (clip != null || p != null) {
+            AnimatedDisc(clip, p, Modifier.fillMaxSize().padding(2.dp).clip(CircleShape))
         } else {
             CircularProgressIndicator(
                 Modifier.size(size * 0.34f),
@@ -160,6 +161,7 @@ private fun PosterGrid(
     items: List<WheelVm.UpItem>,
     selected: Int,
     enabled: Boolean,
+    selClip: PreviewClip?,
     onSelect: (Int) -> Unit
 ) {
     val gap = 6.dp
@@ -195,7 +197,10 @@ private fun PosterGrid(
                         for (col in 0 until cols) {
                             val idx = row * cols + col
                             if (idx < n) {
-                                PosterCell(items[idx], idx == selected, cell, enabled) { onSelect(idx) }
+                                PosterCell(
+                                    items[idx], idx == selected, cell, enabled,
+                                    clip = if (idx == selected) selClip else null
+                                ) { onSelect(idx) }
                             } else {
                                 Spacer(Modifier.size(cell))
                             }
@@ -229,6 +234,7 @@ fun UploadPanel(vm: WheelVm) {
     // заливки. См. комментарий у upItems в WheelVm.
     val items by vm.upItems.collectAsState()
     val sel by vm.upSel.collectAsState()
+    val selClip by vm.upSelClip.collectAsState()
     val status by vm.upStatus.collectAsState()
     val statusKind by vm.upKind.collectAsState()
     val progress by vm.upProgress.collectAsState()
@@ -295,7 +301,7 @@ fun UploadPanel(vm: WheelVm) {
                     }
                 }
             } else {
-                PosterGrid(items, sel.coerceIn(0, items.size - 1), !busy) { vm.selectUpItem(it) }
+                PosterGrid(items, sel.coerceIn(0, items.size - 1), !busy, selClip) { vm.selectUpItem(it) }
             }
 
             Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {

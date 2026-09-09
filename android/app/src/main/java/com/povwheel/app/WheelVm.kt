@@ -25,6 +25,8 @@ import com.povwheel.app.ble.Settings
 import com.povwheel.app.convert.Ani6
 import com.povwheel.app.convert.Converter
 import com.povwheel.app.convert.Fit
+import com.povwheel.app.convert.PreviewClip
+import com.povwheel.app.convert.PreviewClips
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -34,6 +36,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import java.util.TimeZone
 
@@ -150,6 +153,27 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     // Пишется с Dispatchers.IO, читается из отрисовки списка — обычный HashMap
     // здесь может уйти в бесконечный цикл на рехэше.
     private val thumbs = ConcurrentHashMap<String, PreviewFrame>()
+
+    // ---- Локальные анимированные превью ----
+    // При заливке рядом с файлом кладётся компактный рендер (спрайт-лист ~0.5 МБ),
+    // и библиотека потом крутит его локально, не дёргая кадры по BLE. Фото-пикер
+    // Android отдаёт доступ к исходнику лишь на время жизни процесса, поэтому
+    // сохраняется именно рендер, а не сам файл.
+    private val CLIP_MEM_MAX = 20                        // разобранных клипов в памяти
+    private val CLIP_DISK_MAX = 64L * 1024 * 1024        // потолок кэша на диске
+    private val previewDir by lazy { File(ctx.filesDir, "prev").also { it.mkdirs() } }
+    /** Ключ — имя файла на устройстве. Доступ и из IO, и из отрисовки списка,
+     *  поэтому под `synchronized`. При переполнении самый давний просто выпадает
+     *  из карты — утилизировать его битмапы нельзя, их ещё может рисовать строка
+     *  списка; освободит сборщик, когда строка уедет с экрана. */
+    private val clipMem = object : LinkedHashMap<String, PreviewClip>(0, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, PreviewClip>): Boolean =
+            size > CLIP_MEM_MAX
+    }
+    /** Бампается, когда фоновая задача дописала превью в кэш, — строка библиотеки
+     *  по этому ключу перечитывает клип. */
+    val previewVersion = MutableStateFlow(0)
+
     private var logTotal = 0L
     private var pollJob: kotlinx.coroutines.Job? = null
     private var scanStopJob: kotlinx.coroutines.Job? = null
@@ -609,6 +633,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         val fps: Int = 10,
         val lengthSec: Double = 10.0,
         val lenTouched: Boolean = false,   // правил ли пользователь длину вручную
+        val anim: Boolean = false,         // источник анимированный (GIF / WebP / видео)
         val poster: Bitmap? = null,        // круглое превью, null пока считается
         val ready: Boolean = false         // тип определён и постер отрисован
     )
@@ -619,6 +644,11 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     val upKind     = MutableStateFlow(0)       // 0 обычный, 1 успех, 2 ошибка
     val upProgress = MutableStateFlow(-1f)
     val upBusy     = MutableStateFlow(false)
+
+    /** Анимированное превью ВЫБРАННОЙ ячейки сетки. Остальные остаются статичными
+     *  постерами — держать в памяти клипы всех тридцати файлов ни к чему. */
+    val upSelClip  = MutableStateFlow<PreviewClip?>(null)
+    private var selClipJob: kotlinx.coroutines.Job? = null
 
     /** Фоновая подготовка превью. Новый выбор файлов отменяет прошлую. */
     private var prepJob: kotlinx.coroutines.Job? = null
@@ -633,6 +663,8 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     fun onFilesPicked(picked: List<Uri>) {
         if (picked.isEmpty()) return
         prepJob?.cancel()
+        selClipJob?.cancel()
+        upSelClip.value = null
         upItems.value = emptyList()
         upSel.value = 0
         upProgress.value = -1f
@@ -674,7 +706,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                     val isVid = kind == Converter.Kind.VIDEO
                     val dur = if (isVid) withContext(Dispatchers.IO) { converter.videoDurationSec(u) } else 0.0
                     updateByUri(u) {
-                        it.copy(isVideo = isVid, srcDur = dur,
+                        it.copy(isVideo = isVid, anim = kind != Converter.Kind.IMAGE, srcDur = dur,
                             lengthSec = if (isVid && !it.lenTouched) defaultLengthSec(it.fps, dur)
                                         else it.lengthSec)
                     }
@@ -682,6 +714,37 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 val fit = upItems.value.firstOrNull { it.uri == u }?.fit ?: Fit.CROP
                 val poster = withContext(Dispatchers.Default) { converter.posterOf(u, fit, POSTER_PX) }
                 updateByUri(u) { it.copy(poster = poster, ready = true) }
+                // Готова выбранная ячейка — заводим её анимированное превью.
+                if (upItems.value.getOrNull(upSel.value)?.uri == u) refreshSelClip()
+            }
+        }
+    }
+
+    /**
+     * Пересобирает анимированное превью выбранной ячейки. Клип строится только
+     * для неё: держать в памяти по клипу на каждый из тридцати возможных файлов
+     * незачем, а именно эту ячейку пользователь сейчас и разглядывает.
+     */
+    private fun refreshSelClip() {
+        selClipJob?.cancel()
+        val cur = upItems.value.getOrNull(upSel.value)
+        // Прежний клип не утилизируем — его ещё может рисовать ячейка; освободит
+        // сборщик. Один клип за раз, счёт идёт на мегабайты, не на десятки.
+        upSelClip.value = null
+        if (cur == null || !cur.ready || !cur.anim) return
+        val uri = cur.uri
+        val fit = cur.fit
+        selClipJob = viewModelScope.launch {
+            val clip = withContext(Dispatchers.Default) {
+                runCatching {
+                    converter.previewClip(uri, fit, PreviewClips.UPLOAD_PX, PreviewClips.UPLOAD_FRAMES)
+                }.getOrNull()
+            }
+            val now = upItems.value.getOrNull(upSel.value)
+            if (isActive && now != null && now.uri == uri && now.fit == fit) {
+                upSelClip.value = clip
+            } else {
+                clip?.recycle()   // не показан — освобождаем сразу
             }
         }
     }
@@ -700,7 +763,9 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         upItems.value = cur.toMutableList().also { it[i] = f(it[i]) }
     }
 
-    fun selectUpItem(i: Int) { if (i in upItems.value.indices) upSel.value = i }
+    fun selectUpItem(i: Int) {
+        if (i in upItems.value.indices) { upSel.value = i; refreshSelClip() }
+    }
 
     /** Убрать один файл из пачки. */
     fun removeUpItem(i: Int) {
@@ -713,6 +778,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             upStatus.value = "Waiting for a file…"
             upKind.value = 0
         }
+        refreshSelClip()
     }
 
     /** Смена кадрирования выбранного файла — перерисовываем его превью. */
@@ -725,6 +791,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             // свежей отрисовке, а не подсовываем устаревшую.
             updateByUri(u) { if (it.fit == f) it.copy(poster = poster) else it }
         }
+        refreshSelClip()
     }
 
     fun setBackMirror(v: Boolean) = updateSel { it.copy(mirror = v) }
@@ -872,7 +939,12 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                             say((c.hello?.name ?: addr) + ": " + (e.message ?: "upload failed"))
                         }
                     }
-                    if (sentTo > 0) ok++ else { fail++; failedUris.add(item.uri) }
+                    if (sentTo > 0) {
+                        ok++
+                        // Уехал хотя бы на одно колесо — рендерим и кладём в кэш
+                        // компактное превью, пока доступ к исходнику ещё жив.
+                        cachePreview(item, res.fileName)
+                    } else { fail++; failedUris.add(item.uri) }
                 } catch (e: kotlinx.coroutines.CancellationException) {
                     // Отмену пробрасываем: иначе цикл продолжал бы крутиться
                     // после смерти scope, дописывая в мёртвые соединения.
@@ -904,6 +976,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 upItems.value = upItems.value.filter { it.uri in failedUris }
                 upSel.value = 0
             }
+            refreshSelClip()
             refreshFiles()
         }
     }
@@ -913,6 +986,76 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             runCatching { files.value = c.list() }
             runCatching { fsInfo.value = c.fsInfo() }
+            // Убрать превью удалённых файлов и удержать кэш в пределах потолка.
+            prunePreviewCache(files.value.map { it.name }.toHashSet(), strict = connected.value.size <= 1)
+        }
+    }
+
+    /**
+     * Сносит превью, для которых на текущем колесе больше нет файла (только при
+     * одном подключении — при зеркале у колёс разные библиотеки), и обрезает
+     * кэш по размеру, начиная со самых давних.
+     */
+    private fun prunePreviewCache(keep: Set<String>, strict: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val list = previewDir.listFiles() ?: return@runCatching
+                var total = 0L
+                for (pf in list.sortedByDescending { it.lastModified() }) {
+                    // .tmp-обрывок не трогаем: следующая запись того же имени его
+                    // усечёт, а гонка с идущим save() тут ни к чему.
+                    if (!pf.name.endsWith(".pvc")) continue
+                    if (strict && pf.name.removeSuffix(".pvc") !in keep) { pf.delete(); continue }
+                    total += pf.length()
+                    if (total > CLIP_DISK_MAX) pf.delete()
+                }
+            }
+        }
+    }
+
+    /**
+     * Локальный анимированный клип для файла — из кэша, дописанного при заливке.
+     * `null` — вызывающий откатывается на статичную миниатюру [thumb] (файл залит
+     * с другого устройства, из веб-интерфейса или ещё до этой версии).
+     */
+    suspend fun localClip(f: DevFile): PreviewClip? {
+        val key = f.name
+        synchronized(clipMem) { clipMem[key] }?.let { return it }
+        val file = PreviewClips.fileFor(previewDir, f.name)
+        val clip = withContext(Dispatchers.IO) {
+            if (!file.exists()) null
+            else PreviewClips.load(file)?.also {
+                runCatching { file.setLastModified(System.currentTimeMillis()) }
+            }
+        } ?: return null
+        synchronized(clipMem) {
+            val hit = clipMem[key]
+            if (hit != null) { clip.recycle(); return hit }
+            clipMem[key] = clip
+        }
+        return clip
+    }
+
+    /**
+     * Рендерит компактное превью только что залитого файла и кладёт в кэш на
+     * диске. Идёт в фоне: для видео это ещё десяток перемоток MMR, а доступ к
+     * исходнику по BLE не нужен вовсе — превью строится из локального файла.
+     */
+    private fun cachePreview(item: UpItem, deviceName: String) {
+        if (!item.anim) return
+        viewModelScope.launch(Dispatchers.Default) {
+            val clip = runCatching {
+                converter.previewClip(item.uri, item.fit, PreviewClips.CACHE_PX, PreviewClips.CACHE_FRAMES)
+            }.getOrNull()
+            if (clip != null && clip.animated) {
+                runCatching { PreviewClips.save(PreviewClips.fileFor(previewDir, deviceName), clip) }
+            }
+            clip?.recycle()   // построен здесь, в UI не попадал
+            // Прежний разобранный клип (если файл перезаливают) просто убираем из
+            // карты — вдруг его ещё рисует строка; следующее чтение возьмёт новый
+            // с диска, а бамп версии это чтение и запустит.
+            synchronized(clipMem) { clipMem.remove(deviceName) }
+            previewVersion.value = previewVersion.value + 1
         }
     }
 
@@ -1075,6 +1218,10 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 say("Deleted " + name)
                 files.value = c.list()
                 fsInfo.value = c.fsInfo()
+                synchronized(clipMem) { clipMem.remove(name) }
+                withContext(Dispatchers.IO) {
+                    runCatching { PreviewClips.fileFor(previewDir, name).delete() }
+                }
             } catch (e: Exception) {
                 say("Delete failed: " + (e.message ?: ""))
             }
@@ -1147,6 +1294,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     override fun onCleared() {
         stopScan()
         disconnectAll()
+        synchronized(clipMem) { clipMem.clear() }
         super.onCleared()
     }
 }

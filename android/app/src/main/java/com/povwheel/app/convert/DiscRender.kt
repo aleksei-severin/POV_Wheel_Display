@@ -14,9 +14,12 @@ import kotlin.math.roundToInt
  */
 object DiscRender {
 
-    /** Прогоняет квадратный кадр [square] через полярную выборку и обратно. */
-    fun fromSquare(square: Bitmap, size: Int): Bitmap {
-        val sampler = PolarSampler()
+    /**
+     * Прогоняет квадратный кадр [square] через полярную выборку и обратно.
+     * [sampler] можно передать свой — при отрисовке клипа из десятков кадров это
+     * снимает пересоздание внутренних буферов на каждом кадре.
+     */
+    fun fromSquare(square: Bitmap, size: Int, sampler: PolarSampler = PolarSampler()): Bitmap {
         sampler.sample(square, 3)
         return fromRgb(sampler.rgbBuffer, Geom.SECTORS, Geom.LEDS_PER_SIDE, size)
     }

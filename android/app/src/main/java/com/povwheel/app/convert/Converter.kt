@@ -453,47 +453,156 @@ class Converter(private val context: Context) {
      * превью показывает ровно результат на ободе (Crop/Fit, поля, отверстие под
      * ступицу), а не просто вписанный в круг квадрат.
      */
-    fun posterOf(uri: Uri, fitMode: Int, size: Int): Bitmap? {
-        return try {
-            val bytes = if (mimeOf(uri).startsWith("video/")) null else readBytes(uri)
-            val src: Bitmap = when (kindOf(uri, bytes)) {
-                Kind.VIDEO -> {
-                    val mmr = MediaMetadataRetriever()
-                    try {
-                        mmr.setDataSource(context, uri)
-                        mmr.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-                    } finally { try { mmr.release() } catch (_: Exception) {} }
-                }
-                Kind.WEBP_ANIM -> {
-                    val anim = WebP.parse(bytes!!)!!
-                    val still = WebP.stillFromFrame(bytes, anim.frames[0])
-                    still?.let { BitmapFactory.decodeByteArray(it, 0, it.size) }
-                }
-                Kind.GIF -> {
-                    val gif = GifDecoder(bytes!!)
-                    gif.parse()
-                    val f = gif.frames.firstOrNull() ?: return null
-                    val px = IntArray(maxOf(gif.width, 1) * maxOf(gif.height, 1))
-                    blitFrame(px, gif.width, gif.height, f)
-                    Bitmap.createBitmap(gif.width, gif.height, Bitmap.Config.ARGB_8888).also {
-                        it.setPixels(px, 0, gif.width, 0, 0, gif.width, gif.height)
-                    }
-                }
-                Kind.IMAGE -> {
-                    BitmapFactory.decodeByteArray(bytes!!, 0, bytes.size)?.let {
-                        Bitmaps.applyExif(it, exifOrientation(bytes))
-                    }
-                }
-            } ?: return null
+    fun posterOf(uri: Uri, fitMode: Int, size: Int): Bitmap? =
+        previewClip(uri, fitMode, size, 1)?.frames?.firstOrNull()
 
-            val square = Bitmaps.square(size)
-            Bitmaps.drawSquare(src, square, fitMode)
-            src.recycle()
-            val disc = DiscRender.fromSquare(square, size)
-            square.recycle()
-            disc
+    /**
+     * До [maxFrames] кадров источника, выбранных равномерно и прогнанных через то
+     * же полярное преобразование, что и `posterOf`, — круглым «кино» для превью.
+     * GIF, анимированный WebP и видео дают несколько кадров, картинка — один.
+     * Так превью в библиотеке и в выборе файла проигрывается, а не висит
+     * статичной картинкой. Задержка в результате — грубая оценка темпа источника.
+     */
+    fun previewClip(uri: Uri, fitMode: Int, size: Int, maxFrames: Int): PreviewClip? {
+        return try {
+            val cap = maxFrames.coerceAtLeast(1)
+            val bytes = if (mimeOf(uri).startsWith("video/")) null else readBytes(uri)
+            when (kindOf(uri, bytes)) {
+                Kind.VIDEO -> videoClip(uri, fitMode, size, cap)
+                Kind.GIF -> gifClip(bytes!!, fitMode, size, cap)
+                Kind.WEBP_ANIM -> webpClip(bytes!!, fitMode, size, cap)
+                Kind.IMAGE -> {
+                    val src = BitmapFactory.decodeByteArray(bytes!!, 0, bytes.size)?.let {
+                        Bitmaps.applyExif(it, exifOrientation(bytes))
+                    } ?: return null
+                    val d = oneDisc(src, fitMode, size, PolarSampler())
+                    src.recycle()
+                    PreviewClip(listOf(d), 100)
+                }
+            }
         } catch (e: Exception) {
             null
+        }
+    }
+
+    /** Квадрат → полярная выборка → круг. [src] не утилизируется. */
+    private fun oneDisc(src: Bitmap, fitMode: Int, size: Int, sampler: PolarSampler): Bitmap {
+        val square = Bitmaps.square(size)
+        Bitmaps.drawSquare(src, square, fitMode)
+        val disc = DiscRender.fromSquare(square, size, sampler)
+        square.recycle()
+        return disc
+    }
+
+    /** Равномерный выбор до [max] индексов из [n]: первый и последний включены. */
+    private fun pickIndices(n: Int, max: Int): IntArray {
+        if (n <= max) return IntArray(n) { it }
+        if (max <= 1) return intArrayOf(0)
+        return IntArray(max) { ((it.toLong() * (n - 1)) / (max - 1)).toInt() }
+    }
+
+    private fun gifClip(raw: ByteArray, fitMode: Int, size: Int, cap: Int): PreviewClip? {
+        val gif = GifDecoder(raw)
+        gif.parse()
+        if (gif.frames.isEmpty()) return null
+        val n = gif.frames.size
+        val emit = pickIndices(n, cap).toHashSet()
+        val totalMs = gif.frames.sumOf { it.delay.coerceAtLeast(1).toLong() }
+
+        val cw = maxOf(gif.width, 1)
+        val ch = maxOf(gif.height, 1)
+        val canvasPx = IntArray(cw * ch)
+        val canvasBmp = Bitmap.createBitmap(cw, ch, Bitmap.Config.ARGB_8888)
+        val sampler = PolarSampler()
+        val out = ArrayList<Bitmap>()
+        for (i in 0 until n) {
+            // Метод утилизации объявлен вместе с кадром, а применяется к области
+            // ПРЕДЫДУЩЕГО — как в convertGif.
+            if (i > 0 && gif.frames[i - 1].disposal == 2) {
+                val pf = gif.frames[i - 1]
+                clearRect(canvasPx, cw, ch, pf.x, pf.y, pf.w, pf.h)
+            }
+            blitFrame(canvasPx, cw, ch, gif.frames[i])
+            if (i in emit) {
+                canvasBmp.setPixels(canvasPx, 0, cw, 0, 0, cw, ch)
+                out.add(oneDisc(canvasBmp, fitMode, size, sampler))
+                if (out.size == emit.size) break
+            }
+        }
+        canvasBmp.recycle()
+        if (out.isEmpty()) return null
+        val delay = (totalMs / out.size).toInt().coerceIn(40, 200)
+        return PreviewClip(out, delay)
+    }
+
+    private fun webpClip(raw: ByteArray, fitMode: Int, size: Int, cap: Int): PreviewClip? {
+        val anim = WebP.parse(raw) ?: return null
+        if (anim.frames.isEmpty()) return null
+        val n = anim.frames.size
+        val emit = pickIndices(n, cap).toHashSet()
+        val totalMs = anim.frames.sumOf { (if (it.dur < 20) 100 else it.dur).toLong() }
+
+        val canvas = Bitmap.createBitmap(anim.w, anim.h, Bitmap.Config.ARGB_8888)
+        val cv = android.graphics.Canvas(canvas)
+        val sampler = PolarSampler()
+        val out = ArrayList<Bitmap>()
+        for (i in 0 until n) {
+            val fr = anim.frames[i]
+            val still = WebP.stillFromFrame(raw, fr) ?: continue
+            val bmp = BitmapFactory.decodeByteArray(still, 0, still.size) ?: continue
+            if (!fr.blend) {
+                cv.save(); cv.clipRect(fr.x, fr.y, fr.x + fr.w, fr.y + fr.h)
+                cv.drawColor(0, android.graphics.PorterDuff.Mode.CLEAR); cv.restore()
+            }
+            cv.drawBitmap(bmp, fr.x.toFloat(), fr.y.toFloat(), null)
+            bmp.recycle()
+            if (i in emit) {
+                out.add(oneDisc(canvas, fitMode, size, sampler))
+                if (out.size == emit.size) break
+            }
+            if (fr.dispose) {
+                cv.save(); cv.clipRect(fr.x, fr.y, fr.x + fr.w, fr.y + fr.h)
+                cv.drawColor(0, android.graphics.PorterDuff.Mode.CLEAR); cv.restore()
+            }
+        }
+        canvas.recycle()
+        if (out.isEmpty()) return null
+        val delay = (totalMs / out.size).toInt().coerceIn(40, 200)
+        return PreviewClip(out, delay)
+    }
+
+    // Превью видео скользит по первым секундам ролика — этого хватает увидеть
+    // движение, а перемотка MMR к каждому кадру не бесплатна.
+    private val PREVIEW_VIDEO_SPAN_MS = 8000L
+
+    private fun videoClip(uri: Uri, fitMode: Int, size: Int, cap: Int): PreviewClip? {
+        val mmr = MediaMetadataRetriever()
+        try {
+            mmr.setDataSource(context, uri)
+        } catch (e: Exception) {
+            try { mmr.release() } catch (_: Exception) {}
+            return null
+        }
+        try {
+            val durMs = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull() ?: 0L
+            val n = cap
+            val spanMs = if (durMs > 0) minOf(durMs, PREVIEW_VIDEO_SPAN_MS) else PREVIEW_VIDEO_SPAN_MS
+            val sampler = PolarSampler()
+            val out = ArrayList<Bitmap>()
+            for (i in 0 until n) {
+                val tUs = if (n <= 1) 0L else i.toLong() * spanMs * 1000L / (n - 1)
+                val f = try {
+                    mmr.getFrameAtTime(tUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                } catch (e: Exception) { null } ?: continue
+                out.add(oneDisc(f, fitMode, size, sampler))
+                f.recycle()
+            }
+            if (out.isEmpty()) return null
+            val delay = if (out.size > 1) (spanMs / (out.size - 1)).toInt().coerceIn(50, 140) else 100
+            return PreviewClip(out, delay)
+        } finally {
+            try { mmr.release() } catch (_: Exception) {}
         }
     }
 }
