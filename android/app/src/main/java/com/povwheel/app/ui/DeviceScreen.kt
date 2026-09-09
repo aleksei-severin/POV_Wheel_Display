@@ -567,47 +567,7 @@ private fun ColourControls(vm: WheelVm) {
 
 // ------------------------------------------------------------------ Эффекты
 
-private data class Eff(val id: Int, val icon: String, val name: String, val desc: String)
-
-private val EFFECTS = listOf(
-    Eff(1, "🏁", "Speed", "Current speed in km/h — green at a crawl, fully red from 45 km/h up."),
-    Eff(2, "🔥", "Fire", "Flames rise from the hub and flicker out at the rim."),
-    Eff(3, "🌈", "Rainbow", "A spectrum spiral turning against the wheel."),
-    Eff(4, "➕", "Testing", "Diagnostic cross through the hub — blue for 5 s, then each arm in its own colour for 5 s, to spot a per-arm angle offset by eye."),
-    Eff(5, "💧", "Ripples", "Concentric waves from the centre. Stands perfectly still."),
-    Eff(6, "🕑", "Clock", "Numbered dial and three hands, set from your phone.")
-)
-
-@Composable
-private fun EffectsTab(vm: WheelVm, tele: Tele) {
-    // Только сами эффекты. Тап по карточке запускает; вернуться в библиотеку —
-    // кнопкой ■ Stop в шапке карточки DISPLAY или запуском любого файла.
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp)) {
-        EFFECTS.forEach { e ->
-            val active = tele.effect == e.id
-            Card(
-                Modifier.fillMaxWidth().padding(bottom = 8.dp).clickable {
-                    vm.effect(e.id); vm.say(e.name)
-                },
-                colors = CardDefaults.cardColors(
-                    containerColor = if (active) Accent.copy(alpha = 0.18f)
-                                     else MaterialTheme.colorScheme.surface
-                )
-            ) {
-                Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text(e.icon, fontSize = 26.sp)
-                    Spacer(Modifier.width(12.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text(e.name, fontWeight = FontWeight.SemiBold)
-                        Text(e.desc, style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                }
-            }
-        }
-        Spacer(Modifier.height(16.dp))
-    }
-}
+// EffectsTab и его превью живут в ui/EffectsGrid.kt.
 
 // ---------------------------------------------------------------------- Лог
 
