@@ -644,6 +644,9 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     val upKind     = MutableStateFlow(0)       // 0 обычный, 1 успех, 2 ошибка
     val upProgress = MutableStateFlow(-1f)
     val upBusy     = MutableStateFlow(false)
+    /** Uri файла, который льётся прямо сейчас — его ячейка в сетке рисует
+     *  сматывающийся ободок по [upProgress]. null — ничего не льётся. */
+    val upCurrentUri = MutableStateFlow<Uri?>(null)
 
     /** Анимированное превью ВЫБРАННОЙ ячейки сетки. Остальные остаются статичными
      *  постерами — держать в памяти клипы всех тридцати файлов ни к чему. */
@@ -884,6 +887,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             val failedUris = ArrayList<Uri>()
             for (item in jobs) {
                 val label = item.name
+                upCurrentUri.value = item.uri
                 try {
                     upStatus.value = label + " — converting…"
                     upProgress.value = -1f
@@ -944,6 +948,12 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                         // Уехал хотя бы на одно колесо — рендерим и кладём в кэш
                         // компактное превью, пока доступ к исходнику ещё жив.
                         cachePreview(item, res.fileName)
+                        // ...и сразу переносим ячейку из «ждёт заливки» в библиотеку:
+                        // сначала показываем новый файл, потом убираем жёлтую ячейку.
+                        runCatching { currentClient()?.let { files.value = it.list() } }
+                        upItems.value = upItems.value.filter { it.uri != item.uri }
+                        upSel.value = upSel.value.coerceIn(0, maxOf(0, upItems.value.size - 1))
+                        refreshSelClip()
                     } else { fail++; failedUris.add(item.uri) }
                 } catch (e: kotlinx.coroutines.CancellationException) {
                     // Отмену пробрасываем: иначе цикл продолжал бы крутиться
@@ -963,12 +973,16 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 }
             }
             upProgress.value = -1f
+            upCurrentUri.value = null
             upBusy.value = false
             if (fail == 0) {
-                upStatus.value = if (ok == 1) "Uploaded." else ok.toString() + " files uploaded."
+                val msg = if (ok == 1) "Uploaded." else ok.toString() + " files uploaded."
+                upStatus.value = msg
                 upKind.value = 1
                 upItems.value = emptyList()
                 upSel.value = 0
+                // Полоса заливки уже скрылась (очередь пуста) — сообщаем тостом.
+                say(msg)
             } else {
                 upStatus.value = ok.toString() + " uploaded, " + fail + " failed."
                 upKind.value = 2
@@ -1090,6 +1104,48 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     }
     fun effect(id: Int) = onTargets { it.effect(id) }
     fun album(start: Boolean, ms: Int) = onTargets { it.album(start, ms) }
+
+    // ---------------------------------------------------------- слайдшоу
+
+    private fun slideSelKey(addr: String) = "slidesel_" + addr
+
+    /** Отмеченные для слайдшоу файлы из прошлого раза (пересечённые с реально
+     *  лежащими на колесе). Ничего не сохранено или пусто — считаем, что все. */
+    fun savedSlideSelection(allNames: List<String>): Set<String> {
+        val addr = current.value ?: return allNames.toSet()
+        val raw = prefs.getString(slideSelKey(addr), null) ?: return allNames.toSet()
+        val saved = raw.split(",").filter { it.isNotEmpty() }.toSet()
+        val keep = allNames.filter { it in saved }
+        return if (keep.isEmpty()) allNames.toSet() else keep.toSet()
+    }
+
+    /** Запустить слайдшоу с отмеченными [checked] из [allNames]. */
+    fun startSlideshow(delaySecs: Int, checked: Set<String>, allNames: List<String>) {
+        if (checked.isEmpty()) { say("Tick at least one animation"); return }
+        current.value?.let {
+            prefs.edit().putString(slideSelKey(it), checked.joinToString(",")).apply()
+        }
+        val incl = allNames.filter { it in checked }
+        val excl = allNames.filter { it !in checked }
+        // Одна ATT-посылка — до ~20 имён; шлём тот список, что короче.
+        val (mode, names) = when {
+            excl.isEmpty() -> 0 to emptyList()
+            incl.size <= excl.size && incl.size <= 20 -> 1 to incl
+            excl.size <= 20 -> 0 to excl
+            else -> { say("Too many to select individually — showing all"); 0 to emptyList<String>() }
+        }
+        val ms = (delaySecs * 1000).coerceIn(1000, 300000)
+        onTargets { it.album(true, ms, mode, names) }
+        say("Slideshow started")
+    }
+
+    fun stopSlideshow() = onTargets { it.album(false, 0) }.also { say("Slideshow stopped") }
+
+    /** Интервал: если слайдшоу идёт — устройство подхватит на лету, не сбрасывая позицию. */
+    fun setSlideInterval(secs: Int) {
+        val ms = (secs * 1000).coerceIn(1000, 300000)
+        onTargets { c -> if (c.tele.value.slideshow) c.album(true, ms) }
+    }
     /**
      * Переименовать ТЕКУЩЕЕ колесо. Намеренно мимо onTargets: зеркалирование
      * здесь бессмысленно — два колеса с одинаковым именем ровно та задача,
@@ -1210,21 +1266,26 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
 
     fun saveSettings() = onTargets { it.save() }
 
-    fun delete(name: String) {
+    fun delete(name: String) = deleteMany(listOf(name))
+
+    /** Удаляет несколько файлов с ТЕКУЩЕГО колеса (не зеркалит: у колёс разные
+     *  библиотеки), заодно чистит их локальные превью. */
+    fun deleteMany(names: List<String>) {
+        if (names.isEmpty()) return
         val c = currentClient() ?: return
         viewModelScope.launch {
-            try {
-                c.delete(name)
-                say("Deleted " + name)
-                files.value = c.list()
-                fsInfo.value = c.fsInfo()
-                synchronized(clipMem) { clipMem.remove(name) }
+            var ok = 0
+            for (n in names) {
+                try { c.delete(n); ok++ } catch (e: Exception) { say("Delete failed: " + n) }
+                synchronized(clipMem) { clipMem.remove(n) }
                 withContext(Dispatchers.IO) {
-                    runCatching { PreviewClips.fileFor(previewDir, name).delete() }
+                    runCatching { PreviewClips.fileFor(previewDir, n).delete() }
                 }
-            } catch (e: Exception) {
-                say("Delete failed: " + (e.message ?: ""))
             }
+            runCatching { files.value = c.list() }
+            runCatching { fsInfo.value = c.fsInfo() }
+            if (ok == 1) say("Deleted " + names.first())
+            else if (ok > 1) say("Deleted " + ok + " files")
         }
     }
 

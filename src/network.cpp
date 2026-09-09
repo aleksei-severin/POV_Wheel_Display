@@ -1048,6 +1048,22 @@ void setupNetwork() {
                     uint32_t ms = (uint32_t)request->getParam("delay")->value().toInt();
                     if (ms >= 1000 && ms <= 300000) slideInterval = ms;
                 }
+                // Необязательный отбор файлов: ?incl=a.bin,b.bin — играть только их,
+                // ?excl=a.bin,b.bin — играть всё, кроме них. Пусто — крутить всё.
+                if (request->hasParam("incl") || request->hasParam("excl")) {
+                    bool inc = request->hasParam("incl");
+                    String csv = request->getParam(inc ? "incl" : "excl")->value();
+                    std::vector<String> sel;
+                    int start = 0;
+                    while (start < (int)csv.length()) {
+                        int c = csv.indexOf(',', start);
+                        if (c < 0) c = csv.length();
+                        String nm = csv.substring(start, c); nm.trim();
+                        if (nm.length()) sel.push_back(nm);
+                        start = c + 1;
+                    }
+                    applySlideList(inc, sel);
+                }
                 if (slideshowActive) {
                     // Слайдшоу уже идёт — только обновляем интервал, не сбрасываем индекс
                     settings_dirty = true;

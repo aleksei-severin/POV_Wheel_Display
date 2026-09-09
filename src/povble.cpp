@@ -734,7 +734,8 @@ static void handleCmd(const uint8_t* d, size_t n) {
         h.sectors       = SECTORS;
         h.frame_stride  = FRAME_STRIDE_PAL;
         h.mtu           = peer_mtu;
-        h.features      = POV_FEAT_DEFLATE | POV_FEAT_OTA | POV_FEAT_PREVIEW | POV_FEAT_WIFI;
+        h.features      = POV_FEAT_DEFLATE | POV_FEAT_OTA | POV_FEAT_PREVIEW | POV_FEAT_WIFI |
+                          POV_FEAT_ALBUM_SEL;
         h.uptime_s      = millis() / 1000;
         // Именно видимое имя: приложение подписывает им строку списка, и
         // расходиться с тем, что пришло в рекламе, оно не должно.
@@ -894,7 +895,23 @@ static void handleCmd(const uint8_t* d, size_t n) {
                 uint32_t ms; memcpy(&ms, pl + 1, 4);
                 if (ms >= 1000 && ms <= 300000) slideInterval = ms;
             }
-            if (slideshowActive) {         // уже идёт — только интервал, индекс не трогаем
+            // Необязательный отбор файлов (FEAT_ALBUM_SEL):
+            // [u8 mode 0=пропускать 1=играть-только][u16 count]{[u8 len][имя]}.
+            // count 0 или короткий пакет — крутить всё (прежнее поведение).
+            if (pn >= 8) {
+                bool inc = pl[5] != 0;
+                uint16_t cnt; memcpy(&cnt, pl + 6, 2);
+                std::vector<String> sel;
+                size_t o = 8;
+                for (uint16_t i = 0; i < cnt && o < pn; i++) {
+                    uint8_t l = pl[o++];
+                    if (o + l > pn) break;
+                    sel.push_back(String((const char*)(pl + o), (unsigned int)l));
+                    o += l;
+                }
+                applySlideList(inc, sel);
+            }
+            if (slideshowActive) {         // уже идёт — интервал и отбор обновили, индекс не трогаем
                 settings_dirty = true;
                 sendRsp(op, seq, ST_OK);
                 break;

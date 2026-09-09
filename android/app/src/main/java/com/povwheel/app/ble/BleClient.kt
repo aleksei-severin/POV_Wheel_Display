@@ -458,10 +458,29 @@ class BleClient(
         request(Proto.OP_EFFECT, b.array())
     }
 
-    suspend fun album(start: Boolean, delayMs: Int) {
-        val b = Proto.buf(5)
-        b.put(if (start) 1 else 0)
+    /**
+     * Слайдшоу. При старте [names] задаёт отбор файлов (нужен [Hello.hasAlbumSel]):
+     * `null` — отбор не трогать (стоп, либо смена только интервала); пустой список —
+     * сбросить отбор, крутить всё; иначе [listMode] 0 — пропускать эти, 1 — играть
+     * только эти.
+     */
+    suspend fun album(start: Boolean, delayMs: Int, listMode: Int = 0, names: List<String>? = null) {
+        if (!start || names == null) {
+            val b = Proto.buf(5)
+            b.put(if (start) 1 else 0)
+            b.putInt(delayMs)
+            request(Proto.OP_ALBUM, b.array())
+            return
+        }
+        val enc = names.map { it.toByteArray(Charsets.US_ASCII) }.filter { it.size in 1..255 }
+        var size = 8
+        for (e in enc) size += 1 + e.size
+        val b = Proto.buf(size)
+        b.put(1)
         b.putInt(delayMs)
+        b.put(if (listMode != 0) 1 else 0)
+        b.putShort(enc.size.toShort())
+        for (e in enc) { b.put(e.size.toByte()); b.put(e) }
         request(Proto.OP_ALBUM, b.array())
     }
 

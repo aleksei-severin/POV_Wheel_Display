@@ -7,6 +7,7 @@
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <vector>
+#include <algorithm>
 #include <ESPAsyncWebServer.h>
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
@@ -158,6 +159,11 @@ uint32_t slideLastSwitch    = 0;
 // В RTC: после пробуждения слайдшоу обязано продолжиться с той картинки, на
 // которой остановилось, а не начать список заново.
 RTC_DATA_ATTR int slideCurrentIndex = -1;   // индекс в savedFiles (-1 = не запущен)
+
+// Отбор файлов для слайдшоу (см. applySlideList). Пустой — крутить всё.
+std::vector<String> slideList;
+bool slideListInclude = false;
+static volatile bool slide_list_dirty = false;   // нужно сбросить в NVS, когда рендер стоит
 
 RTC_DATA_ATTR volatile float global_gamma         = 2.5f;
 RTC_DATA_ATTR volatile float global_saturation    = 1.5f;
@@ -1974,6 +1980,53 @@ static void flushLastFile() {
     pending_last_file = "";
 }
 
+// --- Отбор файлов для слайдшоу ---
+// Список хранится строкой из имён через '\n' плюс байт режима. NVS-запись
+// отложена по той же причине, что и last_file: putString морозит рендер.
+
+static String slideListJoin() {
+    String s;
+    for (const String& n : slideList) { if (s.length()) s += '\n'; s += n; }
+    return s;
+}
+
+void applySlideList(bool include, const std::vector<String>& names) {
+    slideList = names;
+    slideListInclude = include;
+    slide_list_dirty = true;
+    settings_dirty   = true;   // разбудить отложенный сброс в NVS в loop()
+}
+
+// Играется ли файл в текущем слайдшоу. Пустой список — да, крутим всё.
+bool slideInSlideshow(const String& name) {
+    if (slideList.empty()) return true;
+    bool found = std::find(slideList.begin(), slideList.end(), name) != slideList.end();
+    return slideListInclude ? found : !found;
+}
+
+static void loadSlideList() {
+    String joined = prefs.getString("slidelist", "");
+    slideListInclude = prefs.getUChar("slidelistmode", 0) != 0;
+    slideList.clear();
+    int start = 0;
+    while (start < (int)joined.length()) {
+        int nl = joined.indexOf('\n', start);
+        if (nl < 0) nl = joined.length();
+        if (nl > start) slideList.push_back(joined.substring(start, nl));
+        start = nl + 1;
+    }
+}
+
+// Сбрасывает отбор в NVS. Вызывать только когда отрисовка остановлена.
+static void flushSlideList() {
+    if (!slide_list_dirty) return;
+    String joined = slideListJoin();
+    if (prefs.getString("slidelist", "") != joined) prefs.putString("slidelist", joined);
+    uint8_t mode = slideListInclude ? 1 : 0;
+    if (prefs.getUChar("slidelistmode", 0) != mode) prefs.putUChar("slidelistmode", mode);
+    slide_list_dirty = false;
+}
+
 // Будит renderingTask вне очереди. Нужно загрузчику файла: иначе флаг
 // frame_loading будет замечен только на следующем событии Холла, и лента
 // успеет отсветить лишний кусок оборота старым кадром.
@@ -2036,6 +2089,7 @@ static void applyPowerState(PowerState target) {
             // в NVS: помешать они уже никому не могут.
             flushLastFile();
             flushSettings();
+            flushSlideList();
             webLog("[PWR] Power off");
             break;
 
@@ -2075,6 +2129,7 @@ static void applyPowerState(PowerState target) {
 static void enterDeepSleep() {
     flushLastFile();
     flushSettings();
+    flushSlideList();
     // Снимаем питание и глушим прерывания
     digitalWrite(PIN_EN_DCDC_REST, LOW);
     digitalWrite(PIN_EN_DCDC_ARM1, LOW);
@@ -2266,6 +2321,7 @@ static void enterTransportSleep() {
     // а не сон по простою, и возвращаться сюда часто мы не собираемся.
     flushLastFile();
     flushSettings();
+    flushSlideList();
     saveHallCalibration();
 
     transportSleepArm();
@@ -2502,6 +2558,7 @@ void setup() {
     bleReserve();
     loadSettingsFromNVS();              // до построения таблиц: они зависят от гаммы и балансов
     loadHallCalibration();
+    loadSlideList();                    // отбор файлов для слайдшоу переживает сон и питание
 
     // Таблицы рендера — до первого кадра: пока они не построены,
     // радиальные коэффициенты нулевые и картинка была бы чёрной.
@@ -2675,6 +2732,7 @@ void loop() {
         if (settings_dirty_since == 0) settings_dirty_since = now_ms;
         else if (power_state != PWR_FULL && (now_ms - settings_dirty_since) > 3000) {
             flushSettings();
+            flushSlideList();
             settings_dirty_since = 0;
         }
     } else {
@@ -2727,7 +2785,15 @@ void loop() {
         } else if (slideCurrentIndex < 0 ||
                    (now_ms - slideLastSwitch) >= slideInterval) {
             slideLastSwitch = now_ms;
-            slideCurrentIndex = (slideCurrentIndex + 1) % (int)savedFiles.size();
+            // Ищем следующий файл, входящий в отбор (applySlideList). Если ни один
+            // не подходит — оставляем текущий индекс, показ не дёргается.
+            int n = (int)savedFiles.size();
+            int cand = slideCurrentIndex;
+            for (int step = 0; step < n; step++) {
+                cand = (cand + 1 + n) % n;                 // -1 -> 0
+                if (slideInSlideshow(savedFiles[cand])) { slideCurrentIndex = cand; break; }
+            }
+            if (slideCurrentIndex < 0) slideCurrentIndex = 0;   // всё исключено — покажем первый
             String nextFile = savedFiles[slideCurrentIndex];
             pendingFilePath = "/" + nextFile;
             // Не пишем в NVS прямо здесь: запись во флеш заморозила бы рендер.

@@ -333,6 +333,13 @@ extern uint32_t slideLastSwitch;                // millis() последней �
 extern std::vector<String> savedFiles;
 extern void updateFileList();
 
+// Отбор файлов для слайдшоу. Пустой список — крутить всё (прежнее поведение).
+// В RTC не живёт: перестраивается из NVS в setup(), как и savedFiles.
+extern std::vector<String> slideList;
+extern bool slideListInclude;   // true — slideList это то, что играем; false — то, что пропускаем
+extern void applySlideList(bool include, const std::vector<String>& names);
+extern bool slideInSlideshow(const String& name);
+
 extern Preferences prefs;
 
 // Флаг: web UI запросил воспроизведение — loop() должен включить питание LED

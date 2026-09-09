@@ -227,6 +227,8 @@ The interval only runs while `rendering_active` — while the strip is actually 
 
 While paused, `slideLastSwitch` is **held at the current moment** rather than simply not being checked. Letting it sit still would bank the whole interval during the stop, and the first revolution would then skip straight past the picture the wheel stopped on — the one it is supposed to resume from. `slideCurrentIndex` lives in RTC memory for the same reason, so a deep sleep does not restart the list from the top.
 
+**A subset of files can be excluded from the slideshow.** `applySlideList(include, names)` stores a filename list plus a mode flag: `include == false` — skip those names, `include == true` — play *only* those. Empty list = every file, the original behaviour. The advance loop in `loop()` scans forward past non-matching files (`slideInSlideshow()`); if the selection matches nothing it keeps showing the current frame instead of spinning. The list is **persisted in NVS** (`slidelist` string, `slidelistmode` byte), written by the same deferred `flush*()` path as settings (a flash write mid-render freezes `renderingTask`), and reloaded by `loadSlideList()` in `setup()` — so it survives sleep and a power cut. It is *not* in RTC: `setup()` rebuilds it from NVS anyway, like `savedFiles`. Set over BLE by the extended `OP_ALBUM` start payload (`POV_FEAT_ALBUM_SEL`) or over the web by `/album?action=start&incl=…` / `&excl=…`.
+
 **Nothing outside the Hall ISR may write `last_hall_time`.** The sleep-cancel path used to set it to "now" when USB was connected, as a way of resetting the idle timer. That was a lie about rotation: it zeroed the event age once a minute, the slideshow's rotation check saw a spinning wheel and advanced a file on a device sitting motionless on the charger. Idle timers belong to `last_motion_ms`.
 
 ### Trickle-Charge Recovery
@@ -405,7 +407,7 @@ GET  /info              # JSON: {rpm,dir,pwr,step,fill,kmh}  (step: °/LED updat
 GET  /effect?id=N       # Procedural effect: 0 = off, 1..6 = EffectId. &speed_red=NN sets the red point
 GET  /preview?file=X    # First frame (FRAME_SIZE bytes) for browser-side thumbnail
 GET  /fs_info           # JSON: {total,used,free,psram_free,frame_size}  (psram_free = largest free PSRAM block; frame_size = FRAME_STRIDE_PAL, what a new upload will cost)
-GET  /album             # Slideshow control (action=start|stop&delay=ms)
+GET  /album             # Slideshow control (action=start|stop&delay=ms[&incl=a.bin,b.bin | &excl=a.bin,b.bin])
 GET  /wifi_scan[?start=1]  # Async scan for visible networks: start=1 begins one, plain GET reports {scanning,nets}
 GET  /logs?since=N      # Incremental web log
 POST /settime?t=&tz=    # Browser clock sync for log timestamps

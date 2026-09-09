@@ -1,6 +1,5 @@
 package com.povwheel.app.ui
 
-import android.graphics.Bitmap
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -16,7 +15,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
@@ -40,8 +38,6 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.sp
 import com.povwheel.app.WheelVm
-import com.povwheel.app.ble.DevFile
-import com.povwheel.app.convert.PreviewClip
 import com.povwheel.app.ble.Link
 import com.povwheel.app.ble.Proto
 import com.povwheel.app.ble.Settings
@@ -303,222 +299,7 @@ private fun Hero(vm: WheelVm, tele: Tele) {
 
 // ---------------------------------------------------------------- Библиотека
 
-@Composable
-private fun LibraryTab(vm: WheelVm, tele: Tele) {
-    val files by vm.files.collectAsState()
-    val fs by vm.fsInfo.collectAsState()
-    val connected by vm.connected.collectAsState()
-    val mirror by vm.mirrorAll.collectAsState()
-    var confirmDelete by remember { mutableStateOf<String?>(null) }
-    // Значение с устройства — источник истины. Пока оно не приехало (интервал 0),
-    // держим последнее показанное: иначе регулятор дёргался бы на каждом пакете
-    // телеметрии, приходящем раз в полсекунды.
-    var albumSecs by rememberSaveable { mutableStateOf(10) }
-    var albumTouched by rememberSaveable { mutableStateOf(false) }
-    // Сменили колесо — снова слушаем устройство, а не помним чужую цифру.
-    // У каждого колеса свой интервал, и показывать здесь настройку соседнего
-    // тем вреднее, что она применяется сразу: первое же касание навязало бы её.
-    val currentWheel by vm.current.collectAsState()
-    LaunchedEffect(currentWheel) { albumTouched = false }
-    LaunchedEffect(tele.slideSecs, albumTouched) {
-        if (tele.slideSecs in 1..300 && !albumTouched) albumSecs = tele.slideSecs
-    }
-
-    // Интервал применяется СРАЗУ, без стоп/старта. Устройство при уже идущем
-    // слайдшоу меняет только интервал и не трогает текущий индекс (OP_ALBUM),
-    // так что картинка на ободе от этого не перескакивает.
-    // Задержка — чтобы прокрутка колеса не сыпала командой на каждое деление.
-    LaunchedEffect(albumSecs, tele.slideshow) {
-        if (albumTouched && tele.slideshow) {
-            kotlinx.coroutines.delay(350)
-            vm.album(true, albumSecs * 1000)
-        }
-    }
-
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp)) {
-
-        if (connected.size > 1) {
-            Card(Modifier.fillMaxWidth()) {
-                Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text("Mirror to all " + connected.size + " wheels", Modifier.weight(1f))
-                    Switch(checked = mirror, onCheckedChange = { vm.setMirror(it) })
-                }
-            }
-            Spacer(Modifier.height(12.dp))
-        }
-
-        // Компактно: заголовок, а под ним одна строка — слева кнопка
-        // старт/стоп, справа регулятор задержки. Интервал по-прежнему
-        // применяется сразу (см. LaunchedEffect выше), поэтому подсказку об
-        // этом убрали.
-        Card(Modifier.fillMaxWidth()) {
-            Column(
-                Modifier.padding(12.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Text("Slideshow", fontWeight = FontWeight.SemiBold,
-                    style = MaterialTheme.typography.bodyMedium)
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    Button(onClick = {
-                        if (tele.slideshow) { vm.album(false, 0); vm.say("Slideshow stopped") }
-                        else {
-                            albumTouched = true
-                            vm.album(true, albumSecs * 1000)
-                            vm.say("Slideshow started")
-                        }
-                    }) { Text(if (tele.slideshow) "⏹ Stop" else "⏩ Start") }
-                    NumberSpinner(
-                        value = albumSecs,
-                        range = 1..300,
-                        suffix = " s",
-                        modifier = Modifier.weight(1f),
-                        onChange = { albumTouched = true; albumSecs = it }
-                    )
-                }
-            }
-        }
-
-        Spacer(Modifier.height(12.dp))
-
-        Text("Library", fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.titleMedium)
-        Text("Tap a row to play it on the wheel.", style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Spacer(Modifier.height(8.dp))
-
-        if (files.isEmpty()) {
-            Card(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(18.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("Nothing stored yet.")
-                    Text("Upload a picture to get started.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-            }
-        } else {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                files.forEach { f ->
-                    FileRow(
-                        vm, f,
-                        playing = tele.play && tele.file == f.name,
-                        armed = confirmDelete == f.name,
-                        onArm = { confirmDelete = f.name },
-                        onCancel = { confirmDelete = null },
-                        onDelete = { vm.delete(f.name); confirmDelete = null }
-                    )
-                }
-            }
-        }
-
-        Spacer(Modifier.height(14.dp))
-
-        // «Add animation» переехал сюда, под список: сперва библиотека, потом
-        // то, чем её пополняют.
-        UploadPanel(vm)
-
-        Spacer(Modifier.height(12.dp))
-
-        // Индикатор хранилища. Флеш ограничивает, сколько файлов влезет; PSRAM —
-        // какой длины может быть одна анимация, ведь играет она целиком из ОЗУ.
-        Card(Modifier.fillMaxWidth()) {
-            Column(Modifier.padding(12.dp)) {
-                Text("Storage (flash)", fontWeight = FontWeight.SemiBold)
-                val totalMb = fs.total / 1048576.0
-                val freeMb = fs.free / 1048576.0
-                Text(String.format("%.1f MB free of %.1f MB", freeMb, totalMb),
-                    style = MaterialTheme.typography.bodySmall)
-                Spacer(Modifier.height(6.dp))
-                LinearProgressIndicator(
-                    progress = { if (fs.total > 0) (fs.used.toFloat() / fs.total) else 0f },
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    "Animations play from RAM, not from storage — " +
-                        String.format("%.1f", fs.psramFree / 1048576.0) +
-                        " MB of RAM free, enough for about " + fs.maxFrames +
-                        " frames (~" + (fs.maxFrames / 10) + " s at 10 fps).",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-        }
-        Spacer(Modifier.height(24.dp))
-    }
-}
-
-@Composable
-private fun FileRow(
-    vm: WheelVm, f: DevFile, playing: Boolean, armed: Boolean,
-    onArm: () -> Unit, onCancel: () -> Unit, onDelete: () -> Unit
-) {
-    // Локальный кэш анимированного превью (кладётся при заливке). Есть — крутим
-    // его; нет — прежняя статичная миниатюра одним кадром по BLE.
-    val pv by vm.previewVersion.collectAsState()
-    var thumb by remember(f.name + f.size) { mutableStateOf<Bitmap?>(null) }
-    var clip by remember(f.name + f.size) { mutableStateOf<PreviewClip?>(null) }
-    LaunchedEffect(f.name, f.size, pv) {
-        val c = vm.localClip(f)
-        if (c != null) clip = c
-        else if (thumb == null) {
-            val p = vm.thumb(f)
-            if (p != null) thumb = WheelThumb.render(p, 96)
-        }
-    }
-
-    Card(
-        Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(
-            containerColor = if (playing) Ok.copy(alpha = 0.14f) else MaterialTheme.colorScheme.surface
-        )
-    ) {
-        if (armed) {
-            Column(Modifier.padding(12.dp)) {
-                Text("Delete “" + f.pretty + "”?")
-                Spacer(Modifier.height(8.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(
-                        onClick = onDelete,
-                        colors = ButtonDefaults.buttonColors(containerColor = Danger)
-                    ) { Text("Delete") }
-                    OutlinedButton(onClick = onCancel) { Text("Cancel") }
-                }
-            }
-        } else {
-            Row(
-                Modifier.padding(10.dp).clickable { vm.play(f.name) },
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Box(
-                    Modifier.size(48.dp).clip(CircleShape)
-                        .background(MaterialTheme.colorScheme.surfaceVariant),
-                    contentAlignment = Alignment.Center
-                ) {
-                    AnimatedDisc(clip, thumb, Modifier.size(48.dp).clip(CircleShape))
-                }
-                Spacer(Modifier.width(12.dp))
-                Column(Modifier.weight(1f)) {
-                    Text(f.pretty, fontWeight = FontWeight.SemiBold, maxLines = 1)
-                    Text(
-                        f.kind + "  ·  " + (if (f.frames > 1) f.frames.toString() + " frames" else "still image") +
-                            "  ·  " + fmtSize(f.size),
-                        style = MaterialTheme.typography.bodySmall,
-                        fontFamily = FontFamily.Monospace, fontSize = 11.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-                IconButton(onClick = { vm.play(f.name) }) { Text("▶") }
-                IconButton(onClick = onArm) { Text("✕") }
-            }
-        }
-    }
-}
-
-private fun fmtSize(b: Long): String =
-    if (b >= 1048576) String.format("%.1f MB", b / 1048576.0)
-    else (b / 1024).toString() + " kB"
+// LibraryTab и его ячейки живут в ui/LibraryGrid.kt.
 
 // -------------------------------------------------------------------- Экран
 
@@ -1093,7 +874,7 @@ private fun SliderRow(
 }
 
 @Composable
-private fun NumberDialog(
+internal fun NumberDialog(
     title: String, body: String, initial: Int, unit: String,
     min: Int, max: Int, onDismiss: () -> Unit, onSave: (Int) -> Unit
 ) {

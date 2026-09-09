@@ -86,10 +86,11 @@ object Proto {
         else -> "error " + s
     }
 
-    const val FEAT_DEFLATE = 0x0001
-    const val FEAT_OTA     = 0x0002
-    const val FEAT_PREVIEW = 0x0004
-    const val FEAT_WIFI    = 0x0008
+    const val FEAT_DEFLATE   = 0x0001
+    const val FEAT_OTA       = 0x0002
+    const val FEAT_PREVIEW   = 0x0004
+    const val FEAT_WIFI      = 0x0008
+    const val FEAT_ALBUM_SEL = 0x0010   // OP_ALBUM понимает отбор файлов для слайдшоу
 
     fun buf(n: Int): ByteBuffer = ByteBuffer.allocate(n).order(ByteOrder.LITTLE_ENDIAN)
     fun wrap(b: ByteArray): ByteBuffer = ByteBuffer.wrap(b).order(ByteOrder.LITTLE_ENDIAN)
@@ -110,9 +111,10 @@ data class Hello(
     val sectors: Int, val frameStride: Int, val mtu: Int, val features: Int,
     val uptimeS: Long, val name: String, val fw: String
 ) {
-    val hasDeflate get() = features and Proto.FEAT_DEFLATE != 0
-    val hasOta     get() = features and Proto.FEAT_OTA != 0
-    val hasPreview get() = features and Proto.FEAT_PREVIEW != 0
+    val hasDeflate  get() = features and Proto.FEAT_DEFLATE != 0
+    val hasOta      get() = features and Proto.FEAT_OTA != 0
+    val hasPreview  get() = features and Proto.FEAT_PREVIEW != 0
+    val hasAlbumSel get() = features and Proto.FEAT_ALBUM_SEL != 0
 
     companion object {
         const val SIZE = 48

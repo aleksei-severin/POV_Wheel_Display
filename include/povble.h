@@ -46,6 +46,9 @@ enum PovOp : uint8_t {
     OP_DELETE      = 0x08,  // →  имя файла
     OP_EFFECT      = 0x09,  // →  [u8 id][u16 speed_red]
     OP_ALBUM       = 0x0A,  // →  [u8 action 0=stop 1=start][u32 delay_ms]
+                           //    старт может нести отбор файлов (FEAT_ALBUM_SEL):
+                           //    …[u8 mode 0=пропускать 1=играть-только][u16 n]{[u8 len][имя]}
+                           //    n=0 или короткий пакет — крутить всё (прежнее поведение)
     OP_TELE        = 0x0B,  // →  ничего            ←  PovTele
     OP_PREVIEW     = 0x0C,  // →  имя файла         ←  [u8 sec][u8 rad][RGB565 sec*rad]
     OP_SETTIME     = 0x0D,  // →  [u32 epoch][i32 tz_sec]
@@ -105,10 +108,11 @@ struct PovHello {
     char     fw[12];           // дата сборки, с завершающим нулём
 };
 
-#define POV_FEAT_DEFLATE  0x0001   // OP_UP_BEGIN понимает comp = 1
-#define POV_FEAT_OTA      0x0002   // прошивка по BLE
-#define POV_FEAT_PREVIEW  0x0004
-#define POV_FEAT_WIFI     0x0008   // Wi-Fi можно поднять по требованию
+#define POV_FEAT_DEFLATE   0x0001   // OP_UP_BEGIN понимает comp = 1
+#define POV_FEAT_OTA       0x0002   // прошивка по BLE
+#define POV_FEAT_PREVIEW   0x0004
+#define POV_FEAT_WIFI      0x0008   // Wi-Fi можно поднять по требованию
+#define POV_FEAT_ALBUM_SEL 0x0010   // OP_ALBUM понимает отбор файлов для слайдшоу
 
 // Настройки, симметричные на чтение и запись. Всё, что имеет побочные эффекты
 // (эффект, слайдшоу, воспроизведение), сюда НЕ входит — у этого свои команды,
