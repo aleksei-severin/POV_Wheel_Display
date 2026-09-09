@@ -37,6 +37,8 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import com.povwheel.app.WheelVm
 import com.povwheel.app.ble.Link
 import com.povwheel.app.ble.Proto
@@ -46,9 +48,8 @@ import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
 
 // Меню Tuning больше нет: его настройки переехали в Display, под сворачиваемую
-// секцию «Colour». Четыре коротких имени умещаются в ширину экрана, поэтому
-// TabRow с равными долями вместо прокручиваемого ScrollableTabRow.
-private val TABS = listOf("Library", "Display", "Log")
+// секцию «Colour». Лог — не вкладка, а окно из Display → Maintenance → Log.
+private val TABS = listOf("Library", "Display")
 
 @Composable
 fun DeviceScreen(vm: WheelVm) {
@@ -76,8 +77,7 @@ fun DeviceScreen(vm: WheelVm) {
         Box(Modifier.weight(1f)) {
             when (tab) {
                 0 -> LibraryTab(vm, tele)
-                1 -> DisplayTab(vm, tele)
-                else -> LogTab(vm)
+                else -> DisplayTab(vm, tele)
             }
         }
     }
@@ -307,6 +307,7 @@ private fun DisplayTab(vm: WheelVm, tele: Tele) {
     val s by vm.settings.collectAsState()
     var colourOpen by rememberSaveable { mutableStateOf(false) }
     var confirmOff by remember { mutableStateOf(false) }
+    var showLog by remember { mutableStateOf(false) }
     val fw by vm.fwProgress.collectAsState()
     val fwPicker = rememberLauncherForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.OpenDocument()
@@ -368,21 +369,22 @@ private fun DisplayTab(vm: WheelVm, tele: Tele) {
         SettingCard {
             Text("Maintenance", fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(8.dp))
-            // Четыре кнопки в один ряд: делят ширину поровну, подписи короткие.
-            // «Power off» — уход в транспортный режим: колесо гаснет и до
-            // удержания кнопки не проснётся ни по тряске, ни по BLE.
+            // Кнопки в один ряд: делят ширину поровну, подписи короткие.
+            // «OFF» — уход в транспортный режим: колесо гаснет и до удержания
+            // кнопки не проснётся ни по тряске, ни по BLE.
             Row(
                 Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                horizontalArrangement = Arrangement.spacedBy(5.dp)
             ) {
-                MaintBtn("Power off", fw == null, danger = true) { confirmOff = true }
+                MaintBtn("OFF", fw == null, danger = true) { confirmOff = true }
                 MaintBtn("Reboot", fw == null) { vm.reboot() }
                 MaintBtn("Wi-Fi", fw == null) {
                     vm.wifi(true); vm.say("Wi-Fi is coming up for OTA")
                 }
-                MaintBtn("Firmware", fw == null) {
+                MaintBtn("Update", fw == null) {
                     fwPicker.launch(arrayOf("application/octet-stream", "*/*"))
                 }
+                MaintBtn("Log", fw == null) { showLog = true }
             }
             if (fw != null) {
                 Spacer(Modifier.height(8.dp))
@@ -418,6 +420,8 @@ private fun DisplayTab(vm: WheelVm, tele: Tele) {
             dismissButton = { TextButton(onClick = { confirmOff = false }) { Text("Cancel") } }
         )
     }
+
+    if (showLog) LogDialog(vm) { showLog = false }
 }
 
 /** Блок настроек в своей карточке — рамка вместо линии-разделителя. */
@@ -487,12 +491,12 @@ private fun RowScope.MaintBtn(
         onClick = onClick,
         enabled = enabled,
         modifier = Modifier.weight(1f),
-        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp),
+        contentPadding = PaddingValues(horizontal = 2.dp, vertical = 8.dp),
         colors = if (danger)
             ButtonDefaults.outlinedButtonColors(contentColor = Danger)
         else ButtonDefaults.outlinedButtonColors()
     ) {
-        Text(label, style = MaterialTheme.typography.labelMedium, maxLines = 1, softWrap = false)
+        Text(label, style = MaterialTheme.typography.labelSmall, maxLines = 1, softWrap = false)
     }
 }
 
@@ -569,9 +573,23 @@ private fun ColourControls(vm: WheelVm) {
 // Эффекты переехали в плитку Library (ui/LibraryGrid.kt); превью — ui/EffectPreviews.kt.
 
 // ---------------------------------------------------------------------- Лог
+// Не вкладка, а окно: Display → Maintenance → Log. Опрос идёт, только пока
+// окно открыто.
 
 @Composable
-private fun LogTab(vm: WheelVm) {
+private fun LogDialog(vm: WheelVm, onDismiss: () -> Unit) {
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Surface(
+            Modifier.fillMaxSize().padding(10.dp),
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            LogContent(vm, onDismiss)
+        }
+    }
+}
+
+@Composable
+private fun LogContent(vm: WheelVm, onDismiss: () -> Unit) {
     val lines by vm.logLines.collectAsState()
     LaunchedEffect(Unit) {
         while (true) { vm.pollLog(); delay(2000) }
@@ -624,9 +642,11 @@ private fun LogTab(vm: WheelVm) {
 
     Column(Modifier.fillMaxSize().padding(12.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Device log", fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-            Text(lines.size.toString() + " lines", style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(
+                "Device log · " + lines.size,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.weight(1f)
+            )
             // Выделение пальцем достаёт только то, что на экране, — так устроен
             // SelectionContainer поверх ленивого списка. Для «прислать весь лог»
             // нужна кнопка, и она надёжнее любого жеста.
@@ -637,7 +657,8 @@ private fun LogTab(vm: WheelVm) {
                 },
                 enabled = lines.isNotEmpty()
             ) { Text("Copy") }
-            TextButton(onClick = { vm.clearLogView() }) { Text("✕ Clear") }
+            TextButton(onClick = { vm.clearLogView() }) { Text("Clear") }
+            TextButton(onClick = onDismiss) { Text("✕") }
         }
         Card(Modifier.fillMaxSize()) {
             // SelectionContainer — то, чего не хватало: без него Text в Compose
