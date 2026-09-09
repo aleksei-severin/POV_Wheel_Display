@@ -811,6 +811,10 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             var ok = 0
             var fail = 0
+            // Uri тех файлов, что не уехали ни на одно колесо. По окончании в
+            // сетке остаются только они — успешные убираем, чтобы можно было
+            // повторить одной кнопкой, не разбираясь заново, что не долилось.
+            val failedUris = ArrayList<Uri>()
             for (item in jobs) {
                 val label = item.name
                 try {
@@ -868,7 +872,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                             say((c.hello?.name ?: addr) + ": " + (e.message ?: "upload failed"))
                         }
                     }
-                    if (sentTo > 0) ok++ else fail++
+                    if (sentTo > 0) ok++ else { fail++; failedUris.add(item.uri) }
                 } catch (e: kotlinx.coroutines.CancellationException) {
                     // Отмену пробрасываем: иначе цикл продолжал бы крутиться
                     // после смерти scope, дописывая в мёртвые соединения.
@@ -880,6 +884,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                     // Error, мимо catch(Exception) проходил насквозь и ронял
                     // приложение вместо сообщения об ошибке.
                     fail++
+                    failedUris.add(item.uri)
                     val why = e.message?.takeIf { it.isNotBlank() } ?: e::class.java.simpleName
                     upStatus.value = label + " — failed: " + why
                     upKind.value = 2
@@ -895,6 +900,9 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             } else {
                 upStatus.value = ok.toString() + " uploaded, " + fail + " failed."
                 upKind.value = 2
+                // В сетке оставляем только незагруженные.
+                upItems.value = upItems.value.filter { it.uri in failedUris }
+                upSel.value = 0
             }
             refreshFiles()
         }
