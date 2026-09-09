@@ -90,23 +90,19 @@ private fun MainContent(vm: WheelVm, tele: Tele) {
         }
         item(key = "magnet", span = { GridItemSpan(maxLineSpan) }) {
             SettingCard {
-                // Спиннер справа, а не под заголовком, — так блок ниже по высоте.
-                // Спиннер, а не ползунок: на 360 положениях один пиксель дорожки
-                // стоит больше градуса, а «поставить картинку ровно» — правка на
-                // единицы градусов.
+                // Заголовок и компактный спиннер в одну строку — блок по высоте
+                // совпадает со свёрнутым «Colour». Спиннер, а не ползунок: на 360
+                // положениях один пиксель дорожки стоит больше градуса, а
+                // «поставить картинку ровно» — правка на единицы градусов.
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text("Magnet position", style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.SemiBold)
-                        Text("Stands the animation upright.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
+                    Text("Magnet Position", style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
                     NumberSpinner(
                         value = s.angle,
                         range = 0..360,
                         suffix = "°",
-                        modifier = Modifier.width(176.dp),
+                        modifier = Modifier.width(140.dp),
+                        dense = true,
                         onChange = { vm.settings.value = s.copy(angle = it) },
                         onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() }
                     )
@@ -300,13 +296,15 @@ private fun Hero(vm: WheelVm, tele: Tele, online: Boolean) {
     // Нет связи или телеметрия ещё не пришла — прочерки, как у скорости/оборотов,
     // а не нули напряжения и процентов.
     val battKnown = online && tele.vbatMv > 0
-    // Короткий статус справа от «BATTERY». Discharging/Charged не показываем —
-    // только зарядку и «Low» (когда яркость уже урезана защитой).
+    // Короткий статус справа от «BATTERY». Discharging (просто разряд) не
+    // показываем — только зарядку, «Charged», «Low» (яркость урезана защитой)
+    // и «Empty» (дисплей выключен по разряду).
     val battBadge: Pair<String, Color?>? = when {
         !battKnown -> "Offline" to null
         tele.cutoff -> "Empty" to Danger
         tele.ablCap < 100 -> "Low" to Warn
         tele.chg == 1 -> "Charging" to Accent
+        tele.chg == 2 -> "Charged" to Ok
         else -> null
     }
 
@@ -320,23 +318,25 @@ private fun Hero(vm: WheelVm, tele: Tele, online: Boolean) {
             Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
                 Label("DISPLAY")
                 Spacer(Modifier.height(2.dp))
-                Row(verticalAlignment = Alignment.Bottom) {
+                Row {
                     Text(
                         if (tele.kmh > 0f) String.format("%.1f", tele.kmh) else "--",
                         style = MaterialTheme.typography.headlineSmall,
                         fontWeight = FontWeight.Bold,
-                        modifier = Modifier.clickable { showCirc = true }
+                        modifier = Modifier.alignByBaseline().clickable { showCirc = true }
                     )
                     Text(" km/h", style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Spacer(Modifier.width(10.dp))
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.alignByBaseline())
                     Text(
                         if (tele.rpm > 0f) tele.rpm.roundToInt().toString() else "--",
                         style = MaterialTheme.typography.titleMedium,
-                        modifier = Modifier.clickable { showRpm = true }
+                        modifier = Modifier.alignByBaseline().padding(start = 10.dp)
+                            .clickable { showRpm = true }
                     )
                     Text(" rpm", style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.alignByBaseline())
                 }
             }
         }
@@ -349,11 +349,12 @@ private fun Hero(vm: WheelVm, tele: Tele, online: Boolean) {
                     battBadge?.let { (t, c) -> Badge2(t, c) }
                 }
                 Spacer(Modifier.height(2.dp))
-                Row(verticalAlignment = Alignment.Bottom) {
+                Row {
                     Text(
                         if (battKnown) tele.soc.toString() + "%" else "--",
                         style = MaterialTheme.typography.headlineSmall,
                         fontWeight = FontWeight.Bold,
+                        modifier = Modifier.alignByBaseline(),
                         color = when {
                             !battKnown -> MaterialTheme.colorScheme.onSurfaceVariant
                             tele.soc < 15 -> Danger
@@ -362,9 +363,10 @@ private fun Hero(vm: WheelVm, tele: Tele, online: Boolean) {
                         }
                     )
                     Text(
-                        "  " + (if (battKnown) String.format("%.2f", tele.vbatMv / 1000f) else "--") + " V",
+                        (if (battKnown) String.format("%.2f", tele.vbatMv / 1000f) else "--") + " V",
                         style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.alignByBaseline().padding(start = 6.dp)
                     )
                 }
             }
@@ -486,51 +488,36 @@ private fun RowScope.MaintBtn(
 private fun ColourControls(vm: WheelVm) {
     val s by vm.settings.collectAsState()
     Column {
-        Text(
-            "Gamma, saturation and contrast shape the picture; R/G/B set the white " +
-                "balance of the LEDs.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-        Spacer(Modifier.height(10.dp))
-
         SliderRow("Gamma", String.format("%.1f", s.gammaX100 / 100f),
             s.gammaX100 / 10f, 10f, 50f, 40,
             onChange = { vm.settings.value = s.copy(gammaX100 = it.roundToInt() * 10) },
             onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() })
-        Hint("Higher = deeper shadows and a cleaner black; lower = flatter, brighter mid-tones.")
 
         SliderRow("Saturation", String.format("%.1f", s.satX100 / 100f),
             s.satX100 / 10f, 10f, 30f, 20,
             onChange = { vm.settings.value = s.copy(satX100 = it.roundToInt() * 10) },
             onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() })
-        Hint("How vivid the colours are. 1.0 is the picture as uploaded.")
 
         SliderRow("Contrast", (s.contrastX10 / 10).toString() + "%",
             (s.contrastX10 / 10).toFloat(), 0f, 100f, 100,
             onChange = { vm.settings.value = s.copy(contrastX10 = it.roundToInt() * 10) },
             onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() })
-        Hint("A few percent is usually enough — large values swallow detail at both ends.")
-
-        Spacer(Modifier.height(6.dp))
-        Text("White balance", style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Spacer(Modifier.height(4.dp))
 
         SliderRow("Red", (s.rgX10 / 10).toString() + "%",
             (s.rgX10 / 10).toFloat(), 0f, 100f, 20,
             onChange = { vm.settings.value = s.copy(rgX10 = it.roundToInt() * 10) },
-            onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() })
+            onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() },
+            color = Danger)
         SliderRow("Green", (s.ggX10 / 10).toString() + "%",
             (s.ggX10 / 10).toFloat(), 0f, 100f, 20,
             onChange = { vm.settings.value = s.copy(ggX10 = it.roundToInt() * 10) },
-            onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() })
+            onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() },
+            color = Ok)
         SliderRow("Blue", (s.bgX10 / 10).toString() + "%",
             (s.bgX10 / 10).toFloat(), 0f, 100f, 20,
             onChange = { vm.settings.value = s.copy(bgX10 = it.roundToInt() * 10) },
-            onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() })
-        Hint("Green LEDs are the brightest of the three, so green usually sits lower " +
-             "than the others. Aim for neutral white, not maximum output.")
+            onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() },
+            color = Accent)
 
         Spacer(Modifier.height(12.dp))
         OutlinedButton(
@@ -683,13 +670,6 @@ private fun Label(t: String) = Text(
 )
 
 @Composable
-private fun Hint(t: String) = Text(
-    t, style = MaterialTheme.typography.bodySmall,
-    color = MaterialTheme.colorScheme.onSurfaceVariant,
-    modifier = Modifier.padding(bottom = 8.dp)
-)
-
-@Composable
 private fun Badge2(text: String, color: Color?) {
     val c = color ?: MaterialTheme.colorScheme.onSurfaceVariant
     Box(
@@ -718,12 +698,14 @@ private fun Badge2(text: String, color: Color?) {
  * старой, превращая «1» и «5» в «15». Здесь пустое поле — законное
  * промежуточное состояние, и ничего за спиной пользователя не дописывается.
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun NumberSpinner(
     value: Int,
     range: IntRange,
     suffix: String = "",
     modifier: Modifier = Modifier,
+    dense: Boolean = false,
     onChange: (Int) -> Unit,
     onCommit: () -> Unit = {}
 ) {
@@ -731,6 +713,13 @@ private fun NumberSpinner(
     var text by remember { mutableStateOf("") }
     val focus = remember { FocusRequester() }
     val density = LocalDensity.current
+
+    // Компактный режим: всё в одну строку рядом с заголовком карточки.
+    val btnSize = if (dense) 32.dp else 44.dp
+    val signSize = if (dense) 16.sp else 20.sp
+    val valueStyle = if (dense) MaterialTheme.typography.titleMedium
+                     else MaterialTheme.typography.headlineSmall
+    val dragPadV = if (dense) 2.dp else 6.dp
 
     fun clamp(v: Int) = v.coerceIn(range.first, range.last)
 
@@ -740,13 +729,14 @@ private fun NumberSpinner(
         editing = false
     }
 
+    val row = @Composable {
     Row(modifier, verticalAlignment = Alignment.CenterVertically) {
         FilledTonalButton(
             onClick = { onChange(clamp(value - 1)); onCommit() },
             enabled = value > range.first,
             contentPadding = PaddingValues(0.dp),
-            modifier = Modifier.size(44.dp)
-        ) { Text("−", fontSize = 20.sp) }
+            modifier = Modifier.size(btnSize)
+        ) { Text("−", fontSize = signSize) }
 
         Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
             if (editing) {
@@ -784,7 +774,7 @@ private fun NumberSpinner(
                 var base by remember { mutableStateOf(value) }
                 Text(
                     value.toString() + suffix,
-                    style = MaterialTheme.typography.headlineSmall,
+                    style = valueStyle,
                     fontWeight = FontWeight.SemiBold,
                     modifier = Modifier
                         .clickable { text = value.toString(); editing = true }
@@ -797,7 +787,7 @@ private fun NumberSpinner(
                             onDragStarted = { base = value; acc = 0f },
                             onDragStopped = { acc = 0f; onCommit() }
                         )
-                        .padding(horizontal = 8.dp, vertical = 6.dp)
+                        .padding(horizontal = 8.dp, vertical = dragPadV)
                 )
             }
         }
@@ -806,28 +796,46 @@ private fun NumberSpinner(
             onClick = { onChange(clamp(value + 1)); onCommit() },
             enabled = value < range.last,
             contentPadding = PaddingValues(0.dp),
-            modifier = Modifier.size(44.dp)
-        ) { Text("+", fontSize = 20.sp) }
+            modifier = Modifier.size(btnSize)
+        ) { Text("+", fontSize = signSize) }
     }
+    }
+
+    // В компактном режиме отключаем расширение кнопок до 48 dp — иначе строка
+    // всё равно была бы во весь минимальный тач-таргет и «в одну строку с
+    // Magnet Position» не уместилась бы по высоте свёрнутого «Colour».
+    if (dense) {
+        CompositionLocalProvider(
+            LocalMinimumInteractiveComponentEnforcement provides false, content = row
+        )
+    } else row()
 }
 
 @Composable
 private fun SliderRow(
     label: String, valueText: String,
     value: Float, min: Float, max: Float, steps: Int,
-    onChange: (Float) -> Unit, onCommit: () -> Unit
+    onChange: (Float) -> Unit, onCommit: () -> Unit,
+    color: Color? = null   // R/G/B — красим дорожку и подпись в свой цвет
 ) {
     Column(Modifier.padding(vertical = 4.dp)) {
         Row {
-            Text(label, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
-            Text(valueText, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+            Text(label, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f),
+                color = color ?: Color.Unspecified)
+            Text(valueText, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold,
+                color = color ?: Color.Unspecified)
         }
         Slider(
             value = value.coerceIn(min, max),
             onValueChange = onChange,
             onValueChangeFinished = onCommit,
             valueRange = min..max,
-            steps = (steps - 1).coerceAtLeast(0)
+            steps = (steps - 1).coerceAtLeast(0),
+            colors = if (color != null) SliderDefaults.colors(
+                thumbColor = color,
+                activeTrackColor = color,
+                activeTickColor = color.copy(alpha = 0.4f)
+            ) else SliderDefaults.colors()
         )
     }
 }
