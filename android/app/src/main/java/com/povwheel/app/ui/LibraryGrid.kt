@@ -15,6 +15,7 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyGridScope
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.CircleShape
@@ -83,8 +84,13 @@ private fun cellKey(c: Cell): Any = when (c) {
  * Отбор для слайдшоу (файлы + маска эффектов) — фича прошивки (`Hello.hasAlbumSel`).
  * На старом колесе кнопка Slideshow просто включает/выключает показ всех файлов.
  */
+/**
+ * Единственный экран управления: плитка библиотеки, а следом — блоки настроек
+ * ([extraItems], передаются из DeviceScreen как full-span элементы той же сетки,
+ * чтобы всё скроллилось вместе и в одном стиле).
+ */
 @Composable
-internal fun LibraryTab(vm: WheelVm, tele: Tele) {
+internal fun LibraryTab(vm: WheelVm, tele: Tele, extraItems: (LazyGridScope.() -> Unit)? = null) {
     val files by vm.files.collectAsState()
     val fs by vm.fsInfo.collectAsState()
     val connected by vm.connected.collectAsState()
@@ -201,6 +207,7 @@ internal fun LibraryTab(vm: WheelVm, tele: Tele) {
             }
 
             item(key = "storage", span = { GridItemSpan(maxLineSpan) }) { StorageCard(fs) }
+            extraItems?.invoke(this)
             item(key = "tail", span = { GridItemSpan(maxLineSpan) }) { Spacer(Modifier.height(8.dp)) }
         }
 
@@ -597,12 +604,12 @@ private fun UploadStrip(vm: WheelVm) {
     }
 }
 
-/** Индикатор хранилища. Флеш ограничивает число файлов, PSRAM — длину одной анимации. */
+/** Индикатор хранилища — сколько места на флеше под файлы. */
 @Composable
 private fun StorageCard(fs: com.povwheel.app.ble.FsInfo) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp)) {
-            Text("Storage (flash)", fontWeight = FontWeight.SemiBold)
+            Text("Storage", fontWeight = FontWeight.SemiBold)
             val totalMb = fs.total / 1048576.0
             val freeMb = fs.free / 1048576.0
             Text(String.format("%.1f MB free of %.1f MB", freeMb, totalMb),
@@ -611,15 +618,6 @@ private fun StorageCard(fs: com.povwheel.app.ble.FsInfo) {
             LinearProgressIndicator(
                 progress = { if (fs.total > 0) (fs.used.toFloat() / fs.total) else 0f },
                 modifier = Modifier.fillMaxWidth()
-            )
-            Spacer(Modifier.height(6.dp))
-            Text(
-                "One animation plays from RAM at a time — up to " +
-                    String.format("%.1f", fs.psramFree / 1048576.0) +
-                    " MB, about " + fs.maxFrames +
-                    " frames (~" + (fs.maxFrames / 10) + " s at 10 fps), whatever is on the wheel now.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
     }

@@ -13,10 +13,9 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -47,9 +46,9 @@ import com.povwheel.app.ble.Tele
 import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
 
-// Меню Tuning больше нет: его настройки переехали в Display, под сворачиваемую
-// секцию «Colour». Лог — не вкладка, а окно из Display → Maintenance → Log.
-private val TABS = listOf("Library", "Display")
+// Вкладок больше нет — один экран: сверху библиотека, за ней настройки дисплея
+// той же лентой. Меню Tuning свёрнуто в секцию «Colour». Лог — окно из
+// Maintenance → Log.
 
 @Composable
 fun DeviceScreen(vm: WheelVm) {
@@ -62,25 +61,135 @@ fun DeviceScreen(vm: WheelVm) {
     }
     val link by client.link.collectAsState()
     val tele by client.tele.collectAsState()
-    var tab by rememberSaveable { mutableStateOf(0) }
 
     Column(Modifier.fillMaxSize()) {
         Header(vm, link)
         Hero(vm, tele, link == Link.Ready)
+        Box(Modifier.weight(1f)) { MainContent(vm, tele) }
+    }
+}
 
-        TabRow(selectedTabIndex = tab) {
-            TABS.forEachIndexed { i, t ->
-                Tab(selected = tab == i, onClick = { tab = i }, text = { Text(t) })
+/**
+ * Единый экран: плитка библиотеки ([LibraryTab]) плюс блоки настроек дисплея,
+ * добавленные в ту же сетку full-span элементами — всё скроллится вместе.
+ */
+@Composable
+private fun MainContent(vm: WheelVm, tele: Tele) {
+    val s by vm.settings.collectAsState()
+    var colourOpen by rememberSaveable { mutableStateOf(false) }
+    var confirmOff by remember { mutableStateOf(false) }
+    var showLog by remember { mutableStateOf(false) }
+    val fw by vm.fwProgress.collectAsState()
+    val fwPicker = rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.OpenDocument()
+    ) { uri -> if (uri != null) vm.updateFirmware(uri) { vm.say(it) } }
+
+    LibraryTab(vm, tele) {
+        item(key = "brightness", span = { GridItemSpan(maxLineSpan) }) {
+            SettingCard { AutoBrightnessRange(vm, s, tele) }
+        }
+        item(key = "magnet", span = { GridItemSpan(maxLineSpan) }) {
+            SettingCard {
+                // Спиннер справа, а не под заголовком, — так блок ниже по высоте.
+                // Спиннер, а не ползунок: на 360 положениях один пиксель дорожки
+                // стоит больше градуса, а «поставить картинку ровно» — правка на
+                // единицы градусов.
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Magnet position", style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold)
+                        Text("Stands the animation upright.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    NumberSpinner(
+                        value = s.angle,
+                        range = 0..360,
+                        suffix = "°",
+                        modifier = Modifier.width(176.dp),
+                        onChange = { vm.settings.value = s.copy(angle = it) },
+                        onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() }
+                    )
+                }
             }
         }
-
-        Box(Modifier.weight(1f)) {
-            when (tab) {
-                0 -> LibraryTab(vm, tele)
-                else -> DisplayTab(vm, tele)
+        item(key = "colour", span = { GridItemSpan(maxLineSpan) }) {
+            // Полдюжины ползунков незачем держать перед глазами — прячем под тап.
+            SettingCard {
+                Row(
+                    Modifier.fillMaxWidth()
+                        .clip(RoundedCornerShape(6.dp))
+                        .clickable { colourOpen = !colourOpen }
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Colour", style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                    Text(if (colourOpen) "▾" else "▸",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                if (colourOpen) {
+                    Spacer(Modifier.height(4.dp))
+                    ColourControls(vm)
+                }
+            }
+        }
+        item(key = "maint", span = { GridItemSpan(maxLineSpan) }) {
+            SettingCard {
+                Text("Maintenance", fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.height(8.dp))
+                // «OFF» — уход в транспортный режим: колесо гаснет и до удержания
+                // кнопки не проснётся ни по тряске, ни по BLE.
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(5.dp)
+                ) {
+                    MaintBtn("OFF", fw == null, danger = true) { confirmOff = true }
+                    MaintBtn("Reboot", fw == null) { vm.reboot() }
+                    MaintBtn("Wi-Fi", fw == null) {
+                        vm.wifi(true); vm.say("Wi-Fi is coming up for OTA")
+                    }
+                    MaintBtn("Update", fw == null) {
+                        fwPicker.launch(arrayOf("application/octet-stream", "*/*"))
+                    }
+                    MaintBtn("Log", fw == null) { showLog = true }
+                }
+                if (fw != null) {
+                    Spacer(Modifier.height(8.dp))
+                    LinearProgressIndicator(progress = { fw ?: 0f }, modifier = Modifier.fillMaxWidth())
+                    Text(
+                        "Sending firmware — " + ((fw ?: 0f) * 100).toInt() + "%. " +
+                            "Keep the phone near the wheel; it reboots by itself when done.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
         }
     }
+
+    if (confirmOff) {
+        AlertDialog(
+            onDismissRequest = { confirmOff = false },
+            title = { Text("Power off the wheel?") },
+            text = {
+                Text(
+                    "The wheel shuts down and will not wake on a shake or over " +
+                        "Bluetooth — only by holding its button for about 1.5 s."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmOff = false
+                    vm.powerOff(); vm.say("Powering off")
+                }) { Text("Power off") }
+            },
+            dismissButton = { TextButton(onClick = { confirmOff = false }) { Text("Cancel") } }
+        )
+    }
+
+    if (showLog) LogDialog(vm) { showLog = false }
 }
 
 // ------------------------------------------------------------------- обвязка
@@ -305,139 +414,15 @@ private fun Hero(vm: WheelVm, tele: Tele, online: Boolean) {
     }
 }
 
-// ---------------------------------------------------------------- Библиотека
+// LibraryTab (единый экран: плитка + блоки настроек) — в ui/LibraryGrid.kt;
+// сами блоки настроек собирает MainContent выше.
 
-// LibraryTab и его ячейки живут в ui/LibraryGrid.kt.
-
-// -------------------------------------------------------------------- Экран
-
-@Composable
-private fun DisplayTab(vm: WheelVm, tele: Tele) {
-    val s by vm.settings.collectAsState()
-    var colourOpen by rememberSaveable { mutableStateOf(false) }
-    var confirmOff by remember { mutableStateOf(false) }
-    var showLog by remember { mutableStateOf(false) }
-    val fw by vm.fwProgress.collectAsState()
-    val fwPicker = rememberLauncherForActivityResult(
-        androidx.activity.result.contract.ActivityResultContracts.OpenDocument()
-    ) { uri -> if (uri != null) vm.updateFirmware(uri) { vm.say(it) } }
-
-    // Каждый блок — своя карточка, как у эффектов и файлов; горизонтальных
-    // линий-разделителей больше нет.
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp)) {
-
-        SettingCard { AutoBrightnessRange(vm, s, tele) }
-
-        SettingCard {
-            // Спиннер справа, а не под заголовком, — так блок ниже по высоте.
-            // Спиннер, а не ползунок: на 360 положениях один пиксель дорожки
-            // стоит больше градуса, а «поставить картинку ровно» — это правка
-            // на единицы градусов.
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
-                    Text("Magnet position", style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold)
-                    Text("Stands the animation upright.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-                NumberSpinner(
-                    value = s.angle,
-                    range = 0..360,
-                    suffix = "°",
-                    modifier = Modifier.width(176.dp),
-                    onChange = { vm.settings.value = s.copy(angle = it) },
-                    onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() }
-                )
-            }
-        }
-
-        // Настройки цвета жили в отдельном меню Tuning; теперь они здесь, но
-        // спрятаны под тап по заголовку — полдюжины ползунков незачем держать
-        // перед глазами.
-        SettingCard {
-            Row(
-                Modifier.fillMaxWidth()
-                    .clip(RoundedCornerShape(6.dp))
-                    .clickable { colourOpen = !colourOpen }
-                    .padding(vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("Colour", style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                Text(if (colourOpen) "▾" else "▸",
-                    style = MaterialTheme.typography.titleMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-            if (colourOpen) {
-                Spacer(Modifier.height(4.dp))
-                ColourControls(vm)
-            }
-        }
-
-        SettingCard {
-            Text("Maintenance", fontWeight = FontWeight.SemiBold)
-            Spacer(Modifier.height(8.dp))
-            // Кнопки в один ряд: делят ширину поровну, подписи короткие.
-            // «OFF» — уход в транспортный режим: колесо гаснет и до удержания
-            // кнопки не проснётся ни по тряске, ни по BLE.
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(5.dp)
-            ) {
-                MaintBtn("OFF", fw == null, danger = true) { confirmOff = true }
-                MaintBtn("Reboot", fw == null) { vm.reboot() }
-                MaintBtn("Wi-Fi", fw == null) {
-                    vm.wifi(true); vm.say("Wi-Fi is coming up for OTA")
-                }
-                MaintBtn("Update", fw == null) {
-                    fwPicker.launch(arrayOf("application/octet-stream", "*/*"))
-                }
-                MaintBtn("Log", fw == null) { showLog = true }
-            }
-            if (fw != null) {
-                Spacer(Modifier.height(8.dp))
-                LinearProgressIndicator(progress = { fw ?: 0f }, modifier = Modifier.fillMaxWidth())
-                Text(
-                    "Sending firmware — " + ((fw ?: 0f) * 100).toInt() + "%. " +
-                        "Keep the phone near the wheel; it reboots by itself when done.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-        }
-
-        Spacer(Modifier.height(12.dp))
-    }
-
-    if (confirmOff) {
-        AlertDialog(
-            onDismissRequest = { confirmOff = false },
-            title = { Text("Power off the wheel?") },
-            text = {
-                Text(
-                    "The wheel shuts down and will not wake on a shake or over " +
-                        "Bluetooth — only by holding its button for about 1.5 s."
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    confirmOff = false
-                    vm.powerOff(); vm.say("Powering off")
-                }) { Text("Power off") }
-            },
-            dismissButton = { TextButton(onClick = { confirmOff = false }) { Text("Cancel") } }
-        )
-    }
-
-    if (showLog) LogDialog(vm) { showLog = false }
-}
-
-/** Блок настроек в своей карточке — рамка вместо линии-разделителя. */
+/** Блок настроек в своей карточке. Отступы между карточками задаёт сетка
+ *  (`verticalArrangement`), поэтому своего нижнего поля у карточки нет. */
 @Composable
 private fun SettingCard(content: @Composable ColumnScope.() -> Unit) {
-    Card(Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
-        Column(Modifier.padding(14.dp), content = content)
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp), content = content)
     }
 }
 
