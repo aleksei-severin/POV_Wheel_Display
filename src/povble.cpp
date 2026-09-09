@@ -961,12 +961,21 @@ static void handleCmd(const uint8_t* d, size_t n) {
         i.total        = total;
         i.used         = used;
         i.free         = total - used;
-        i.psram_free   = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
         i.frame_stride = FRAME_STRIDE_PAL;
-        // Тот же расчёт, что делал браузер: минимум из PSRAM и флеша, с теми же
-        // резервами. Считаем на устройстве — двум местам расходиться не за чем.
-        const uint32_t MARGIN = 256 * 1024, FS_RESERVE = 128 * 1024, HDR = 8;
-        uint32_t byPs = (i.psram_free > MARGIN) ? (i.psram_free - MARGIN) / FRAME_STRIDE_PAL : 1;
+        // PSRAM-потолок считаем НЕ от «свободно сейчас», а от полного объёма
+        // минус постоянный резерв (BLE-буферы ~112 КБ, словарь распаковки 32 КБ,
+        // служебное): в любой момент из PSRAM играет ровно ОДНА анимация, а
+        // loadFrameFromFile освобождает прежний буфер перед новым — так что один
+        // файл может занимать почти весь PSRAM, сколько бы ни было занято тем,
+        // что сейчас на ободе.
+        // 640 КБ резерва оставляют потолок «пустого» PSRAM примерно там же, где
+        // он был у прежнего расчёта от largest_free_block − 256 КБ, но теперь он
+        // не проседает, когда что-то играет.
+        const uint32_t PS_RESERVE = 640 * 1024, FS_RESERVE = 128 * 1024, HDR = 8;
+        size_t ps_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+        uint32_t ps_usable = (ps_total > PS_RESERVE) ? (ps_total - PS_RESERVE) : 0;
+        i.psram_free = ps_usable;   // приложение показывает это как «доступно под анимацию»
+        uint32_t byPs = (ps_usable > HDR) ? (ps_usable - HDR) / FRAME_STRIDE_PAL : 1;
         uint32_t byFs = (i.free > FS_RESERVE + HDR) ? (i.free - FS_RESERVE - HDR) / FRAME_STRIDE_PAL : 1;
         uint32_t mx = byPs < byFs ? byPs : byFs;
         if (mx < 1) mx = 1;

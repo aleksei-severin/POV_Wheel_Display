@@ -869,7 +869,6 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         // неизменяемом UpItem, а ряд пилюль всё равно заблокирован, пока upBusy, —
         // так что правка настроек на уже идущую заливку не влияет.
         val jobs = list.toList()
-        val jobMaxFrames = fsInfo.value.maxFrames
 
         // Сканирование и заливка делят одно радио: LOW_LATENCY-поиск поверх
         // передачи отбирает у неё эфир. Экран списка колёс сам возобновит
@@ -879,6 +878,11 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         upBusy.value = true
         upKind.value = 0
         viewModelScope.launch {
+            // Свежий fs_info: место во флеше могло измениться. Потолок кадров
+            // устройство считает от ПОЛНОГО объёма PSRAM (играет всегда одна
+            // анимация), так что он не зависит от того, что сейчас на ободе.
+            runCatching { currentClient()?.fsInfo()?.let { fsInfo.value = it } }
+            val jobMaxFrames = fsInfo.value.maxFrames
             var ok = 0
             var fail = 0
             // Uri тех файлов, что не уехали ни на одно колесо. По окончании в

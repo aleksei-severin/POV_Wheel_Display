@@ -66,7 +66,7 @@ fun DeviceScreen(vm: WheelVm) {
 
     Column(Modifier.fillMaxSize()) {
         Header(vm, link)
-        Hero(vm, tele)
+        Hero(vm, tele, link == Link.Ready)
 
         TabRow(selectedTabIndex = tab) {
             TABS.forEachIndexed { i, t ->
@@ -183,10 +183,14 @@ private fun RenameDialog(current: String, onDismiss: () -> Unit, onSave: (String
 }
 
 @Composable
-private fun Hero(vm: WheelVm, tele: Tele) {
+private fun Hero(vm: WheelVm, tele: Tele, online: Boolean) {
     var showCirc by remember { mutableStateOf(false) }
     var showRpm by remember { mutableStateOf(false) }
     val settings by vm.settings.collectAsState()
+
+    // Нет связи или телеметрия ещё не пришла — в поле Battery прочерки, как у
+    // скорости/оборотов, а не нули напряжения и процентов.
+    val battKnown = online && tele.vbatMv > 0
 
     // IntrinsicSize.Min + fillMaxHeight — обе карточки одной высоты, по более
     // высокой из двух.
@@ -232,37 +236,42 @@ private fun Hero(vm: WheelVm, tele: Tele) {
                 Label("BATTERY")
                 Row(verticalAlignment = Alignment.Bottom) {
                     Text(
-                        tele.soc.toString() + "%",
+                        if (battKnown) tele.soc.toString() + "%" else "--",
                         style = MaterialTheme.typography.headlineSmall,
                         fontWeight = FontWeight.Bold,
                         color = when {
+                            !battKnown -> MaterialTheme.colorScheme.onSurfaceVariant
                             tele.soc < 15 -> Danger
                             tele.soc < 35 -> Warn
                             else -> Ok
                         }
                     )
                     Text(
-                        "  " + String.format("%.2f", tele.vbatMv / 1000f) + " V",
+                        "  " + (if (battKnown) String.format("%.2f", tele.vbatMv / 1000f) else "--") + " V",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
                 Text(
-                    "USB " + String.format("%.2f", tele.vusbMv / 1000f) + " V",
+                    "USB " + (if (battKnown) String.format("%.2f", tele.vusbMv / 1000f) else "--") + " V",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Spacer(Modifier.height(4.dp))
-                val chg = when (tele.chg) {
-                    1 -> "Charging"; 2 -> "Charged"; else -> "Discharging"
-                }
-                Badge2(chg, if (tele.chg == 2) Ok else if (tele.chg == 1) Accent else null)
-                if (tele.cutoff) {
-                    Spacer(Modifier.height(4.dp))
-                    Badge2("Empty — display off until charged", Danger)
-                } else if (tele.ablCap < 100) {
-                    Spacer(Modifier.height(4.dp))
-                    Badge2("Low — power limited to " + tele.ablCap + "%", Warn)
+                if (battKnown) {
+                    val chg = when (tele.chg) {
+                        1 -> "Charging"; 2 -> "Charged"; else -> "Discharging"
+                    }
+                    Badge2(chg, if (tele.chg == 2) Ok else if (tele.chg == 1) Accent else null)
+                    if (tele.cutoff) {
+                        Spacer(Modifier.height(4.dp))
+                        Badge2("Empty — display off until charged", Danger)
+                    } else if (tele.ablCap < 100) {
+                        Spacer(Modifier.height(4.dp))
+                        Badge2("Low — power limited to " + tele.ablCap + "%", Warn)
+                    }
+                } else {
+                    Badge2("Offline", null)
                 }
             }
         }

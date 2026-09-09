@@ -119,13 +119,9 @@ internal fun LibraryTab(vm: WheelVm, tele: Tele) {
     val gallery = rememberLauncherForActivityResult(
         ActivityResultContracts.PickMultipleVisualMedia(MAX_PICK)
     ) { picked -> vm.onFilesPicked(picked) }
-    val browser = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenMultipleDocuments()
-    ) { picked -> vm.onFilesPicked(picked) }
-    val pickGallery = {
+    val onAdd = {
         gallery.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
     }
-    val pickBrowser = { browser.launch(arrayOf("image/*", "video/*")) }
 
     val cells = remember(items, files) {
         buildList {
@@ -195,7 +191,7 @@ internal fun LibraryTab(vm: WheelVm, tele: Tele) {
                     uploading = upCurUri != null && (cell as? Cell.Pending)?.item?.uri == upCurUri,
                     progress = upProgress,
                     playing = playing,
-                    onPickGallery = pickGallery, onPickBrowser = pickBrowser,
+                    onAdd = onAdd,
                     onToggleCheck = { n -> checks = if (n in checks) checks - n else checks + n },
                     onEnterDelete = { n -> mode = LibMode.DELETE; checks = setOf(n) }
                 )
@@ -325,13 +321,11 @@ private fun LibraryCell(
     uploading: Boolean,
     progress: Float,
     playing: Boolean,
-    onPickGallery: () -> Unit,
-    onPickBrowser: () -> Unit,
+    onAdd: () -> Unit,
     onToggleCheck: (String) -> Unit,
     onEnterDelete: (String) -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
-    var menuOpen by remember { mutableStateOf(false) }
     var confirmRemove by remember { mutableStateOf(false) }
 
     val ring: Color? = when {
@@ -361,7 +355,7 @@ private fun LibraryCell(
                 .combinedClickable(
                     onClick = {
                         when (cell) {
-                            Cell.Add -> if (!upBusy) menuOpen = true
+                            Cell.Add -> if (!upBusy) onAdd()
                             is Cell.Pending -> if (mode == LibMode.NORMAL) vm.selectUpItem(cell.index)
                             is Cell.Stored ->
                                 if (mode == LibMode.NORMAL) vm.play(cell.file.name)
@@ -437,12 +431,6 @@ private fun LibraryCell(
         if (showCheck) CheckDot(checked, Modifier.align(Alignment.BottomEnd))
     }
 
-    if (cell is Cell.Add) DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-        DropdownMenuItem(text = { Text("Photo gallery") },
-            onClick = { menuOpen = false; onPickGallery() })
-        DropdownMenuItem(text = { Text("Browse files") },
-            onClick = { menuOpen = false; onPickBrowser() })
-    }
     if (confirmRemove && cell is Cell.Pending) AlertDialog(
         onDismissRequest = { confirmRemove = false },
         title = { Text("Remove from upload?") },
@@ -623,10 +611,10 @@ private fun StorageCard(fs: com.povwheel.app.ble.FsInfo) {
             )
             Spacer(Modifier.height(6.dp))
             Text(
-                "Animations play from RAM, not from storage — " +
+                "One animation plays from RAM at a time — up to " +
                     String.format("%.1f", fs.psramFree / 1048576.0) +
-                    " MB of RAM free, enough for about " + fs.maxFrames +
-                    " frames (~" + (fs.maxFrames / 10) + " s at 10 fps).",
+                    " MB, about " + fs.maxFrames +
+                    " frames (~" + (fs.maxFrames / 10) + " s at 10 fps), whatever is on the wheel now.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )

@@ -393,6 +393,19 @@ void loadFrameFromFile(String path) {
         size_t dataSize = (size_t)newTotalFrames * dstFrame;
         newBuf = (uint8_t*)ps_malloc(dataSize);
 
+        // Не хватило РЯДОМ со старым буфером (пик old+new). Лента уже погашена по
+        // frame_loading, показывать нечего — освобождаем прежнюю анимацию и
+        // пробуем снова. Один файл в PSRAM помещается всегда, если поместился во
+        // флеш (потолок в OP_FSINFO считается именно от полного объёма PSRAM).
+        if (!newBuf && frameBuffer != nullptr) {
+            free(frameBuffer);
+            frameBuffer        = nullptr;
+            totalFrames        = 0;
+            currentDisplayFile = "";
+            newBuf = (uint8_t*)ps_malloc(dataSize);
+            webLogf("[DISP] Dropped previous buffer to fit %u KB", (unsigned)(dataSize / 1024));
+        }
+
         // Старому формату нужен буфер под ОДИН исходный кадр: разворачивать всю
         // анимацию в RGB888 нельзя — ради этого объёма всё и затевалось.
         uint8_t* tmp = nullptr;
