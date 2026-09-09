@@ -1114,19 +1114,17 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun play(name: String) = onTargets { it.play(name) }.also { say("Playing " + name) }
-    fun stopDisplay() = onTargets { it.stop() }.also { say("Display stopped") }
-
-    /**
-     * Кнопка «Пуск», когда ничего явно не выбрано: возобновляем то, что было
-     * загружено в колесо, иначе первый файл из библиотеки.
-     */
-    fun currentPlayAgain() {
-        val c = currentClient() ?: return
-        val name = c.tele.value.file.ifEmpty { files.value.firstOrNull()?.name ?: "" }
-        if (name.isEmpty()) { say("Pick a file in the library first"); return }
-        play(name)
+    fun play(name: String) = onTargets { it.play(name) }.also {
+        // «Playing …» с человекочитаемым именем и размером файла — по одному
+        // взгляду видно, сколько какой ролик весит.
+        val f = files.value.firstOrNull { it.name == name }
+        val size = f?.size?.let { s ->
+            if (s >= 1_048_576) String.format("%.1f MB", s / 1_048_576.0)
+            else (s / 1024).toString() + " kB"
+        }
+        say("Playing " + (f?.pretty ?: name) + (if (size != null) "  ·  " + size else ""))
     }
+    fun stopDisplay() = onTargets { it.stop() }.also { say("Display stopped") }
     fun effect(id: Int) = onTargets { it.effect(id) }
     fun album(start: Boolean, ms: Int) = onTargets { it.album(start, ms) }
 

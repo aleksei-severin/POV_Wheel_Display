@@ -11,6 +11,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -161,6 +162,8 @@ internal fun LibraryTab(vm: WheelVm, tele: Tele, extraItems: (LazyGridScope.() -
                     selecting = mode == LibMode.SLIDESHOW,
                     // hasSel → можно сделать слайдшоу из одних эффектов, файлы не нужны.
                     enabled = tele.slideshow || files.isNotEmpty() || hasSel,
+                    playing = tele.play && !tele.slideshow,
+                    onStop = { vm.stopDisplay() },
                     onTap = {
                         when {
                             tele.slideshow -> vm.stopSlideshow()
@@ -255,13 +258,16 @@ private fun LibraryHeader(
     slideshowOn: Boolean,
     selecting: Boolean,
     enabled: Boolean,
+    playing: Boolean,          // играет отдельная анимация/эффект (не слайдшоу)
+    onStop: () -> Unit,
     onTap: () -> Unit,
     onLongPress: () -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
     Row(
         Modifier.fillMaxWidth().padding(bottom = 2.dp),
-        verticalAlignment = Alignment.CenterVertically
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         Text(
             "Library",
@@ -269,6 +275,21 @@ private fun LibraryHeader(
             fontWeight = FontWeight.SemiBold,
             modifier = Modifier.weight(1f)
         )
+
+        // Слева от Slideshow: Stop для текущей анимации (бывшая кнопка окна DISPLAY).
+        if (playing && !slideshowOn) {
+            Box(
+                Modifier
+                    .clip(RoundedCornerShape(50))
+                    .background(Danger.copy(alpha = 0.14f))
+                    .border(1.dp, Danger, RoundedCornerShape(50))
+                    .clickable(onClick = onStop)
+                    .padding(horizontal = 14.dp, vertical = 7.dp)
+            ) {
+                Text("■ Stop", style = MaterialTheme.typography.labelLarge, color = Danger)
+            }
+        }
+
         val border = when {
             !enabled -> cs.outline.copy(alpha = 0.38f)
             slideshowOn -> Danger

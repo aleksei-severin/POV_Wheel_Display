@@ -297,19 +297,29 @@ private fun Hero(vm: WheelVm, tele: Tele, online: Boolean) {
     var showRpm by remember { mutableStateOf(false) }
     val settings by vm.settings.collectAsState()
 
-    // Нет связи или телеметрия ещё не пришла — в поле Battery прочерки, как у
-    // скорости/оборотов, а не нули напряжения и процентов.
+    // Нет связи или телеметрия ещё не пришла — прочерки, как у скорости/оборотов,
+    // а не нули напряжения и процентов.
     val battKnown = online && tele.vbatMv > 0
+    // Короткий статус справа от «BATTERY». Discharging/Charged не показываем —
+    // только зарядку и «Low» (когда яркость уже урезана защитой).
+    val battBadge: Pair<String, Color?>? = when {
+        !battKnown -> "Offline" to null
+        tele.cutoff -> "Empty" to Danger
+        tele.ablCap < 100 -> "Low" to Warn
+        tele.chg == 1 -> "Charging" to Accent
+        else -> null
+    }
 
-    // IntrinsicSize.Min + fillMaxHeight — обе карточки одной высоты, по более
-    // высокой из двух.
+    // Обе карточки — две строки (метка + число), вдвое ниже прежнего: кнопку
+    // Start/Stop и напряжение USB убрали.
     Row(
         Modifier.fillMaxWidth().height(IntrinsicSize.Min).padding(horizontal = 12.dp),
         horizontalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         Card(Modifier.weight(1f).fillMaxHeight()) {
-            Column(Modifier.padding(12.dp)) {
+            Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
                 Label("DISPLAY")
+                Spacer(Modifier.height(2.dp))
                 Row(verticalAlignment = Alignment.Bottom) {
                     Text(
                         if (tele.kmh > 0f) String.format("%.1f", tele.kmh) else "--",
@@ -328,21 +338,17 @@ private fun Hero(vm: WheelVm, tele: Tele, online: Boolean) {
                     Text(" rpm", style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                Spacer(Modifier.height(8.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(
-                        onClick = { if (tele.play) vm.stopDisplay() else vm.currentPlayAgain() },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (tele.play) Danger else Ok
-                        )
-                    ) { Text(if (tele.play) "■ Stop" else "▶ Start") }
-                }
             }
         }
 
         Card(Modifier.weight(1f).fillMaxHeight()) {
-            Column(Modifier.padding(12.dp)) {
-                Label("BATTERY")
+            Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Label("BATTERY")
+                    Spacer(Modifier.weight(1f))
+                    battBadge?.let { (t, c) -> Badge2(t, c) }
+                }
+                Spacer(Modifier.height(2.dp))
                 Row(verticalAlignment = Alignment.Bottom) {
                     Text(
                         if (battKnown) tele.soc.toString() + "%" else "--",
@@ -360,27 +366,6 @@ private fun Hero(vm: WheelVm, tele: Tele, online: Boolean) {
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-                }
-                Text(
-                    "USB " + (if (battKnown) String.format("%.2f", tele.vusbMv / 1000f) else "--") + " V",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                Spacer(Modifier.height(4.dp))
-                if (battKnown) {
-                    val chg = when (tele.chg) {
-                        1 -> "Charging"; 2 -> "Charged"; else -> "Discharging"
-                    }
-                    Badge2(chg, if (tele.chg == 2) Ok else if (tele.chg == 1) Accent else null)
-                    if (tele.cutoff) {
-                        Spacer(Modifier.height(4.dp))
-                        Badge2("Empty — display off until charged", Danger)
-                    } else if (tele.ablCap < 100) {
-                        Spacer(Modifier.height(4.dp))
-                        Badge2("Low — power limited to " + tele.ablCap + "%", Warn)
-                    }
-                } else {
-                    Badge2("Offline", null)
                 }
             }
         }
