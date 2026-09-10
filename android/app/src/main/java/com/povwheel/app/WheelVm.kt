@@ -480,7 +480,11 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      */
     fun selectWheel(addr: String) {
         if (current.value == addr && settingsLoaded.value) return
-        livePushJob?.cancel(); livePushJob = null; livePushPending = null
+        // Очередь записи настроек — для уходящего колеса. Отмена здесь безопасна:
+        // следующая запись пойдёт на ДРУГОЙ клиент (другое GATT-соединение), а не
+        // сразу на тот же — коллизии, из-за которой падало «radio refused», нет.
+        settingsJob?.cancel(); settingsJob = null
+        settingsPending = null; savePending = false
 
         // Снимок уходящего колеса — на нём держится мгновенный возврат.
         current.value?.let { old ->
@@ -1327,10 +1331,51 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     /** Ход прошивки, 0..1. null — не идёт. */
     val fwProgress = MutableStateFlow<Float?>(null)
 
+    // --- Единая сериализованная запись настроек на колесо ---
+    // И «живьём» при перетаскивании ползунка/градусов, и по кнопкам/отпусканию —
+    // ВСЁ через одну очередь. Раньше pushSettings отменял «живую» задачу
+    // (`livePushJob.cancel()`), и если та висела внутри BLE-записи с
+    // подтверждением, GATT-слой оставался занят — следующая запись падала с
+    // «the radio refused the write» (а изменение при этом успевало примениться
+    // с другой попытки). Здесь ничего не отменяется: цикл сам вычерпывает
+    // накопленное, не чаще ~10 раз/с, и по флагу дописывает NVS.
+    private var settingsJob: kotlinx.coroutines.Job? = null
+    @Volatile private var settingsPending: Settings? = null
+    @Volatile private var savePending = false
+    private val SETTINGS_WRITE_GAP_MS = 100L
+
+    private fun queueSettingsWrite(s: Settings, save: Boolean) {
+        settings.value = s
+        settingsPending = s
+        if (save) savePending = true
+        if (settingsJob?.isActive == true) return
+        settingsJob = viewModelScope.launch {
+            while (true) {
+                val snap = settingsPending ?: break
+                settingsPending = null
+                val doSave = savePending
+                savePending = false
+                val addr = current.value
+                val c = clients[addr]
+                if (c != null && c.link.value == Link.Ready) {
+                    try {
+                        c.setSettings(snap)
+                        if (doSave) c.save()
+                    } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                    catch (_: Exception) {}
+                }
+                delay(SETTINGS_WRITE_GAP_MS)
+            }
+        }
+    }
+
+    /** Промежуточное значение во время перетаскивания — применяется сразу, без NVS. */
+    fun pushSettingsLive(s: Settings) {
+        if (settingsLoaded.value) queueSettingsWrite(s, save = false)
+    }
+
+    /** Авторитетная отправка (отпускание пальца, кнопка, поле ввода) + запись в NVS. */
     fun pushSettings(s: Settings) {
-        // Отпускание пальца — это авторитетная отправка: снимаем throttled
-        // «живую», чтобы её хвост не перезаписал финальное значение.
-        livePushJob?.cancel(); livePushJob = null; livePushPending = null
         if (!settingsLoaded.value) {
             // Отправить сейчас значило бы записать на устройство наши значения
             // по умолчанию вместо его собственных.
@@ -1338,41 +1383,12 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             refreshAll()
             return
         }
-        settings.value = s
-        onTargets { c -> c.setSettings(s) }
+        queueSettingsWrite(s, save = true)
     }
 
-    // --- Живое применение настройки во время перетаскивания ---
-    // pushSettings (по отпусканию пальца) шлёт полный блок и сохраняет в NVS.
-    // pushSettingsLive применяет промежуточные значения СРАЗУ, чтобы результат
-    // было видно на ободе прямо в движении пальца, но не чаще ~10 раз в секунду —
-    // иначе за один жест в очередь BLE встанут десятки записей, которые
-    // продолжат уходить и после того, как палец убрали, — и без записи в NVS.
-    private var livePushJob: kotlinx.coroutines.Job? = null
-    @Volatile private var livePushPending: Settings? = null
-    private val LIVE_PUSH_MS = 100L
-
-    fun pushSettingsLive(s: Settings) {
-        if (!settingsLoaded.value) return
-        settings.value = s
-        livePushPending = s
-        if (livePushJob?.isActive == true) return
-        livePushJob = viewModelScope.launch {
-            while (true) {
-                val snap = livePushPending ?: break
-                livePushPending = null
-                val c = currentClient()
-                if (c != null && c.link.value == Link.Ready) {
-                    try { c.setSettings(snap) }
-                    catch (e: kotlinx.coroutines.CancellationException) { throw e }
-                    catch (_: Exception) {}
-                }
-                delay(LIVE_PUSH_MS)
-            }
-        }
+    fun saveSettings() {
+        if (settingsLoaded.value) queueSettingsWrite(settings.value, save = true)
     }
-
-    fun saveSettings() = onTargets { it.save() }
 
     fun delete(name: String) = deleteMany(listOf(name))
 
