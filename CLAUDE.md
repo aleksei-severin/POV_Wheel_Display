@@ -147,12 +147,18 @@ Per-sensor mechanical/threshold spread would otherwise inject a phase jump 6× p
 
 ### Transport Mode (software off)
 
-Holding **IO0 for 1.5 s** shuts the wheel down; the same hold brings it back. The
-whole point is the one line that differs from `enterDeepSleep()`: **the vibration
-sensor is not armed as a wake source at all.** Ordinary idle sleep is woken by any
-shake, and in a bag or on a rack the wheel shakes continuously — it woke, waited
-out its idle minute, slept, and repeated until the cell was flat. Here the only
-wake source is the button, so the quiescent draw is the honest ~10 µA.
+Holding **IO0 for 1.5 s** shuts the wheel down (`XPORT_HOLD_MS`). Waking is a
+**single click** (`transportConfirmWake()` — ~`XPORT_WAKE_MS` of steady LOW, not
+a hold): the 1.5 s is only for going *to* sleep. The whole point is still the one
+line that differs from `enterDeepSleep()`: **the vibration sensor is not armed as
+a wake source at all.** Ordinary idle sleep is woken by any shake, and in a bag
+or on a rack the wheel shakes continuously — it woke, waited out its idle minute,
+slept, and repeated until the cell was flat. Here the only wake source is the
+button. Making the wake a click rather than a hold does re-open a narrower
+version of the bag problem — an accidental firm press for `XPORT_WAKE_MS`+ wakes
+it into *normal* mode (not transport), and then continuous shaking keeps it up —
+but that is the tradeoff the shorter gesture buys; `XPORT_WAKE_MS` (80 ms)
+filters ordinary brushes.
 
 **`OP_POWEROFF` (BLE) reaches the same `enterTransportSleep()`** — the phone's
 *Power off* button. The command only raises `pending_transport_off`; `loop()` runs
@@ -163,13 +169,15 @@ off from a phone that then walks away stays off.
 
 - `transport_mode` lives in RTC memory: it has to survive the very sleep it
   causes. A full power cut loses it, which is the correct escape hatch — a wheel
-  with the battery reconnected boots normally.
+  with the battery reconnected boots normally (and now shows the wake wave — see
+  Power-on reset below).
 - **EXT0 wakes on a level, not an edge**, so two things follow. `transportSleepArm()`
   waits for the button to be released (50 ms of steady HIGH, the switch bounces)
   before sleeping, or the chip would wake in the same millisecond. And any brush
-  of the button wakes the chip, so `transportConfirmWake()` re-checks the hold
-  before anything is initialised; an unconfirmed wake goes straight back to sleep
-  without touching flash, which is what keeps a stray press costing microamps.
+  of the button wakes the chip, so `transportConfirmWake()` re-checks it before
+  anything is initialised — now it wants a steady ~`XPORT_WAKE_MS` LOW (a click),
+  where it used to want the full 1.5 s hold; an unconfirmed wake still goes
+  straight back to sleep without touching flash.
 - **`loop()` will not count a hold until the button has been released once.**
   Coming out of transport mode *is* a press of the same length, and control reaches `loop()` with
   the button still down — without that latch, hesitating to let go would switch the
@@ -204,11 +212,12 @@ display that Stop has disabled no longer burns the arms for the three seconds it
 takes to fall back to `PWR_OFF`.
 
 **IO0 is a strapping pin, and that is the one thing to verify on hardware.**
-GPIO0 low at reset selects download boot on ESP32-S3. Whether a deep-sleep wake
-re-samples strapping is not settled by the local headers; if the wheel ever fails
-to wake, that is the reason, and the fallback is a timer wake polling the button
-(~1.5 mA average — far worse than 10 µA, still far better than waking on every
-bump).
+GPIO0 low at reset selects download boot on ESP32-S3. It is now a wake source for
+*both* sleeps (idle EXT1 and transport EXT0), so a wake-by-button holds IO0 LOW
+through the reset — if that ever selects download mode instead of running, that
+is the reason. Whether a deep-sleep wake re-samples strapping is not settled by
+the local headers; the fallback is a timer wake polling the button (~1.5 mA
+average — far worse than 10 µA, still far better than waking on every bump).
 
 ### Wall Clock
 
@@ -456,8 +465,8 @@ ALS-PT19 photodiode with a 12 kΩ load on `PIN_ADC_LIGHT` (IO9), sampled every 1
 - **Use `spi_device_queue_trans` + `spi_device_get_trans_result`, never `spi_device_polling_start`** — polling holds a global spinlock for ~433 µs and starves lwIP and the watchdog.
 - **`SK9822_SPI_HZ` (compile-time, fixed at 20 MHz) sets the angular resolution, and the clock *duty cycle* is why it can't safely go higher.** The SPI clock source is APB 80 MHz with integer dividers (`f = 80 / (pre·n)`), so the achievable ladder is 40 / 26.67 / 20 / 16 / 13.3 MHz — nothing between 20 and 26.67, in particular no 25 MHz. Worse, the high phase is `h = round(duty·n/256)` APB ticks, so **an odd `n` cannot give 50 %**: 20 MHz (n=4) is a clean 25/25 ns, but 26.67 MHz (n=3) is 12.5/25 ns. The first arm is clocked straight from the ESP32 over IO_MUX (IO11/IO12 are the native SPI2 pins) and tolerates the 12.5 ns phase; downstream arms are clocked by an SK9822 CKO output through a connector and 50 mm of trace, where that phase collapses — which is why arms 2–6 break first, and why 20 MHz is the only rate this hardware runs reliably. `SK9822_DUTY_POS` flips which phase is the short one (128 → 12.5 ns high, 170 → 12.5 ns low). Actual clock and phase widths are printed at boot by `initSK9822Device()`. There is no runtime clock setting — an earlier `spi_div` slider was removed.
 - **Only ADC1 pins (GPIO1–10)** may be used for analog reads; ADC2 conflicts with WiFi.
-- **Deep sleep wake is EXT0 on IO15, level-triggered.** The wake level is chosen as the opposite of the pin's current state so a stuck-closed vibration switch cannot cause an immediate re-wake. Both DCDC enables are `gpio_hold_en`'d LOW before sleeping.
-- **Cold boot with no USB and no vibration wake goes straight back to deep sleep** so the board does not drain the battery on a shelf. A software reset (OTA reboot) deliberately does *not*, otherwise there would be no window to reflash.
+- **Idle deep sleep wakes on EXT1 `ANY_LOW`, mask `{IO0, IO15}`** — a shake (the vibration sensor pulses IO15 LOW) *or* a single button click (IO0 LOW). Level-triggered, so `enterDeepSleep()`/`enterTrickleSleep()` first spin ≤2 s for both pins to read HIGH; if the vibration sensor is still LOW (stuck) it is dropped from the mask and only the button wakes. `esp_sleep_get_ext1_wakeup_status()` says which pin fired, for the log. `user_wake` (`xport_wake || wakeup == EXT1`) means a human woke it — used to skip the on-USB trickle re-check. Transport sleep still uses EXT0 on IO0 alone (single-pin, and by design no vibration). Both DCDC enables are `gpio_hold_en`'d LOW before sleeping.
+- **A power-on reset (battery reconnect / reset button) with no USB now wakes into normal mode with the wake wave** (`wake_wave` → `transportShowWave(true)`), instead of dropping straight back to deep sleep. The old "cold boot → sleep" guard was only ever on `ESP_RST_POWERON`; that is now treated as a deliberate "wake me". If nothing then happens, the normal 60 s idle timeout sleeps it anyway (one cycle, ~1 mAh), so the shelf-drain concern is bounded. Brownout/WDT resets are unaffected (they already booted through). A software reset (OTA reboot) still boots without the wave.
 - **Task WDT** is detached from `loopTask` and Core 1 IDLE — `renderingTask` occupies Core 1 almost continuously while spinning.
 - **Flash layout (`pov_16MB.csv`): app0/app1 1472 KB each, littlefs exactly 13.00 MB, last 64 KB unallocated.** The two app slots must be equal — the build checks the firmware against the linked slot, so an oversized slot pair would let a firmware through that then fails to OTA into the smaller one — and each must start on a 64 KB boundary. Exactly 13.00 MB of storage only falls out of 1472 KB slots, hence the 64 KB tail. 13.00 MB and not 12.94 because the web UI counts in binary megabytes and would otherwise read "12.9". Headroom left for the firmware is ~550 KB against the current ~920 KB; for scale, the entire effects module cost 9 KB.
 - **Keep `pov_16MB.csv` ASCII-only.** PlatformIO's `checkprogsize` re-reads the CSV with the system codepage rather than UTF-8 and aborts the build on anything else — the failure surfaces as a `UnicodeDecodeError` from `_parse_partitions`, long after the partition binary itself was generated fine.

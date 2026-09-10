@@ -2144,11 +2144,18 @@ static void enterDeepSleep() {
 
     saveHallCalibration();
 
-    // Пробуждение по вибродатчику. EXT0 срабатывает по УРОВНЮ, поэтому
-    // ловим уровень, противоположный текущему: если контакт сейчас замкнут,
-    // ждём размыкания, иначе — замыкания.
-    if (digitalRead(PIN_VIBRATION) == LOW) esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_VIBRATION, 1);
-    else                                   esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_VIBRATION, 0);
+    // Пробуждение: толчок вибродатчика (IO15 пульсирует LOW) ИЛИ одиночное
+    // нажатие кнопки (IO0 → LOW). Оба активны в LOW → EXT1 ANY_LOW.
+    // Ждём, пока оба пина отпущены: EXT1 будит по УРОВНЮ, и сон с уже
+    // притянутым к земле пином = мгновенное пробуждение обратно. Если
+    // вибродатчик так и не размыкается (заклинил) — исключаем его из маски,
+    // будим только кнопкой.
+    uint32_t sw0 = millis();
+    while (millis() - sw0 < 2000 &&
+           (digitalRead(PIN_BUTTON) == LOW || digitalRead(PIN_VIBRATION) == LOW)) delay(5);
+    uint64_t wake_mask = (1ULL << PIN_BUTTON);
+    if (digitalRead(PIN_VIBRATION) == HIGH) wake_mask |= (1ULL << PIN_VIBRATION);
+    esp_sleep_enable_ext1_wakeup(wake_mask, ESP_EXT1_WAKEUP_ANY_LOW);
 
     // Замораживаем Enable обоих DCDC в LOW на время сна
     gpio_hold_en((gpio_num_t)PIN_EN_DCDC_ARM1);
@@ -2173,8 +2180,11 @@ static void enterTrickleSleep(uint32_t seconds) {
     gpio_hold_en((gpio_num_t)PIN_EN_DCDC_REST);
     gpio_deep_sleep_hold_en();
 
-    if (digitalRead(PIN_VIBRATION) == LOW) esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_VIBRATION, 1);
-    else                                   esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_VIBRATION, 0);
+    // Толчок вибродатчика ИЛИ нажатие кнопки — оба в LOW. Заклинивший в LOW
+    // датчик исключаем, иначе ANY_LOW сработал бы сразу.
+    uint64_t wake_mask = (1ULL << PIN_BUTTON);
+    if (digitalRead(PIN_VIBRATION) == HIGH) wake_mask |= (1ULL << PIN_VIBRATION);
+    esp_sleep_enable_ext1_wakeup(wake_mask, ESP_EXT1_WAKEUP_ANY_LOW);
     esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
     esp_deep_sleep_start();
 }
@@ -2333,16 +2343,20 @@ static void enterTransportSleep() {
     transportSleepArm();
 }
 
-// Проверка удержания кнопки после пробуждения из транспортного режима.
-// EXT0 будит по УРОВНЮ, то есть по любому касанию кнопки; настоящий выход —
-// только удержание, поэтому подтверждаем его здесь и при неудаче засыпаем
-// обратно, ничего не включая.
+// Проверка нажатия кнопки после пробуждения из транспортного режима.
+// EXT0 будит по УРОВНЮ, то есть по любому касанию; настоящее пробуждение —
+// одиночное нажатие (устойчивый LOW ~XPORT_WAKE_MS, фильтр случайных касаний в
+// сумке), НЕ удержание. При неудаче засыпаем обратно, ничего не включая.
 static bool transportConfirmWake() {
-    uint32_t held = 0;
-    while (digitalRead(PIN_BUTTON) == LOW) {
+    uint32_t low_ms = 0, t0 = millis();
+    while (millis() - t0 < 400) {
+        if (digitalRead(PIN_BUTTON) == LOW) {
+            low_ms += XPORT_WAKE_POLL_MS;
+            if (low_ms >= XPORT_WAKE_MS) return true;
+        } else {
+            low_ms = 0;
+        }
         delay(XPORT_WAKE_POLL_MS);
-        held += XPORT_WAKE_POLL_MS;
-        if (held >= XPORT_HOLD_MS) return true;
     }
     return false;
 }
@@ -2489,9 +2503,18 @@ void setup() {
         }
     }
 
-    if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
-        webLog(xport_wake ? "[XPORT] Wakeup: button held, waking up"
-                          : "[SYS] Wakeup: vibration (IO15)");
+    // Обычный сон по простою будит EXT1 (кнопка IO0 или вибродатчик IO15).
+    bool ext1_wake = (wakeup_reason == ESP_SLEEP_WAKEUP_EXT1);
+    bool user_wake = xport_wake || ext1_wake;   // разбудил ЧЕЛОВЕК (тряска/кнопка)
+    bool wake_wave = false;   // считаем ниже, когда известно про USB
+
+    if (ext1_wake) {
+        uint64_t st = esp_sleep_get_ext1_wakeup_status();
+        webLog((st & (1ULL << PIN_BUTTON)) ? "[SYS] Wakeup: button (IO0)"
+                                           : "[SYS] Wakeup: vibration (IO15)");
+    } else if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
+        webLog(xport_wake ? "[XPORT] Wakeup: button, waking up"
+                          : "[SYS] Wakeup: EXT0");
     } else if (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED) {
         const char* rr_str = "unknown";
         switch (reset_reason) {
@@ -2516,21 +2539,23 @@ void setup() {
     uint32_t vusb_mv = (uint32_t)(readMilliVoltsAvg(PIN_ADC_VUSB, 8) * ADC_DIVIDER_RATIO);
     bool     usb_present = vusb_mv > VUSB_PRESENT_MV;
 
-    // Холодный старт (подключили батарею) без USB и без вибрации — сразу спать,
-    // чтобы устройство не разряжало батарею на полке. После sw-reset (OTA) и
-    // прочих перезагрузок остаёмся в работе — иначе не поймать окно для прошивки.
-    if (wakeup_reason != ESP_SLEEP_WAKEUP_EXT0 &&
-        reset_reason  == ESP_RST_POWERON && !usb_present) {
-        webLog("[SYS] Cold boot, no USB, sleeping...");
-        enterDeepSleep();
-    }
+    // Раньше: холодный старт без USB и без пробуждения — сразу обратно в сон,
+    // чтобы не разряжать батарею на полке. Теперь сброс по питанию
+    // (переподключили батарею / нажали reset) без USB — это осознанное
+    // «разбуди»: просыпаемся в рабочий режим с волной-подтверждением. Если
+    // после этого ничего не происходит, обычный таймер простоя (60 с) всё равно
+    // уложит колесо спать. На USB волну не крутим — там и так видно по serial/
+    // веб, и не мигать синим на каждой заливке.
+    wake_wave = xport_wake ||
+        (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED &&
+         reset_reason  == ESP_RST_POWERON && !usb_present);
 
     // Зарядник в предзаряде даёт 100 мА — ровно столько же съедает работающий
     // Wi-Fi, и ячейка не растёт. Спим, пока не выберется. Пробуждение по
     // вибрации и перезагрузка по OTA дают окно доступа: иначе до устройства
     // с севшей батареей вообще не добраться.
     uint32_t vbat_mv = (uint32_t)(readMilliVoltsAvg(PIN_ADC_VBAT, 8) * ADC_DIVIDER_RATIO);
-    if (usb_present && wakeup_reason != ESP_SLEEP_WAKEUP_EXT0 && reset_reason != ESP_RST_SW) {
+    if (usb_present && !user_wake && reset_reason != ESP_RST_SW) {
         uint32_t thr = batt_trickle_mode ? BATT_TRICKLE_EXIT_MV : BATT_TRICKLE_MV;
         if (vbat_mv < thr) {
             batt_trickle_mode = true;
@@ -2602,9 +2627,12 @@ void setup() {
     initSK9822_DMA();
     blankAllLEDs_DMA();
 
-    // Волна от центра к ободу — подтверждение, что колесо проснулось.
-    // Здесь, а не раньше: до initSK9822_DMA() слать в ленту нечем.
-    if (xport_wake) transportShowWave(true);
+    // Волна от центра к ободу — подтверждение, что колесо проснулось (выход из
+    // транспортного режима или сброс по питанию). Здесь, а не раньше: до
+    // initSK9822_DMA() слать в ленту нечем. transportShowWave поднимает силовую
+    // на полсекунды даже на USB — это заложенное исключение из правила про
+    // 100 мА, а trickle-сон (если батарея села) случился бы ещё выше.
+    if (wake_wave) transportShowWave(true);
 
     hallSemaphore       = xSemaphoreCreateBinary();
     fileLoaderSemaphore = xSemaphoreCreateBinary();

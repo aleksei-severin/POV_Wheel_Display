@@ -421,7 +421,7 @@ private fun IdleContent(wheels: List<WheelEntry>, cur: WheelEntry?) {
                     // Переподключение крутится само.
                     Text(cur.name + " is offline", style = MaterialTheme.typography.titleMedium)
                     Text(
-                        "Reconnecting automatically — give it a shake to wake it.",
+                        "Reconnecting automatically — shake it or click any button to wake it.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         textAlign = TextAlign.Center
@@ -432,7 +432,7 @@ private fun IdleContent(wheels: List<WheelEntry>, cur: WheelEntry?) {
                 else -> {
                     Text("Looking for wheels…", style = MaterialTheme.typography.titleMedium)
                     Text(
-                        "A shake wakes it; a 1.5 s button-hold seals the deal.",
+                        "Shake or click any button to wake up.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         textAlign = TextAlign.Center
