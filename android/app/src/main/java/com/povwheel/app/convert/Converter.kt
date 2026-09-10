@@ -349,12 +349,18 @@ class Converter(private val context: Context) {
         // pts, что и свой кадр из декодера, поэтому их можно сравнивать в лоб.
         val durMs: Long
         val rotation: Int
+        val srcW: Int
+        val srcH: Int
         val mmr0 = MediaMetadataRetriever()
         try {
             mmr0.setDataSource(context, uri)
             durMs = mmr0.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                 ?.toLongOrNull() ?: 0L
             rotation = mmr0.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
+                ?.toIntOrNull() ?: 0
+            srcW = mmr0.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
+                ?.toIntOrNull() ?: 0
+            srcH = mmr0.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
                 ?.toIntOrNull() ?: 0
         } catch (e: Exception) {
             throw IllegalStateException("this phone cannot decode this video")
@@ -368,6 +374,18 @@ class Converter(private val context: Context) {
         // Задержка кадра в заголовке — целые миллисекунды, uint16.
         val delay = maxOf(1, (1000.0 / vid.fps).roundToInt())
         val out = Ani6.allocate(n, delay, mirrorBack)
+
+        // 1:1 ролики — мимо быстрого пути. У MediaCodec + GL ориентацию квадратного
+        // кадра нельзя перепроверить по форме (все четыре поворота дают тот же
+        // квадрат), а зависит она и от матрицы SurfaceTexture, и от того, применил
+        // ли декодер поворот контейнера, — квадратные видео уходили на бок или вверх
+        // ногами, хотя MMR-превью было верным. MMR отдаёт кадр уже правильно
+        // развёрнутым (тот же путь, что у превью), так что для квадрата берём его —
+        // медленнее, зато без догадок об ориентации.
+        if (srcW > 0 && srcW == srcH) {
+            convertVideoSlow(uri, out, fitMode, vid, n, prog)
+            return Result(nr.name, out, n, nr.warning)
+        }
 
         // Быстрый путь: MediaCodec гонит поток подряд, кадры уменьшает GPU,
         // выборка+квантование идут пулом воркеров. На части телефонов кодек или
@@ -401,11 +419,18 @@ class Converter(private val context: Context) {
             val work = Bitmaps.square(Geom.SRC_SIZE_VID)
             val sampler = PolarSampler()
             val quant = Quantizer()
+            // Кадр всё равно ужимается в SRC_SIZE_VID — просим у MMR сразу мелкий,
+            // это заметно быстрее полного декода (getScaledFrameAtTime — API 27+).
+            val scaled = android.os.Build.VERSION.SDK_INT >= 27
+            val box = Geom.SRC_SIZE_VID
             var got = 0
             for (i in 0 until n) {
                 val tUs = ((i.toDouble() / vid.fps) * 1_000_000.0).toLong()
                 val bmp = try {
-                    mmr.getFrameAtTime(tUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                    if (scaled)
+                        mmr.getScaledFrameAtTime(tUs, MediaMetadataRetriever.OPTION_CLOSEST, box, box)
+                    else
+                        mmr.getFrameAtTime(tUs, MediaMetadataRetriever.OPTION_CLOSEST)
                 } catch (e: Exception) { null }
                 if (bmp == null) {
                     if (got == 0) throw IllegalStateException("no frames could be read from this video")

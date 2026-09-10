@@ -39,7 +39,10 @@ internal object VideoFrames {
     private val STOP = Task(-1, null)
 
     private const val READ_CAP = 1440   // длинная сторона обратного чтения; дальше drawSquare → 400
-    private const val THUMB_LONG = 72   // длинная сторона миниатюры для подбора поворота
+    private const val THUMB_LONG = 160  // длинная сторона миниатюры для подбора поворота:
+                                        // эталон (MMR, софт) и кадр (MediaCodec + GL)
+                                        // декодируются по-разному, структура должна
+                                        // перебивать пиксельный шум их разницы
 
     /** Грейскейл-миниатюра С СОХРАНЕНИЕМ пропорций (длинная сторона THUMB_LONG). */
     class OThumb(val w: Int, val h: Int, val px: IntArray)
@@ -79,14 +82,26 @@ internal object VideoFrames {
         return OThumb(nw, nh, out)
     }
 
-    /** Ошибка на пиксель: [cand] ресемплится на сетку [ref] ближайшим соседом. */
-    private fun ssd(ref: OThumb, cand: OThumb): Long {
+    private fun meanOf(t: OThumb): Long {
+        var s = 0L
+        for (v in t.px) s += v
+        return s / maxOf(1, t.px.size)
+    }
+
+    /**
+     * Ошибка на пиксель с выравниванием по яркости: у эталона (MMR, софт) и кадра
+     * (MediaCodec + GL) разный тон, поэтому обе миниатюры центрируем по своему
+     * среднему, иначе постоянный сдвиг тона маскирует структурное совпадение.
+     * [cand] ресемплится на сетку [ref] ближайшим соседом.
+     */
+    private fun diff(ref: OThumb, refMean: Long, cand: OThumb): Long {
+        val cm = meanOf(cand)
         var e = 0L
         for (y in 0 until ref.h) {
             val cy = (y * cand.h / ref.h).coerceIn(0, cand.h - 1)
             for (x in 0 until ref.w) {
                 val cx = (x * cand.w / ref.w).coerceIn(0, cand.w - 1)
-                val d = (ref.px[y * ref.w + x] - cand.px[cy * cand.w + cx]).toLong()
+                val d = (ref.px[y * ref.w + x] - refMean) - (cand.px[cy * cand.w + cx] - cm)
                 e += d * d
             }
         }
@@ -107,24 +122,24 @@ internal object VideoFrames {
      * которые заливались лежащими на боку или вверх ногами, хотя в превью (оно из
      * MMR, всегда верное) всё правильно. Физически вариантов только два: декодер
      * уже развернул кадр как надо — тогда 0°, или отдал сырым — тогда его нужно
-     * довернуть на угол из контейнера [hintN] (ровно то, что делает MMR). Причём
-     * доворачиваем ТОЛЬКО если это заметно (≥20 %) уменьшает расхождение с
-     * эталоном: часть декодеров разворот применяет сама, и тогда верный ответ —
-     * 0°, а на почти симметричном сюжете чистый SSD (тем более с перевесом
-     * метаданным) уводил в hintN и переворачивал кадр. Ничья и мусор в
-     * метаданных → 0° (лишний разворот виден сильнее, чем его отсутствие на
-     * симметричной картинке). Пути декода у эталона (MMR, софт) и у кадра
-     * (MediaCodec + GL) разные, поэтому миниатюра крупнее обычного — структура
-     * должна перебивать пиксельный шум.
+     * довернуть на угол из контейнера [hintN] (ровно то, что делает MMR для
+     * эталона). Поэтому сравниваем именно эти два варианта и берём тот, что ближе
+     * к эталону; 0° выигрывает лишь честную ничью (± 2 %, чтобы не дребезжать на
+     * точной симметрии). Прежний вариант с перекосом в пользу 0° (доворот только
+     * при выигрыше ≥ 20 %) глотал реальный разворот на сюжете без явной верх-низ
+     * асимметрии — и ролик заливался вверх ногами, хотя MMR-превью было верным.
+     * Надёжность даёт крупная миниатюра ([THUMB_LONG]) и выравнивание по яркости
+     * в [diff] — пути декода у эталона (MMR, софт) и кадра (MediaCodec + GL) разные.
      */
     private fun matchRotation(ref: OThumb, frame: OThumb, hint: Int): Int {
         val hintN = ((hint % 360) + 360) % 360
+        val refMean = meanOf(ref)
 
         if (ref.w == ref.h) {
             if (hintN != 90 && hintN != 180 && hintN != 270) return 0
-            val e0 = ssd(ref, frame)                    // rotated(frame, 0) == frame
-            val eh = ssd(ref, rotated(frame, hintN))
-            return if (eh * 5 < e0 * 4) hintN else 0    // hintN только при выигрыше ≥20 %
+            val e0 = diff(ref, refMean, frame)              // rotated(frame, 0) == frame
+            val eh = diff(ref, refMean, rotated(frame, hintN))
+            return if (eh * 100 < e0 * 98) hintN else 0     // доворот при любом явном выигрыше
         }
 
         val refLand = ref.w >= ref.h
@@ -133,7 +148,7 @@ internal object VideoFrames {
         for (deg in intArrayOf(0, 90, 180, 270)) {
             val r = rotated(frame, deg)
             if ((r.w >= r.h) != refLand) continue           // не та ориентация — мимо
-            var e = ssd(ref, r)
+            var e = diff(ref, refMean, r)
             if (deg == hintN) e = e * 9 / 10                 // перевес подсказке
             if (e < bestErr) { bestErr = e; best = deg }
         }
