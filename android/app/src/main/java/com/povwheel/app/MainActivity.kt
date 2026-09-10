@@ -44,7 +44,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.povwheel.app.ui.DeviceScreen
-import com.povwheel.app.ui.DevicesScreen
 import com.povwheel.app.ui.PovTheme
 import com.povwheel.app.ui.hapticClick
 
@@ -247,6 +246,7 @@ private fun Gate(vm: WheelVm) {
         return
     }
 
-    val current by vm.current.collectAsState()
-    if (current == null) DevicesScreen(vm) else DeviceScreen(vm)
+    // Один экран: страница дисплея, а список доступных колёс — строкой в его
+    // шапке. Отдельного экрана-списка больше нет.
+    DeviceScreen(vm)
 }

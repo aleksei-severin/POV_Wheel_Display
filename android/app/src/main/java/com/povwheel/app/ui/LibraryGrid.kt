@@ -38,7 +38,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.povwheel.app.WheelVm
 import com.povwheel.app.ble.DevFile
-import com.povwheel.app.ble.Link
 import com.povwheel.app.ble.Tele
 import com.povwheel.app.convert.Fit
 import com.povwheel.app.convert.PreviewClip
@@ -96,8 +95,6 @@ internal fun LibraryTab(
 ) {
     val files by vm.files.collectAsState()
     val fs by vm.fsInfo.collectAsState()
-    val wheels by vm.wheels.collectAsState()
-    val group by vm.mirrorSet.collectAsState()
     val items by vm.upItems.collectAsState()
     val upSel by vm.upSel.collectAsState()
     val upSelClip by vm.upSelClip.collectAsState()
@@ -108,10 +105,12 @@ internal fun LibraryTab(
 
     val hasSel = vm.currentClient()?.hello?.hasAlbumSel == true
     val allNames = files.map { it.name }
-    val liveWheels = wheels.filter { it.link == Link.Ready }
 
     var mode by remember { mutableStateOf(LibMode.NORMAL) }
     var checks by remember { mutableStateOf<Set<String>>(emptySet()) }
+    // Счётчик повторных тапов по «Slideshow» в режиме выбора: сохранённое → все →
+    // ничего → все → ничего → …
+    var slideCycle by remember { mutableStateOf(0) }
     var confirmDelete by remember { mutableStateOf(false) }
     var intervalDialog by remember { mutableStateOf(false) }
     // Локальный интервал: пока пользователь не трогал — следуем за устройством.
@@ -119,7 +118,9 @@ internal fun LibraryTab(
     val slideSecs = if (secsLocal > 0) secsLocal else (tele.slideSecs.takeIf { it in 1..300 } ?: 10)
 
     // Сменили колесо или библиотека уехала из-под режима — выходим из него.
-    LaunchedEffect(curWheel) { mode = LibMode.NORMAL; checks = emptySet(); secsLocal = -1 }
+    LaunchedEffect(curWheel) {
+        mode = LibMode.NORMAL; checks = emptySet(); secsLocal = -1; slideCycle = 0
+    }
     LaunchedEffect(mode, files) {
         // Держим только реально существующие файлы + токены эффектов (@eN).
         if (mode != LibMode.NORMAL)
@@ -152,34 +153,6 @@ internal fun LibraryTab(
         ) {
             leadingItems?.invoke(this)   // окошки DISPLAY/BATTERY — скроллятся вместе с лентой
 
-            if (liveWheels.size > 1) item(key = "mirror", span = { GridItemSpan(maxLineSpan) }) {
-                Card(Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(12.dp)) {
-                        Text("Sync wheels", style = MaterialTheme.typography.labelLarge)
-                        Text(
-                            "Ticked wheels act as one — while the open wheel is ticked too.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Spacer(Modifier.height(2.dp))
-                        liveWheels.forEach { w ->
-                            Row(
-                                Modifier.fillMaxWidth().tapClickable {
-                                    vm.toggleMirror(w.address, w.address !in group)
-                                },
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Checkbox(
-                                    checked = w.address in group,
-                                    onCheckedChange = hapticChange { vm.toggleMirror(w.address, it) }
-                                )
-                                Text(w.name, style = MaterialTheme.typography.bodyMedium)
-                            }
-                        }
-                    }
-                }
-            }
-
             item(key = "header", span = { GridItemSpan(maxLineSpan) }) {
                 LibraryHeader(
                     freeText = if (fs.total > 0)
@@ -194,7 +167,17 @@ internal fun LibraryTab(
                         when {
                             tele.slideshow -> vm.stopSlideshow()
                             !hasSel -> vm.album(true, slideSecs * 1000)
-                            else -> { checks = vm.savedSlideSelection(allNames); mode = LibMode.SLIDESHOW }
+                            // Первый тап — режим выбора с сохранённым набором.
+                            mode != LibMode.SLIDESHOW -> {
+                                checks = vm.savedSlideSelection(allNames)
+                                slideCycle = 0
+                                mode = LibMode.SLIDESHOW
+                            }
+                            // Дальше по кругу: все анимации из памяти → ничего → …
+                            else -> {
+                                slideCycle++
+                                checks = if (slideCycle % 2 == 1) allNames.toSet() else emptySet()
+                            }
                         }
                     },
                     onLongPress = { intervalDialog = true }

@@ -1,11 +1,17 @@
 package com.povwheel.app.ui
 
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.compose.animation.core.Animatable
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.horizontalDrag
 import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -41,16 +47,20 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.povwheel.app.WheelEntry
 import com.povwheel.app.WheelVm
+import com.povwheel.app.ble.BleClient
 import com.povwheel.app.ble.Link
 import com.povwheel.app.ble.Proto
 import com.povwheel.app.ble.Settings
 import com.povwheel.app.ble.Tele
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -60,29 +70,93 @@ import kotlin.math.roundToInt
 
 @Composable
 fun DeviceScreen(vm: WheelVm) {
-    val client = vm.currentClient()
-    if (client == null) {
-        // Колесо пропало, пока его экран был открыт: возвращаемся к списку,
-        // а не рисуем интерфейс поверх мёртвой ссылки.
-        LaunchedEffect(Unit) { vm.current.value = null }
-        return
+    val wheels by vm.wheels.collectAsState()
+    val current by vm.current.collectAsState()
+    val client = vm.client(current)
+    val curEntry = wheels.firstOrNull { it.address == current }
+
+    // Открываем последнее колесо сразу, а не ждём тапа по строке.
+    LaunchedEffect(Unit) { if (vm.current.value == null) vm.openLastWheel() }
+
+    // Поиск идёт всё время, пока открыт экран, и снимается уходом с него: колесо
+    // обычно будят уже после того, как достали телефон. Кроме времени заливки —
+    // она делит одно радио с LOW_LATENCY-поиском.
+    val upBusy by vm.upBusy.collectAsState()
+    DisposableEffect(upBusy) {
+        if (!upBusy) vm.startScan()
+        onDispose { vm.stopScan() }
     }
+
+    // Свайп влево/вправо по контенту — следующее/предыдущее колесо по кругу.
+    val canSwipe = wheels.count { it.reachable } >= 2
+    val scope = rememberCoroutineScope()
+    val dragX = remember { Animatable(0f) }
+
+    Column(Modifier.fillMaxSize()) {
+        WheelStrip(vm, wheels, current)
+        Box(
+            Modifier.fillMaxWidth().height(1.dp)
+                .background(MaterialTheme.colorScheme.surfaceVariant)
+        )
+        Box(
+            Modifier
+                .weight(1f)
+                .then(if (!canSwipe) Modifier else Modifier.pointerInput(Unit) {
+                    // acc — реальный путь пальца (решение о переключении),
+                    // dragX — только картинка (демпфированный сдвиг контента).
+                    var acc = 0f
+                    detectHorizontalDragGestures(
+                        onDragStart = { acc = 0f },
+                        onDragEnd = {
+                            val threshold = 100.dp.toPx()
+                            val w = size.width.toFloat()
+                            when {
+                                // Свайп влево — следующее колесо; новый контент
+                                // въезжает справа (snapTo(+w) → animateTo(0)).
+                                acc <= -threshold -> {
+                                    vm.cycleWheel(1)
+                                    scope.launch { dragX.snapTo(w); dragX.animateTo(0f) }
+                                }
+                                acc >= threshold -> {
+                                    vm.cycleWheel(-1)
+                                    scope.launch { dragX.snapTo(-w); dragX.animateTo(0f) }
+                                }
+                                else -> scope.launch { dragX.animateTo(0f) }
+                            }
+                        },
+                        onDragCancel = { scope.launch { dragX.animateTo(0f) } }
+                    ) { change, drag ->
+                        change.consume()
+                        acc += drag
+                        // Настоящей «второй страницы» под контентом нет —
+                        // движение лишь показывает, что экран свайпается.
+                        val target = acc * 0.5f
+                        scope.launch { dragX.snapTo(target) }
+                    }
+                })
+                .offset { IntOffset(dragX.value.roundToInt(), 0) }
+        ) {
+            if (client != null && curEntry?.link == Link.Ready) {
+                key(current) { ConnectedContent(vm, client) }
+            } else {
+                IdleContent(wheels, curEntry)
+            }
+        }
+    }
+}
+
+@Composable
+private fun ConnectedContent(vm: WheelVm, client: BleClient) {
     val link by client.link.collectAsState()
     val tele by client.tele.collectAsState()
-
-    // Окошки DISPLAY/BATTERY уехали внутрь ленты (первым элементом сетки) —
-    // при скролле они прокручиваются вместе с содержимым, а не висят сверху.
-    // Пришпилен только Header.
-    Column(Modifier.fillMaxSize()) {
-        Header(vm, link)
-        Box(Modifier.weight(1f)) { MainContent(vm, tele, link == Link.Ready) }
-    }
+    MainContent(vm, tele, link == Link.Ready)
 }
 
 /**
  * Единый экран: плитка библиотеки ([LibraryTab]) плюс блоки настроек дисплея,
  * добавленные в ту же сетку full-span элементами — всё скроллится вместе.
  */
+@OptIn(ExperimentalMaterial3Api::class)   // LocalMinimumInteractiveComponentEnforcement
 @Composable
 private fun MainContent(vm: WheelVm, tele: Tele, online: Boolean) {
     val s by vm.settings.collectAsState()
@@ -152,23 +226,26 @@ private fun MainContent(vm: WheelVm, tele: Tele, online: Boolean) {
         }
         item(key = "maint", span = { GridItemSpan(maxLineSpan) }) {
             SettingCard {
-                Text("Maintenance", fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(8.dp))
-                // «OFF» — уход в транспортный режим: колесо гаснет и до удержания
-                // кнопки не проснётся ни по тряске, ни по BLE.
-                Row(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(5.dp)
+                // Только кнопки, без заголовка — карточка по высоте как «Magnet
+                // Position». «OFF» — уход в транспортный режим: колесо гаснет и
+                // до удержания кнопки не проснётся ни по тряске, ни по BLE.
+                CompositionLocalProvider(
+                    LocalMinimumInteractiveComponentEnforcement provides false
                 ) {
-                    MaintBtn("OFF", fw == null, danger = true) { confirmOff = true }
-                    MaintBtn("Reboot", fw == null) { vm.reboot() }
-                    MaintBtn("Wi-Fi", fw == null) {
-                        vm.wifi(true); vm.say("Wi-Fi is coming up for OTA")
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(5.dp)
+                    ) {
+                        MaintBtn("OFF", fw == null, danger = true) { confirmOff = true }
+                        MaintBtn("Reboot", fw == null) { vm.reboot() }
+                        MaintBtn("Wi-Fi", fw == null) {
+                            vm.wifi(true); vm.say("Wi-Fi is coming up for OTA")
+                        }
+                        MaintBtn("Update", fw == null) {
+                            fwPicker.launch(arrayOf("application/octet-stream", "*/*"))
+                        }
+                        MaintBtn("Log", fw == null) { showLog = true }
                     }
-                    MaintBtn("Update", fw == null) {
-                        fwPicker.launch(arrayOf("application/octet-stream", "*/*"))
-                    }
-                    MaintBtn("Log", fw == null) { showLog = true }
                 }
                 if (fw != null) {
                     Spacer(Modifier.height(8.dp))
@@ -207,80 +284,157 @@ private fun MainContent(vm: WheelVm, tele: Tele, online: Boolean) {
     if (showLog) LogDialog(vm) { showLog = false }
 }
 
-// ------------------------------------------------------------------- обвязка
+// --------------------------------------------------------------- строка колёс
 
+/**
+ * Шапка экрана: доступные дисплеи именами в одну строку с прокруткой вправо.
+ * Тап — открыть/подключиться ([WheelVm.openWheel]), долгое удержание — диалог
+ * переименования/забыть. Отдельного экрана-списка больше нет.
+ *
+ * Подписка ТОЛЬКО на [WheelVm.wheels] — тот же приём, что был на экране-списке:
+ * состояние связи каждого колеса уже сведено во ViewModel, и здесь нет
+ * условных `collectAsState` на клиенте (их появление/исчезновение меняло бы
+ * состав composable-вызовов, чего Compose не допускает).
+ */
 @Composable
-private fun Header(vm: WheelVm, link: Link) {
-    val client = vm.currentClient()
-    // Имя берём из общего списка, а НЕ из client.hello. hello — снимок,
-    // сделанный при подключении: он не меняется от переименования, да и
-    // Compose за ним не следит (обычное @Volatile-поле, не State). Поэтому
-    // после Rename заголовок так и показывал старое POV-xxxx, хотя строка в
-    // списке колёс обновлялась сразу.
-    val wheels by vm.wheels.collectAsState()
-    val curAddr by vm.current.collectAsState()
-    val title = wheels.firstOrNull { it.address == curAddr }?.name
-        ?: client?.hello?.name ?: "POV Wheel"
-
-    var renaming by remember { mutableStateOf(false) }
-
-    // Одна строка: «‹ Wheels», имя (оно же кнопка переименования) и статус
-    // связи справа — там, где раньше была светящаяся точка. Дату сборки убрали,
-    // высоту шапки — до одной строки.
+private fun WheelStrip(vm: WheelVm, wheels: List<WheelEntry>, current: String?) {
     Row(
-        Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 2.dp),
-        verticalAlignment = Alignment.CenterVertically
+        Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState())
+            .padding(horizontal = 6.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(2.dp)
     ) {
-        TextButton(
-            onClick = hapticClick { vm.current.value = null },
-            contentPadding = PaddingValues(horizontal = 8.dp)
-        ) { Text("‹ Wheels") }
-
-        // Тап по имени открывает переименование — отдельной строки «Name» в
-        // Display больше нет.
-        Text(
-            title,
-            fontWeight = FontWeight.Bold,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier
-                .weight(1f)
-                .clip(RoundedCornerShape(6.dp))
-                .tapClickable { renaming = true }
-                .padding(horizontal = 6.dp, vertical = 6.dp)
-        )
-
-        Text(
-            if (link == Link.Ready) "Online" else "Offline",
-            style = MaterialTheme.typography.labelLarge,
-            fontWeight = FontWeight.SemiBold,
-            color = if (link == Link.Ready) Ok else Danger,
-            modifier = Modifier.padding(end = 10.dp)
-        )
-    }
-
-    if (renaming) {
-        RenameDialog(
-            current = title,
-            onDismiss = { renaming = false },
-            onSave = { name -> vm.renameCurrent(name) { vm.say(it) }; renaming = false }
-        )
+        if (wheels.isEmpty()) {
+            Text(
+                "Searching for wheels…",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp)
+            )
+        }
+        wheels.forEach { w -> WheelName(vm, w, selected = w.address == current) }
     }
 }
 
 @Composable
-private fun RenameDialog(current: String, onDismiss: () -> Unit, onSave: (String) -> Unit) {
+private fun WheelName(vm: WheelVm, w: WheelEntry, selected: Boolean) {
+    var renaming by remember { mutableStateOf(false) }
+    val cs = MaterialTheme.colorScheme
+
+    // К колесу можно подключиться: оно в эфире, но связи ещё нет.
+    val connectable = w.link != Link.Ready && w.link != Link.Connecting &&
+        !w.stale && w.rssi != Int.MIN_VALUE
+
+    val nameColor = when {
+        selected             -> cs.primary
+        w.link == Link.Ready -> cs.onSurface
+        connectable          -> cs.onSurface
+        else                 -> cs.onSurfaceVariant   // серый: неактивно / не в эфире
+    }
+
+    Row(
+        Modifier
+            .clip(RoundedCornerShape(50))
+            .then(if (selected) Modifier.background(cs.primary.copy(alpha = 0.14f)) else Modifier)
+            .tapCombinedClickable(
+                onClick = { vm.openWheel(w.address, w.name) },
+                onLongClick = { renaming = true }
+            )
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(5.dp)
+    ) {
+        when {
+            w.link == Link.Connecting ->
+                CircularProgressIndicator(Modifier.size(11.dp), strokeWidth = 1.5.dp, color = Warn)
+            w.link == Link.Ready ->
+                Box(Modifier.size(7.dp).clip(CircleShape).background(if (selected) cs.primary else Ok))
+            // значок «можно подключиться» — полое кольцо в акцентном цвете
+            connectable ->
+                Box(Modifier.size(8.dp).clip(CircleShape).border(1.5.dp, Accent, CircleShape))
+            else -> Spacer(Modifier.size(0.dp))
+        }
+        Text(
+            w.name,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+            color = nameColor,
+            maxLines = 1,
+            softWrap = false
+        )
+    }
+
+    if (renaming) RenameDialog(
+        current = w.name,
+        connected = w.link == Link.Ready,
+        onDismiss = { renaming = false },
+        onForget = { vm.forget(w.address); renaming = false },
+        onSave = { name -> vm.renameWheel(w.address, name) { vm.say(it) }; renaming = false }
+    )
+}
+
+@Composable
+private fun IdleContent(wheels: List<WheelEntry>, cur: WheelEntry?) {
+    Box(Modifier.fillMaxSize().padding(28.dp), contentAlignment = Alignment.Center) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            when {
+                cur?.link == Link.Connecting -> {
+                    CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp)
+                    Text("Connecting to " + cur.name + "…")
+                }
+                cur != null -> {
+                    // Открытое колесо отвалилось (сон, уехало из радиуса).
+                    // Переподключение крутится само.
+                    Text(cur.name + " is offline", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "Reconnecting automatically — give it a shake to wake it.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center
+                    )
+                }
+                wheels.any { it.link == Link.Ready || (!it.stale && it.rssi != Int.MIN_VALUE) } ->
+                    Text("Tap a wheel above to connect", style = MaterialTheme.typography.titleMedium)
+                else -> {
+                    Text("Looking for wheels…", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "A shake wakes it; a 1.5 s button-hold seals the deal.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RenameDialog(
+    current: String,
+    connected: Boolean,
+    onDismiss: () -> Unit,
+    onForget: () -> Unit,
+    onSave: (String) -> Unit
+) {
     var draft by remember { mutableStateOf(current) }
-    val ok = Proto.nameOk(draft.trim())
+    val nameOk = Proto.nameOk(draft.trim())
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Rename wheel") },
+        title = { Text(current) },
         text = {
             Column {
                 Text(
-                    "What this wheel is called in the device list. Two wheels on one " +
-                        "bike are both \"POV-xxxx\" out of the box, and which is which is " +
-                        "anyone's guess.",
+                    if (connected)
+                        "Rename this wheel. Two wheels on one bike are both \"POV-xxxx\" " +
+                            "out of the box, and which is which is anyone's guess."
+                    else
+                        "Connect to this wheel first to rename it.",
                     style = MaterialTheme.typography.bodySmall
                 )
                 Spacer(Modifier.height(10.dp))
@@ -288,7 +442,8 @@ private fun RenameDialog(current: String, onDismiss: () -> Unit, onSave: (String
                     value = draft,
                     onValueChange = { draft = it.take(Proto.NAME_MAX) },
                     singleLine = true,
-                    isError = draft.isNotEmpty() && !ok,
+                    enabled = connected,
+                    isError = connected && draft.isNotEmpty() && !nameOk,
                     label = { Text("Display name") }
                 )
                 Text(
@@ -297,14 +452,27 @@ private fun RenameDialog(current: String, onDismiss: () -> Unit, onSave: (String
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+                Spacer(Modifier.height(4.dp))
+                TextButton(
+                    onClick = hapticClick(onForget),
+                    contentPadding = PaddingValues(0.dp)
+                ) { Text("Forget this wheel", color = Danger) }
             }
         },
         confirmButton = {
-            TextButton(enabled = ok, onClick = hapticClick { onSave(draft.trim()) }) { Text("Rename") }
+            TextButton(
+                enabled = connected && nameOk,
+                onClick = hapticClick { onSave(draft.trim()) }
+            ) { Text("Rename") }
         },
         dismissButton = { TextButton(onClick = hapticClick(onDismiss)) { Text("Cancel") } }
     )
 }
+
+// Высота строки-заголовка карточек DISPLAY/BATTERY. Фиксирована, чтобы бейдж
+// статуса (LOW/Charging/…) не растягивал карточку вниз и числа в обеих
+// карточках стояли на одном уровне.
+private val HERO_HEADER_H = 22.dp
 
 @Composable
 private fun Hero(vm: WheelVm, tele: Tele, online: Boolean) {
@@ -336,7 +504,11 @@ private fun Hero(vm: WheelVm, tele: Tele, online: Boolean) {
     ) {
         Card(Modifier.weight(1f).fillMaxHeight()) {
             Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
-                Label("DISPLAY")
+                // Строка-заголовок фиксированной высоты — как у BATTERY с бейджем,
+                // чтобы числа в обеих карточках стояли на одном уровне.
+                Box(Modifier.height(HERO_HEADER_H), contentAlignment = Alignment.CenterStart) {
+                    Label("DISPLAY")
+                }
                 Spacer(Modifier.height(2.dp))
                 Row {
                     Text(
@@ -363,7 +535,12 @@ private fun Hero(vm: WheelVm, tele: Tele, online: Boolean) {
 
         Card(Modifier.weight(1f).fillMaxHeight()) {
             Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                // Фиксированная высота: бейдж (LOW/Charging/…) появляется и
+                // исчезает, не меняя высоту карточки.
+                Row(
+                    Modifier.fillMaxWidth().height(HERO_HEADER_H),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     Label("BATTERY")
                     Spacer(Modifier.weight(1f))
                     battBadge?.let { (t, c) -> Badge2(t, c) }
@@ -567,8 +744,8 @@ private fun RowScope.MaintBtn(
     OutlinedButton(
         onClick = hapticClick(onClick),
         enabled = enabled,
-        modifier = Modifier.weight(1f),
-        contentPadding = PaddingValues(horizontal = 2.dp, vertical = 8.dp),
+        modifier = Modifier.weight(1f).height(32.dp),   // как компактный спиннер «Magnet Position»
+        contentPadding = PaddingValues(horizontal = 2.dp),
         colors = if (danger)
             ButtonDefaults.outlinedButtonColors(contentColor = Danger)
         else ButtonDefaults.outlinedButtonColors()
@@ -770,7 +947,8 @@ private fun Badge2(text: String, color: Color?) {
     val c = color ?: MaterialTheme.colorScheme.onSurfaceVariant
     Box(
         Modifier.clip(RoundedCornerShape(6.dp)).background(c.copy(alpha = 0.16f))
-            .padding(horizontal = 8.dp, vertical = 3.dp)
+            .padding(horizontal = 8.dp, vertical = 2.dp),
+        contentAlignment = Alignment.Center
     ) { Text(text, style = MaterialTheme.typography.labelSmall, color = c) }
 }
 

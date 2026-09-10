@@ -80,6 +80,11 @@ data class WheelEntry(
     /** Реклама не приходила достаточно долго, чтобы считать колесо недоступным. */
     val stale: Boolean get() = link != Link.Ready && seenAgo > STALE_AFTER_MS
 
+    /** На связи или хотя бы в эфире — колесо, на которое имеет смысл переключиться
+     *  (тап по имени, свайп). Отсеивает известные, но давно не слышные. */
+    val reachable: Boolean get() =
+        link == Link.Ready || link == Link.Connecting || (!stale && rssi != Int.MIN_VALUE)
+
     companion object { const val STALE_AFTER_MS = 20_000L }
 }
 
@@ -117,15 +122,17 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     private val reconnectJobs = HashMap<String, kotlinx.coroutines.Job>()
 
     /**
-     * Последнее известное «Положение магнита» (Settings.angle) каждого колеса,
-     * по адресу. Это механическая калибровка конкретного колеса — как и
-     * калибровка датчиков Холла: магнит на вилке у каждого колеса стоит под
-     * своим углом. В режиме зеркалирования её нельзя навязывать соседям, поэтому
-     * блок настроек уходит на не-текущие колёса с их собственным углом, а не с
-     * углом активного колеса. Заполняется при каждом чтении настроек колеса
-     * (см. [adoptSettings]); в [pushSettings] служит источником этого угла.
+     * Последнее известное состояние каждого колеса по адресу — библиотека,
+     * место на флеше, настройки. При возврате на колесо (тап/свайп) показываем
+     * это мгновенно, а `refreshAll` освежает в фоне; без кэша при каждом
+     * переключении библиотека на доли секунды пустела, пока не придёт ответ по
+     * BLE. Наполняется снимком при уходе с колеса ([selectWheel]) и фоновым
+     * префетчем при подключении соседнего колеса ([prefetchWheel]).
      */
-    private val magnetByAddr = HashMap<String, Int>()
+    private val filesByAddr    = HashMap<String, List<DevFile>>()
+    private val fsInfoByAddr   = HashMap<String, FsInfo>()
+    private val settingsByAddr = HashMap<String, Settings>()
+    private val prefetched     = HashSet<String>()
 
     /** Какое колесо показывает экран управления. */
     val current = MutableStateFlow<String?>(null)
@@ -142,19 +149,6 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     val fsInfo = MutableStateFlow(FsInfo())
     val logLines = MutableStateFlow<List<String>>(emptyList())
     val toast = MutableStateFlow<String?>(null)
-
-    /**
-     * Группа синхронизации: адреса колёс, которые работают как одно целое —
-     * воспроизведение, эффекты, настройки и заливка идут на всю группу разом,
-     * но ТОЛЬКО когда открытое на экране колесо само входит в эту группу.
-     * У велосипеда обычно два колеса (переднее и заднее), и на них нужна одна
-     * картинка; отметить можно как эти два, так и любой другой набор. Меньше
-     * двух подключённых колёс в группе — синхронизации нет, всё идёт только на
-     * открытое колесо. Хранится набором адресов в prefs («mirror_set»).
-     */
-    val mirrorSet = MutableStateFlow(
-        (prefs.getStringSet("mirror_set", emptySet()) ?: emptySet()).toSet()
-    )
 
     // Пишется с Dispatchers.IO, читается из отрисовки списка — обычный HashMap
     // здесь может уйти в бесконечный цикл на рехэше.
@@ -260,29 +254,41 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     fun client(addr: String?): BleClient? = if (addr == null) null else clients[addr]
     fun currentClient(): BleClient? = client(current.value)
 
-    /** Включить/выключить колесо [addr] в группе синхронизации. */
-    fun toggleMirror(addr: String, on: Boolean) {
-        val next = mirrorSet.value.toMutableSet()
-        if (on) next.add(addr) else next.remove(addr)
-        mirrorSet.value = next
-        prefs.edit().putStringSet("mirror_set", next).apply()
+    /** Открытый клиент, но только если он на связи — получатель всех команд. */
+    private fun readyClient(): BleClient? =
+        currentClient()?.takeIf { it.link.value == Link.Ready }
+
+    /**
+     * Открыть колесо по тапу в строке: если оно уже на связи — просто показать,
+     * иначе показать «подключаемся» и запустить соединение.
+     */
+    fun openWheel(addr: String, name: String) {
+        val c = clients[addr]
+        if (c != null && c.link.value == Link.Ready) selectWheel(addr)
+        else {
+            current.value = addr
+            prefs.edit().putString("last_wheel", addr).apply()
+            connect(addr, name)
+        }
+    }
+
+    /** При старте приложения — сразу открыть последнее колесо, а не ждать тапа. */
+    fun openLastWheel() {
+        val addr = prefs.getString("last_wheel", null) ?: return
+        openWheel(addr, prefs.getString("name_" + addr, "POV wheel")!!)
     }
 
     /**
-     * Колёса-получатели команды/заливки. Вся группа синхронизации — если
-     * открытое колесо в неё входит и в группе есть ещё хотя бы одно колесо на
-     * связи; иначе только открытое. Возвращаются только клиенты в состоянии
-     * Link.Ready.
+     * Свайп между колёсами: +1 — следующее, −1 — предыдущее, по кругу. Список —
+     * достижимые колёса ([WheelEntry.reachable]) в том же порядке, что в строке.
+     * Меньше двух — свайп ничего не делает.
      */
-    private fun mirrorTargets(): List<BleClient> {
-        val cur = current.value
-        if (cur != null && cur in mirrorSet.value) {
-            val live = clients.values.filter {
-                it.address in mirrorSet.value && it.link.value == Link.Ready
-            }
-            if (live.size >= 2) return live
-        }
-        return listOfNotNull(currentClient()).filter { it.link.value == Link.Ready }
+    fun cycleWheel(dir: Int) {
+        val list = wheels.value.filter { it.reachable }
+        if (list.size < 2) return
+        val i = list.indexOfFirst { it.address == current.value }.coerceAtLeast(0)
+        val next = list[(i + dir).mod(list.size)]
+        openWheel(next.address, next.name)
     }
 
     fun say(msg: String) { toast.value = msg }
@@ -384,8 +390,11 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         disconnect(addr)
         val known = prefs.getStringSet("known", emptySet())!!.toMutableSet()
         known.remove(addr)
-        prefs.edit().putStringSet("known", known).remove("name_" + addr).apply()
+        val edit = prefs.edit().putStringSet("known", known).remove("name_" + addr)
+        if (prefs.getString("last_wheel", null) == addr) edit.remove("last_wheel")
+        edit.apply()
         nameCache.remove(addr)
+        filesByAddr.remove(addr); fsInfoByAddr.remove(addr); settingsByAddr.remove(addr)
         found.value = found.value.filter { it.address != addr }
         rebuildWheels()
     }
@@ -426,7 +435,12 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         // экрана. Отписываемся вместе с удалением клиента.
         watchJobs[addr]?.cancel()
         watchJobs[addr] = viewModelScope.launch {
-            launch { c.link.collect { rebuildWheels() } }
+            launch { c.link.collect { lk ->
+                rebuildWheels()
+                // Соседнее колесо вышло на связь — тихо прогреваем кэш, чтобы
+                // свайп на него открывал библиотеку сразу, а не с задержкой.
+                if (lk == Link.Ready) prefetchWheel(addr) else prefetched.remove(addr)
+            } }
             launch { c.tele.collect { rebuildWheels() } }
         }
         c.onLinkLost = { viewModelScope.launch { onLinkLost(addr) } }
@@ -460,19 +474,29 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
 
     /**
      * Делает колесо активным. Всё, что показывает экран, принадлежит одному
-     * устройству, поэтому переключение обязано сбросить и данные, и счётчики
-     * опроса: два колеса легко стоят на одинаковых версиях состояния (счётчики
-     * растут только при изменениях), и тогда опрос решил бы, что перечитывать
-     * нечего, и оставил бы на экране чужие настройки.
+     * устройству. Данные подставляем из кэша ([filesByAddr] и т.д.) — сразу,
+     * без пустого экрана на время ответа по BLE; `startPolling` всё равно
+     * перечитает всё на первой же итерации (счётчики версий стартуют с −1).
      */
     fun selectWheel(addr: String) {
         if (current.value == addr && settingsLoaded.value) return
         livePushJob?.cancel(); livePushJob = null; livePushPending = null
+
+        // Снимок уходящего колеса — на нём держится мгновенный возврат.
+        current.value?.let { old ->
+            filesByAddr[old]  = files.value
+            fsInfoByAddr[old] = fsInfo.value
+            if (settingsLoaded.value) settingsByAddr[old] = settings.value
+        }
+
         current.value = addr
-        settingsLoaded.value = false
-        settings.value = Settings()
-        files.value = emptyList()
-        fsInfo.value = FsInfo()
+        prefs.edit().putString("last_wheel", addr).apply()   // открыть его при следующем старте
+
+        val cachedS = settingsByAddr[addr]
+        settings.value       = cachedS ?: Settings()
+        settingsLoaded.value = cachedS != null
+        files.value  = filesByAddr[addr] ?: emptyList()
+        fsInfo.value = fsInfoByAddr[addr] ?: FsInfo()
         logLines.value = emptyList()
         logTotal = 0
         refreshAll()
@@ -537,7 +561,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         wantConnected.remove(addr)
         reconnectJobs.remove(addr)?.cancel()
         watchJobs.remove(addr)?.cancel()
-        magnetByAddr.remove(addr)
+        prefetched.remove(addr)
         clients.remove(addr)?.also { it.onLinkLost = null; it.close() }
         connected.value = clients.values.toList()
         rebuildWheels()
@@ -555,9 +579,9 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         reconnectJobs.clear()
         watchJobs.values.forEach { it.cancel() }
         watchJobs.clear()
+        prefetched.clear()
         clients.values.forEach { it.onLinkLost = null; it.close() }
         clients.clear()
-        magnetByAddr.clear()
         connected.value = emptyList()
         current.value = null
         rebuildWheels()
@@ -574,7 +598,8 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             var lastFile = -1L
             while (true) {
                 val c = currentClient()
-                if (c != null && c.link.value == Link.Ready) {
+                val addr = current.value
+                if (c != null && addr != null && c.link.value == Link.Ready) {
                     val t = c.tele.value
                     // Устройство увеличивает эти счётчики при любом изменении,
                     // поэтому правки со второго телефона (или самого колеса)
@@ -582,7 +607,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                     if (t.stateVer != lastState) {
                         lastState = t.stateVer
                         val got = runCatching { c.getSettings() }.getOrNull()
-                        if (got != null) {
+                        if (got != null && current.value == addr) {
                             adoptSettings(got)
                         } else {
                             // Не удалось прочитать — не отмечаем как загруженные,
@@ -592,8 +617,14 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                     }
                     if (t.fileVer != lastFile) {
                         lastFile = t.fileVer
-                        runCatching { files.value = c.list() }
-                        runCatching { fsInfo.value = c.fsInfo() }
+                        runCatching { c.list() }.getOrNull()?.let {
+                            filesByAddr[addr] = it
+                            if (current.value == addr) files.value = it
+                        }
+                        runCatching { c.fsInfo() }.getOrNull()?.let {
+                            fsInfoByAddr[addr] = it
+                            if (current.value == addr) fsInfo.value = it
+                        }
                     }
                 }
                 delay(1500)
@@ -602,12 +633,39 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     }
 
     fun refreshAll() {
-        val c = currentClient() ?: return
+        val addr = current.value ?: return
+        val c = clients[addr] ?: return
         viewModelScope.launch {
-            runCatching { c.getSettings() }.getOrNull()?.let { adoptSettings(it) }
-            runCatching { files.value = c.list() }
-            runCatching { fsInfo.value = c.fsInfo() }
+            // Быстрые свайпы между колёсами: ответ мог прийти уже после того,
+            // как открыли другое колесо — тогда не применяем его к чужому экрану.
+            runCatching { c.getSettings() }.getOrNull()?.let {
+                if (current.value == addr) adoptSettings(it)
+            }
+            runCatching { c.list() }.getOrNull()?.let {
+                filesByAddr[addr] = it
+                if (current.value == addr) files.value = it
+            }
+            runCatching { c.fsInfo() }.getOrNull()?.let {
+                fsInfoByAddr[addr] = it
+                if (current.value == addr) fsInfo.value = it
+            }
             runCatching { c.telemetry() }
+        }
+    }
+
+    /**
+     * Тихо прочитать библиотеку/место/настройки соседнего (не открытого) колеса
+     * в кэш — один раз на подключение. Тогда свайп на него открывает всё сразу.
+     */
+    private fun prefetchWheel(addr: String) {
+        if (addr == current.value || !prefetched.add(addr)) return
+        val c = clients[addr] ?: return
+        viewModelScope.launch {
+            runCatching { c.getSettings() }.getOrNull()?.let {
+                settingsByAddr[addr] = if (it.ablX10 != 1000) it.copy(ablX10 = 1000) else it
+            }
+            runCatching { c.list() }.getOrNull()?.let { filesByAddr[addr] = it }
+            runCatching { c.fsInfo() }.getOrNull()?.let { fsInfoByAddr[addr] = it }
         }
     }
 
@@ -623,9 +681,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         val fixed = if (got.ablX10 != 1000) got.copy(ablX10 = 1000) else got
         settings.value = fixed
         settingsLoaded.value = true
-        // Запоминаем положение магнита этого колеса, чтобы зеркалирование чужих
-        // настроек его не затирало.
-        current.value?.let { magnetByAddr[it] = fixed.angle }
+        current.value?.let { settingsByAddr[it] = fixed }
         if (fixed !== got) {
             val c = currentClient() ?: return
             viewModelScope.launch { runCatching { c.setSettings(fixed); c.save() } }
@@ -878,14 +934,9 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         val list = upItems.value
         if (list.isEmpty()) { upStatus.value = "Select a file first."; upKind.value = 2; return }
 
-        // Только колёса НА СВЯЗИ и Link.Ready — mirrorTargets() уже это
-        // фильтрует. Спящее колесо из группы раньше роняло весь пакет: файлы
-        // честно уезжали на живое, но считались неудачей.
-        //
-        // Адреса, а не сами объекты: авто-переподключение создаёт НОВЫЙ
-        // BleClient, и захваченная на всю пачку ссылка указывала бы на
-        // закрытый.
-        val targetAddrs = mirrorTargets().map { it.address }
+        // Адрес, а не сам объект: авто-переподключение создаёт НОВЫЙ BleClient,
+        // и захваченная на всю пачку ссылка указывала бы на закрытый.
+        val targetAddrs = listOfNotNull(readyClient()?.address)
         if (targetAddrs.isEmpty()) { upStatus.value = "Not connected."; upKind.value = 2; return }
 
         // Пачку снимаем целиком СЕЙЧАС. Настройки у каждого файла свои и лежат в
@@ -943,9 +994,9 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                         // уже другим объектом.
                         val c = client(addr)
                         if (c == null || c.link.value != Link.Ready) continue
-                        // Все прочие подключённые колёса — на «мягкий» линк: два
-                        // активных BLE-соединения делят радио телефона, и без
-                        // этого заливка на активное колесо шла ~20 вместо ~110 кБ/с.
+                        // Второе подключённое колесо (если есть) — на «мягкий»
+                        // линк: два активных BLE-соединения делят радио телефона,
+                        // без этого заливка шла ~20 вместо ~110 кБ/с.
                         focusUploadLink(addr)
                         try {
                             val wire = withContext(Dispatchers.Default) {
@@ -953,16 +1004,13 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                             }
                             val ratio = res.data.size.toDouble() / maxOf(wire.bytes.size, 1)
                             val started = System.currentTimeMillis()
-                            // При зеркале — на какое колесо льём прямо сейчас.
-                            val toWheel = if (targetAddrs.size > 1)
-                                " → " + (c.hello?.name ?: addr) else ""
                             c.upload(res.fileName, wire.bytes, res.data.size, crc, wire.compressed) { p ->
                                 upProgress.value = p.sent.toFloat() / maxOf(p.totalWire, 1L)
                                 val kb = p.sent / 1024
                                 val tot = p.totalWire / 1024
                                 val secs = (System.currentTimeMillis() - started) / 1000.0
                                 val rate = if (secs > 0.4) (p.sent / 1024.0 / secs) else 0.0
-                                upStatus.value = label + toWheel + " — " +
+                                upStatus.value = label + " — " +
                                     (p.sent * 100 / maxOf(p.totalWire, 1L)) + "%  ·  " +
                                     kb + " / " + tot + " kB" +
                                     (if (wire.compressed) String.format("  ·  x%.1f smaller", ratio) else "") +
@@ -1044,10 +1092,17 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     }
 
     fun refreshFiles() {
-        val c = currentClient() ?: return
+        val addr = current.value ?: return
+        val c = clients[addr] ?: return
         viewModelScope.launch {
-            runCatching { files.value = c.list() }
-            runCatching { fsInfo.value = c.fsInfo() }
+            runCatching { c.list() }.getOrNull()?.let {
+                filesByAddr[addr] = it
+                if (current.value == addr) files.value = it
+            }
+            runCatching { c.fsInfo() }.getOrNull()?.let {
+                fsInfoByAddr[addr] = it
+                if (current.value == addr) fsInfo.value = it
+            }
             // Убрать превью удалённых файлов и удержать кэш в пределах потолка.
             prunePreviewCache(files.value.map { it.name }.toHashSet(), strict = connected.value.size <= 1)
         }
@@ -1055,7 +1110,8 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
 
     /**
      * Сносит превью, для которых на текущем колесе больше нет файла (только при
-     * одном подключении — при зеркале у колёс разные библиотеки), и обрезает
+     * одном подключении — у двух подключённых колёс разные библиотеки, и файла,
+     * которого нет на одном, может не быть превью зря удалённого), и обрезает
      * кэш по размеру, начиная со самых давних.
      */
     private fun prunePreviewCache(keep: Set<String>, strict: Boolean) {
@@ -1123,18 +1179,12 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
 
     // --------------------------------------------------------------- команды
 
-    /**
-     * Выполняет [block] на открытом колесе, а если оно входит в группу
-     * синхронизации — на всей группе (см. [mirrorTargets]).
-     */
+    /** Выполняет [block] на открытом колесе, если оно на связи. */
     private fun onTargets(block: suspend (BleClient) -> Unit) {
-        val targets = mirrorTargets()
+        val c = readyClient() ?: return
         viewModelScope.launch {
-            for (c in targets) {
-                if (c.link.value != Link.Ready) continue
-                try { block(c) } catch (e: Exception) {
-                    say((c.hello?.name ?: c.address) + ": " + (e.message ?: "failed"))
-                }
+            try { block(c) } catch (e: Exception) {
+                say((c.hello?.name ?: c.address) + ": " + (e.message ?: "failed"))
             }
         }
     }
@@ -1200,15 +1250,13 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         val ms = (secs * 1000).coerceIn(1000, 300000)
         onTargets { c -> if (c.tele.value.slideshow) c.album(true, ms) }
     }
-    /**
-     * Переименовать ТЕКУЩЕЕ колесо. Намеренно мимо onTargets: зеркалирование
-     * здесь бессмысленно — два колеса с одинаковым именем ровно та задача,
-     * которую переименование и решает.
-     */
-    fun renameCurrent(name: String, onDone: (String) -> Unit) {
-        val c = currentClient()
-        val addr = current.value
-        if (c == null || addr == null) { say("Not connected"); return }
+    /** Переименовать колесо [addr]. Требует связи — имя пишется на устройство. */
+    fun renameWheel(addr: String, name: String, onDone: (String) -> Unit) {
+        val c = clients[addr]
+        if (c == null || c.link.value != Link.Ready) {
+            onDone("Connect to this wheel first")
+            return
+        }
         if (!Proto.nameOk(name)) {
             onDone("Latin letters, digits, - and _ only, up to " + Proto.NAME_MAX)
             return
@@ -1240,8 +1288,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
 
     /**
      * Выключение в транспортный режим: колесо гаснет и до удержания кнопки уже
-     * не проснётся — ни по тряске, ни по BLE. Если открытое колесо в группе
-     * синхронизации — гасит всю группу разом, как и «Reboot».
+     * не проснётся — ни по тряске, ни по BLE.
      */
     fun powerOff() = onTargets { it.powerOff() }
 
@@ -1249,10 +1296,6 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      * Прошивка по BLE. Транспорт тот же, что у анимаций, но сжатия нет:
      * образ и так почти несжимаем, а устройство пишет его в раздел OTA
      * напрямую, минуя распаковщик (см. OP_OTA_BEGIN в povble.cpp).
-     *
-     * Идёт ТОЛЬКО на открытое колесо, даже когда оно в группе синхронизации:
-     * залить одну прошивку сразу в два устройства значит на время передачи
-     * ослепнуть на оба, а если образ окажется битым — остаться без обоих сразу.
      */
     fun updateFirmware(uri: android.net.Uri, onDone: (String) -> Unit) {
         val c = currentClient()
@@ -1296,23 +1339,13 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             return
         }
         settings.value = s
-        val cur = current.value
-        if (cur != null) magnetByAddr[cur] = s.angle
-        onTargets { c ->
-            // На активное колесо — блок как есть. На остальные (режим
-            // зеркалирования) — с их собственным «Положением магнита»: это
-            // калибровка под конкретное колесо, у соседа магнит стоит иначе.
-            val out = if (c.address == cur) s
-                      else s.copy(angle = mirrorMagnet(c, s.angle))
-            c.setSettings(out)
-        }
+        onTargets { c -> c.setSettings(s) }
     }
 
     // --- Живое применение настройки во время перетаскивания ---
-    // pushSettings (по отпусканию пальца) шлёт полный блок на всю группу и
-    // сохраняет в NVS. pushSettingsLive применяет промежуточные значения СРАЗУ,
-    // чтобы результат было видно на ободе прямо в движении пальца. Отличия:
-    // только открытое колесо (калибруют по одному), не чаще ~10 раз в секунду —
+    // pushSettings (по отпусканию пальца) шлёт полный блок и сохраняет в NVS.
+    // pushSettingsLive применяет промежуточные значения СРАЗУ, чтобы результат
+    // было видно на ободе прямо в движении пальца, но не чаще ~10 раз в секунду —
     // иначе за один жест в очередь BLE встанут десятки записей, которые
     // продолжат уходить и после того, как палец убрали, — и без записи в NVS.
     private var livePushJob: kotlinx.coroutines.Job? = null
@@ -1322,7 +1355,6 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     fun pushSettingsLive(s: Settings) {
         if (!settingsLoaded.value) return
         settings.value = s
-        current.value?.let { magnetByAddr[it] = s.angle }
         livePushPending = s
         if (livePushJob?.isActive == true) return
         livePushJob = viewModelScope.launch {
@@ -1339,19 +1371,6 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             }
         }
     }
-
-    /**
-     * «Положение магнита», которое нужно оставить не-текущему колесу при
-     * зеркалировании настроек. Берём запомненное при последнем чтении его
-     * настроек; если колесо ещё ни разу не открывали — дочитываем сейчас и
-     * запоминаем. Совсем в крайнем случае (чтение не удалось) — [fallback],
-     * то есть угол активного колеса: не идеально, но не хуже прежнего поведения.
-     */
-    private suspend fun mirrorMagnet(c: BleClient, fallback: Int): Int =
-        magnetByAddr[c.address]
-            ?: runCatching { c.getSettings().angle }.getOrNull()
-                ?.also { magnetByAddr[c.address] = it }
-            ?: fallback
 
     fun saveSettings() = onTargets { it.save() }
 
