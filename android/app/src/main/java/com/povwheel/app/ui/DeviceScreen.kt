@@ -643,36 +643,53 @@ private fun SettingCard(content: @Composable ColumnScope.() -> Unit) {
  * Диапазон авто-яркости одним слайдером с двумя бегунками вместо двух
  * отдельных. Оранжевая метка на той же шкале — текущая яркость
  * (`global_effective_brightness`) по нынешней освещённости.
+ *
+ * Шкала для пользователя 1..25 линейно натянута на реальный brightness-байт
+ * [BRI_LO]..[BRI_HI]: user 1 = байт 6 (ниже лента едва различима даже в
+ * темноте), user 25 = байт 31 (максимум 5-битного поля тока SK9822).
  */
+private const val BRI_LO = 6
+private const val BRI_HI = 31
+private const val BRI_U_MAX = 25
+
+private fun briToUser(b: Int): Int =
+    (1 + ((b - BRI_LO) * (BRI_U_MAX - 1).toFloat() / (BRI_HI - BRI_LO)).roundToInt())
+        .coerceIn(1, BRI_U_MAX)
+
+private fun userToBri(u: Int): Int =
+    (BRI_LO + ((u - 1) * (BRI_HI - BRI_LO).toFloat() / (BRI_U_MAX - 1)).roundToInt())
+        .coerceIn(BRI_LO, BRI_HI)
+
 @Composable
 private fun AutoBrightnessRange(vm: WheelVm, s: Settings, tele: Tele) {
+    val lo = briToUser(minOf(s.bmin, s.bmax))
+    val hi = briToUser(maxOf(s.bmin, s.bmax))
     Row(verticalAlignment = Alignment.CenterVertically) {
         Text("Auto Brightness Range", style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-        Text(s.bmin.toString() + "–" + s.bmax + " / 31",
+        Text(lo.toString() + "–" + hi + " / " + BRI_U_MAX,
             style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.SemiBold)
     }
     BoxWithConstraints(Modifier.fillMaxWidth()) {
         // Дорожка слайдера отбита от краёв на радиус бегунка — метку считаем
         // в тех же границах, иначе она разъедется с делениями.
         val inset = 10.dp
-        val lo = s.bmin.coerceAtMost(s.bmax)
-        val hi = s.bmax.coerceAtLeast(s.bmin)
         StepRangeSlider(
-            lo = lo, hi = hi, valueRange = 1..31,
+            lo = lo, hi = hi, valueRange = 1..BRI_U_MAX,
             onChange = { a, b ->
                 vm.settings.value = s.copy(
-                    bmin = a.coerceAtMost(b),
-                    bmax = b.coerceAtLeast(a)
+                    bmin = userToBri(minOf(a, b)),
+                    bmax = userToBri(maxOf(a, b))
                 )
             },
             onChangeFinished = { vm.pushSettings(vm.settings.value); vm.saveSettings() },
             modifier = Modifier.fillMaxWidth()
         )
-        // Оранжевая метка — только когда лента реально светит: на выключенном
-        // дисплее eff_bri == 0, и метка у левого края читалась бы как «яркость 1».
-        if (tele.effBri in 1..31) {
-            val frac = ((tele.effBri - 1f) / 30f).coerceIn(0f, 1f)
+        // Оранжевая метка — текущая эффективная яркость на пользовательской шкале;
+        // прячем ниже пола (лента выключена или очень тускло) — метка у левого
+        // края читалась бы как «яркость 1».
+        if (tele.effBri in BRI_LO..BRI_HI) {
+            val frac = ((tele.effBri - BRI_LO).toFloat() / (BRI_HI - BRI_LO)).coerceIn(0f, 1f)
             Box(
                 Modifier
                     .align(Alignment.CenterStart)

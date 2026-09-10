@@ -506,9 +506,13 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         current.value = addr
         prefs.edit().putString("last_wheel", addr).apply()   // открыть его при следующем старте
 
-        val cachedS = settingsByAddr[addr]
-        settings.value       = cachedS ?: Settings()
-        settingsLoaded.value = cachedS != null
+        // Кэш — ТОЛЬКО для мгновенного показа; settingsLoaded держим false, пока
+        // не придёт настоящее чтение с устройства (adoptSettings). Иначе первое
+        // же касание ползунка/спиннера отправило бы на колесо кэш — а он мог
+        // оказаться значениями по умолчанию (колесо в дефолтном состоянии, или
+        // старый снимок), и настройки на устройстве затёрлись бы дефолтами.
+        settings.value       = settingsByAddr[addr] ?: Settings()
+        settingsLoaded.value = false
         files.value  = filesByAddr[addr] ?: emptyList()
         fsInfo.value = fsInfoByAddr[addr] ?: FsInfo()
         magnetLocked.value = prefs.getBoolean(magnetLockKey(addr), false)
@@ -529,6 +533,9 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      */
     private fun onLinkLost(addr: String) {
         rebuildWheels()
+        // Колесо могло за время обрыва перезагрузиться и потерять RTC-настройки —
+        // после реконнекта перечитываем их заново, а не доверяем старой копии.
+        if (addr == current.value) settingsLoaded.value = false
         if (!wantConnected.contains(addr)) return
         reconnectJobs[addr]?.cancel()
         reconnectJobs[addr] = viewModelScope.launch {
@@ -677,7 +684,9 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         val c = clients[addr] ?: return
         viewModelScope.launch {
             runCatching { c.getSettings() }.getOrNull()?.let {
-                settingsByAddr[addr] = if (it.ablX10 != 1000) it.copy(ablX10 = 1000) else it
+                var f = if (it.ablX10 != 1000) it.copy(ablX10 = 1000) else it
+                if (f.bmin < 6) f = f.copy(bmin = 6, bmax = f.bmax.coerceAtLeast(6))
+                settingsByAddr[addr] = f
             }
             runCatching { c.list() }.getOrNull()?.let { filesByAddr[addr] = it }
             runCatching { c.fsInfo() }.getOrNull()?.let { fsInfoByAddr[addr] = it }
@@ -687,20 +696,22 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     /**
      * Принять настройки, прочитанные с колеса.
      *
-     * Power Limit убран из интерфейса — пользователь его не трогает, — и держится
-     * на 100 %. Если на устройстве застряло меньшее значение (его мог оставить
-     * старый веб-интерфейс), чиним его один раз: иначе лента светила бы тусклее
-     * без всякого объяснения в приложении.
+     * Мелкие несоответствия правим ТОЛЬКО в локальной копии для показа
+     * (Power Limit держим на 100 %, пол яркости 6 — шкала 1..25 = байт 6..31):
+     * `pushSettings` при первой же правке пользователя всё равно отправит на
+     * колесо весь блок целиком, уже с поправками.
+     *
+     * Раньше здесь был автоматический `setSettings + save`. Это опасно: если
+     * колесо на дефолтах (свежая перепрошивка, сброшенный NVS-blob), приложение
+     * тут же цементировало эти дефолты в NVS — калибровку было не вернуть. Теперь
+     * приложение НИЧЕГО не пишет само; только показывает прочитанное.
      */
     private fun adoptSettings(got: Settings) {
-        val fixed = if (got.ablX10 != 1000) got.copy(ablX10 = 1000) else got
+        var fixed = if (got.ablX10 != 1000) got.copy(ablX10 = 1000) else got
+        if (fixed.bmin < 6) fixed = fixed.copy(bmin = 6, bmax = fixed.bmax.coerceAtLeast(6))
         settings.value = fixed
         settingsLoaded.value = true
         current.value?.let { settingsByAddr[it] = fixed }
-        if (fixed !== got) {
-            val c = currentClient() ?: return
-            viewModelScope.launch { runCatching { c.setSettings(fixed); c.save() } }
-        }
     }
 
     // =================================================================
