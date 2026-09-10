@@ -46,6 +46,7 @@ import androidx.core.content.ContextCompat
 import com.povwheel.app.ui.DeviceScreen
 import com.povwheel.app.ui.DevicesScreen
 import com.povwheel.app.ui.PovTheme
+import com.povwheel.app.ui.hapticClick
 
 class MainActivity : ComponentActivity() {
 
@@ -186,7 +187,7 @@ private fun Gate(vm: WheelVm) {
                 textAlign = TextAlign.Center,
                 style = MaterialTheme.typography.bodyMedium
             )
-            Button(onClick = { permLauncher.launch(needed) }) { Text("Grant permission") }
+            Button(onClick = hapticClick { permLauncher.launch(needed) }) { Text("Grant permission") }
             // После второго отказа система показывает диалог мгновенно и
             // впустую — единственный оставшийся путь ведёт в настройки.
             if (asked) {
@@ -197,7 +198,7 @@ private fun Gate(vm: WheelVm) {
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                OutlinedButton(onClick = {
+                OutlinedButton(onClick = hapticClick {
                     settingsLauncher.launch(
                         Intent(
                             Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
@@ -217,7 +218,7 @@ private fun Gate(vm: WheelVm) {
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Text("Bluetooth is off", style = MaterialTheme.typography.titleLarge)
-            Button(onClick = {
+            Button(onClick = hapticClick {
                 btLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
             }) { Text("Turn Bluetooth on") }
         }
@@ -238,10 +239,10 @@ private fun Gate(vm: WheelVm) {
                 textAlign = TextAlign.Center,
                 style = MaterialTheme.typography.bodyMedium
             )
-            Button(onClick = {
+            Button(onClick = hapticClick {
                 settingsLauncher.launch(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
             }) { Text("Open location settings") }
-            OutlinedButton(onClick = { locOn = locationOn(ctx) }) { Text("I turned it on") }
+            OutlinedButton(onClick = hapticClick { locOn = locationOn(ctx) }) { Text("I turned it on") }
         }
         return
     }

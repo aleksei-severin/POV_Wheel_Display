@@ -1,7 +1,6 @@
 package com.povwheel.app.ui
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,8 +18,8 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -56,8 +55,7 @@ import com.povwheel.app.ble.Link
 fun DevicesScreen(vm: WheelVm) {
     val wheels by vm.wheels.collectAsState()
     val scanning by vm.scanning.collectAsState()
-    val connected by vm.connected.collectAsState()
-    val mirror by vm.mirrorAll.collectAsState()
+    val group by vm.mirrorSet.collectAsState()
 
     // Поиск идёт, пока открыт этот экран, и снимается уходом с него, а не
     // таймером на пятнадцать секунд: колесо обычно включают уже после того,
@@ -97,25 +95,37 @@ fun DevicesScreen(vm: WheelVm) {
                 CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
                 Spacer(Modifier.size(10.dp))
             }
-            OutlinedButton(onClick = { if (scanning) vm.stopScan() else vm.startScan() }) {
+            OutlinedButton(onClick = hapticClick { if (scanning) vm.stopScan() else vm.startScan() }) {
                 Text(if (scanning) "Stop" else "Scan")
             }
         }
 
         Spacer(Modifier.height(12.dp))
 
-        if (connected.size > 1) {
+        if (live > 1) {
             Card(Modifier.fillMaxWidth()) {
-                Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text("Mirror to all wheels", fontWeight = FontWeight.SemiBold)
-                        Text(
-                            "Playback, effects and settings go to every connected wheel at once.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                Column(Modifier.padding(14.dp)) {
+                    Text("Sync wheels", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "Ticked wheels play, show effects and take uploads together — while the open wheel is one of them.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    wheels.filter { it.link == Link.Ready }.forEach { w ->
+                        Row(
+                            Modifier.fillMaxWidth().tapClickable {
+                                vm.toggleMirror(w.address, w.address !in group)
+                            },
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Checkbox(
+                                checked = w.address in group,
+                                onCheckedChange = hapticChange { vm.toggleMirror(w.address, it) }
+                            )
+                            Text(w.name)
+                        }
                     }
-                    Switch(checked = mirror, onCheckedChange = { vm.setMirror(it) })
                 }
             }
             Spacer(Modifier.height(12.dp))
@@ -171,7 +181,7 @@ private fun DeviceRow(vm: WheelVm, w: WheelEntry) {
     }
 
     Card(
-        Modifier.fillMaxWidth().clickable { vm.connect(w.address, w.name) },
+        Modifier.fillMaxWidth().tapClickable { vm.connect(w.address, w.name) },
         colors = CardDefaults.cardColors(
             containerColor = if (w.link == Link.Ready) MaterialTheme.colorScheme.surfaceVariant
                              else MaterialTheme.colorScheme.surface
@@ -203,15 +213,15 @@ private fun DeviceRow(vm: WheelVm, w: WheelEntry) {
             }
             when (w.link) {
                 Link.Ready -> {
-                    TextButton(onClick = { vm.selectWheel(w.address) }) { Text("Open") }
-                    TextButton(onClick = { vm.disconnect(w.address) }) { Text("Drop") }
+                    TextButton(onClick = hapticClick { vm.selectWheel(w.address) }) { Text("Open") }
+                    TextButton(onClick = hapticClick { vm.disconnect(w.address) }) { Text("Drop") }
                 }
                 Link.Connecting -> {
-                    TextButton(onClick = { vm.disconnect(w.address) }) { Text("Cancel") }
+                    TextButton(onClick = hapticClick { vm.disconnect(w.address) }) { Text("Cancel") }
                 }
                 else -> {
-                    TextButton(onClick = { vm.connect(w.address, w.name) }) { Text("Connect") }
-                    if (w.known) TextButton(onClick = { vm.forget(w.address) }) { Text("Forget") }
+                    TextButton(onClick = hapticClick { vm.connect(w.address, w.name) }) { Text("Connect") }
+                    if (w.known) TextButton(onClick = hapticClick { vm.forget(w.address) }) { Text("Forget") }
                 }
             }
         }

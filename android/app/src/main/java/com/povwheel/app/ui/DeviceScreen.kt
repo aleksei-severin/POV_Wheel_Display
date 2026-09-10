@@ -3,7 +3,6 @@ package com.povwheel.app.ui
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -35,6 +34,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -114,11 +114,15 @@ private fun MainContent(vm: WheelVm, tele: Tele, online: Boolean) {
                         fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
                     NumberSpinner(
                         value = s.angle,
-                        range = 0..360,
+                        range = 0..359,          // 360 == 0, поэтому предел — 359
                         suffix = "°",
                         modifier = Modifier.width(140.dp),
                         dense = true,
-                        onChange = { vm.settings.value = s.copy(angle = it) },
+                        wrap = true,              // прокрутка бесконечная, без упора в 0/359
+                        // Применяем на дисплей ПРЯМО во время перетаскивания
+                        // (throttled, только на открытое колесо, без записи в
+                        // NVS) — калибровать вслепую до отпускания пальца неудобно.
+                        onChange = { vm.pushSettingsLive(s.copy(angle = it)) },
                         onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() }
                     )
                 }
@@ -130,7 +134,7 @@ private fun MainContent(vm: WheelVm, tele: Tele, online: Boolean) {
                 Row(
                     Modifier.fillMaxWidth()
                         .clip(RoundedCornerShape(6.dp))
-                        .clickable { colourOpen = !colourOpen }
+                        .tapClickable { colourOpen = !colourOpen }
                         .padding(vertical = 4.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -191,12 +195,12 @@ private fun MainContent(vm: WheelVm, tele: Tele, online: Boolean) {
                 )
             },
             confirmButton = {
-                TextButton(onClick = {
+                TextButton(onClick = hapticClick {
                     confirmOff = false
                     vm.powerOff(); vm.say("Powering off")
                 }) { Text("Power off") }
             },
-            dismissButton = { TextButton(onClick = { confirmOff = false }) { Text("Cancel") } }
+            dismissButton = { TextButton(onClick = hapticClick { confirmOff = false }) { Text("Cancel") } }
         )
     }
 
@@ -228,7 +232,7 @@ private fun Header(vm: WheelVm, link: Link) {
         verticalAlignment = Alignment.CenterVertically
     ) {
         TextButton(
-            onClick = { vm.current.value = null },
+            onClick = hapticClick { vm.current.value = null },
             contentPadding = PaddingValues(horizontal = 8.dp)
         ) { Text("‹ Wheels") }
 
@@ -242,7 +246,7 @@ private fun Header(vm: WheelVm, link: Link) {
             modifier = Modifier
                 .weight(1f)
                 .clip(RoundedCornerShape(6.dp))
-                .clickable { renaming = true }
+                .tapClickable { renaming = true }
                 .padding(horizontal = 6.dp, vertical = 6.dp)
         )
 
@@ -296,9 +300,9 @@ private fun RenameDialog(current: String, onDismiss: () -> Unit, onSave: (String
             }
         },
         confirmButton = {
-            TextButton(enabled = ok, onClick = { onSave(draft.trim()) }) { Text("Rename") }
+            TextButton(enabled = ok, onClick = hapticClick { onSave(draft.trim()) }) { Text("Rename") }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+        dismissButton = { TextButton(onClick = hapticClick(onDismiss)) { Text("Cancel") } }
     )
 }
 
@@ -339,7 +343,7 @@ private fun Hero(vm: WheelVm, tele: Tele, online: Boolean) {
                         if (tele.kmh > 0f) String.format("%.1f", tele.kmh) else "--",
                         style = MaterialTheme.typography.headlineSmall,
                         fontWeight = FontWeight.Bold,
-                        modifier = Modifier.alignByBaseline().clickable { showCirc = true }
+                        modifier = Modifier.alignByBaseline().tapClickable { showCirc = true }
                     )
                     Text(" km/h", style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -348,7 +352,7 @@ private fun Hero(vm: WheelVm, tele: Tele, online: Boolean) {
                         if (tele.rpm > 0f) tele.rpm.roundToInt().toString() else "--",
                         style = MaterialTheme.typography.titleMedium,
                         modifier = Modifier.alignByBaseline().padding(start = 10.dp)
-                            .clickable { showRpm = true }
+                            .tapClickable { showRpm = true }
                     )
                     Text(" rpm", style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -495,6 +499,7 @@ private fun StepRangeSlider(
 ) {
     val cs = MaterialTheme.colorScheme
     val density = LocalDensity.current
+    val view = LocalView.current
     val thumbR = 10.dp
     val trackH = 4.dp
     val grab = 22.dp                    // насколько близко к центру бегунка нужно попасть
@@ -526,10 +531,13 @@ private fun StepRangeSlider(
                     val movingLo = dLo <= dHi
                     down.consume()
                     var moved = false
+                    var lastV = if (movingLo) loS.value else hiS.value
                     horizontalDrag(down.id) { ch ->
                         ch.consume()
                         moved = true
                         val v = vOf(ch.position.x)
+                        // Хаптик-щелчок на каждое пройденное деление шкалы.
+                        if (v != lastV) { view.tickFeedback(); lastV = v }
                         if (movingLo) onChange(v.coerceAtMost(hiS.value), hiS.value)
                         else onChange(loS.value, v.coerceAtLeast(loS.value))
                     }
@@ -557,7 +565,7 @@ private fun RowScope.MaintBtn(
     label: String, enabled: Boolean, danger: Boolean = false, onClick: () -> Unit
 ) {
     OutlinedButton(
-        onClick = onClick,
+        onClick = hapticClick(onClick),
         enabled = enabled,
         modifier = Modifier.weight(1f),
         contentPadding = PaddingValues(horizontal = 2.dp, vertical = 8.dp),
@@ -609,7 +617,7 @@ private fun ColourControls(vm: WheelVm) {
 
         Spacer(Modifier.height(12.dp))
         OutlinedButton(
-            onClick = {
+            onClick = hapticClick {
                 val d = vm.settings.value.copy(
                     gammaX100 = 250, satX100 = 150, contrastX10 = 50,
                     rgX10 = 1000, ggX10 = 800, bgX10 = 1000
@@ -705,14 +713,14 @@ private fun LogContent(vm: WheelVm, onDismiss: () -> Unit) {
             // SelectionContainer поверх ленивого списка. Для «прислать весь лог»
             // нужна кнопка, и она надёжнее любого жеста.
             TextButton(
-                onClick = {
+                onClick = hapticClick {
                     clipboard.setText(AnnotatedString(lines.joinToString("\n")))
                     vm.say("Log copied (" + lines.size + " lines)")
                 },
                 enabled = lines.isNotEmpty()
             ) { Text("Copy") }
-            TextButton(onClick = { vm.clearLogView() }) { Text("Clear") }
-            TextButton(onClick = onDismiss) { Text("✕") }
+            TextButton(onClick = hapticClick { vm.clearLogView() }) { Text("Clear") }
+            TextButton(onClick = hapticClick(onDismiss)) { Text("✕") }
         }
         Card(Modifier.fillMaxSize()) {
             // SelectionContainer — то, чего не хватало: без него Text в Compose
@@ -794,6 +802,7 @@ private fun NumberSpinner(
     suffix: String = "",
     modifier: Modifier = Modifier,
     dense: Boolean = false,
+    wrap: Boolean = false,   // прокрутка по кругу: ниже range.first → range.last и дальше
     onChange: (Int) -> Unit,
     onCommit: () -> Unit = {}
 ) {
@@ -801,6 +810,7 @@ private fun NumberSpinner(
     var text by remember { mutableStateOf("") }
     val focus = remember { FocusRequester() }
     val density = LocalDensity.current
+    val view = LocalView.current
 
     // Компактный режим: всё в одну строку рядом с заголовком карточки.
     val btnSize = if (dense) 32.dp else 44.dp
@@ -809,19 +819,30 @@ private fun NumberSpinner(
                      else MaterialTheme.typography.headlineSmall
     val dragPadV = if (dense) 2.dp else 6.dp
 
-    fun clamp(v: Int) = v.coerceIn(range.first, range.last)
+    // wrap = true: значение ходит по кругу [range.first..range.last] — ниже
+    // нижней границы продолжает с верхней и наоборот. Иначе упирается в края.
+    fun norm(v: Int): Int =
+        if (!wrap) v.coerceIn(range.first, range.last)
+        else {
+            val n = range.last - range.first + 1
+            range.first + ((v - range.first) % n + n) % n
+        }
+
+    // Показываемое значение всегда приведено к диапазону — старое значение из
+    // NVS (например 360) на экране будет 0.
+    val shown = norm(value)
 
     fun commitText() {
         val v = text.trim().toIntOrNull()
-        if (v != null) { onChange(clamp(v)); onCommit() }   // мусор и пустое — просто откат
+        if (v != null) { onChange(norm(v)); onCommit() }   // мусор и пустое — просто откат
         editing = false
     }
 
     val row = @Composable {
     Row(modifier, verticalAlignment = Alignment.CenterVertically) {
         FilledTonalButton(
-            onClick = { onChange(clamp(value - 1)); onCommit() },
-            enabled = value > range.first,
+            onClick = hapticClick { onChange(norm(shown - 1)); onCommit() },
+            enabled = wrap || shown > range.first,
             contentPadding = PaddingValues(0.dp),
             modifier = Modifier.size(btnSize)
         ) { Text("−", fontSize = signSize) }
@@ -859,20 +880,25 @@ private fun NumberSpinner(
                 // перекомпоновкой, поэтому три шага за кадр давали бы
                 // (value + 1) трижды — то есть всё те же +1.
                 var acc by remember { mutableStateOf(0f) }
-                var base by remember { mutableStateOf(value) }
+                var base by remember { mutableStateOf(shown) }
+                var lastEmit by remember { mutableStateOf(shown) }
                 Text(
-                    value.toString() + suffix,
+                    shown.toString() + suffix,
                     style = valueStyle,
                     fontWeight = FontWeight.SemiBold,
                     modifier = Modifier
-                        .clickable { text = value.toString(); editing = true }
+                        .tapClickable { text = shown.toString(); editing = true }
                         .draggable(
                             orientation = Orientation.Horizontal,
                             state = rememberDraggableState { d ->
                                 acc += d
-                                onChange(clamp(base + (acc / stepPx).toInt()))
+                                val v = norm(base + (acc / stepPx).toInt())
+                                // Хаптик-щелчок на каждый пройденный градус, а
+                                // не на каждый пиксель жеста.
+                                if (v != lastEmit) { view.tickFeedback(); lastEmit = v }
+                                onChange(v)
                             },
-                            onDragStarted = { base = value; acc = 0f },
+                            onDragStarted = { base = shown; acc = 0f; lastEmit = shown },
                             onDragStopped = { acc = 0f; onCommit() }
                         )
                         .padding(horizontal = 8.dp, vertical = dragPadV)
@@ -881,8 +907,8 @@ private fun NumberSpinner(
         }
 
         FilledTonalButton(
-            onClick = { onChange(clamp(value + 1)); onCommit() },
-            enabled = value < range.last,
+            onClick = hapticClick { onChange(norm(shown + 1)); onCommit() },
+            enabled = wrap || shown < range.last,
             contentPadding = PaddingValues(0.dp),
             modifier = Modifier.size(btnSize)
         ) { Text("+", fontSize = signSize) }
@@ -906,6 +932,10 @@ private fun SliderRow(
     onChange: (Float) -> Unit, onCommit: () -> Unit,
     color: Color? = null   // R/G/B — красим дорожку и подпись в свой цвет
 ) {
+    val view = LocalView.current
+    val divs = steps.coerceAtLeast(1)
+    // Индекс деления, на котором был бегунок в прошлый раз (−1 — жест ещё не шёл).
+    var lastIdx by remember { mutableStateOf(-1) }
     Column(Modifier.padding(vertical = 4.dp)) {
         Row {
             Text(label, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f),
@@ -915,8 +945,17 @@ private fun SliderRow(
         }
         Slider(
             value = value.coerceIn(min, max),
-            onValueChange = onChange,
-            onValueChangeFinished = onCommit,
+            onValueChange = {
+                // Хаптик-щелчок на каждое пройденное деление, а не на каждый
+                // промежуточный кадр перетаскивания.
+                val idx = ((it - min) / (max - min) * divs).roundToInt()
+                if (idx != lastIdx) {
+                    if (lastIdx >= 0) view.tickFeedback()
+                    lastIdx = idx
+                }
+                onChange(it)
+            },
+            onValueChangeFinished = { lastIdx = -1; onCommit() },
             valueRange = min..max,
             steps = (steps - 1).coerceAtLeast(0),
             colors = if (color != null) SliderDefaults.colors(
@@ -948,11 +987,11 @@ internal fun NumberDialog(
             }
         },
         confirmButton = {
-            TextButton(onClick = {
+            TextButton(onClick = hapticClick {
                 onSave((text.toIntOrNull() ?: initial).coerceIn(min, max))
             }) { Text("Save") }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+        dismissButton = { TextButton(onClick = hapticClick(onDismiss)) { Text("Cancel") } }
     )
 }
 
@@ -981,7 +1020,7 @@ private fun RpmDialog(on: Int, off: Int, onDismiss: () -> Unit, onSave: (Int, In
             }
         },
         confirmButton = {
-            TextButton(onClick = {
+            TextButton(onClick = hapticClick {
                 val nOn = (a.toIntOrNull() ?: on).coerceIn(30, 600)
                 // Разрыв в 5 об/мин обязателен, как и на веб-странице: без
                 // гистерезиса картинка мигает на самом пороге.
@@ -989,6 +1028,6 @@ private fun RpmDialog(on: Int, off: Int, onDismiss: () -> Unit, onSave: (Int, In
                 onSave(nOn, nOff)
             }) { Text("Save") }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+        dismissButton = { TextButton(onClick = hapticClick(onDismiss)) { Text("Cancel") } }
     )
 }

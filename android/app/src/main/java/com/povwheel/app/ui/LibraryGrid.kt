@@ -1,5 +1,3 @@
-@file:OptIn(ExperimentalFoundationApi::class)
-
 package com.povwheel.app.ui
 
 import android.graphics.Bitmap
@@ -8,11 +6,8 @@ import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
@@ -43,6 +38,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.povwheel.app.WheelVm
 import com.povwheel.app.ble.DevFile
+import com.povwheel.app.ble.Link
 import com.povwheel.app.ble.Tele
 import com.povwheel.app.convert.Fit
 import com.povwheel.app.convert.PreviewClip
@@ -100,8 +96,8 @@ internal fun LibraryTab(
 ) {
     val files by vm.files.collectAsState()
     val fs by vm.fsInfo.collectAsState()
-    val connected by vm.connected.collectAsState()
-    val mirror by vm.mirrorAll.collectAsState()
+    val wheels by vm.wheels.collectAsState()
+    val group by vm.mirrorSet.collectAsState()
     val items by vm.upItems.collectAsState()
     val upSel by vm.upSel.collectAsState()
     val upSelClip by vm.upSelClip.collectAsState()
@@ -112,6 +108,7 @@ internal fun LibraryTab(
 
     val hasSel = vm.currentClient()?.hello?.hasAlbumSel == true
     val allNames = files.map { it.name }
+    val liveWheels = wheels.filter { it.link == Link.Ready }
 
     var mode by remember { mutableStateOf(LibMode.NORMAL) }
     var checks by remember { mutableStateOf<Set<String>>(emptySet()) }
@@ -155,11 +152,30 @@ internal fun LibraryTab(
         ) {
             leadingItems?.invoke(this)   // окошки DISPLAY/BATTERY — скроллятся вместе с лентой
 
-            if (connected.size > 1) item(key = "mirror", span = { GridItemSpan(maxLineSpan) }) {
+            if (liveWheels.size > 1) item(key = "mirror", span = { GridItemSpan(maxLineSpan) }) {
                 Card(Modifier.fillMaxWidth()) {
-                    Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text("Mirror to all " + connected.size + " wheels", Modifier.weight(1f))
-                        Switch(checked = mirror, onCheckedChange = { vm.setMirror(it) })
+                    Column(Modifier.padding(12.dp)) {
+                        Text("Sync wheels", style = MaterialTheme.typography.labelLarge)
+                        Text(
+                            "Ticked wheels act as one — while the open wheel is ticked too.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(Modifier.height(2.dp))
+                        liveWheels.forEach { w ->
+                            Row(
+                                Modifier.fillMaxWidth().tapClickable {
+                                    vm.toggleMirror(w.address, w.address !in group)
+                                },
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Checkbox(
+                                    checked = w.address in group,
+                                    onCheckedChange = hapticChange { vm.toggleMirror(w.address, it) }
+                                )
+                                Text(w.name, style = MaterialTheme.typography.bodyMedium)
+                            }
+                        }
                     }
                 }
             }
@@ -245,12 +261,12 @@ internal fun LibraryTab(
         onDismissRequest = { confirmDelete = false },
         title = { Text("Delete " + checks.size + (if (checks.size == 1) " animation?" else " animations?")) },
         confirmButton = {
-            TextButton(onClick = {
+            TextButton(onClick = hapticClick {
                 vm.deleteMany(checks.filterNot { vm.isSlideEffect(it) })   // эффекты не удаляются
                 confirmDelete = false; mode = LibMode.NORMAL; checks = emptySet()
             }) { Text("Delete", color = Danger) }
         },
-        dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("Cancel") } }
+        dismissButton = { TextButton(onClick = hapticClick { confirmDelete = false }) { Text("Cancel") } }
     )
 
     if (intervalDialog) NumberDialog(
@@ -303,7 +319,7 @@ private fun LibraryHeader(
                     .clip(RoundedCornerShape(50))
                     .background(Danger.copy(alpha = 0.14f))
                     .border(1.dp, Danger, RoundedCornerShape(50))
-                    .clickable(onClick = onStop)
+                    .tapClickable(onClick = onStop)
                     .padding(horizontal = 12.dp, vertical = 7.dp)
             ) {
                 Text("■ Stop", style = MaterialTheme.typography.labelLarge, color = Danger)
@@ -326,7 +342,7 @@ private fun LibraryHeader(
                 .clip(RoundedCornerShape(50))
                 .background(if (slideshowOn && enabled) Danger.copy(alpha = 0.14f) else Color.Transparent)
                 .border(1.dp, border, RoundedCornerShape(50))
-                .combinedClickable(enabled = enabled, onClick = onTap, onLongClick = onLongPress)
+                .tapCombinedClickable(enabled = enabled, onClick = onTap, onLongClick = onLongPress)
                 .padding(horizontal = 12.dp, vertical = 7.dp)
         ) {
             Text(
@@ -351,9 +367,9 @@ private fun ActionBar(
             Modifier.fillMaxWidth().padding(12.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            OutlinedButton(onClick = onCancel, modifier = Modifier.weight(1f)) { Text("Cancel") }
+            OutlinedButton(onClick = hapticClick(onCancel), modifier = Modifier.weight(1f)) { Text("Cancel") }
             Button(
-                onClick = onAction, enabled = enabled, modifier = Modifier.weight(1f),
+                onClick = hapticClick(onAction), enabled = enabled, modifier = Modifier.weight(1f),
                 colors = ButtonDefaults.buttonColors(containerColor = if (danger) Danger else Ok)
             ) { Text(label) }
         }
@@ -403,7 +419,7 @@ private fun LibraryCell(
                     if (ring != null && !uploading) Modifier.border(ringW, ring, CircleShape)
                     else Modifier
                 )
-                .combinedClickable(
+                .tapCombinedClickable(
                     onClick = {
                         when (cell) {
                             Cell.Add -> if (!upBusy) onAdd()
@@ -487,11 +503,11 @@ private fun LibraryCell(
         title = { Text("Remove from upload?") },
         text = { Text(cell.item.name) },
         confirmButton = {
-            TextButton(onClick = { vm.removeUpItem(cell.index); confirmRemove = false }) {
+            TextButton(onClick = hapticClick { vm.removeUpItem(cell.index); confirmRemove = false }) {
                 Text("Remove", color = Danger)
             }
         },
-        dismissButton = { TextButton(onClick = { confirmRemove = false }) { Text("Cancel") } }
+        dismissButton = { TextButton(onClick = hapticClick { confirmRemove = false }) { Text("Cancel") } }
     )
 }
 
@@ -561,7 +577,7 @@ private fun UploadStrip(vm: WheelVm) {
             .padding(12.dp)
     ) {
         Button(
-            onClick = { vm.startUpload() }, enabled = !busy,
+            onClick = hapticClick { vm.startUpload() }, enabled = !busy,
             modifier = Modifier.fillMaxWidth()
         ) { Text(if (busy) "Working…" else "↑ Convert & upload (" + items.size + ")") }
 
@@ -591,7 +607,7 @@ private fun UploadStrip(vm: WheelVm) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.weight(1f)
                 )
-                TextButton(onClick = { vm.applyUpSettingsToAll() }, enabled = !busy) {
+                TextButton(onClick = hapticClick { vm.applyUpSettingsToAll() }, enabled = !busy) {
                     Text("Apply to all", style = MaterialTheme.typography.labelMedium)
                 }
             }
@@ -666,7 +682,7 @@ private fun Pill(
         else -> cs.onSurface
     }
     Surface(
-        onClick = onClick,
+        onClick = hapticClick(onClick),
         enabled = enabled,
         shape = PILL_SHAPE,
         color = if (selected) cs.primary.copy(alpha = 0.12f) else Color.Transparent,
