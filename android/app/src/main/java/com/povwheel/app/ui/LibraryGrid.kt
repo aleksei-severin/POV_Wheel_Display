@@ -479,6 +479,23 @@ private fun LibraryCell(
             else -> false
         }
         if (showCheck) CheckDot(checked, Modifier.align(Alignment.BottomEnd))
+
+        // В режиме выбора у файла — его размер в левом нижнем углу.
+        if (cell is Cell.Stored && mode != LibMode.NORMAL) {
+            Text(
+                fmtBytes(cell.file.size),
+                fontSize = 9.sp,
+                fontWeight = FontWeight.Medium,
+                color = Color.White,
+                maxLines = 1,
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(2.dp)
+                    .clip(RoundedCornerShape(4.dp))
+                    .background(Color.Black.copy(alpha = 0.55f))
+                    .padding(horizontal = 4.dp, vertical = 1.dp)
+            )
+        }
     }
 
     if (confirmRemove && cell is Cell.Pending) AlertDialog(
@@ -492,6 +509,12 @@ private fun LibraryCell(
         },
         dismissButton = { TextButton(onClick = hapticClick { confirmRemove = false }) { Text("Cancel") } }
     )
+}
+
+private fun fmtBytes(b: Long): String = when {
+    b >= 1_048_576 -> String.format("%.1f MB", b / 1_048_576.0)
+    b >= 1024      -> (b / 1024).toString() + " kB"
+    else           -> b.toString() + " B"
 }
 
 /** Кружок в углу превью в режиме выбора. */

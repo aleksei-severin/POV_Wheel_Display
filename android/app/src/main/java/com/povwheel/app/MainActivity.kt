@@ -25,8 +25,6 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.SnackbarHost
-import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -55,14 +53,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         setContent {
             PovTheme {
-                val snack = remember { SnackbarHostState() }
-                val toast by vm.toast.collectAsState()
-                LaunchedEffect(toast) {
-                    toast?.let {
-                        snack.showSnackbar(it)
-                        vm.toast.value = null
-                    }
-                }
+                // Всплывающих уведомлений снизу нет: важное показано по месту
+                // (статус заливки в UploadStrip, ошибки связи в строке колёс).
                 // Экран держим включённым, пока идёт долгая передача, и делаем
                 // это ЗДЕСЬ — выше всех экранов. Заливка живёт во ViewModel и
                 // переживает и смену вкладки, и возврат к списку колёс; будь
@@ -79,7 +71,7 @@ class MainActivity : ComponentActivity() {
                     onDispose { view.keepScreenOn = false }
                 }
 
-                Scaffold(snackbarHost = { SnackbarHost(snack) }) { pad ->
+                Scaffold { pad ->
                     Column(Modifier.fillMaxSize().padding(pad)) {
                         Gate(vm)
                     }

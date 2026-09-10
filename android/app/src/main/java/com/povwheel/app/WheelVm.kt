@@ -150,6 +150,15 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     val logLines = MutableStateFlow<List<String>>(emptyList())
     val toast = MutableStateFlow<String?>(null)
 
+    /** Замок «Magnet Position» — защита от случайной правды на ходу. Своё
+     *  значение на колесо, в prefs (`maglock_<addr>`). */
+    val magnetLocked = MutableStateFlow(false)
+    private fun magnetLockKey(addr: String) = "maglock_" + addr
+    fun setMagnetLocked(v: Boolean) {
+        magnetLocked.value = v
+        current.value?.let { prefs.edit().putBoolean(magnetLockKey(it), v).apply() }
+    }
+
     // Пишется с Dispatchers.IO, читается из отрисовки списка — обычный HashMap
     // здесь может уйти в бесконечный цикл на рехэше.
     private val thumbs = ConcurrentHashMap<String, PreviewFrame>()
@@ -395,6 +404,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         edit.apply()
         nameCache.remove(addr)
         filesByAddr.remove(addr); fsInfoByAddr.remove(addr); settingsByAddr.remove(addr)
+        prefs.edit().remove(magnetLockKey(addr)).apply()
         found.value = found.value.filter { it.address != addr }
         rebuildWheels()
     }
@@ -501,6 +511,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         settingsLoaded.value = cachedS != null
         files.value  = filesByAddr[addr] ?: emptyList()
         fsInfo.value = fsInfoByAddr[addr] ?: FsInfo()
+        magnetLocked.value = prefs.getBoolean(magnetLockKey(addr), false)
         logLines.value = emptyList()
         logTotal = 0
         refreshAll()

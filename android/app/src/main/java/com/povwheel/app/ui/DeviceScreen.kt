@@ -2,6 +2,8 @@ package com.povwheel.app.ui
 
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -12,6 +14,7 @@ import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.gestures.horizontalDrag
 import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -31,9 +34,13 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -160,6 +167,7 @@ private fun ConnectedContent(vm: WheelVm, client: BleClient) {
 @Composable
 private fun MainContent(vm: WheelVm, tele: Tele, online: Boolean) {
     val s by vm.settings.collectAsState()
+    val magLocked by vm.magnetLocked.collectAsState()
     var colourOpen by rememberSaveable { mutableStateOf(false) }
     var confirmOff by remember { mutableStateOf(false) }
     var showLog by remember { mutableStateOf(false) }
@@ -183,16 +191,31 @@ private fun MainContent(vm: WheelVm, tele: Tele, online: Boolean) {
                 // совпадает со свёрнутым «Colour». Спиннер, а не ползунок: на 360
                 // положениях один пиксель дорожки стоит больше градуса, а
                 // «поставить картинку ровно» — правка на единицы градусов.
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                // SpaceBetween ставит замок ровно посередине между заголовком и
+                // спиннером — равные зазоры слева и справа от него.
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     Text("Magnet Position", style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                        fontWeight = FontWeight.SemiBold, maxLines = 1)
+                    // Замок: тап — закрыть и залочить значение; чтобы открыть —
+                    // держать 1 с (кольцо вокруг замка показывает прогресс).
+                    MagnetLock(
+                        locked = magLocked,
+                        onLock = { vm.setMagnetLocked(true) },
+                        onUnlock = { vm.setMagnetLocked(false) },
+                        onHint = { vm.say("Hold the lock 1 s to unlock") }
+                    )
                     NumberSpinner(
                         value = s.angle,
                         range = 0..359,          // 360 == 0, поэтому предел — 359
                         suffix = "°",
-                        modifier = Modifier.width(140.dp),
+                        modifier = Modifier.width(120.dp),
                         dense = true,
                         wrap = true,              // прокрутка бесконечная, без упора в 0/359
+                        enabled = !magLocked,
                         // Применяем на дисплей ПРЯМО во время перетаскивания
                         // (throttled, только на открытое колесо, без записи в
                         // NVS) — калибровать вслепую до отпускания пальца неудобно.
@@ -212,11 +235,17 @@ private fun MainContent(vm: WheelVm, tele: Tele, online: Boolean) {
                         .padding(vertical = 4.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("Colour", style = MaterialTheme.typography.titleMedium,
+                    Text("Color Correction", style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                    Text(if (colourOpen) "▾" else "▸",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(
+                        "▾",
+                        fontSize = 22.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier
+                            .padding(end = 6.dp)
+                            .rotate(if (colourOpen) 0f else -90f)
+                    )
                 }
                 if (colourOpen) {
                     Spacer(Modifier.height(4.dp))
@@ -705,17 +734,27 @@ private fun StepRangeSlider(
                     val dHi = abs(x - xOf(hiS.value))
                     // Не по бегунку — выходим не трогая событие: пусть скроллится список.
                     if (dLo > grabPx && dHi > grabPx) return@awaitEachGesture
-                    val movingLo = dLo <= dHi
+                    // Бегунки на одном делении: какой тянуть — решаем по НАПРАВЛЕНИЮ
+                    // первого движения (влево — нижний, вправо — верхний), иначе
+                    // при равном расстоянии всегда выигрывал бы нижний и верхний
+                    // было не сдвинуть вправо вообще.
+                    var movingLo: Boolean? =
+                        if (loS.value == hiS.value) null else dLo <= dHi
                     down.consume()
                     var moved = false
-                    var lastV = if (movingLo) loS.value else hiS.value
+                    var lastV = if (movingLo == false) hiS.value else loS.value
                     horizontalDrag(down.id) { ch ->
                         ch.consume()
+                        if (movingLo == null) {
+                            val dx = ch.position.x - x
+                            if (abs(dx) < 4f) return@horizontalDrag   // мало — ждём
+                            movingLo = dx < 0f
+                        }
                         moved = true
                         val v = vOf(ch.position.x)
                         // Хаптик-щелчок на каждое пройденное деление шкалы.
                         if (v != lastV) { view.tickFeedback(); lastV = v }
-                        if (movingLo) onChange(v.coerceAtMost(hiS.value), hiS.value)
+                        if (movingLo == true) onChange(v.coerceAtMost(hiS.value), hiS.value)
                         else onChange(loS.value, v.coerceAtLeast(loS.value))
                     }
                     if (moved) onChangeFinished()
@@ -730,6 +769,18 @@ private fun StepRangeSlider(
                 drawLine(cs.surfaceVariant, Offset(insetPx, cy),
                     Offset(size.width - insetPx, cy), th, StrokeCap.Round)
                 drawLine(cs.primary, Offset(loX, cy), Offset(hiX, cy), th, StrokeCap.Round)
+                // Деления-точки на фоне, как у ползунков в «Colour» (штатный
+                // Slider со `steps`): по одной на каждое положение шкалы.
+                val tickR = 1.dp.toPx()
+                for (v in first..valueRange.last) {
+                    val x = insetPx + usable * (v - first) / spanV
+                    val active = x in loX..hiX
+                    drawCircle(
+                        color = (if (active) cs.onPrimary else cs.onSurfaceVariant).copy(alpha = 0.38f),
+                        radius = tickR,
+                        center = Offset(x, cy)
+                    )
+                }
                 drawCircle(cs.primary, thumbR.toPx(), Offset(loX, cy))
                 drawCircle(cs.primary, thumbR.toPx(), Offset(hiX, cy))
             }
@@ -800,7 +851,7 @@ private fun ColourControls(vm: WheelVm) {
                     rgX10 = 1000, ggX10 = 800, bgX10 = 1000
                 )
                 vm.pushSettings(d); vm.saveSettings()
-                vm.say("Colour settings restored")
+                vm.say("Color correction reset")
             },
             modifier = Modifier.fillMaxWidth()
         ) { Text("↺ Restore defaults") }
@@ -981,6 +1032,7 @@ private fun NumberSpinner(
     modifier: Modifier = Modifier,
     dense: Boolean = false,
     wrap: Boolean = false,   // прокрутка по кругу: ниже range.first → range.last и дальше
+    enabled: Boolean = true,
     onChange: (Int) -> Unit,
     onCommit: () -> Unit = {}
 ) {
@@ -989,6 +1041,7 @@ private fun NumberSpinner(
     val focus = remember { FocusRequester() }
     val density = LocalDensity.current
     val view = LocalView.current
+    LaunchedEffect(enabled) { if (!enabled) editing = false }
 
     // Компактный режим: всё в одну строку рядом с заголовком карточки.
     val btnSize = if (dense) 32.dp else 44.dp
@@ -1016,17 +1069,30 @@ private fun NumberSpinner(
         editing = false
     }
 
+    // Состояние жеста перетаскивания — создаём безусловно (rememberDraggableState —
+    // composable), а само перетаскивание глушим через draggable(enabled = …).
+    val stepPx = with(density) { 8.dp.toPx() }
+    var acc by remember { mutableStateOf(0f) }
+    var base by remember { mutableStateOf(shown) }
+    var lastEmit by remember { mutableStateOf(shown) }
+    val dragState = rememberDraggableState { d ->
+        acc += d
+        val v = norm(base + (acc / stepPx).toInt())
+        if (v != lastEmit) { view.tickFeedback(); lastEmit = v }
+        onChange(v)
+    }
+
     val row = @Composable {
     Row(modifier, verticalAlignment = Alignment.CenterVertically) {
         FilledTonalButton(
             onClick = hapticClick { onChange(norm(shown - 1)); onCommit() },
-            enabled = wrap || shown > range.first,
+            enabled = enabled && (wrap || shown > range.first),
             contentPadding = PaddingValues(0.dp),
             modifier = Modifier.size(btnSize)
         ) { Text("−", fontSize = signSize) }
 
         Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
-            if (editing) {
+            if (editing && enabled) {
                 // Поле только что появилось и фокуса ещё не получало, а
                 // onFocusChanged срабатывает и на «не в фокусе» при первой же
                 // компоновке. Без этого флага правка закрывалась бы в тот же
@@ -1048,34 +1114,22 @@ private fun NumberSpinner(
                 )
                 LaunchedEffect(Unit) { focus.requestFocus() }
             } else {
-                // Шаг перетаскивания. 8 dp на единицу — мелкие правки берутся
-                // пальцем, а до дальнего конца шкалы всё равно быстрее добраться
-                // вводом с клавиатуры, чем протаскиванием.
-                val stepPx = with(density) { 8.dp.toPx() }
-                // Считаем от значения на момент НАЧАЛА жеста и от общего
-                // пройденного расстояния. Прибавлять по единице на каждый шаг
-                // внутри обработчика нельзя: value меняется только с
-                // перекомпоновкой, поэтому три шага за кадр давали бы
-                // (value + 1) трижды — то есть всё те же +1.
-                var acc by remember { mutableStateOf(0f) }
-                var base by remember { mutableStateOf(shown) }
-                var lastEmit by remember { mutableStateOf(shown) }
+                // Значение: тап — правка с клавиатуры, горизонтальное
+                // перетаскивание — листание по градусу (шаг 8 dp). База берётся
+                // на НАЧАЛЕ жеста от общего пройденного пути, иначе три шага за
+                // кадр дали бы (value+1) трижды. Всё глохнет, когда замок закрыт.
                 Text(
                     shown.toString() + suffix,
                     style = valueStyle,
                     fontWeight = FontWeight.SemiBold,
+                    color = if (enabled) Color.Unspecified
+                            else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f),
                     modifier = Modifier
-                        .tapClickable { text = shown.toString(); editing = true }
+                        .tapClickable(enabled = enabled) { text = shown.toString(); editing = true }
                         .draggable(
                             orientation = Orientation.Horizontal,
-                            state = rememberDraggableState { d ->
-                                acc += d
-                                val v = norm(base + (acc / stepPx).toInt())
-                                // Хаптик-щелчок на каждый пройденный градус, а
-                                // не на каждый пиксель жеста.
-                                if (v != lastEmit) { view.tickFeedback(); lastEmit = v }
-                                onChange(v)
-                            },
+                            state = dragState,
+                            enabled = enabled,
                             onDragStarted = { base = shown; acc = 0f; lastEmit = shown },
                             onDragStopped = { acc = 0f; onCommit() }
                         )
@@ -1086,7 +1140,7 @@ private fun NumberSpinner(
 
         FilledTonalButton(
             onClick = hapticClick { onChange(norm(shown + 1)); onCommit() },
-            enabled = wrap || shown < range.last,
+            enabled = enabled && (wrap || shown < range.last),
             contentPadding = PaddingValues(0.dp),
             modifier = Modifier.size(btnSize)
         ) { Text("+", fontSize = signSize) }
@@ -1101,6 +1155,113 @@ private fun NumberSpinner(
             LocalMinimumInteractiveComponentEnforcement provides false, content = row
         )
     } else row()
+}
+
+/**
+ * Замок значения «Magnet Position». Тап по открытому — закрывает и лочит
+ * спиннер. Открыть можно только удержанием ≥ 1 с (кольцо вокруг замка тем
+ * временем заполняется); короткий тап по закрытому — подсказка [onHint].
+ */
+@Composable
+private fun MagnetLock(
+    locked: Boolean,
+    onLock: () -> Unit,
+    onUnlock: () -> Unit,
+    onHint: () -> Unit
+) {
+    val view = LocalView.current
+    val scope = rememberCoroutineScope()
+    val hold = remember { Animatable(0f) }
+    val cs = MaterialTheme.colorScheme
+
+    // Смена состояния (в т.ч. разблокировка по таймеру, когда жест-корутина
+    // обрывается на середине) — кольцо прогресса обнуляем принудительно.
+    LaunchedEffect(locked) { hold.snapTo(0f) }
+
+    Box(
+        Modifier
+            .size(30.dp)
+            .pointerInput(locked) {
+                awaitEachGesture {
+                    awaitFirstDown()
+                    if (!locked) {
+                        if (waitForUpOrCancellation() != null) { view.tapFeedback(); onLock() }
+                        return@awaitEachGesture
+                    }
+                    // Закрыт: разблокировка удержанием 1 с. Отдельный таймер, а
+                    // не тайм-аут ожидания up — чтобы отличить «держал 1 с» от
+                    // «жест отменён» (палец увело в скролл).
+                    scope.launch { hold.snapTo(0f); hold.animateTo(1f, tween(1000, easing = LinearEasing)) }
+                    var done = false
+                    val timer = scope.launch {
+                        delay(1000)
+                        done = true
+                        view.tickFeedback()
+                        onUnlock()
+                    }
+                    val up = waitForUpOrCancellation()
+                    timer.cancel()
+                    scope.launch { hold.animateTo(0f, tween(140)) }
+                    if (!done && up != null) onHint()   // отпустил рано; отмена — молча
+                }
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        if (hold.value > 0.01f) {
+            Canvas(Modifier.matchParentSize().padding(1.dp)) {
+                drawArc(
+                    color = cs.primary,
+                    startAngle = -90f,
+                    sweepAngle = 360f * hold.value,
+                    useCenter = false,
+                    style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round)
+                )
+            }
+        }
+        LockIcon(
+            locked = locked,
+            tint = if (locked) cs.primary else cs.onSurfaceVariant,
+            modifier = Modifier.size(15.dp)
+        )
+    }
+}
+
+/** Пиктограмма навесного замка: закрыт — дужка сомкнута, открыт — правая ножка
+ *  отведена. Рисуется в цвете [tint], без эмодзи, как «▾▸−+» рядом. */
+@Composable
+private fun LockIcon(locked: Boolean, tint: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier) {
+        val w = size.width
+        val h = size.height
+        val sw = h * 0.13f
+        // тело
+        val bodyW = w * 0.74f
+        val bodyH = h * 0.5f
+        val bx = (w - bodyW) / 2f
+        val by = h - bodyH
+        drawRoundRect(
+            color = tint,
+            topLeft = Offset(bx, by),
+            size = Size(bodyW, bodyH),
+            cornerRadius = CornerRadius(sw * 1.6f)
+        )
+        // дужка
+        val shW = bodyW * 0.58f
+        val sx = (w - shW) / 2f
+        val shTop = if (locked) h * 0.09f else 0f
+        drawArc(
+            color = tint,
+            startAngle = 180f, sweepAngle = 180f, useCenter = false,
+            topLeft = Offset(sx, shTop),
+            size = Size(shW, shW),
+            style = Stroke(width = sw, cap = StrokeCap.Round)
+        )
+        val legTop = shTop + shW / 2f
+        val legBottom = by + sw * 0.4f
+        drawLine(tint, Offset(sx, legTop), Offset(sx, legBottom), strokeWidth = sw, cap = StrokeCap.Round)
+        val rightBottom = if (locked) legBottom else legTop + shW * 0.3f
+        drawLine(tint, Offset(sx + shW, legTop), Offset(sx + shW, rightBottom), strokeWidth = sw, cap = StrokeCap.Round)
+    }
 }
 
 @Composable
