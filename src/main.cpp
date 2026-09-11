@@ -2156,11 +2156,30 @@ static void enterDeepSleep() {
     // притянутым к земле пином = мгновенное пробуждение обратно. Если
     // вибродатчик так и не размыкается (заклинил) — исключаем его из маски,
     // будим только кнопкой.
+    //
+    // Дебаунсим КАЖДЫЙ пин отдельно (нужен устойчивый HIGH хотя бы
+    // RELEASE_STABLE_MS), а не одним общим циклом с единственным отсчётом в
+    // конце: раньше дребезг на одной кнопке мог продержать общий цикл все
+    // 2 с, и единственный финальный digitalRead(PIN_VIBRATION) — снятый в
+    // произвольной фазе чужого дребезга вибродатчика, который сам по себе
+    // исправен, — с равным шансом попадал на LOW и насовсем вычёркивал
+    // вибродатчик из маски пробуждения на весь этот сон: дальше будила
+    // только кнопка, хотя заснули не по её удержанию.
+    const uint32_t RELEASE_STABLE_MS = 50;
     uint32_t sw0 = millis();
+    uint32_t btn_high_ms = 0, vib_high_ms = 0;
     while (millis() - sw0 < 2000 &&
-           (digitalRead(PIN_BUTTON) == LOW || digitalRead(PIN_VIBRATION) == LOW)) delay(5);
+           (btn_high_ms < RELEASE_STABLE_MS || vib_high_ms < RELEASE_STABLE_MS)) {
+        btn_high_ms = (digitalRead(PIN_BUTTON)    == HIGH) ? btn_high_ms + 5 : 0;
+        vib_high_ms = (digitalRead(PIN_VIBRATION) == HIGH) ? vib_high_ms + 5 : 0;
+        delay(5);
+    }
     uint64_t wake_mask = (1ULL << PIN_BUTTON);
-    if (digitalRead(PIN_VIBRATION) == HIGH) wake_mask |= (1ULL << PIN_VIBRATION);
+    if (vib_high_ms >= RELEASE_STABLE_MS) {
+        wake_mask |= (1ULL << PIN_VIBRATION);
+    } else {
+        webLog("[SYS] Vibration sensor stuck LOW at sleep entry, waking by button only");
+    }
     esp_sleep_enable_ext1_wakeup(wake_mask, ESP_EXT1_WAKEUP_ANY_LOW);
 
     // Замораживаем Enable обоих DCDC в LOW на время сна
@@ -2187,9 +2206,17 @@ static void enterTrickleSleep(uint32_t seconds) {
     gpio_deep_sleep_hold_en();
 
     // Толчок вибродатчика ИЛИ нажатие кнопки — оба в LOW. Заклинивший в LOW
-    // датчик исключаем, иначе ANY_LOW сработал бы сразу.
+    // датчик исключаем, иначе ANY_LOW сработал бы сразу. Тот же дебаунс на
+    // 50 мс устойчивого HIGH, что и в enterDeepSleep() — один мгновенный
+    // отсчёт мог поймать обычный дребезг датчика и исключить его без
+    // всякой реальной неисправности.
+    uint32_t sw0v = millis(), vib_high_ms2 = 0;
+    while (millis() - sw0v < 2000 && vib_high_ms2 < 50) {
+        vib_high_ms2 = (digitalRead(PIN_VIBRATION) == HIGH) ? vib_high_ms2 + 5 : 0;
+        delay(5);
+    }
     uint64_t wake_mask = (1ULL << PIN_BUTTON);
-    if (digitalRead(PIN_VIBRATION) == HIGH) wake_mask |= (1ULL << PIN_VIBRATION);
+    if (vib_high_ms2 >= 50) wake_mask |= (1ULL << PIN_VIBRATION);
     esp_sleep_enable_ext1_wakeup(wake_mask, ESP_EXT1_WAKEUP_ANY_LOW);
     esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
     esp_deep_sleep_start();
