@@ -2494,12 +2494,26 @@ void setup() {
     // чтобы такие пробуждения стоили доли миллиампер-секунды.
     bool xport_wake = false;
     if (transport_mode) {
-        if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0 && transportConfirmWake()) {
-            transport_mode     = false;
-            force_stop_display = xport_saved_stop;   // ровно то, что играло до выключения
-            xport_wake         = true;   // волну покажем, когда поднимется SPI
+        if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
+            if (transportConfirmWake()) {
+                transport_mode     = false;
+                force_stop_display = xport_saved_stop;   // ровно то, что играло до выключения
+                xport_wake         = true;   // волну покажем, когда поднимется SPI
+            } else {
+                transportSleepArm();        // не возвращается
+            }
         } else {
-            transportSleepArm();        // не возвращается
+            // transportSleepArm() — единственное место, где transport_mode
+            // становится true, и оно всегда вооружает ТОЛЬКО EXT0 (кнопку).
+            // Если разбудило что-то другое (тряска по EXT1, браунаут, любой
+            // сброс), значит транспортного сна на самом деле не было — флаг
+            // пережил его в RTC-памяти (посадка по питанию во время удержания,
+            // сторожевой таймер и т.п.), но не сам сон. Считать его в этом
+            // случае достоверным значит запереть колесо в ложном транспортном
+            // режиме: следующая же тряска будила бы чип и тут же усыпляла его
+            // обратно кнопкой-only, неотличимо от «не просыпается по тряске».
+            webLog("[XPORT] Stale transport flag cleared (woke by non-button cause)");
+            transport_mode = false;
         }
     }
 
