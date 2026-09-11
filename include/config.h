@@ -335,6 +335,12 @@ extern uint32_t slideLastSwitch;                // millis() последней �
 #include <vector>
 extern std::vector<String> savedFiles;
 extern void updateFileList();
+// Вызывать СРАЗУ после LittleFS.remove() (BLE OP_DELETE, HTTP /delete) с
+// именем удалённого файла, включая ведущий "/". Если это был файл, что сейчас
+// на ободе, — останавливает показ, освобождает PSRAM и, если он играл в
+// слайдшоу, сразу подставляет следующий пункт (или останавливает слайдшоу,
+// если пунктов не осталось). См. main.cpp.
+extern void handleFileDeleted(const String& fname);
 
 // Отбор для слайдшоу. Список имён файлов (include/exclude) плюс битовая маска
 // эффектов, которые тоже крутятся в показе (бит N-1 = EffectId N, см. effects.h).
@@ -344,6 +350,11 @@ extern bool slideListInclude;   // true — slideList это то, что игр
 extern uint8_t slideEffectMask; // биты 0..5 — эффекты 1..6 в слайдшоу; 0 — только файлы
 extern void applySlideList(bool include, const std::vector<String>& names, uint8_t effectMask);
 extern bool slideInSlideshow(const String& name);
+// Полная остановка показа: слайдшоу, эффект и файл — гасим всё разом. Общая
+// часть для OP_STOP/`/stop` и OP_ALBUM(стоп)/`/album?action=stop`: «остановить
+// слайдшоу» должно гасить ленту, а не оставлять последнюю картинку висеть до
+// повторного нажатия Stop. См. main.cpp.
+extern void stopDisplayAndSlideshow();
 
 extern Preferences prefs;
 

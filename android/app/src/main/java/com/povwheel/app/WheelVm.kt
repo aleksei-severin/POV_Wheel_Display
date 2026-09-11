@@ -134,6 +134,104 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     private val settingsByAddr = HashMap<String, Settings>()
     private val prefetched     = HashSet<String>()
 
+    // ------------------------------------------------------- синхронизация слайдшоу
+    //
+    // Колёса не умеют говорить друг с другом напрямую, поэтому единственные
+    // часы — телефон: корутина в startSyncedSlideshow() раз в интервал шлёт
+    // OP_PLAY на ОБА адреса сразу, независимо от того, крутится ли колесо.
+    // OP_PLAY грузит кадр в PSRAM вне зависимости от power_state (см.
+    // loadFrameFromFile в прошивке), поэтому неподвижное колесо всё равно
+    // получает верный файл и покажет то же самое в ту же секунду, как начнёт
+    // вращаться, — а не то, на чём само остановилось.
+
+    private class SyncGroup(val a: String, val b: String, var files: List<String>, var intervalMs: Int) {
+        var index = -1
+        var job: kotlinx.coroutines.Job? = null
+    }
+    /** По адресу — группа, если это колесо сейчас с кем-то синхронизировано.
+     *  Оба адреса пары указывают на один и тот же объект. */
+    private val syncGroups = HashMap<String, SyncGroup>()
+    /** Адрес → адрес партнёра, для реактивного UI. */
+    val syncPartner = MutableStateFlow<Map<String, String>>(emptyMap())
+
+    data class PendingSyncDelete(val names: List<String>, val partnerAddr: String, val partnerName: String)
+    /** Удаление на синхронизированном колесе задело общий файл — ждём ответа,
+     *  удалять ли его и у партнёра тоже. */
+    val pendingSyncDelete = MutableStateFlow<PendingSyncDelete?>(null)
+
+    /** Имена файлов, совпадающих у [addr] и [other] по имени И размеру —
+     *  ровно то, что безопасно проигрывать в одной последовательности на
+     *  обоих. Всегда освежает список по BLE: кэш фоновых колёс
+     *  ([prefetchWheel]) обновляется только раз при подключении. */
+    suspend fun commonFileNames(addr: String, other: String): Set<String> {
+        val ca = clients[addr] ?: return emptySet()
+        val cb = clients[other] ?: return emptySet()
+        val fa = runCatching { ca.list() }.getOrNull() ?: filesByAddr[addr] ?: emptyList()
+        val fb = runCatching { cb.list() }.getOrNull() ?: filesByAddr[other] ?: emptyList()
+        filesByAddr[addr] = fa
+        filesByAddr[other] = fb
+        if (current.value == addr) files.value = fa
+        if (current.value == other) files.value = fb
+        val keyB = fb.map { it.name to it.size }.toHashSet()
+        return fa.filter { (it.name to it.size) in keyB }.map { it.name }.toCollection(LinkedHashSet())
+    }
+
+    /** Прекратить синхронизацию, в которой участвует [addr] (если есть). */
+    private fun endSync(addr: String?) {
+        val group = addr?.let { syncGroups[it] } ?: return
+        group.job?.cancel()
+        syncGroups.remove(group.a)
+        syncGroups.remove(group.b)
+        syncPartner.value = syncPartner.value - group.a - group.b
+    }
+
+    /**
+     * Запустить синхронное слайдшоу текущего колеса с [partner]. Часы —
+     * телефон: одна корутина шлёт OP_PLAY на оба адреса разом, поэтому
+     * последовательность и тайминг гарантированно общие — `checked.toList()`
+     * это один и тот же список объектов для обеих сторон.
+     */
+    fun startSyncedSlideshow(partner: String, delaySecs: Int, checked: Set<String>) {
+        val addr = current.value ?: return
+        val list = checked.toList()
+        if (list.isEmpty()) { say("Tick at least one shared animation"); return }
+        endSync(addr); endSync(partner)
+        val ms = (delaySecs * 1000).coerceIn(1000, 300000)
+        val group = SyncGroup(addr, partner, list, ms)
+        syncGroups[addr] = group
+        syncGroups[partner] = group
+        syncPartner.value = syncPartner.value + (addr to partner) + (partner to addr)
+        group.job = viewModelScope.launch {
+            while (isActive) {
+                if (group.files.isEmpty()) break
+                group.index = (group.index + 1).let { if (it >= group.files.size) 0 else it }
+                val name = group.files[group.index]
+                for (a in listOf(group.a, group.b)) {
+                    clients[a]?.takeIf { it.link.value == Link.Ready }?.let { c ->
+                        runCatching { c.play(name) }
+                    }
+                }
+                delay(group.intervalMs.toLong())
+            }
+        }
+        say("Synced slideshow started")
+    }
+
+    /** Остановить синхронное слайдшоу И погасить ленту на ОБОИХ колёсах —
+     *  нажатие Stop не должно требовать повторного нажатия на каждом. */
+    fun stopSyncedSlideshow(addr: String) {
+        val group = syncGroups[addr] ?: return
+        val members = listOf(group.a, group.b)
+        endSync(addr)
+        viewModelScope.launch {
+            for (m in members) {
+                clients[m]?.takeIf { it.link.value == Link.Ready }?.let { c ->
+                    runCatching { c.stop() }
+                }
+            }
+        }
+    }
+
     /** Какое колесо показывает экран управления. */
     val current = MutableStateFlow<String?>(null)
 
@@ -580,6 +678,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     }
 
     fun disconnect(addr: String) {
+        endSync(addr)
         wantConnected.remove(addr)
         reconnectJobs.remove(addr)?.cancel()
         watchJobs.remove(addr)?.cancel()
@@ -1215,7 +1314,9 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun play(name: String) = onTargets { it.play(name) }.also {
+    fun play(name: String) {
+        endSync(current.value)   // ручной выбор файла рвёт синхронизацию — иначе следующий тик перебьёт его обратно
+        onTargets { it.play(name) }
         // «Playing …» с человекочитаемым именем и размером файла — по одному
         // взгляду видно, сколько какой ролик весит.
         val f = files.value.firstOrNull { it.name == name }
@@ -1225,9 +1326,12 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         }
         say("Playing " + (f?.pretty ?: name) + (if (size != null) "  ·  " + size else ""))
     }
-    fun stopDisplay() = onTargets { it.stop() }.also { say("Display stopped") }
-    fun effect(id: Int) = onTargets { it.effect(id) }
-    fun album(start: Boolean, ms: Int) = onTargets { it.album(start, ms) }
+    fun stopDisplay() { endSync(current.value); onTargets { it.stop() }; say("Display stopped") }
+    fun effect(id: Int) { endSync(current.value); onTargets { it.effect(id) } }
+    fun album(start: Boolean, ms: Int) {
+        if (start) endSync(current.value)
+        onTargets { it.album(start, ms) }
+    }
 
     // ---------------------------------------------------------- слайдшоу
 
@@ -1251,6 +1355,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     /** Запустить слайдшоу с отмеченным [checked] (имена файлов + токены эффектов). */
     fun startSlideshow(delaySecs: Int, checked: Set<String>, fileNames: List<String>) {
         if (checked.isEmpty()) { say("Tick at least one item"); return }
+        endSync(current.value)   // это НЕ синхронное слайдшоу — снимаем прежнее, если было
         current.value?.let {
             prefs.edit().putString(slideSelKey(it), checked.joinToString(",")).apply()
         }
@@ -1271,9 +1376,12 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
 
     fun stopSlideshow() = onTargets { it.album(false, 0) }.also { say("Slideshow stopped") }
 
-    /** Интервал: если слайдшоу идёт — устройство подхватит на лету, не сбрасывая позицию. */
+    /** Интервал: если слайдшоу идёт — устройство подхватит на лету, не сбрасывая позицию.
+     *  На синхронизированной паре меняет общий таймер на телефоне — тоже без сброса позиции. */
     fun setSlideInterval(secs: Int) {
         val ms = (secs * 1000).coerceIn(1000, 300000)
+        val group = current.value?.let { syncGroups[it] }
+        if (group != null) { group.intervalMs = ms; return }
         onTargets { c -> if (c.tele.value.slideshow) c.album(true, ms) }
     }
     /** Переименовать колесо [addr]. Требует связи — имя пишется на устройство. */
@@ -1414,11 +1522,17 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
 
     fun delete(name: String) = deleteMany(listOf(name))
 
-    /** Удаляет несколько файлов с ТЕКУЩЕГО колеса (не зеркалит: у колёс разные
-     *  библиотеки), заодно чистит их локальные превью. */
+    /** Удаляет несколько файлов с ТЕКУЩЕГО колеса, заодно чистит их локальные
+     *  превью. Обычно НЕ зеркалит на другие колёса — у них разные библиотеки —
+     *  но если текущее колесо синхронизировано ([syncGroups]) и среди
+     *  удалённых есть файлы из общего списка, спрашивает через
+     *  [pendingSyncDelete], удалить ли их и у партнёра: иначе синхронный показ
+     *  наткнётся на файл, которого больше нет на одной из сторон. */
     fun deleteMany(names: List<String>) {
         if (names.isEmpty()) return
+        val addr = current.value
         val c = currentClient() ?: return
+        val group = addr?.let { syncGroups[it] }
         viewModelScope.launch {
             var ok = 0
             for (n in names) {
@@ -1432,6 +1546,41 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             runCatching { fsInfo.value = c.fsInfo() }
             if (ok == 1) say("Deleted " + names.first())
             else if (ok > 1) say("Deleted " + ok + " files")
+
+            if (group != null) {
+                val shared = names.filter { it in group.files }
+                group.files = group.files - names.toSet()
+                if (group.files.isEmpty()) {
+                    endSync(addr)
+                    say("Synced slideshow stopped — no shared files left")
+                } else if (group.index >= group.files.size) {
+                    group.index = -1
+                }
+                if (shared.isNotEmpty()) {
+                    val partner = if (group.a == addr) group.b else group.a
+                    pendingSyncDelete.value = PendingSyncDelete(
+                        shared, partner,
+                        wheels.value.firstOrNull { it.address == partner }?.name ?: "the other wheel"
+                    )
+                }
+            }
+        }
+    }
+
+    /** Ответ на диалог [pendingSyncDelete]: удалить те же файлы у партнёра тоже. */
+    fun confirmSyncDelete(doIt: Boolean) {
+        val pend = pendingSyncDelete.value ?: return
+        pendingSyncDelete.value = null
+        if (!doIt) return
+        val c = clients[pend.partnerAddr] ?: return
+        viewModelScope.launch {
+            for (n in pend.names) runCatching { c.delete(n) }
+            val list = runCatching { c.list() }.getOrNull()
+            if (list != null) {
+                filesByAddr[pend.partnerAddr] = list
+                if (current.value == pend.partnerAddr) files.value = list
+            }
+            say("Deleted on " + pend.partnerName + " too")
         }
     }
 

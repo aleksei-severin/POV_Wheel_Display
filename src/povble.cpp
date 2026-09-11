@@ -831,14 +831,7 @@ static void handleCmd(const uint8_t* d, size_t n) {
     }
 
     case OP_STOP:
-        slideshowActive    = false;
-        force_stop_display = true;
-        if (effect_id != EFF_NONE) {
-            pending_effect = EFF_NONE;
-            xSemaphoreGive(fileLoaderSemaphore);
-            settings_dirty = true;
-        }
-        pov_state_version++;
+        stopDisplayAndSlideshow();
         webLog("[BLE] Stop");
         sendRsp(op, seq, ST_OK);
         break;
@@ -848,6 +841,7 @@ static void handleCmd(const uint8_t* d, size_t n) {
         String fname((const char*)pl, pn);
         if (!nameOk(fname)) { sendRsp(op, seq, ST_BAD_ARG); break; }
         LittleFS.remove("/" + fname);
+        handleFileDeleted("/" + fname);
         pov_state_version++;
         pov_file_version++;
         webLogf("[BLE] Delete: %s", fname.c_str());
@@ -887,9 +881,7 @@ static void handleCmd(const uint8_t* d, size_t n) {
         if (pn < 1) { sendRsp(op, seq, ST_BAD_ARG); break; }
         uint8_t action = pl[0];
         if (action == 0) {
-            slideshowActive = false;
-            settings_dirty  = true;
-            pov_state_version++;
+            stopDisplayAndSlideshow();
             webLog("[BLE] Slideshow stop");
             sendRsp(op, seq, ST_OK);
         } else {

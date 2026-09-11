@@ -516,6 +516,27 @@ void loadFrameFromFile(String path) {
     }
 }
 
+// Освобождает буфер кадра, ничего не загружая взамен. Нужен, когда файл,
+// который сейчас показывается, только что удалили с флеша (см.
+// handleFileDeleted() в main.cpp): перезалить нечего, а держать в PSRAM
+// декодированную копию удалённого файла незачем. Тот же гасим-и-ждём, что и
+// в loadFrameFromFile(), но без чтения.
+void unloadCurrentFrame() {
+    frame_loading = true;
+    wakeRenderingTask();
+    for (int i = 0; i < 1000 && render_in_fill;   i++) vTaskDelay(1);
+    for (int i = 0; i <  200 && rendering_active; i++) vTaskDelay(1);
+
+    effectsStop();
+
+    if (frameBuffer != nullptr) { free(frameBuffer); frameBuffer = nullptr; }
+    totalFrames        = 0;
+    currentDisplayFile = "";
+    newFrameReady      = false;
+    force_stop_display = true;
+    frame_loading      = false;
+}
+
 // --- Поиск сетей ---
 // Сканирование БЛОКИРУЮЩЕЕ и живёт в сетевой задаче, а не асинхронное из
 // обработчика HTTP. Асинхронный вариант молча не заводился: пока STA пытается
@@ -1002,16 +1023,7 @@ void setupNetwork() {
 
     server.on("/stop", HTTP_GET, [](AsyncWebServerRequest *request){
         last_web_activity_time = millis();
-        slideshowActive = false;
-        force_stop_display = true;
-        // Эффект снимаем через заявку: остановка ждёт рендер, а держать на этом
-        // задачу AsyncTCP нельзя. PSRAM при этом вернётся длинным анимациям.
-        if (effect_id != EFF_NONE) {
-            pending_effect = EFF_NONE;
-            xSemaphoreGive(fileLoaderSemaphore);
-            settings_dirty = true;
-        }
-        pov_state_version++;
+        stopDisplayAndSlideshow();
         webLog("[DISP] Stop");
         request->send(200, "text/plain", "Stopped");
     });
@@ -1111,9 +1123,7 @@ void setupNetwork() {
                 webLogf("[DISP] Slideshow start, interval %lus", (unsigned long)(slideInterval / 1000));
                 request->send(200, "text/plain", "OK");
             } else if (action == "stop") {
-                slideshowActive = false;
-                settings_dirty  = true;
-                pov_state_version++;
+                stopDisplayAndSlideshow();
                 webLog("[DISP] Slideshow stop");
                 request->send(200, "text/plain", "OK");
             } else {
@@ -1140,6 +1150,7 @@ void setupNetwork() {
                 webLogf("[WARN] Closed open upload before delete: %s", path.c_str());
             }
             LittleFS.remove(path);
+            handleFileDeleted(path);
             pov_state_version++;
             pov_file_version++;
             request->send(200, "text/plain", "Deleted");

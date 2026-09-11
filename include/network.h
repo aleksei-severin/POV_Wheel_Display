@@ -6,6 +6,7 @@ void setupStorage();                // NVS + имя устройства. Все
 void setupNetwork();                // Подъём радио. Только по команде OP_WIFI из приложения
 void loopNetwork();
 void loadFrameFromFile(String path);
+void unloadCurrentFrame();          // Освободить буфер кадра, ничего не загружая взамен
 void webLog(const char* msg);
 void webLogf(const char* fmt, ...);
 void resetTimeSync();               // Вызывать в начале setup() — сбрасывает millis-базу

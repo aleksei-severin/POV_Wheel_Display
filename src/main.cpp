@@ -150,6 +150,12 @@ static SemaphoreHandle_t   hallSemaphore = nullptr;
 static SemaphoreHandle_t   dmaMutex      = nullptr;
 SemaphoreHandle_t          fileLoaderSemaphore = nullptr;
 String                     pendingFilePath;
+// Заявка «текущий файл только что удалили» — обрабатывается в fileLoaderTask,
+// а не на месте: снятие буфера ждёт render_in_fill/rendering_active (до ~1.2 с),
+// и делать это прямо в колбэке BLE/HTTP значит держать задачу хоста NimBLE (или
+// обработчик HTTP) всё это время — тот же риск обрыва связи по супервизии, что
+// у синхронной записи во флеш. См. handleFileDeleted()/handleActiveFileUnload().
+static volatile bool pending_unload = false;
 
 // Слайдшоу: переключение файлов по таймеру
 // Флаг и интервал живут в RTC — восстанавливаются после deep sleep
@@ -2376,11 +2382,135 @@ void updateFileList() {
     }
 }
 
+// Выбирает и запрашивает следующий пункт слайдшоу (файл или эффект) из
+// виртуальной последовательности: подходящие файлы в порядке savedFiles,
+// затем отмеченные эффекты 1..6. Общая часть для обычной смены по таймеру
+// (см. вызов ниже, в loop()) и принудительной смены из handleActiveFileUnload() —
+// там ждать slideInterval незачем, показывать всё равно больше нечего.
+// Возвращает false, если сейчас показывать нечего — слайдшоу пора остановить.
+static bool advanceSlideshow() {
+    int fileCount = 0;
+    for (const String& f : savedFiles) if (slideInSlideshow(f)) fileCount++;
+    int total = fileCount + __builtin_popcount(slideEffectMask);
+    if (total == 0) return false;
+    int pos = ((slideCurrentIndex < 0 ? -1 : slideCurrentIndex) + 1) % total;
+    slideCurrentIndex = pos;
+
+    if (pos < fileCount) {
+        int seen = 0, fi = 0;
+        for (int i = 0; i < (int)savedFiles.size(); i++) {
+            if (!slideInSlideshow(savedFiles[i])) continue;
+            if (seen == pos) { fi = i; break; }
+            seen++;
+        }
+        String nextFile = savedFiles[fi];
+        // Единственный файл в отборе (total==1) выбирает сам себя каждый раз:
+        // loadFrameFromFile() гасит ленту на всё время чтения, и перечитывать
+        // то, что и так уже лежит в PSRAM неизменным, значит гасить картинку
+        // раз в интервал без единой смены кадра. Не трогаем её вовсе.
+        if (("/" + nextFile) == currentDisplayFile) {
+            last_web_activity_time = millis();
+            return true;
+        }
+        pending_effect     = -1;
+        pendingFilePath    = "/" + nextFile;
+        // Не пишем в NVS прямо здесь: запись во флеш заморозила бы рендер.
+        pending_last_file  = nextFile;
+        force_stop_display = false;
+        request_play_flag  = true;
+        xSemaphoreGive(fileLoaderSemaphore);
+        webLogf("[DISP] Slideshow: %s (%d/%d)", nextFile.c_str(), pos + 1, total);
+    } else {
+        int ord = pos - fileCount, eid = 0, c = 0;
+        for (int e = 1; e <= 6; e++) {
+            if (!(slideEffectMask & (1 << (e - 1)))) continue;
+            if (c == ord) { eid = e; break; }
+            c++;
+        }
+        // Тот же эффект уже крутится (тоже total==1 случай) — не перезапускаем
+        // его: effectsStart() сбросил бы состояние (искры Fire, стрелки Clock)
+        // и на миг погасил бы ленту ради ровно той же картинки.
+        if (eid > 0 && eid != effect_id) {
+            pendingFilePath    = "";
+            pending_effect     = (int8_t)eid;
+            force_stop_display = false;
+            request_play_flag  = true;
+            xSemaphoreGive(fileLoaderSemaphore);
+            webLogf("[DISP] Slideshow: effect %s (%d/%d)", effectName(eid), pos + 1, total);
+        }
+    }
+    last_web_activity_time = millis();
+    return true;
+}
+
+// Сама работа за pending_unload — вызывается ТОЛЬКО из fileLoaderTask, где
+// блокироваться на render_in_fill/rendering_active безопасно (это его штатная
+// работа для любой смены кадра). Останавливает показ, освобождает буфер и,
+// если удалённый файл был частью слайдшоу, сразу подставляет следующий пункт
+// последовательности — ждать интервал незачем, показывать всё равно больше
+// нечего; если пунктов не осталось, слайдшоу останавливается вовсе.
+static void handleActiveFileUnload() {
+    bool wasSlideshow = slideshowActive;
+    int  pos          = slideCurrentIndex;
+    unloadCurrentFrame();
+    updateFileList();
+    if (!wasSlideshow) return;
+    slideCurrentIndex = pos - 1;   // компенсирует +1 внутри advanceSlideshow()
+    if (!advanceSlideshow()) {
+        slideshowActive = false;
+        webLog("[DISP] Slideshow stopped — no files left");
+    }
+}
+
+// Вызывать СРАЗУ после LittleFS.remove() обоими путями удаления (BLE
+// OP_DELETE, HTTP /delete) с именем файла, включая ведущий "/" (как в
+// currentDisplayFile). Если удалённый файл не тот, что сейчас на ободе, —
+// рендеру всё равно, он адресует уже загруженный в PSRAM буфер и файла на
+// флеше больше не касается: выходим сразу же, не блокируя вызывающего.
+// Если это ОН — сам рендер этого не заметит (кадр целиком лежит в PSRAM), но
+// настоящая чистка (см. handleActiveFileUnload) ждёт гашения ленты и может
+// занять до ~1.2 с, поэтому лишь взводим заявку и будим fileLoaderTask — так
+// же, как OP_PLAY не грузит файл сам, а поручает это той же задаче.
+void handleFileDeleted(const String& fname) {
+    if (fname != currentDisplayFile) return;
+    pending_unload = true;
+    xSemaphoreGive(fileLoaderSemaphore);
+}
+
+// Полная остановка: слайдшоу, эффект и файл — гасим всё разом, вместо того
+// чтобы просто перестать листать и оставить последнюю картинку висеть до
+// повторного нажатия Stop. Эффект снимаем через заявку fileLoaderTask —
+// сама остановка не должна ждать, пока рендер отпустит буфер кадра (вызывается
+// и из BLE-колбэка, и из обработчика HTTP, которым блокироваться нельзя, см.
+// handleFileDeleted). settings_dirty — БЕЗУСЛОВНО: slideshowActive входит в
+// SettingsBlob (см. fillSettingsBlob), и без флага его новое значение может
+// не долететь до NVS перед сном — тогда loadSettingsFromNVS() на пробуждении
+// поднимет слайдшоу заново, ровно то, что пользователь только что остановил.
+void stopDisplayAndSlideshow() {
+    slideshowActive    = false;
+    force_stop_display = true;
+    if (effect_id != EFF_NONE) {
+        pending_effect = EFF_NONE;
+        xSemaphoreGive(fileLoaderSemaphore);
+    }
+    settings_dirty = true;
+    pov_state_version++;
+}
+
 // Задача загрузки файлов — работает на Core 0 (не мешает рендерингу на Core 1),
 // приоритет 2 (ниже WiFi) — не блокирует HTTP-стек во время чтения LittleFS.
 void fileLoaderTask(void* pvParameters) {
     while (true) {
         xSemaphoreTake(fileLoaderSemaphore, portMAX_DELAY);
+        // Чистка за удалённым активным файлом — первой: если следом в этом же
+        // проходе просят загрузить что-то новое (pendingFilePath/pending_effect),
+        // тот файл к тому моменту уже не активен (currentDisplayFile меняет
+        // только эта задача), и порядок между ними не важен — но опустевший
+        // буфер лучше снять до, а не после.
+        if (pending_unload) {
+            pending_unload = false;
+            handleActiveFileUnload();
+        }
         // Эффект проверяем первым: он не читает флеш, но так же ждёт, пока
         // рендер отпустит буфер кадра, и в обработчике HTTP этому не место.
         if (pending_effect >= 0) {
@@ -2833,50 +2963,7 @@ void loop() {
             slideLastSwitch = now_ms;
         } else if (due) {
             slideLastSwitch = now_ms;
-            // Виртуальная последовательность показа: сперва подходящие файлы (в
-            // порядке savedFiles), затем отмеченные эффекты 1..6. Считаем её только
-            // в момент смены, а не каждый проход loop().
-            int fileCount = 0;
-            for (const String& f : savedFiles) if (slideInSlideshow(f)) fileCount++;
-            int total = fileCount + __builtin_popcount(slideEffectMask);
-            if (total > 0) {
-                int pos = ((slideCurrentIndex < 0 ? -1 : slideCurrentIndex) + 1) % total;
-                slideCurrentIndex = pos;
-
-                if (pos < fileCount) {
-                    int seen = 0, fi = 0;
-                    for (int i = 0; i < (int)savedFiles.size(); i++) {
-                        if (!slideInSlideshow(savedFiles[i])) continue;
-                        if (seen == pos) { fi = i; break; }
-                        seen++;
-                    }
-                    String nextFile = savedFiles[fi];
-                    pending_effect     = -1;
-                    pendingFilePath    = "/" + nextFile;
-                    // Не пишем в NVS прямо здесь: запись во флеш заморозила бы рендер.
-                    pending_last_file  = nextFile;
-                    force_stop_display = false;
-                    request_play_flag  = true;
-                    xSemaphoreGive(fileLoaderSemaphore);
-                    webLogf("[DISP] Slideshow: %s (%d/%d)", nextFile.c_str(), pos + 1, total);
-                } else {
-                    int ord = pos - fileCount, eid = 0, c = 0;
-                    for (int e = 1; e <= 6; e++) {
-                        if (!(slideEffectMask & (1 << (e - 1)))) continue;
-                        if (c == ord) { eid = e; break; }
-                        c++;
-                    }
-                    if (eid > 0) {
-                        pendingFilePath    = "";
-                        pending_effect     = (int8_t)eid;
-                        force_stop_display = false;
-                        request_play_flag  = true;
-                        xSemaphoreGive(fileLoaderSemaphore);
-                        webLogf("[DISP] Slideshow: effect %s (%d/%d)", effectName(eid), pos + 1, total);
-                    }
-                }
-                last_web_activity_time = now_ms;  // не засыпаем во время активного слайдшоу
-            }
+            advanceSlideshow();
         }
     }
 
