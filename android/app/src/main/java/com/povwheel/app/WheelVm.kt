@@ -379,10 +379,27 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** При старте приложения — сразу открыть последнее колесо, а не ждать тапа. */
+    /**
+     * При старте приложения — сразу открыть последнее колесо, а не ждать тапа.
+     * Если оно не отвечает (уехало из зоны действия, спит транспортным сном),
+     * `connect()` доходит до отказа только через таймаут в 20 с — слишком
+     * долго сидеть с мёртвым колесом на экране, если рядом крутится другое,
+     * уже известное или просто найденное сканом. Короткая пауза даёт
+     * последнему колесу честный шанс откликнуться (обычное GATT-соединение
+     * укладывается в секунду-две), а дальше раз в секунду проверяем, не
+     * появилось ли рядом что-то доступное — и тут же переключаемся.
+     */
     fun openLastWheel() {
         val addr = prefs.getString("last_wheel", null) ?: return
         openWheel(addr, prefs.getString("name_" + addr, "POV wheel")!!)
+        viewModelScope.launch {
+            delay(3000)
+            while (current.value == addr && clients[addr]?.link?.value != Link.Ready) {
+                val alt = wheels.value.firstOrNull { it.reachable && it.address != addr }
+                if (alt != null) { openWheel(alt.address, alt.name); return@launch }
+                delay(1000)
+            }
+        }
     }
 
     /**

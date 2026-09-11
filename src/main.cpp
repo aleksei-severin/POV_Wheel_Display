@@ -101,11 +101,7 @@ static volatile int8_t   dir_score     = 0;   // Голосование за н�
 
 // Пропущенный проход мимо датчика неотличим от честного оборота: интервал
 // между двумя срабатываниями ОДНОГО датчика получается ровно кратным (2×, 3×),
-// и обороты читаются вдвое-втрое меньше реальных. Счётчики ниже — для лога:
-// по ним видно, какой именно датчик теряет магнит.
-static volatile uint32_t hall_rev_skips    = 0;   // сколько замеров отвергнуто
-static volatile uint32_t hall_rev_skip_us  = 0;   // последний отвергнутый замер
-static volatile uint8_t  hall_rev_skip_idx = 0;   // и датчик, который его дал
+// и обороты читаются вдвое-втрое меньше реальных.
 static volatile uint8_t  hall_rev_long     = 0;   // длинных замеров подряд
 
 // Калибровка углового положения датчиков.
@@ -414,10 +410,7 @@ void IRAM_ATTR hallInterruptHandler(void* arg) {
     if (rev_ok && cur != 0 && rev > cur + (cur >> 1)) {
         if (hall_rev_long < 1) {
             hall_rev_long++;
-            rev_ok            = false;
-            hall_rev_skips++;
-            hall_rev_skip_us  = rev;
-            hall_rev_skip_idx = (uint8_t)k;
+            rev_ok = false;
         } else {
             hall_rev_long = 0;          // подтвердилось — колесо действительно замедлилось
         }
@@ -466,12 +459,6 @@ static void loadHallCalibration() {
     hall_cal_ready = true;
     for (int i = 1; i < HALL_COUNT; i++)
         if (rtc_hall_cal_n[i] < HALL_CAL_MIN_N) hall_cal_ready = false;
-
-    if (hall_cal_ready) {
-        webLogf("[HALL] Cal: %.1f %.1f %.1f %.1f %.1f",
-                rtc_hall_cal[1], rtc_hall_cal[2], rtc_hall_cal[3],
-                rtc_hall_cal[4], rtc_hall_cal[5]);
-    }
 }
 
 // Сохраняет калибровку в NVS только если она заметно изменилась —
@@ -1098,28 +1085,6 @@ static void fillSectorIntoBuffer(uint8_t* buf, uint8_t buf_idx, float sector0, f
 // только когда весь кадр уйдёт по SPI (SK9822_FRAME_US), и будут гореть до
 // следующего обновления. Без этой поправки картинка уезжала тем сильнее,
 // чем выше обороты, и «Angle Offset» приходилось бы крутить под скорость.
-// Снимок для диагностики фазы (см. renderingTask), публикуемый раз в 10 с.
-// webLog()/webLogf() пишут в RTC_DATA_ATTR-буфер (см. network.cpp) — память там
-// тактируется на порядки медленнее обычной SRAM, и один такой вызов стоит
-// порядка миллисекунды. Внутри renderingTask это лишний, самой же диагностикой
-// внесённый скачок lead раз в 10 с — измеряя стабильность, мы её портили.
-// Поэтому renderingTask только копирует цифры сюда (дёшево), а сам вывод в лог
-// делает loop() — там для лишней миллисекунды есть место.
-struct HallDiagSnapshot {
-    bool     cal_ready;
-    float    err_max;
-    float    off1, off2, off3, off4, off5;
-    float    lead_min, lead_max, jit, fill_us, show_us, aT2;
-    float    w_corr_pct;
-    float    lead_hall_min, lead_hall_max; uint32_t n_hall;
-    float    lead_norm_min, lead_norm_max; uint32_t n_norm;
-    uint32_t outer_min, outer_max, outer_over100;
-    uint32_t sem_min, sem_max;
-    float    e_min[HALL_COUNT], e_max[HALL_COUNT];
-    uint32_t e_steady[HALL_COUNT], e_notsteady[HALL_COUNT];
-};
-static HallDiagSnapshot   hall_diag_snap;
-static volatile bool      hall_diag_pending = false;
 
 void renderingTask(void* pvParameters) {
     uint8_t active     = 0;
@@ -1150,16 +1115,6 @@ void renderingTask(void* pvParameters) {
 
     // Предыдущее измерение средней скорости (для оценки ускорения)
     bool     alpha_ok   = false;   // фильтр α уже наполнен
-    float    phase_err_max = 0.0f; // максимальная невязка ФАПЧ за окно диагностики
-    float    w_corr_max_pct = 0.0f; // макс. правка ω 2-м порядком ФАПЧ (HALL_PLL_KV), % от ω
-    uint32_t phase_dbg_ms  = 0;
-    float    lead_min = 1e9f, lead_max = 0.0f;   // размах упреждения, мкс
-    // То же самое, но раздельно для «первого кадра после переанкеровки по
-    // событию Холла» и для всех остальных («обычных») кадров — проверить,
-    // действительно ли разброс lead сосредоточен именно в hall-кадрах.
-    float    lead_hall_min = 1e9f, lead_hall_max = 0.0f;
-    float    lead_norm_min = 1e9f, lead_norm_max = 0.0f;
-    uint32_t n_hall_frames = 0, n_norm_frames = 0;
     float    w_avg_prev = 0.0f;
     uint32_t t_mid_prev = 0;
     bool     w_prev_ok  = false;
@@ -1167,43 +1122,13 @@ void renderingTask(void* pvParameters) {
     int  sectors_drawn = 0;
     bool arm_reverse_seen = global_arm_reverse;
 
-    // Сырой (до усреднения 0.06 и до отсечения |e|<20) разброс калибровочного
-    // измерения e по каждому датчику — проверить, действительно ли сошедшееся
-    // rtc_hall_cal[] отражает типичное отдельное измерение, или отдельные
-    // измерения гуляют куда шире (тогда среднее занижает истинную величину
-    // перекоса, а не сам перекос стабилен и мал). Индексы 1..5, индекс 0 не
-    // используется (опорный датчик).
-    float    e_raw_min[HALL_COUNT] = {1e9f, 1e9f, 1e9f, 1e9f, 1e9f, 1e9f};
-    float    e_raw_max[HALL_COUNT] = {-1e9f, -1e9f, -1e9f, -1e9f, -1e9f, -1e9f};
-    uint32_t e_n_steady[HALL_COUNT]    = {0, 0, 0, 0, 0, 0};
-    uint32_t e_n_notsteady[HALL_COUNT] = {0, 0, 0, 0, 0, 0};
-
-    // Диагностика: сколько времени занимает сам проход внешнего цикла (от
-    // возврата xSemaphoreTake до повторного входа во внутренний цикл рендера)
-    // — проверить, не здесь ли гуляет lead-hall из предыдущего замера.
-    uint32_t outer_dur_min = 0xFFFFFFFFu, outer_dur_max = 0;
-    uint32_t outer_dur_over100 = 0;   // сколько раз за окно проход был дольше 100 мкс
-    // То же самое, но именно для xSemaphoreTake() — она НЕ входит в outer-pass
-    // (тот стартует уже ПОСЛЕ неё), а разрыв lead-hall/lead-norm (~70-90 мкс)
-    // больше, чем outer-pass (~13-15 мкс) — недостача может прятаться именно тут.
-    // Считаем только «короткие» ожидания (<2000 мкс): долгие — это штатное
-    // ожидание СЛЕДУЮЩЕГО события Холла (колесо не крутится), не задержка.
-    uint32_t sem_dur_min = 0xFFFFFFFFu, sem_dur_max = 0;
-
     // Момент последнего гашения и минимальная пауза до повторного розжига.
     static const uint32_t RENDER_RESUME_HOLD_MS = 600;
     uint32_t render_pause_ms = 0;
 
     while (true) {
         // Ждём нового события Холла максимум 500 мс.
-        uint32_t sem_t0 = micros();
         xSemaphoreTake(hallSemaphore, pdMS_TO_TICKS(500));
-        uint32_t outer_t0  = micros();   // начало прохода внешнего цикла
-        uint32_t sem_dur   = (uint32_t)(outer_t0 - sem_t0);
-        if (sem_dur < 2000) {   // длинные — штатное ожидание, не задержка
-            if (sem_dur < sem_dur_min) sem_dur_min = sem_dur;
-            if (sem_dur > sem_dur_max) sem_dur_max = sem_dur;
-        }
 
         // Смена порядка лучей меняет знак arm_step — накопленная калибровка
         // датчиков в старой системе координат больше не действительна.
@@ -1212,7 +1137,6 @@ void renderingTask(void* pvParameters) {
             for (int i = 0; i < HALL_COUNT; i++) { rtc_hall_cal[i] = 0.0f; rtc_hall_cal_n[i] = 0; }
             rtc_hall_cal_n[0] = 255;
             hall_cal_ready = false;
-            webLog("[HALL] Arm order changed, calibration reset");
         }
 
         // --- Снимок данных ISR ---
@@ -1293,10 +1217,6 @@ void renderingTask(void* pvParameters) {
                 // Формула симметрична по направлению вращения, поэтому годится
                 // и для заднего хода. Обновляем только на ровном ходу.
                 bool steady = fabsf(rotor_alpha) * (float)ev_rev * (float)ev_rev < 2.0f;
-                // Вынесено из-под steady: хотим видеть сырой разброс e ВСЕГДА, а не
-                // только те выборки, что проходят гейт — иначе не отличить «датчик
-                // стабильно даёт большее значение» от «гейт пропускает только часть
-                // выборок, и по ним не видно истинного разброса».
                 if (ev_idx != 0 && ref0_ok) {
                     uint32_t d = (uint32_t)(ev_t - t_ref0);
                     if (d > 0 && d < ev_rev) {
@@ -1306,9 +1226,6 @@ void renderingTask(void* pvParameters) {
                         // Нормируем в (-180, 180]
                         while (e >  180.0f) e -= 360.0f;
                         while (e <= -180.0f) e += 360.0f;
-                        if (e < e_raw_min[ev_idx]) e_raw_min[ev_idx] = e;
-                        if (e > e_raw_max[ev_idx]) e_raw_max[ev_idx] = e;
-                        if (steady) e_n_steady[ev_idx]++; else e_n_notsteady[ev_idx]++;
                         if (steady && fabsf(e) < 20.0f) {
                             rtc_hall_cal[ev_idx] += (e - rtc_hall_cal[ev_idx]) * 0.06f;
                             if (rtc_hall_cal_n[ev_idx] < 255) rtc_hall_cal_n[ev_idx]++;
@@ -1316,10 +1233,7 @@ void renderingTask(void* pvParameters) {
                                 bool ready = true;
                                 for (int i = 1; i < HALL_COUNT; i++)
                                     if (rtc_hall_cal_n[i] < HALL_CAL_MIN_N) ready = false;
-                                if (ready) {
-                                    hall_cal_ready = true;
-                                    webLog("[HALL] Sensor calibration ready");
-                                }
+                                if (ready) hall_cal_ready = true;
                             }
                         }
                     }
@@ -1346,12 +1260,7 @@ void renderingTask(void* pvParameters) {
                     while (err <= -180.0f) err += 360.0f;
                     // Большая невязка — не разброс датчиков, а потеря синхронизации:
                     // захватываем фазу жёстко, чтобы не ползти к ней целый оборот.
-                    // Размах невязки — прямая мера дрожания фазы: именно на
-                    // столько модель расходится с датчиками. Копим максимум,
-                    // печатаем раз в 10 с (см. ниже): без этого числа спорить
-                    // о стабильности картинки можно только на глаз.
                     float ea = fabsf(err);
-                    if (ea < 30.0f && ea > phase_err_max) phase_err_max = ea;
                     // Три режима: мягкая подтяжка на ровном ходу, резче при
                     // систематической невязке разгона, жёсткий захват при
                     // потере синхронизации.
@@ -1382,9 +1291,6 @@ void renderingTask(void* pvParameters) {
                             float dwmax = 0.10f * fabsf(rotor_omega);
                             dw = constrain(dw, -dwmax, dwmax);
                             rotor_omega += dw;
-                            float p = (fabsf(rotor_omega) > 1e-9f)
-                                    ? fabsf(dw) / fabsf(rotor_omega) * 100.0f : 0.0f;
-                            if (p > w_corr_max_pct) w_corr_max_pct = p;
                         }
                     }
                 } else {
@@ -1398,59 +1304,6 @@ void renderingTask(void* pvParameters) {
 
                 anchor_t  = ev_t;
                 anchor_ok = true;
-            }
-
-            // Диагностика фазы. Раз в 10 с при живой отрисовке: готова ли
-            // калибровка (от неё зависит, цепляемся мы за шесть датчиков или
-            // за один, а это разница в шесть раз по накоплению ошибки), какова
-            // невязка и к чему сошлись поправки датчиков.
-            uint32_t now_dbg = millis();
-            if (rendering_active && (uint32_t)(now_dbg - phase_dbg_ms) > 10000 && !hall_diag_pending) {
-                phase_dbg_ms = now_dbg;
-                // Разброс упреждения в градусах — прямая мера того, насколько
-                // гуляет картинка из-за таймингов вывода, а не из-за фазы.
-                float jit = (lead_max > lead_min)
-                          ? (lead_max - lead_min) * fabsf(rotor_omega) : 0.0f;
-                // aT2 — поправка за оборот от ускорения, в градусах: сколько
-                // именно доигрывает член ½·α·Δt². На ровном ходу около нуля, на
-                // разгоне и торможении растёт — по нему и видно, работает ли
-                // компенсация вообще.
-                float aT2 = rotor_alpha * (float)ev_rev * (float)ev_rev;
-                // Только присваивания — быстро, в отличие от самого webLogf().
-                // Печать делает loop() (см. там), когда заметит hall_diag_pending.
-                hall_diag_snap.cal_ready = hall_cal_ready;
-                hall_diag_snap.err_max   = phase_err_max;
-                hall_diag_snap.off1 = rtc_hall_cal[1]; hall_diag_snap.off2 = rtc_hall_cal[2];
-                hall_diag_snap.off3 = rtc_hall_cal[3]; hall_diag_snap.off4 = rtc_hall_cal[4];
-                hall_diag_snap.off5 = rtc_hall_cal[5];
-                hall_diag_snap.lead_min = lead_min; hall_diag_snap.lead_max = lead_max;
-                hall_diag_snap.jit = jit; hall_diag_snap.fill_us = fill_us;
-                hall_diag_snap.show_us = show_us; hall_diag_snap.aT2 = aT2;
-                hall_diag_snap.w_corr_pct = w_corr_max_pct;
-                hall_diag_snap.lead_hall_min = lead_hall_min; hall_diag_snap.lead_hall_max = lead_hall_max;
-                hall_diag_snap.n_hall        = n_hall_frames;
-                hall_diag_snap.lead_norm_min = lead_norm_min; hall_diag_snap.lead_norm_max = lead_norm_max;
-                hall_diag_snap.n_norm        = n_norm_frames;
-                hall_diag_snap.outer_min = outer_dur_min; hall_diag_snap.outer_max = outer_dur_max;
-                hall_diag_snap.outer_over100 = outer_dur_over100;
-                hall_diag_snap.sem_min = sem_dur_min; hall_diag_snap.sem_max = sem_dur_max;
-                for (int i = 1; i < HALL_COUNT; i++) {
-                    hall_diag_snap.e_min[i] = e_raw_min[i];
-                    hall_diag_snap.e_max[i] = e_raw_max[i];
-                    hall_diag_snap.e_steady[i]    = e_n_steady[i];
-                    hall_diag_snap.e_notsteady[i] = e_n_notsteady[i];
-                    e_raw_min[i] = 1e9f; e_raw_max[i] = -1e9f;
-                    e_n_steady[i] = 0; e_n_notsteady[i] = 0;
-                }
-                hall_diag_pending = true;
-
-                phase_err_max = 0.0f;
-                w_corr_max_pct = 0.0f;
-                lead_min = 1e9f; lead_max = 0.0f;
-                lead_hall_min = 1e9f; lead_hall_max = 0.0f; n_hall_frames = 0;
-                lead_norm_min = 1e9f; lead_norm_max = 0.0f; n_norm_frames = 0;
-                outer_dur_min = 0xFFFFFFFFu; outer_dur_max = 0; outer_dur_over100 = 0;
-                sem_dur_min = 0xFFFFFFFFu; sem_dur_max = 0;
             }
         }
 
@@ -1537,7 +1390,10 @@ void renderingTask(void* pvParameters) {
             // Пауза короче времени раскрутки, так что старту не мешает.
             if ((uint32_t)(millis() - render_pause_ms) < RENDER_RESUME_HOLD_MS) continue;
             rendering_active = true;
-            webLog("[PWR] Rendering started");
+            // Обороты уже выше порога — rotation_dir опирается на свежие голоса
+            // ISR по порядку срабатывания датчиков, а не на значение,
+            // оставшееся с прошлой остановки.
+            webLogf("[PWR] Rendering started (%s)", rotation_dir >= 0 ? "forward" : "reverse");
         }
 
         // LUT и таблицы усиления обновляем один раз за проход — powf не место
@@ -1545,21 +1401,12 @@ void renderingTask(void* pvParameters) {
         updateLUTIfNeeded();
         updateGainTablesIfNeeded();
 
-        {
-            uint32_t d = (uint32_t)(micros() - outer_t0);
-            if (d < outer_dur_min) outer_dur_min = d;
-            if (d > outer_dur_max) outer_dur_max = d;
-            if (d > 100) outer_dur_over100++;
-        }
-
         float last_psi  = 0.0f;   // угол ротора на момент последнего обновления ленты
         bool  psi_valid = false;
         // Чем был вызван ЭТОТ свежий вход в цикл — обычным событием Холла (тогда
         // слив транзакции внизу пропускается) или чем-то ещё? exited_for_hall
-        // хранит причину выхода ПРЕДЫДУЩЕГО прохода; читаем её здесь, для
-        // диагностики первого кадра нового прохода, и сразу сбрасываем — этот
+        // хранит причину выхода ПРЕДЫДУЩЕГО прохода; сбрасываем здесь — этот
         // проход выставит её заново, если тоже завершится по событию Холла.
-        bool  this_entry_was_hall = exited_for_hall;
         exited_for_hall = false;
 
         while (true) {
@@ -1622,27 +1469,6 @@ void renderingTask(void* pvParameters) {
             // обновления. Целимся в середину этого интервала.
             float start_in = (fill_us > bus_busy) ? fill_us : bus_busy;  // когда уйдёт наш кадр
             float dtf      = dt0 + start_in + dma_frame_us + show_us * 0.5f;
-
-            // Упреждение целиком, без dt0: именно оно, а не якорь, переводит
-            // джиттер таймингов в градусы на ободе. Копим размах за окно.
-            float lead = dtf - dt0;
-            if (lead < lead_min) lead_min = lead;
-            if (lead > lead_max) lead_max = lead;
-            // Раздельная статистика: !psi_valid — это ПЕРВЫЙ кадр свежего
-            // прохода; this_entry_was_hall говорит, вызван ли этот проход
-            // обычным событием Холла. Сравнить hall- и norm-диапазоны — это и
-            // есть проверка гипотезы про сброс bus_busy на каждом датчике.
-            if (!psi_valid) {
-                if (this_entry_was_hall) {
-                    if (lead < lead_hall_min) lead_hall_min = lead;
-                    if (lead > lead_hall_max) lead_hall_max = lead;
-                    n_hall_frames++;
-                }
-            } else {
-                if (lead < lead_norm_min) lead_norm_min = lead;
-                if (lead > lead_norm_max) lead_norm_max = lead;
-                n_norm_frames++;
-            }
 
             float base = anchor_deg + rotor_omega * dtf + 0.5f * rotor_alpha * dtf * dtf
                        + (float)global_angle_offset;
@@ -2138,6 +1964,36 @@ static void applyPowerState(PowerState target) {
     }
 }
 
+// Если вибродатчик не отпустило на входе в обычный сон по простою (не
+// поломка, а чаще просто положение колеса — см. VIB_STUCK_RECHECK_S в
+// config.h), кнопка не должна оставаться единственным будильником НАВСЕГДА:
+// setup() видит этот флаг и, если разбудил именно наш короткий таймер, а
+// датчик всё ещё LOW, тихо ложится обратно тем же путём, не поднимая
+// систему целиком. Настоящее пробуждение (кнопка или отпустившийся
+// вибродатчик) проходит эту проверку насквозь и обрабатывается как обычно.
+RTC_DATA_ATTR static bool vib_stuck_recheck = false;
+
+// Общий финальный шаг ухода в обычный сон по простою: держит DCDC в LOW и
+// вооружает источники пробуждения. arm_vib == false дополнительно ставит
+// таймер VIB_STUCK_RECHECK_S. Не трогает флеш — можно звать повторно сколько
+// угодно раз подряд (см. vib_stuck_recheck выше), не изнашивая её.
+static void armWakeSourcesAndSleep(bool arm_vib) {
+    gpio_hold_en((gpio_num_t)PIN_EN_DCDC_ARM1);
+    gpio_hold_en((gpio_num_t)PIN_EN_DCDC_REST);
+    gpio_deep_sleep_hold_en();
+
+    uint64_t wake_mask = (1ULL << PIN_BUTTON);
+    if (arm_vib) {
+        wake_mask |= (1ULL << PIN_VIBRATION);
+        vib_stuck_recheck = false;
+    } else {
+        vib_stuck_recheck = true;
+        esp_sleep_enable_timer_wakeup((uint64_t)VIB_STUCK_RECHECK_S * 1000000ULL);
+    }
+    esp_sleep_enable_ext1_wakeup(wake_mask, ESP_EXT1_WAKEUP_ANY_LOW);
+    esp_deep_sleep_start();
+}
+
 static void enterDeepSleep() {
     flushLastFile();
     flushSettings();
@@ -2154,8 +2010,9 @@ static void enterDeepSleep() {
     // нажатие кнопки (IO0 → LOW). Оба активны в LOW → EXT1 ANY_LOW.
     // Ждём, пока оба пина отпущены: EXT1 будит по УРОВНЮ, и сон с уже
     // притянутым к земле пином = мгновенное пробуждение обратно. Если
-    // вибродатчик так и не размыкается (заклинил) — исключаем его из маски,
-    // будим только кнопкой.
+    // вибродатчик так и не размыкается за это окно — не исключаем его
+    // насовсем (см. armWakeSourcesAndSleep выше), а ставим короткий таймер
+    // перепроверки вместо "молчания до кнопки".
     //
     // Дебаунсим КАЖДЫЙ пин отдельно (нужен устойчивый HIGH хотя бы
     // RELEASE_STABLE_MS), а не одним общим циклом с единственным отсчётом в
@@ -2174,20 +2031,12 @@ static void enterDeepSleep() {
         vib_high_ms = (digitalRead(PIN_VIBRATION) == HIGH) ? vib_high_ms + 5 : 0;
         delay(5);
     }
-    uint64_t wake_mask = (1ULL << PIN_BUTTON);
-    if (vib_high_ms >= RELEASE_STABLE_MS) {
-        wake_mask |= (1ULL << PIN_VIBRATION);
-    } else {
-        webLog("[SYS] Vibration sensor stuck LOW at sleep entry, waking by button only");
+    bool vib_ok = (vib_high_ms >= RELEASE_STABLE_MS);
+    if (!vib_ok) {
+        webLogf("[SYS] Vibration sensor stuck LOW at sleep entry, rechecking every %us",
+                (unsigned)VIB_STUCK_RECHECK_S);
     }
-    esp_sleep_enable_ext1_wakeup(wake_mask, ESP_EXT1_WAKEUP_ANY_LOW);
-
-    // Замораживаем Enable обоих DCDC в LOW на время сна
-    gpio_hold_en((gpio_num_t)PIN_EN_DCDC_ARM1);
-    gpio_hold_en((gpio_num_t)PIN_EN_DCDC_REST);
-    gpio_deep_sleep_hold_en();
-
-    esp_deep_sleep_start();
+    armWakeSourcesAndSleep(vib_ok);   // не возвращается
 }
 
 // Сон на время предзаряда. Отдельно от enterDeepSleep() намеренно:
@@ -2644,6 +2493,21 @@ void setup() {
     esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
     esp_reset_reason_t       reset_reason  = esp_reset_reason();
 
+    // --- Перепроверка "залипшего" вибродатчика: до всего остального тоже ---
+    // Если разбудил именно наш короткий таймер (см. armWakeSourcesAndSleep) и
+    // датчик всё ещё LOW — это не пробуждение человеком, а рутинная
+    // перепроверка, которой нечего сообщить. Не поднимаем систему целиком:
+    // сразу ложимся обратно на тот же срок, ничего не инициализируя. Если
+    // датчик отпустило или разбудило что-то другое (кнопка) — идём обычным
+    // путём ниже, и следующий уход в сон снова честно попробует включить
+    // вибро в маску пробуждения.
+    if (vib_stuck_recheck) {
+        vib_stuck_recheck = false;
+        if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER && digitalRead(PIN_VIBRATION) == LOW) {
+            armWakeSourcesAndSleep(false);   // не возвращается
+        }
+    }
+
     // --- Транспортный режим: разбираемся ДО всего остального ---
     // Проверка стоит здесь, а не ниже, потому что при неподтверждённом
     // пробуждении (кнопку задели, а не удержали) мы обязаны уснуть обратно
@@ -2894,40 +2758,6 @@ void loop() {
 
     uint32_t now_ms = millis();
 
-    // --- Отложенная печать диагностики фазы (см. renderingTask) ---
-    // webLog() стоит порядка миллисекунды (RTC_DATA_ATTR-буфер) — печатаем
-    // здесь, на приоритете 1, а не внутри горячего цикла рендера.
-    if (hall_diag_pending) {
-        const HallDiagSnapshot& s = hall_diag_snap;
-        webLogf("[HALL] cal=%d err=%.1f off %.1f %.1f %.1f %.1f %.1f",
-                s.cal_ready ? 1 : 0, (double)s.err_max,
-                (double)s.off1, (double)s.off2, (double)s.off3, (double)s.off4, (double)s.off5);
-        webLogf("[HALL] lead %.0f..%.0f = %.2f deg, fill %.0f show %.0f aT2 %.1f wcorr %.2f%%",
-                (double)s.lead_min, (double)s.lead_max, (double)s.jit,
-                (double)s.fill_us, (double)s.show_us, (double)s.aT2, (double)s.w_corr_pct);
-        webLogf("[HALL] lead-hall %.0f..%.0f n=%lu | lead-norm %.0f..%.0f n=%lu",
-                (double)s.lead_hall_min, (double)s.lead_hall_max, (unsigned long)s.n_hall,
-                (double)s.lead_norm_min, (double)s.lead_norm_max, (unsigned long)s.n_norm);
-        // Сырой разброс e (до усреднения 0.06, до отсечения |e|<20) по датчикам
-        // 1..5 — сравнить с уже сошедшимся off: если тут размах в разы больше
-        // 0.9°, среднее занижает истинный перекос, а не сам перекос мал и стабилен.
-        webLogf("[HALL] e-raw 1:%.1f/%.1f 2:%.1f/%.1f 3:%.1f/%.1f 4:%.1f/%.1f 5:%.1f/%.1f",
-                (double)s.e_min[1], (double)s.e_max[1], (double)s.e_min[2], (double)s.e_max[2],
-                (double)s.e_min[3], (double)s.e_max[3], (double)s.e_min[4], (double)s.e_max[4],
-                (double)s.e_min[5], (double)s.e_max[5]);
-        webLogf("[HALL] e-n st/ns 1:%lu/%lu 2:%lu/%lu 3:%lu/%lu 4:%lu/%lu 5:%lu/%lu",
-                (unsigned long)s.e_steady[1], (unsigned long)s.e_notsteady[1],
-                (unsigned long)s.e_steady[2], (unsigned long)s.e_notsteady[2],
-                (unsigned long)s.e_steady[3], (unsigned long)s.e_notsteady[3],
-                (unsigned long)s.e_steady[4], (unsigned long)s.e_notsteady[4],
-                (unsigned long)s.e_steady[5], (unsigned long)s.e_notsteady[5]);
-        webLogf("[HALL] outer-pass %lu..%lu us, >100us x%lu",
-                (unsigned long)s.outer_min, (unsigned long)s.outer_max,
-                (unsigned long)s.outer_over100);
-        webLogf("[HALL] sem-take %lu..%lu us", (unsigned long)s.sem_min, (unsigned long)s.sem_max);
-        hall_diag_pending = false;
-    }
-
     // --- Отложенная запись настроек ---
     // Ждать выключения питания необязательно: пока колесо не раскручено до
     // порога, renderingTask ничего не рисует, и запись во флеш никому не мешает.
@@ -2991,25 +2821,6 @@ void loop() {
         } else if (due) {
             slideLastSwitch = now_ms;
             advanceSlideshow();
-        }
-    }
-
-    // --- Диагностика пропусков датчиков ---
-    // Если какой-то луч регулярно не видит магнит, его номер виден здесь —
-    // это уже механика (зазор до магнита), а не прошивка. Реже раза в 5 с,
-    // иначе кольцевой буфер лога забьётся одной и той же строкой.
-    {
-        static uint32_t skips_seen    = 0;
-        static uint32_t skips_last_ms = 0;
-        uint32_t sk = hall_rev_skips;
-        if (sk != skips_seen && (now_ms - skips_last_ms) > 5000) {
-            webLogf("[HALL] Sensor %u missed the magnet: %lu ms instead of %lu (%lu total)",
-                    (unsigned)hall_rev_skip_idx + 1,
-                    (unsigned long)(hall_rev_skip_us / 1000),
-                    (unsigned long)(rev_period / 1000),
-                    (unsigned long)(sk - skips_seen));
-            skips_seen    = sk;
-            skips_last_ms = now_ms;
         }
     }
 
