@@ -8,6 +8,8 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
@@ -22,6 +24,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathEffect
@@ -36,6 +39,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.povwheel.app.WheelEntry
 import com.povwheel.app.WheelVm
 import com.povwheel.app.ble.DevFile
 import com.povwheel.app.ble.Link
@@ -104,14 +108,14 @@ internal fun LibraryTab(
     val upProgress by vm.upProgress.collectAsState()
     val curWheel by vm.current.collectAsState()
     val wheels by vm.wheels.collectAsState()
-    val syncPartnerMap by vm.syncPartner.collectAsState()
+    val syncPartnersMap by vm.syncPartners.collectAsState()
     val pendingSyncDelete by vm.pendingSyncDelete.collectAsState()
 
     val hasSel = vm.currentClient()?.hello?.hasAlbumSel == true
     val allNames = files.map { it.name }
     // Другие колёса, с которыми прямо сейчас можно синхронизировать слайдшоу.
     val otherReady = wheels.filter { it.link == Link.Ready && it.address != curWheel }
-    val activePartner = curWheel?.let { syncPartnerMap[it] }
+    val activePartners = curWheel?.let { syncPartnersMap[it] } ?: emptyList()
 
     var mode by remember { mutableStateOf(LibMode.NORMAL) }
     var checks by remember { mutableStateOf<Set<String>>(emptySet()) }
@@ -124,30 +128,31 @@ internal fun LibraryTab(
     var secsLocal by remember { mutableStateOf(-1) }
     val slideSecs = if (secsLocal > 0) secsLocal else (tele.slideSecs.takeIf { it in 1..300 } ?: 10)
 
-    // Партнёр, выбранный (пока не запущено) в режиме выбора слайдшоу, и общий
-    // с ним список файлов (имя+размер совпадают на обоих колёсах).
-    var pickedPartner by remember { mutableStateOf<String?>(null) }
+    // Партнёры (два и больше), отмеченные (пока не запущено) в режиме выбора
+    // слайдшоу, и общий с ними список файлов (имя+размер совпадают у всех).
+    var pickedPartners by remember { mutableStateOf<Set<String>>(emptySet()) }
     var commonNames by remember { mutableStateOf<Set<String>>(emptySet()) }
-    var syncPickerOpen by remember { mutableStateOf(false) }
 
     // Сменили колесо или библиотека уехала из-под режима — выходим из него.
     LaunchedEffect(curWheel) {
         mode = LibMode.NORMAL; checks = emptySet(); secsLocal = -1; slideCycle = 0
-        pickedPartner = null; commonNames = emptySet()
+        pickedPartners = emptySet(); commonNames = emptySet()
     }
     LaunchedEffect(mode, files) {
         // Держим только реально существующие файлы + токены эффектов (@eN).
         if (mode != LibMode.NORMAL)
             checks = checks.filterTo(HashSet()) { it in allNames || vm.isSlideEffect(it) }
     }
-    // Партнёра выбрали (или отменили) в диалоге — пересчитываем общий список и
-    // отмечаем ровно его: только на общих анимациях должны стоять галочки.
-    LaunchedEffect(pickedPartner) {
-        val partner = pickedPartner
+    // Партнёров отметили (или сняли) — пересчитываем общий список и отмечаем
+    // ровно его: только на общих для ВСЕХ выбранных колёс анимациях должны
+    // стоять галочки (эффекты общие всегда — их отбор трогать не надо).
+    LaunchedEffect(pickedPartners) {
+        val partners = pickedPartners
         val addr = curWheel
-        if (partner != null && addr != null) {
-            commonNames = vm.commonFileNames(addr, partner)
-            checks = commonNames
+        if (partners.isNotEmpty() && addr != null) {
+            val common = vm.commonFileNames(addr, partners)
+            commonNames = common
+            checks = (common + checks.filter { vm.isSlideEffect(it) }).toSet()
         } else {
             commonNames = emptySet()
             if (mode == LibMode.SLIDESHOW) checks = vm.savedSlideSelection(allNames)
@@ -161,17 +166,19 @@ internal fun LibraryTab(
         gallery.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
     }
 
-    // Пока выбирается партнёр для синхронного слайдшоу, плитка сужена до общих
-    // файлов: эффекты синхронизировать нечем (нет OP_PLAY-эквивалента), а файл,
-    // которого нет у партнёра, отметить нельзя — иначе последовательность
-    // разойдётся между колёсами с первого же переключения.
-    val syncPicking = mode == LibMode.SLIDESHOW && pickedPartner != null
-    val cells = remember(items, files, syncPicking, commonNames) {
+    // Пока выбираются партнёры для синхронного слайдшоу, плитка показывает всё
+    // как обычно (файлы и эффекты) — просто файл, которого нет у кого-то из
+    // выбранных партнёров, нельзя отметить (см. LibraryCell.lockedForSync):
+    // иначе последовательность разойдётся между колёсами с первого же
+    // переключения. Эффекты общие всегда (это не файл с колеса), поэтому их
+    // теперь можно включать в синхронный показ наравне с анимациями.
+    val syncPicking = mode == LibMode.SLIDESHOW && pickedPartners.isNotEmpty()
+    val cells = remember(items, files) {
         buildList {
             add(Cell.Add)
             items.forEachIndexed { i, it -> add(Cell.Pending(it, i)) }
-            files.forEach { f -> if (!syncPicking || f.name in commonNames) add(Cell.Stored(f)) }
-            if (!syncPicking) EFFECT_IDS.forEach { add(Cell.Effect(it)) }   // эффекты в хвосте плитки
+            files.forEach { f -> add(Cell.Stored(f)) }
+            EFFECT_IDS.forEach { add(Cell.Effect(it)) }   // эффекты в хвосте плитки
         }
     }
 
@@ -189,15 +196,15 @@ internal fun LibraryTab(
                 LibraryHeader(
                     freeText = if (fs.total > 0)
                         String.format("%.1f MB free", fs.free / 1048576.0) else "",
-                    slideshowOn = tele.slideshow || activePartner != null,
+                    slideshowOn = tele.slideshow || activePartners.isNotEmpty(),
                     selecting = mode == LibMode.SLIDESHOW,
                     // hasSel → можно сделать слайдшоу из одних эффектов, файлы не нужны.
-                    enabled = tele.slideshow || activePartner != null || files.isNotEmpty() || hasSel,
+                    enabled = tele.slideshow || activePartners.isNotEmpty() || files.isNotEmpty() || hasSel,
                     playing = tele.play && !tele.slideshow,
                     onStop = { vm.stopDisplay() },
                     onTap = {
                         when {
-                            activePartner != null -> curWheel?.let { vm.stopSyncedSlideshow(it) }
+                            activePartners.isNotEmpty() -> curWheel?.let { vm.stopSyncedSlideshow(it) }
                             tele.slideshow -> vm.stopSlideshow()
                             !hasSel -> vm.album(true, slideSecs * 1000)
                             // Первый тап — режим выбора с сохранённым набором.
@@ -237,9 +244,15 @@ internal fun LibraryTab(
                     is Cell.Effect -> ("@e" + cell.id) in checks
                     else -> false
                 }
+                // Файла нет у кого-то из выбранных для синхронного показа
+                // партнёров — оставляем его в плитке (не убираем совсем), но
+                // отмечать нельзя: иначе последовательность разойдётся между
+                // колёсами с первого же переключения. Эффекты общие всегда.
+                val lockedForSync = syncPicking && cell is Cell.Stored && cell.file.name !in commonNames
                 LibraryCell(
                     vm = vm, cell = cell, mode = mode, upBusy = upBusy,
                     checked = checked,
+                    lockedForSync = lockedForSync,
                     selectedPending = isSelPending,
                     pendingClip = if (isSelPending) upSelClip else null,
                     uploading = upCurUri != null && (cell as? Cell.Pending)?.item?.uri == upCurUri,
@@ -262,20 +275,28 @@ internal fun LibraryTab(
                 onCancel = { mode = LibMode.NORMAL; checks = emptySet() }
             )
             LibMode.SLIDESHOW -> Column {
-                if (otherReady.isNotEmpty()) SyncPickerRow(
-                    partnerName = otherReady.firstOrNull { it.address == pickedPartner }?.name,
-                    onClick = { syncPickerOpen = true }
+                // Выбор партнёров доступен сразу, без отдельного диалога — тап
+                // по имени колеса переключает его участие в группе, и можно
+                // отметить сразу несколько (два, три и больше дисплеев).
+                if (otherReady.isNotEmpty()) SyncTargetsRow(
+                    others = otherReady,
+                    picked = pickedPartners,
+                    onToggle = { a -> pickedPartners = if (a in pickedPartners) pickedPartners - a else pickedPartners + a }
                 )
+                val synced = pickedPartners.isNotEmpty()
                 ActionBar(
-                    label = if (pickedPartner != null) "▶ Start synced slideshow" else "▶ Start slideshow",
+                    label = if (synced) "▶ Start synced slideshow" else "▶ Start slideshow",
                     danger = false, enabled = checks.isNotEmpty(),
+                    // Длинная надпись «Start synced slideshow» должна уместиться в
+                    // одну строку — расширяем кнопку действия за счёт Cancel.
+                    cancelWeight = if (synced) 0.7f else 1f,
+                    actionWeight = if (synced) 1.6f else 1f,
                     onAction = {
-                        val partner = pickedPartner
-                        if (partner != null) vm.startSyncedSlideshow(partner, slideSecs, checks)
+                        if (synced) vm.startSyncedSlideshow(pickedPartners, slideSecs, checks)
                         else vm.startSlideshow(slideSecs, checks, allNames)
-                        mode = LibMode.NORMAL; pickedPartner = null
+                        mode = LibMode.NORMAL; pickedPartners = emptySet()
                     },
-                    onCancel = { mode = LibMode.NORMAL; checks = emptySet(); pickedPartner = null }
+                    onCancel = { mode = LibMode.NORMAL; checks = emptySet(); pickedPartners = emptySet() }
                 )
             }
             LibMode.NORMAL -> {}
@@ -302,32 +323,14 @@ internal fun LibraryTab(
         onSave = { secsLocal = it; vm.setSlideInterval(it); intervalDialog = false }
     )
 
-    if (syncPickerOpen) AlertDialog(
-        onDismissRequest = { syncPickerOpen = false },
-        title = { Text("Sync slideshow with") },
-        text = {
-            Column {
-                otherReady.forEach { w ->
-                    TextButton(onClick = hapticClick { pickedPartner = w.address; syncPickerOpen = false }) {
-                        Text(w.name, modifier = Modifier.fillMaxWidth())
-                    }
-                }
-                if (pickedPartner != null) TextButton(
-                    onClick = hapticClick { pickedPartner = null; syncPickerOpen = false }
-                ) { Text("Don't sync", color = Danger, modifier = Modifier.fillMaxWidth()) }
-            }
-        },
-        confirmButton = { TextButton(onClick = hapticClick { syncPickerOpen = false }) { Text("Close") } }
-    )
-
     val pending = pendingSyncDelete
     if (pending != null) AlertDialog(
         onDismissRequest = { vm.confirmSyncDelete(false) },
-        title = { Text("Delete for " + pending.partnerName + " too?") },
+        title = { Text("Delete for " + pending.partners.joinToString(", ") { it.second } + " too?") },
         text = {
             Text(
                 (if (pending.names.size == 1) pending.names.first() else pending.names.size.toString() + " files") +
-                    " — part of the synced slideshow with " + pending.partnerName +
+                    " — part of the synced slideshow with " + pending.partners.joinToString(", ") { it.second } +
                     ". Leaving it there will break the sync unless it's removed too."
             )
         },
@@ -416,24 +419,55 @@ private fun LibraryHeader(
     }
 }
 
-/** Строка над ActionBar в режиме выбора слайдшоу: с кем сейчас синхронизируем
- *  (если вообще с кем-то) и тап, чтобы это поменять. Показывается, только пока
- *  есть хоть одно другое подключённое колесо ([otherReady] на вызывающей
- *  стороне). */
+/**
+ * Строка над ActionBar в режиме выбора слайдшоу: с кем сейчас синхронизируем.
+ * Доступна сразу, без отдельного диалога, — тап по имени колеса переключает
+ * его участие в группе, отметить можно сразу несколько (два, три и больше).
+ * Показывается, только пока есть хоть одно другое подключённое колесо
+ * ([otherReady] на вызывающей стороне); список сам скроллится вправо, если
+ * имена не влезают в ширину экрана.
+ */
 @Composable
-private fun SyncPickerRow(partnerName: String?, onClick: () -> Unit) {
+private fun SyncTargetsRow(
+    others: List<WheelEntry>,
+    picked: Set<String>,
+    onToggle: (String) -> Unit
+) {
     val cs = MaterialTheme.colorScheme
     Row(
-        Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
-        verticalAlignment = Alignment.CenterVertically
+        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         Text(
-            "Sync: " + (partnerName ?: "Off"),
+            "Sync with:",
             style = MaterialTheme.typography.bodyMedium,
-            color = if (partnerName != null) Accent else cs.onSurfaceVariant,
-            modifier = Modifier.weight(1f)
+            color = cs.onSurfaceVariant
         )
-        TextButton(onClick = hapticClick(onClick)) { Text(if (partnerName != null) "Change" else "Sync with…") }
+        others.forEach { w ->
+            SyncChip(w.name, selected = w.address in picked, onClick = { onToggle(w.address) })
+        }
+    }
+}
+
+/** Пилюля-переключатель одного колеса в [SyncTargetsRow]. В отличие от [Pill]
+ *  ширина не фиксирована — колёса называют по-разному, а список и так скроллится. */
+@Composable
+private fun SyncChip(text: String, selected: Boolean, onClick: () -> Unit) {
+    val cs = MaterialTheme.colorScheme
+    val border = if (selected) cs.primary else cs.outline
+    val fg = if (selected) cs.primary else cs.onSurface
+    Surface(
+        onClick = hapticClick(onClick),
+        shape = PILL_SHAPE,
+        color = if (selected) cs.primary.copy(alpha = 0.12f) else Color.Transparent,
+        border = BorderStroke(1.dp, border),
+        modifier = Modifier.height(PILL_HEIGHT)
+    ) {
+        Box(Modifier.padding(horizontal = 14.dp).fillMaxHeight(), contentAlignment = Alignment.Center) {
+            Text(text, style = MaterialTheme.typography.labelMedium, color = fg, maxLines = 1)
+        }
     }
 }
 
@@ -443,18 +477,21 @@ private fun ActionBar(
     danger: Boolean,
     enabled: Boolean,
     onAction: () -> Unit,
-    onCancel: () -> Unit
+    onCancel: () -> Unit,
+    cancelWeight: Float = 1f,
+    actionWeight: Float = 1f
 ) {
     Surface(tonalElevation = 3.dp, shadowElevation = 8.dp) {
         Row(
             Modifier.fillMaxWidth().padding(12.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            OutlinedButton(onClick = hapticClick(onCancel), modifier = Modifier.weight(1f)) { Text("Cancel") }
+            OutlinedButton(onClick = hapticClick(onCancel), modifier = Modifier.weight(cancelWeight)) { Text("Cancel") }
             Button(
-                onClick = hapticClick(onAction), enabled = enabled, modifier = Modifier.weight(1f),
-                colors = ButtonDefaults.buttonColors(containerColor = if (danger) Danger else Ok)
-            ) { Text(label) }
+                onClick = hapticClick(onAction), enabled = enabled, modifier = Modifier.weight(actionWeight),
+                colors = ButtonDefaults.buttonColors(containerColor = if (danger) Danger else Ok),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp)
+            ) { Text(label, maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis) }
         }
     }
 }
@@ -466,6 +503,10 @@ private fun LibraryCell(
     mode: LibMode,
     upBusy: Boolean,
     checked: Boolean,
+    // Файла нет у кого-то из партнёров, отмеченных для синхронного показа —
+    // ячейка остаётся в плитке (чтобы не путать «нет на колесе» с «нельзя
+    // синхронизировать»), только тускнеет и не отмечается тапом.
+    lockedForSync: Boolean,
     selectedPending: Boolean,
     pendingClip: PreviewClip?,
     uploading: Boolean,
@@ -489,7 +530,8 @@ private fun LibraryCell(
     // фон/ободок/содержимое (и обрезанный по кругу ripple) живут во внутреннем
     // боксе, чекбокс — поверх, в углу.
     Box(
-        Modifier.fillMaxWidth().aspectRatio(1f),
+        Modifier.fillMaxWidth().aspectRatio(1f)
+            .then(if (lockedForSync) Modifier.alpha(0.35f) else Modifier),
         contentAlignment = Alignment.Center
     ) {
         Box(
@@ -509,7 +551,7 @@ private fun LibraryCell(
                             is Cell.Pending -> if (mode == LibMode.NORMAL) vm.selectUpItem(cell.index)
                             is Cell.Stored ->
                                 if (mode == LibMode.NORMAL) vm.play(cell.file.name)
-                                else onToggleCheck(cell.file.name)
+                                else if (!lockedForSync) onToggleCheck(cell.file.name)
                             is Cell.Effect -> when (mode) {
                                 // тап по идущему эффекту гасит показ, по другому — запускает
                                 LibMode.NORMAL ->

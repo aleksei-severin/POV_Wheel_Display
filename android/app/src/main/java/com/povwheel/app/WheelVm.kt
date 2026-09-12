@@ -138,77 +138,119 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     //
     // Колёса не умеют говорить друг с другом напрямую, поэтому единственные
     // часы — телефон: корутина в startSyncedSlideshow() раз в интервал шлёт
-    // OP_PLAY на ОБА адреса сразу, независимо от того, крутится ли колесо.
-    // OP_PLAY грузит кадр в PSRAM вне зависимости от power_state (см.
-    // loadFrameFromFile в прошивке), поэтому неподвижное колесо всё равно
-    // получает верный файл и покажет то же самое в ту же секунду, как начнёт
-    // вращаться, — а не то, на чём само остановилось.
+    // OP_PLAY (или OP_EFFECT — см. ниже) на ВСЕ адреса группы сразу,
+    // независимо от того, крутится ли колесо. OP_PLAY грузит кадр в PSRAM вне
+    // зависимости от power_state (см. loadFrameFromFile в прошивке), поэтому
+    // неподвижное колесо всё равно получает верный файл и покажет то же самое
+    // в ту же секунду, как начнёт вращаться, — а не то, на чём само
+    // остановилось. Группа — два и больше колёс: с двумя устройствами и не
+    // разгонишься дальше пары, но у велосипеда бывает и третье (запасное,
+    // прицеп) — список, а не пара, ничего не усложняет.
 
-    private class SyncGroup(val a: String, val b: String, var files: List<String>, var intervalMs: Int) {
+    private class SyncGroup(val members: List<String>, var files: List<String>, var intervalMs: Int) {
         var index = -1
         var job: kotlinx.coroutines.Job? = null
     }
     /** По адресу — группа, если это колесо сейчас с кем-то синхронизировано.
-     *  Оба адреса пары указывают на один и тот же объект. */
+     *  Все адреса группы указывают на один и тот же объект. */
     private val syncGroups = HashMap<String, SyncGroup>()
-    /** Адрес → адрес партнёра, для реактивного UI. */
-    val syncPartner = MutableStateFlow<Map<String, String>>(emptyMap())
+    /** Адрес → остальные адреса его группы, для реактивного UI. */
+    val syncPartners = MutableStateFlow<Map<String, List<String>>>(emptyMap())
 
-    data class PendingSyncDelete(val names: List<String>, val partnerAddr: String, val partnerName: String)
+    data class PendingSyncDelete(val names: List<String>, val partners: List<Pair<String, String>>)
     /** Удаление на синхронизированном колесе задело общий файл — ждём ответа,
-     *  удалять ли его и у партнёра тоже. */
+     *  удалять ли его и у остальных участников группы тоже. */
     val pendingSyncDelete = MutableStateFlow<PendingSyncDelete?>(null)
 
-    /** Имена файлов, совпадающих у [addr] и [other] по имени И размеру —
-     *  ровно то, что безопасно проигрывать в одной последовательности на
-     *  обоих. Всегда освежает список по BLE: кэш фоновых колёс
-     *  ([prefetchWheel]) обновляется только раз при подключении. */
-    suspend fun commonFileNames(addr: String, other: String): Set<String> {
+    /** Имена файлов, совпадающих у [addr] и КАЖДОГО из [others] по имени И
+     *  размеру — ровно то, что безопасно проигрывать в одной
+     *  последовательности на всех сразу. Всегда освежает список по BLE для
+     *  каждого участника: кэш фоновых колёс ([prefetchWheel]) обновляется
+     *  только раз при подключении. */
+    suspend fun commonFileNames(addr: String, others: Set<String>): Set<String> {
         val ca = clients[addr] ?: return emptySet()
-        val cb = clients[other] ?: return emptySet()
         val fa = runCatching { ca.list() }.getOrNull() ?: filesByAddr[addr] ?: emptyList()
-        val fb = runCatching { cb.list() }.getOrNull() ?: filesByAddr[other] ?: emptyList()
         filesByAddr[addr] = fa
-        filesByAddr[other] = fb
         if (current.value == addr) files.value = fa
-        if (current.value == other) files.value = fb
-        val keyB = fb.map { it.name to it.size }.toHashSet()
-        return fa.filter { (it.name to it.size) in keyB }.map { it.name }.toCollection(LinkedHashSet())
+        var common = fa.map { it.name to it.size }.toHashSet()
+        for (other in others) {
+            val co = clients[other] ?: continue
+            val fo = runCatching { co.list() }.getOrNull() ?: filesByAddr[other] ?: emptyList()
+            filesByAddr[other] = fo
+            if (current.value == other) files.value = fo
+            val keyO = fo.map { it.name to it.size }.toHashSet()
+            common = common.filterTo(HashSet()) { it in keyO }
+        }
+        return fa.filter { (it.name to it.size) in common }.map { it.name }.toCollection(LinkedHashSet())
     }
 
-    /** Прекратить синхронизацию, в которой участвует [addr] (если есть). */
+    /** Прекратить синхронизацию, в которой участвует [addr] (если есть) —
+     *  снимает всю группу, не только этот адрес. */
     private fun endSync(addr: String?) {
         val group = addr?.let { syncGroups[it] } ?: return
         group.job?.cancel()
-        syncGroups.remove(group.a)
-        syncGroups.remove(group.b)
-        syncPartner.value = syncPartner.value - group.a - group.b
+        for (m in group.members) syncGroups.remove(m)
+        syncPartners.value = syncPartners.value - group.members.toSet()
+    }
+
+    /** Токен эффекта («@e3») → его номер, иначе null (значит это имя файла). */
+    private fun slideEffectId(token: String): Int? =
+        if (isSlideEffect(token)) token.removePrefix("@e").toIntOrNull() else null
+
+    /**
+     * Скопировать пороги оборотов (start/stop speed) и диапазон авто-яркости
+     * с текущего колеса на [targets]. Оба (или все) дисплеи синхронного показа
+     * должны разгораться, гаснуть и притемняться на одной и той же скорости —
+     * иначе на одном картинка уже идёт (или уже погасла), а на другом ещё нет
+     * при одном и том же км/ч. Остальное (угол, гамма, баланс, реверс лучей —
+     * калибровка именно этого физического корпуса) не трогаем и не читаем.
+     */
+    private fun syncRpmAndBrightness(targets: List<String>, src: Settings) {
+        for (to in targets) {
+            val c = clients[to] ?: continue
+            viewModelScope.launch {
+                val base = runCatching { c.getSettings() }.getOrNull() ?: settingsByAddr[to] ?: return@launch
+                if (base.bmin == src.bmin && base.bmax == src.bmax &&
+                    base.rpmOn == src.rpmOn && base.rpmOff == src.rpmOff) return@launch
+                val merged = base.copy(
+                    bmin = src.bmin, bmax = src.bmax, rpmOn = src.rpmOn, rpmOff = src.rpmOff
+                )
+                runCatching { c.setSettings(merged); c.save() }
+                settingsByAddr[to] = merged
+                if (current.value == to) settings.value = merged
+            }
+        }
     }
 
     /**
-     * Запустить синхронное слайдшоу текущего колеса с [partner]. Часы —
-     * телефон: одна корутина шлёт OP_PLAY на оба адреса разом, поэтому
-     * последовательность и тайминг гарантированно общие — `checked.toList()`
-     * это один и тот же список объектов для обеих сторон.
+     * Запустить синхронное слайдшоу текущего колеса с [partners] (два и
+     * больше адресов). Часы — телефон: одна корутина шлёт OP_PLAY/OP_EFFECT на
+     * все адреса группы разом, поэтому последовательность и тайминг
+     * гарантированно общие — `checked.toList()` это один и тот же список
+     * объектов для всех сторон.
      */
-    fun startSyncedSlideshow(partner: String, delaySecs: Int, checked: Set<String>) {
+    fun startSyncedSlideshow(partners: Set<String>, delaySecs: Int, checked: Set<String>) {
         val addr = current.value ?: return
+        val others = (partners - addr).toList()
+        if (others.isEmpty()) return
         val list = checked.toList()
         if (list.isEmpty()) { say("Tick at least one shared animation"); return }
-        endSync(addr); endSync(partner)
+        val members = listOf(addr) + others
+        endSync(addr); others.forEach { endSync(it) }
         val ms = (delaySecs * 1000).coerceIn(1000, 300000)
-        val group = SyncGroup(addr, partner, list, ms)
-        syncGroups[addr] = group
-        syncGroups[partner] = group
-        syncPartner.value = syncPartner.value + (addr to partner) + (partner to addr)
+        val group = SyncGroup(members, list, ms)
+        for (m in members) syncGroups[m] = group
+        syncPartners.value = syncPartners.value + members.associateWith { m -> members - m }
+        if (settingsLoaded.value) syncRpmAndBrightness(others, settings.value)
         group.job = viewModelScope.launch {
             while (isActive) {
                 if (group.files.isEmpty()) break
                 group.index = (group.index + 1).let { if (it >= group.files.size) 0 else it }
                 val name = group.files[group.index]
-                for (a in listOf(group.a, group.b)) {
+                val effId = slideEffectId(name)
+                for (a in group.members) {
                     clients[a]?.takeIf { it.link.value == Link.Ready }?.let { c ->
-                        runCatching { c.play(name) }
+                        runCatching { if (effId != null) c.effect(effId) else c.play(name) }
                     }
                 }
                 delay(group.intervalMs.toLong())
@@ -217,11 +259,11 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         say("Synced slideshow started")
     }
 
-    /** Остановить синхронное слайдшоу И погасить ленту на ОБОИХ колёсах —
+    /** Остановить синхронное слайдшоу И погасить ленту на ВСЕХ колёсах группы —
      *  нажатие Stop не должно требовать повторного нажатия на каждом. */
     fun stopSyncedSlideshow(addr: String) {
         val group = syncGroups[addr] ?: return
-        val members = listOf(group.a, group.b)
+        val members = group.members
         endSync(addr)
         viewModelScope.launch {
             for (m in members) {
@@ -364,6 +406,10 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     /** Открытый клиент, но только если он на связи — получатель всех команд. */
     private fun readyClient(): BleClient? =
         currentClient()?.takeIf { it.link.value == Link.Ready }
+
+    /** Открытое сейчас колесо и правда на связи — экран у него есть смысл не отбирать. */
+    private fun currentIsActive(): Boolean =
+        current.value?.let { clients[it]?.link?.value == Link.Ready } == true
 
     /**
      * Открыть колесо по тапу в строке: если оно уже на связи — просто показать,
@@ -584,16 +630,25 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 return@launch
             }
             // Поиск НЕ останавливаем: у велосипеда колёс два, и второе должно
-            // найтись, пока пользователь возится с первым.
-            selectWheel(addr)
+            // найтись, пока пользователь возится с первым. Открывать его на
+            // экране, впрочем, не нужно, если пользователь и так занят другим,
+            // активным колесом — иначе появление или пробуждение соседнего
+            // колеса в эфире перебрасывало бы экран с того, что человек и так
+            // смотрит. Показываем это подключение, только если экран свободен
+            // (ничего не выбрано, либо выбранное само не на связи) либо это
+            // как раз то колесо, что уже открыто (переподключение того же).
+            if (addr == current.value || !currentIsActive()) {
+                selectWheel(addr)
+                refreshAll()
+                startPolling()
+            }
             // Часы переживают глубокий сон, но после полного обесточивания
-            // взяться им неоткуда — любое соединение это повод их выставить.
+            // взяться им неоткуда — любое соединение это повод их выставить,
+            // даже фоновому колесу, которое сейчас не на экране.
             try {
                 val tz = TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 1000
                 c.setTime(System.currentTimeMillis() / 1000, tz)
             } catch (_: Exception) {}
-            refreshAll()
-            startPolling()
         }
     }
 
@@ -650,7 +705,18 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         rebuildWheels()
         // Колесо могло за время обрыва перезагрузиться и потерять RTC-настройки —
         // после реконнекта перечитываем их заново, а не доверяем старой копии.
-        if (addr == current.value) settingsLoaded.value = false
+        if (addr == current.value) {
+            settingsLoaded.value = false
+            // Именно текущее колесо и отвалилось — это тот случай, когда экран
+            // ДОЛЖЕН уйти с него: правило «не отбирать экран у активного
+            // колеса» (см. connect()) относится только к ещё живому текущему.
+            // Переходим на любое другое доступное и остаёмся там — назад сюда
+            // не утащит, пока это, отвалившееся, само не переподключится, пока
+            // оно ещё текущее (см. проверку в connect()).
+            val alt = wheels.value.firstOrNull { it.address != addr && it.link == Link.Ready }
+                ?: wheels.value.firstOrNull { it.address != addr && it.reachable }
+            if (alt != null) openWheel(alt.address, alt.name)
+        }
         if (!wantConnected.contains(addr)) return
         reconnectJobs[addr]?.cancel()
         reconnectJobs[addr] = viewModelScope.launch {
@@ -1543,8 +1609,9 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      *  превью. Обычно НЕ зеркалит на другие колёса — у них разные библиотеки —
      *  но если текущее колесо синхронизировано ([syncGroups]) и среди
      *  удалённых есть файлы из общего списка, спрашивает через
-     *  [pendingSyncDelete], удалить ли их и у партнёра: иначе синхронный показ
-     *  наткнётся на файл, которого больше нет на одной из сторон. */
+     *  [pendingSyncDelete], удалить ли их и у остальных участников группы:
+     *  иначе синхронный показ наткнётся на файл, которого больше нет у кого-то
+     *  из них. */
     fun deleteMany(names: List<String>) {
         if (names.isEmpty()) return
         val addr = current.value
@@ -1574,30 +1641,32 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                     group.index = -1
                 }
                 if (shared.isNotEmpty()) {
-                    val partner = if (group.a == addr) group.b else group.a
-                    pendingSyncDelete.value = PendingSyncDelete(
-                        shared, partner,
-                        wheels.value.firstOrNull { it.address == partner }?.name ?: "the other wheel"
-                    )
+                    val partners = group.members.filter { it != addr }.map { p ->
+                        p to (wheels.value.firstOrNull { w -> w.address == p }?.name ?: "the other wheel")
+                    }
+                    if (partners.isNotEmpty()) pendingSyncDelete.value = PendingSyncDelete(shared, partners)
                 }
             }
         }
     }
 
-    /** Ответ на диалог [pendingSyncDelete]: удалить те же файлы у партнёра тоже. */
+    /** Ответ на диалог [pendingSyncDelete]: удалить те же файлы у остальных
+     *  участников группы тоже. */
     fun confirmSyncDelete(doIt: Boolean) {
         val pend = pendingSyncDelete.value ?: return
         pendingSyncDelete.value = null
         if (!doIt) return
-        val c = clients[pend.partnerAddr] ?: return
         viewModelScope.launch {
-            for (n in pend.names) runCatching { c.delete(n) }
-            val list = runCatching { c.list() }.getOrNull()
-            if (list != null) {
-                filesByAddr[pend.partnerAddr] = list
-                if (current.value == pend.partnerAddr) files.value = list
+            for ((addr, _) in pend.partners) {
+                val c = clients[addr] ?: continue
+                for (n in pend.names) runCatching { c.delete(n) }
+                val list = runCatching { c.list() }.getOrNull()
+                if (list != null) {
+                    filesByAddr[addr] = list
+                    if (current.value == addr) files.value = list
+                }
             }
-            say("Deleted on " + pend.partnerName + " too")
+            say("Deleted on " + pend.partners.joinToString(", ") { it.second } + " too")
         }
     }
 

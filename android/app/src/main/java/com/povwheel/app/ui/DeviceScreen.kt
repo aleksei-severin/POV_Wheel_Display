@@ -39,6 +39,7 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
@@ -498,11 +499,6 @@ private fun RenameDialog(
     )
 }
 
-// Высота строки-заголовка карточек DISPLAY/BATTERY. Фиксирована, чтобы бейдж
-// статуса (LOW/Charging/…) не растягивал карточку вниз и числа в обеих
-// карточках стояли на одном уровне.
-private val HERO_HEADER_H = 22.dp
-
 @Composable
 private fun Hero(vm: WheelVm, tele: Tele, online: Boolean) {
     var showCirc by remember { mutableStateOf(false) }
@@ -512,81 +508,74 @@ private fun Hero(vm: WheelVm, tele: Tele, online: Boolean) {
     // Нет связи или телеметрия ещё не пришла — прочерки, как у скорости/оборотов,
     // а не нули напряжения и процентов.
     val battKnown = online && tele.vbatMv > 0
-    // Короткий статус справа от «BATTERY». Discharging (просто разряд) не
-    // показываем — только зарядку, «Charged», «Low» (яркость урезана защитой)
-    // и «Empty» (дисплей выключен по разряду).
+    // Короткий статус рядом с процентом — теперь только «Offline»/«Empty»:
+    // «Low», «Charging» и «Charged» были текстовыми бейджами и раздували
+    // карточку по высоте отдельной строкой. «Charging» заменён значком молнии
+    // прямо на иконке батареи (см. BatteryIcon); «Low» и «Charged» и так видны
+    // по цвету/значению самого процента — отдельная надпись под них не нужна.
     val battBadge: Pair<String, Color?>? = when {
         !battKnown -> "Offline" to null
         tele.cutoff -> "Empty" to Danger
-        tele.ablCap < 100 -> "Low" to Warn
-        tele.chg == 1 -> "Charging" to Accent
-        tele.chg == 2 -> "Charged" to Ok
         else -> null
     }
+    val charging = battKnown && tele.chg == 1
+    val battColor = when {
+        !battKnown -> MaterialTheme.colorScheme.onSurfaceVariant
+        tele.soc < 15 -> Danger
+        tele.soc < 35 -> Warn
+        else -> Ok
+    }
+    // Значок батареи — той же высоты, что и сам процент рядом с ним.
+    val battIconSize = with(LocalDensity.current) { MaterialTheme.typography.headlineSmall.fontSize.toDp() }
 
-    // Обе карточки — две строки (метка + число), вдвое ниже прежнего: кнопку
-    // Start/Stop и напряжение USB убрали. Горизонтальные поля даёт сетка
-    // (contentPadding), своего padding у ряда нет.
+    // Обе карточки — одна строка чисел без заголовка («DISPLAY»/«BATTERY» не
+    // несли ничего, чего не видно из самих чисел, и только отъедали высоту).
+    // Горизонтальные поля даёт сетка (contentPadding), своего padding у ряда нет.
     Row(
         Modifier.fillMaxWidth().height(IntrinsicSize.Min),
         horizontalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         Card(Modifier.weight(1f).fillMaxHeight()) {
-            Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
-                // Строка-заголовок фиксированной высоты — как у BATTERY с бейджем,
-                // чтобы числа в обеих карточках стояли на одном уровне.
-                Box(Modifier.height(HERO_HEADER_H), contentAlignment = Alignment.CenterStart) {
-                    Label("DISPLAY")
-                }
-                Spacer(Modifier.height(2.dp))
-                Row {
-                    Text(
-                        if (tele.kmh > 0f) String.format("%.1f", tele.kmh) else "--",
-                        style = MaterialTheme.typography.headlineSmall,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.alignByBaseline().tapClickable { showCirc = true }
-                    )
-                    Text(" km/h", style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.alignByBaseline())
-                    Text(
-                        if (tele.rpm > 0f) tele.rpm.roundToInt().toString() else "--",
-                        style = MaterialTheme.typography.titleMedium,
-                        modifier = Modifier.alignByBaseline().padding(start = 10.dp)
-                            .tapClickable { showRpm = true }
-                    )
-                    Text(" rpm", style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.alignByBaseline())
-                }
+            Row(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                Text(
+                    if (tele.kmh > 0f) String.format("%.1f", tele.kmh) else "--",
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.alignByBaseline().tapClickable { showCirc = true }
+                )
+                Text(" km/h", style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.alignByBaseline())
+                Text(
+                    if (tele.rpm > 0f) tele.rpm.roundToInt().toString() else "--",
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.alignByBaseline().padding(start = 10.dp)
+                        .tapClickable { showRpm = true }
+                )
+                Text(" rpm", style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.alignByBaseline())
             }
         }
 
         Card(Modifier.weight(1f).fillMaxHeight()) {
             Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
-                // Фиксированная высота: бейдж (LOW/Charging/…) появляется и
-                // исчезает, не меняя высоту карточки.
-                Row(
-                    Modifier.fillMaxWidth().height(HERO_HEADER_H),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Label("BATTERY")
-                    Spacer(Modifier.weight(1f))
-                    battBadge?.let { (t, c) -> Badge2(t, c) }
-                }
-                Spacer(Modifier.height(2.dp))
                 Row {
+                    // Иконка перед процентом — в цвете самого процента, чтобы
+                    // заряд читался с одного взгляда даже без цифр.
+                    BatteryIcon(
+                        fraction = tele.soc / 100f,
+                        charging = charging,
+                        tint = battColor,
+                        modifier = Modifier.align(Alignment.CenterVertically)
+                            .height(battIconSize).aspectRatio(1.7f)
+                    )
                     Text(
                         if (battKnown) tele.soc.toString() + "%" else "--",
                         style = MaterialTheme.typography.headlineSmall,
                         fontWeight = FontWeight.Bold,
-                        modifier = Modifier.alignByBaseline(),
-                        color = when {
-                            !battKnown -> MaterialTheme.colorScheme.onSurfaceVariant
-                            tele.soc < 15 -> Danger
-                            tele.soc < 35 -> Warn
-                            else -> Ok
-                        }
+                        modifier = Modifier.alignByBaseline().padding(start = 6.dp),
+                        color = battColor
                     )
                     Text(
                         (if (battKnown) String.format("%.2f", tele.vbatMv / 1000f) else "--") + " V",
@@ -594,6 +583,12 @@ private fun Hero(vm: WheelVm, tele: Tele, online: Boolean) {
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.alignByBaseline().padding(start = 6.dp)
                     )
+                }
+                // Бейдж — отдельной строкой только когда есть что сказать: не
+                // резервируем под него высоту, пока нет ни зарядки, ни защиты.
+                battBadge?.let { (t, c) ->
+                    Spacer(Modifier.height(2.dp))
+                    Badge2(t, c)
                 }
             }
         }
@@ -1005,12 +1000,6 @@ private fun logColor(l: String): Color = when {
 // ------------------------------------------------------------ вспомогательное
 
 @Composable
-private fun Label(t: String) = Text(
-    t, style = MaterialTheme.typography.labelSmall,
-    color = MaterialTheme.colorScheme.onSurfaceVariant
-)
-
-@Composable
 private fun Badge2(text: String, color: Color?) {
     val c = color ?: MaterialTheme.colorScheme.onSurfaceVariant
     Box(
@@ -1278,6 +1267,65 @@ private fun LockIcon(locked: Boolean, tint: Color, modifier: Modifier = Modifier
         drawLine(tint, Offset(sx, legTop), Offset(sx, legBottom), strokeWidth = sw, cap = StrokeCap.Round)
         val rightBottom = if (locked) legBottom else legTop + shW * 0.3f
         drawLine(tint, Offset(sx + shW, legTop), Offset(sx + shW, rightBottom), strokeWidth = sw, cap = StrokeCap.Round)
+    }
+}
+
+/** Пиктограмма батареи рядом с процентом заряда: корпус + контакт справа,
+ *  залита пропорционально [fraction] — либо, пока идёт зарядка ([charging]),
+ *  вместо заливки по уровню рисуется молния: сам факт «идёт зарядка» важнее
+ *  текущего процента, а показывать оба сразу в значке такого размера тесно и
+ *  нечитаемо (это и заменило собой отдельный текстовый бейдж «Charging»,
+ *  раздувавший карточку по высоте). Цвет [tint] — тот же, что у самого
+ *  процента (Danger/Warn/Ok), без эмодзи, как остальные значки в этом файле. */
+@Composable
+private fun BatteryIcon(fraction: Float, charging: Boolean, tint: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier) {
+        val w = size.width
+        val h = size.height
+        val nubW = w * 0.10f
+        val bodyW = w - nubW
+        val sw = h * 0.11f
+        drawRoundRect(
+            color = tint,
+            topLeft = Offset(sw / 2f, sw / 2f),
+            size = Size(bodyW - sw, h - sw),
+            cornerRadius = CornerRadius(h * 0.2f),
+            style = Stroke(width = sw)
+        )
+        val nubH = h * 0.4f
+        drawRoundRect(
+            color = tint,
+            topLeft = Offset(bodyW - sw / 2f, (h - nubH) / 2f),
+            size = Size(nubW, nubH),
+            cornerRadius = CornerRadius(h * 0.08f)
+        )
+        if (charging) {
+            val bw = bodyW * 0.5f
+            val bh = h * 0.8f
+            val bx = (bodyW - bw) / 2f
+            val by = (h - bh) / 2f
+            val bolt = Path().apply {
+                moveTo(bx + bw * 0.62f, by)
+                lineTo(bx + bw * 0.08f, by + bh * 0.56f)
+                lineTo(bx + bw * 0.42f, by + bh * 0.56f)
+                lineTo(bx + bw * 0.30f, by + bh)
+                lineTo(bx + bw * 0.95f, by + bh * 0.38f)
+                lineTo(bx + bw * 0.56f, by + bh * 0.38f)
+                close()
+            }
+            drawPath(bolt, color = tint)
+        } else {
+            val pad = sw * 1.7f
+            val fillW = (bodyW - pad * 2f) * fraction.coerceIn(0f, 1f)
+            if (fillW > 0f) {
+                drawRoundRect(
+                    color = tint,
+                    topLeft = Offset(pad, pad),
+                    size = Size(fillW, h - pad * 2f),
+                    cornerRadius = CornerRadius(h * 0.1f)
+                )
+            }
+        }
     }
 }
 
