@@ -9,10 +9,14 @@ import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.ParcelUuid
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.povwheel.app.ble.BleClient
@@ -136,38 +140,48 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
 
     // ------------------------------------------------------- синхронизация слайдшоу
     //
-    // Колёса не умеют говорить друг с другом напрямую, поэтому единственные
-    // часы — телефон: корутина (`group.job`) раз в интервал шлёт OP_PLAY (или
-    // OP_EFFECT) на ВСЕ адреса группы сразу, через СВОИ, уже открытые во
-    // ViewModel соединения — участники обязаны быть Ready, иначе их и выбрать
-    // нельзя (см. otherReady на экране), так что соединение есть железно.
+    // Два слоя, один поверх другого.
     //
-    // На каждом колесе заводить вместо этого его же собственное штатное
-    // `OP_ALBUM`-слайдшоу и дать им считать самим — короткое время и было
-    // устроено именно так (ради того, чтобы показ переживал даже смерть
-    // самого сервиса), но это ломает синхронизацию по-другому и хуже: порядок
-    // файлов в `OP_ALBUM` строится из `savedFiles` — сырого порядка обхода
-    // LittleFS на КАЖДОМ колесе (см. updateFileList() в прошивке), а он ничем
-    // не гарантированно совпадает между двумя независимо прошитыми/залитыми
-    // устройствами. Один и тот же ОТБОР файлов превращался в РАЗНЫЙ порядок
-    // показа — то есть колёса не расходились со временем, а с первого же
-    // переключения показывали разные картинки. Явный `play(name)`/`effect(id)`
-    // с телефона называет файл по ИМЕНИ, а не по индексу в чужом списке, так
-    // что порядок на устройстве в принципе ни при чём — это и есть жёсткая,
-    // гарантированно совпадающая синхронизация, а не мягкая.
+    // ЖЁСТКИЙ (основной, пока есть кому его вести). Колёса не умеют говорить
+    // друг с другом напрямую, поэтому единственные часы — телефон: корутина
+    // (`group.job`, см. startGroupTicker) раз в интервал шлёт OP_SYNC_TICK
+    // (см. BleClient.syncTick — «называет» файл/эффект по ИМЕНИ, а не по
+    // индексу в чьём-то списке) на ВСЕ адреса группы сразу. Живёт ровно пока
+    // жив ведущий: пока открыт экран — это ViewModel, на её собственных
+    // соединениях (участники обязаны быть Ready, иначе их и в партнёры не
+    // выбрать — см. otherReady на экране, — так что соединение есть железно);
+    // как только Activity закрывают (WheelVm.onCleared()), тикер передаётся в
+    // SyncSlideshowService — она подключается к участникам С НУЛЯ и продолжает
+    // слать те же команды своими соединениями, специально ПОСЛЕ того, как
+    // ViewModel уже отпустила свои (см. её комментарий): второе, параллельное
+    // соединение к ещё занятому адресу — вещь ненадёжная (Bluetooth не держит
+    // два по-настоящему разных ACL-канала к одному устройству с одного
+    // телефона), и именно так выглядела реальная поломка «показ не
+    // запускается вовсе». Если экран открывают заново, пока служба уже ведёт
+    // показ сама, restoreSyncStateIfNeeded просит её вернуть тикер обратно
+    // сюда — по той же причине: держать оба соединения разом нельзя.
     //
-    // Плата за это та же, что и раньше: показ живёт, пока жив тикер. Пока жив
-    // экран (ViewModel) — тикер здесь, на её соединениях. Как только Activity
-    // закрывают (WheelVm.onCleared()), тикер передаётся в SyncSlideshowService:
-    // она подключается к участникам С НУЛЯ и продолжает слать те же команды
-    // своими соединениями — специально ПОСЛЕ того, как ViewModel уже отпустила
-    // свои (см. её комментарий): второе, параллельное соединение к ещё занятому
-    // этой ViewModel адресу — вещь ненадёжная (Bluetooth не держит два
-    // по-настоящему разных ACL-канала к одному устройству с одного телефона),
-    // и именно так выглядела предыдущая поломка «показ не запускается вовсе».
-    // Если экран открывают заново, пока служба уже ведёт показ сама,
-    // `restoreSyncStateIfNeeded` просит её вернуть тикер обратно сюда — опять
-    // же по той же причине: держать оба соединения разом нельзя.
+    // МЯГКИЙ (запасной, переживает и телефон, и саму службу). При старте
+    // armGroupFallback() вооружает на КАЖДОМ колесе его же штатное
+    // `OP_ALBUM`-слайдшоу с тем же отбором и интервалом — и колесо готово
+    // считать само, автономно, глубоким сном включительно. Раньше это было
+    // ЕДИНСТВЕННЫМ механизмом (ради того, чтобы показ переживал смерть
+    // сервиса), и это ломало синхронизацию по-другому и хуже: порядок файлов
+    // в OP_ALBUM строился из savedFiles — сырого порядка обхода LittleFS на
+    // КАЖДОМ колесе (updateFileList() в прошивке), ничем не гарантированно
+    // совпадающего между независимо прошитыми/залитыми устройствами; один и
+    // тот же ОТБОР превращался в РАЗНЫЙ порядок показа — колёса показывали
+    // разное с первого же переключения, а не расходились со временем. Это
+    // чинится на стороне прошивки (advanceSlideshow() берёт файлы отбора в
+    // порядке САМОГО присланного списка, не savedFiles — см. main.cpp), но
+    // сама мягкая синхронизация остаётся мягкой: без телефона, поминутно
+    // поправляющего каждое колесо, они могут медленно разойтись по фазе от
+    // разницы хода часов — секунды в час, не больше, и только пока телефон
+    // (или служба) не вернутся. OP_SYNC_TICK специально НЕ трогает
+    // slideshowActive (в отличие от OP_PLAY/OP_EFFECT) — жёсткий слой лишь
+    // ПОДПРАВЛЯЕТ мягкий на ходу (позицию и время последней смены, см.
+    // syncTick() в main.cpp), а не подменяет его, так что рассылка каждого
+    // тика не разоружает страховку, ради которой она и существует.
     //
     // Группа — два и больше колёс: с двумя устройствами и не разгонишься
     // дальше пары, но у велосипеда бывает и третье (запасное, прицеп) —
@@ -270,7 +284,11 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 val effId = slideEffectId(name)
                 for (a in group.members) {
                     clients[a]?.takeIf { it.link.value == Link.Ready }?.let { c ->
-                        runCatching { if (effId != null) c.effect(effId) else c.play(name) }
+                        // syncTick — не play()/effect(): те гасят автономный ход
+                        // слайдшоу на колесе (см. комментарий в начале секции и
+                        // syncTick() в прошивке), а он должен остаться вооружён
+                        // на случай, если телефон пропадёт без предупреждения.
+                        runCatching { if (effId != null) c.syncTick(null, effId) else c.syncTick(name) }
                     }
                 }
                 delay(group.intervalMs.toLong())
@@ -316,6 +334,29 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                     connect(m, prefs.getString("name_" + m, "POV wheel")!!)
                 }
             }
+        }
+    }
+
+    /**
+     * [addr] только что снова стал Ready посреди группы, у которой тикер уже
+     * есть и продолжал идти по своим (телефонным) часам всё время, пока это
+     * колесо было недостижимо — group.index уже указывает на правильную,
+     * актуальную позицию, тикеру осталось только дождаться своего follow-up
+     * `delay()`, а это до целого интервала показа. Досылаем ту же поправку
+     * немедленно, не дожидаясь расписания — иначе накопленный за время
+     * реального обрыва рассинхрон был бы виден ещё один полный интервал
+     * после того, как связь уже восстановлена. У свежесозданной группы
+     * (см. [restoreSyncStateIfNeeded]) index ещё −1 — там первый тик уже и
+     * так уходит немедленно из [startGroupTicker], лишний здесь не нужен.
+     */
+    private fun nudgeGroupSync(addr: String) {
+        val group = syncGroups[addr] ?: return
+        if (group.index !in group.files.indices) return
+        val c = clients[addr] ?: return
+        val name = group.files[group.index]
+        val effId = slideEffectId(name)
+        viewModelScope.launch {
+            runCatching { if (effId != null) c.syncTick(null, effId) else c.syncTick(name) }
         }
     }
 
@@ -398,6 +439,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         syncPartners.value = syncPartners.value + members.associateWith { m -> members - m }
         slideIntervalMs.value = slideIntervalMs.value + members.associateWith { ms }
         if (settingsLoaded.value) applyGroupSyncedFields(group, settings.value)
+        armGroupFallback(members, list, ms)
         startGroupTicker(group)
         val names = members.map { m -> wheels.value.firstOrNull { it.address == m }?.name ?: m }
         SyncSlideshowService.track(ctx, members, names, list, ms)
@@ -475,6 +517,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     private var logTotal = 0L
     private var pollJob: kotlinx.coroutines.Job? = null
     private var scanStopJob: kotlinx.coroutines.Job? = null
+    private var btStateReceiver: BroadcastReceiver? = null
 
     init {
         // Тик устаревания. Без него строка «видели 3 с назад» так и висит
@@ -487,6 +530,64 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         }
         found.value = knownDevices()
         rebuildWheels()
+        registerBtStateReceiver()
+    }
+
+    /**
+     * Выключение Bluetooth на телефоне роняет весь адаптер разом — это не то
+     * же самое, что обрыв одного GATT-соединения, и `onConnectionStateChange`
+     * в этом случае у многих версий Android/производителей вообще не
+     * приходит: стеку, у которого только что выключили радио, уже некому
+     * сказать «отключено». Без этой подписки клиент так и оставался бы
+     * Ready навсегда — свой собственный тикер группы (см. startGroupTicker)
+     * продолжал бы слать syncTick в мёртвую пустоту, и ни он, ни onLinkLost
+     * никогда не узнали бы, что связь пропала, а значит и переподключение
+     * никогда бы не началось. Именно это и было настоящей причиной жалобы
+     * «после подключения обратно синхронизация не возобновляется» — телефон
+     * реально переподключался, а приложение об этом не знало, потому что
+     * никогда не замечало, что связь вообще пропадала.
+     */
+    private fun registerBtStateReceiver() {
+        val rx = object : BroadcastReceiver() {
+            override fun onReceive(c: Context?, intent: Intent?) {
+                when (intent?.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1)) {
+                    BluetoothAdapter.STATE_OFF -> onBluetoothTurnedOff()
+                    BluetoothAdapter.STATE_ON -> onBluetoothTurnedOn()
+                }
+            }
+        }
+        btStateReceiver = rx
+        try {
+            ContextCompat.registerReceiver(
+                ctx, rx, IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED),
+                ContextCompat.RECEIVER_NOT_EXPORTED
+            )
+        } catch (_: Exception) {}
+    }
+
+    /** Адаптер выключили — принудительно считаем мёртвым каждое ещё не
+     *  закрытое соединение и пускаем его тем же путём восстановления, что и
+     *  настоящий обрыв ([onLinkLost]), вместо того чтобы ждать колбэк,
+     *  который в этом случае может не прийти вовсе (см. [registerBtStateReceiver]). */
+    private fun onBluetoothTurnedOff() {
+        for (addr in clients.keys.toList()) {
+            val c = clients[addr] ?: continue
+            if (c.link.value == Link.Disconnected) continue
+            c.close()
+            viewModelScope.launch { onLinkLost(addr) }
+        }
+    }
+
+    /** Адаптер снова включили — куда более надёжный повод пробовать
+     *  переподключиться прямо сейчас, чем ждать растущий таймер [onLinkLost]
+     *  (тот доходит до минуты простоя между попытками). */
+    private fun onBluetoothTurnedOn() {
+        for (addr in wantConnected.toList()) {
+            val lk = clients[addr]?.link?.value
+            if (lk == Link.Ready || lk == Link.Connecting) continue
+            reconnectJobs[addr]?.cancel()
+            connect(addr, prefs.getString("name_" + addr, "POV wheel")!!)
+        }
     }
 
     /** Пересобрать [wheels]. Дёшево: колёс единицы, а не сотни. */
@@ -759,7 +860,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 rebuildWheels()
                 // Соседнее колесо вышло на связь — тихо прогреваем кэш, чтобы
                 // свайп на него открывал библиотеку сразу, а не с задержкой.
-                if (lk == Link.Ready) { prefetchWheel(addr); restoreSyncStateIfNeeded(addr) }
+                if (lk == Link.Ready) { prefetchWheel(addr); restoreSyncStateIfNeeded(addr); nudgeGroupSync(addr) }
                 else prefetched.remove(addr)
             } }
             launch { c.tele.collect { rebuildWheels() } }
@@ -1615,6 +1716,40 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Как [albumSelectionFor], но ВСЕГДА include, а не то из include/exclude,
+     * что короче: синхронному показу порядок важнее размера ATT-посылки —
+     * прошивка теперь берёт файлы отбора-include в порядке САМОГО присланного
+     * списка (см. advanceSlideshow() в main.cpp), и это единственный способ
+     * гарантировать, что автономный запасной ход слайдшоу (см. комментарий в
+     * начале секции синхронизации) идёт в ОДНОМ порядке на всех колёсах
+     * группы, а не в порядке, в котором каждое из них когда-то получило файлы.
+     */
+    private fun syncAlbumSelection(checked: Set<String>): AlbumSelection {
+        val effMask = slideEffectTokens.foldIndexed(0) { i, m, t -> if (t in checked) m or (1 shl i) else m }
+        val names = checked.filterNot { isSlideEffect(it) }
+        return AlbumSelection(1, names, effMask, names.size > 20)
+    }
+
+    /**
+     * Вооружить автономный запасной ход слайдшоу на каждом из [members] — тот
+     * же `album(true, …)`, что и у обычного показа, но всегда через
+     * [syncAlbumSelection]. Это НЕ основной механизм показа (им остаётся
+     * тикер, см. [startGroupTicker]/`syncTick`), а страховка: если телефон
+     * (или сама [SyncSlideshowService]) пропадёт совсем — без Bluetooth, без
+     * предупреждения, — колесо не застынет на последнем кадре, а продолжит
+     * крутить ЭТУ ЖЕ последовательность по собственным часам, слегка теряя
+     * точную фазу со временем, но не содержимое.
+     */
+    private fun armGroupFallback(members: List<String>, files: List<String>, ms: Int) {
+        val sel = syncAlbumSelection(files.toSet())
+        for (m in members) {
+            clients[m]?.takeIf { it.link.value == Link.Ready }?.let { c ->
+                viewModelScope.launch { runCatching { c.album(true, ms, sel.mode, sel.names, sel.effectMask) } }
+            }
+        }
+    }
+
     /** Запустить слайдшоу с отмеченным [checked] (имена файлов + токены эффектов). */
     fun startSlideshow(delaySecs: Int, checked: Set<String>, fileNames: List<String>) {
         if (checked.isEmpty()) { say("Tick at least one item"); return }
@@ -1652,10 +1787,19 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         val group = syncGroups[addr]
         if (group != null) {
             // Тикер (см. startGroupTicker) читает group.intervalMs заново на
-            // каждом обороте — менять здесь больше нечего рассылать.
+            // каждом обороте — рассылать для него отдельно нечего. А вот
+            // вооружённый на каждом колесе запасной ход (см. armGroupFallback)
+            // хранит интервал у СЕБЯ, в NVS устройства, — его нужно поправить
+            // отдельно, иначе после исчезновения телефона колесо продолжит
+            // считать по старому, забытому значению.
             group.intervalMs = ms
             slideIntervalMs.value = slideIntervalMs.value + group.members.associateWith { ms }
             SyncSlideshowService.updateConfig(group.files, ms)
+            for (m in group.members) {
+                clients[m]?.takeIf { it.link.value == Link.Ready }?.let { c ->
+                    viewModelScope.launch { runCatching { c.album(true, ms) } }
+                }
+            }
         } else {
             slideIntervalMs.value = slideIntervalMs.value + (addr to ms)
             onTargets { c -> if (c.tele.value.slideshow) c.album(true, ms) }
@@ -1837,13 +1981,18 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                     endSync(addr)
                     say("Synced slideshow stopped — no shared files left")
                 } else {
-                    // Группа продолжает идти без удалённых файлов — тикер
-                    // (см. startGroupTicker) читает group.files заново на
-                    // каждом обороте, рассылать отдельно нечего; служебной
-                    // копии конфигурации (на случай будущей передачи тикера
-                    // в SyncSlideshowService) тоже сообщаем.
+                    // Группа продолжает идти без удалённых файлов — тикеру
+                    // (см. startGroupTicker) отдельно рассылать нечего, он
+                    // читает group.files заново на каждом обороте. А вот
+                    // вооружённый на каждом колесе запасной ход (см.
+                    // armGroupFallback) держит свой отбор в NVS устройства —
+                    // без обновления он бы ещё пытался сыграть то, чего
+                    // больше нет, если телефон вдруг пропадёт. Служебной
+                    // копии конфигурации (на случай передачи тикера в
+                    // SyncSlideshowService) тоже сообщаем.
                     if (group.index >= group.files.size) group.index = -1
                     SyncSlideshowService.updateConfig(group.files, group.intervalMs)
+                    armGroupFallback(group.members, group.files, group.intervalMs)
                 }
                 if (shared.isNotEmpty()) {
                     val partners = group.members.filter { it != addr }.map { p ->
@@ -1939,6 +2088,8 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     }
 
     override fun onCleared() {
+        btStateReceiver?.let { try { ctx.unregisterReceiver(it) } catch (_: Exception) {} }
+        btStateReceiver = null
         stopScan()
         handOffActiveSyncGroups()
         disconnectAll()

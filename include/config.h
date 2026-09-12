@@ -373,6 +373,13 @@ extern bool slideListInclude;   // true — slideList это то, что игр
 extern uint8_t slideEffectMask; // биты 0..5 — эффекты 1..6 в слайдшоу; 0 — только файлы
 extern void applySlideList(bool include, const std::vector<String>& names, uint8_t effectMask);
 extern bool slideInSlideshow(const String& name);
+// Разовая правка позиции внутри УЖЕ идущего слайдшоу от внешних, более точных
+// часов (см. OP_SYNC_TICK в povble.cpp и комментарий у syncTick() в main.cpp)
+// — в отличие от applySlideList()/OP_PLAY, не трогает slideshowActive: показ
+// продолжает крутиться автономно, если внешние часы (телефон) потом пропадут.
+// name пуст → показываем эффект effId (1..6); иначе — файл name, effId не
+// используется. false — файл не найден на флеше.
+extern bool syncTick(const String& name, int effId);
 // Полная остановка показа: слайдшоу, эффект и файл — гасим всё разом. Общая
 // часть для OP_STOP/`/stop` и OP_ALBUM(стоп)/`/album?action=stop`: «остановить
 // слайдшоу» должно гасить ленту, а не оставлять последнюю картинку висеть до

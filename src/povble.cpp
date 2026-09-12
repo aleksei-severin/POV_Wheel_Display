@@ -925,6 +925,25 @@ static void handleCmd(const uint8_t* d, size_t n) {
         break;
     }
 
+    case OP_SYNC_TICK: {
+        // Правка позиции внутри уже идущего слайдшоу — только пока оно
+        // действительно идёт: без запущенного OP_ALBUM слейдшоу нечего
+        // синхронизировать, а начинать его отсюда, минуя отбор/интервал —
+        // значит гадать за телефон, что показывать после того, как он уйдёт.
+        if (!slideshowActive) { sendRsp(op, seq, ST_STATE); break; }
+        if (pn < 2) { sendRsp(op, seq, ST_BAD_ARG); break; }
+        uint8_t kind = pl[0];
+        bool ok;
+        if (kind == 1) {
+            ok = syncTick(String(), pl[1]);
+        } else {
+            String fname((const char*)(pl + 1), pn - 1);
+            ok = nameOk(fname) && syncTick(fname, -1);
+        }
+        sendRsp(op, seq, ok ? ST_OK : ST_NOT_FOUND);
+        break;
+    }
+
     case OP_TELE: {
         PovTele t; fillTele(&t);
         sendRsp(op, seq, ST_OK, &t, sizeof(t));

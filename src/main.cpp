@@ -2292,27 +2292,55 @@ void updateFileList() {
 }
 
 // Выбирает и запрашивает следующий пункт слайдшоу (файл или эффект) из
-// виртуальной последовательности: подходящие файлы в порядке savedFiles,
-// затем отмеченные эффекты 1..6. Общая часть для обычной смены по таймеру
-// (см. вызов ниже, в loop()) и принудительной смены из handleActiveFileUnload() —
-// там ждать slideInterval незачем, показывать всё равно больше нечего.
-// Возвращает false, если сейчас показывать нечего — слайдшоу пора остановить.
+// виртуальной последовательности, затем отмеченные эффекты 1..6. Порядок
+// файлов: если отбор — "играть только эти" (slideListInclude), это порядок
+// САМОГО присланного списка slideList; иначе (exclude, или файлов не
+// прислали вовсе — "все файлы") — сырой порядок обхода LittleFS (savedFiles).
+//
+// Раньше файлы ВСЕГДА брались в порядке savedFiles, даже когда с ними
+// пришёл явный include-список, и это ломало синхронный показ на телефоне:
+// он рассылает один и тот же список общих файлов всем колёсам группы, но
+// savedFiles — это сырой порядок обхода файлов на КАЖДОМ колесе, ничем не
+// гарантированно совпадающий между независимо залитыми устройствами. Один и
+// тот же отбор превращался в разный порядок показа — колёса показывали
+// разные картинки с первого же переключения, а не расходились со временем.
+// Список, который прислали явно (для синхронного показа — телефон, с
+// ФИКСИРОВАННЫМ порядком, общим для всех участников группы), порядка не
+// теряет: слайдшоу просто идёт по нему, как есть, отфильтровав то, чего уже
+// нет на флеше. Общая часть для обычной смены по таймеру (см. вызов ниже, в
+// loop()) и принудительной смены из handleActiveFileUnload() — там ждать
+// slideInterval незачем, показывать всё равно больше нечего. Возвращает
+// false, если сейчас показывать нечего — слайдшоу пора остановить.
 static bool advanceSlideshow() {
+    bool explicitOrder = slideListInclude && !slideList.empty();
+
     int fileCount = 0;
-    for (const String& f : savedFiles) if (slideInSlideshow(f)) fileCount++;
+    if (explicitOrder) {
+        for (const String& f : slideList) if (LittleFS.exists("/" + f)) fileCount++;
+    } else {
+        for (const String& f : savedFiles) if (slideInSlideshow(f)) fileCount++;
+    }
     int total = fileCount + __builtin_popcount(slideEffectMask);
     if (total == 0) return false;
     int pos = ((slideCurrentIndex < 0 ? -1 : slideCurrentIndex) + 1) % total;
     slideCurrentIndex = pos;
 
     if (pos < fileCount) {
-        int seen = 0, fi = 0;
-        for (int i = 0; i < (int)savedFiles.size(); i++) {
-            if (!slideInSlideshow(savedFiles[i])) continue;
-            if (seen == pos) { fi = i; break; }
-            seen++;
+        String nextFile;
+        int seen = 0;
+        if (explicitOrder) {
+            for (const String& f : slideList) {
+                if (!LittleFS.exists("/" + f)) continue;
+                if (seen == pos) { nextFile = f; break; }
+                seen++;
+            }
+        } else {
+            for (int i = 0; i < (int)savedFiles.size(); i++) {
+                if (!slideInSlideshow(savedFiles[i])) continue;
+                if (seen == pos) { nextFile = savedFiles[i]; break; }
+                seen++;
+            }
         }
-        String nextFile = savedFiles[fi];
         // Единственный файл в отборе (total==1) выбирает сам себя каждый раз:
         // loadFrameFromFile() гасит ленту на всё время чтения, и перечитывать
         // то, что и так уже лежит в PSRAM неизменным, значит гасить картинку
@@ -2349,6 +2377,88 @@ static bool advanceSlideshow() {
         }
     }
     last_web_activity_time = millis();
+    return true;
+}
+
+// Позиция файла [name] (пустая строка — не ищем файл) или, если name пуст,
+// эффекта [effId] (1..6) в ТОЙ ЖЕ виртуальной последовательности, которую
+// строит advanceSlideshow() — общая логика продублирована, а не вынесена в
+// одну функцию с ней: там нужен N-й элемент, здесь — позиция ДАННОГО
+// элемента, и совмещать оба запроса в одном проходе не стоило усложнения.
+// -1, если не нашли (например, отбор сменился между командой и её обработкой).
+static int slideSequencePositionOf(const String& name, int effId) {
+    bool explicitOrder = slideListInclude && !slideList.empty();
+    int fileCount = 0, filePos = -1;
+    if (explicitOrder) {
+        for (const String& f : slideList) {
+            if (!LittleFS.exists("/" + f)) continue;
+            if (name.length() && filePos < 0 && f == name) filePos = fileCount;
+            fileCount++;
+        }
+    } else {
+        for (const String& f : savedFiles) {
+            if (!slideInSlideshow(f)) continue;
+            if (name.length() && filePos < 0 && f == name) filePos = fileCount;
+            fileCount++;
+        }
+    }
+    if (name.length()) return filePos;
+    if (effId < 1 || effId > 6 || !(slideEffectMask & (1 << (effId - 1)))) return -1;
+    int c = 0;
+    for (int e = 1; e <= 6; e++) {
+        if (!(slideEffectMask & (1 << (e - 1)))) continue;
+        if (e == effId) return fileCount + c;
+        c++;
+    }
+    return -1;
+}
+
+// Разовая правка "какой пункт слайдшоу сейчас показываем" от более точного
+// внешнего источника времени — см. OP_SYNC_TICK в povble.cpp: пока телефон
+// подключён к нескольким колёсам сразу, он поддерживает между ними жёсткую
+// синхронизацию, посылая эту команду вместо того, чтобы полагаться на то, что
+// автономные часы каждого колеса совпадают. В ОТЛИЧИЕ от OP_PLAY/OP_EFFECT,
+// НЕ трогает slideshowActive — автономный ход (advanceSlideshow() по таймеру
+// в loop()) остаётся вооружён, и в этом весь смысл: если телефон пропадёт без
+// единого шанса на явную передачу (сел Bluetooth, само приложение не
+// закрывали штатно, колесо ушло в глубокий сон) — колесо не застывает на
+// последнем кадре, а продолжает крутить ту же последовательность по
+// собственным часам, начиная ровно с того места, где остановился телефон.
+//
+// slideCurrentIndex ставится на позицию этого пункта в общей
+// последовательности (см. slideSequencePositionOf) — если не нашли (отбор
+// уже успел смениться), просто не трогаем индекс, следующий автономный шаг
+// посчитает сам. slideLastSwitch сбрасывается на "сейчас": иначе набежавшая
+// с последней автономной смены выдержка сработала бы сразу же следующим
+// проходом loop(), доиграв то, что телефон только что и без того показал.
+//
+// Возвращает false, если файл не нашёлся на флеше (список эффектов, в
+// отличие от файлов, фиксирован прошивкой и всегда "существует").
+bool syncTick(const String& name, int effId) {
+    if (name.length()) {
+        if (!LittleFS.exists("/" + name)) return false;
+    } else if (effId < 1 || effId > 6) {
+        return false;
+    }
+    int pos = slideSequencePositionOf(name, effId);
+    if (pos >= 0) slideCurrentIndex = pos;
+    slideLastSwitch = millis();
+    if (name.length()) {
+        if (("/" + name) != currentDisplayFile) {
+            pending_effect     = -1;
+            pendingFilePath    = "/" + name;
+            pending_last_file  = name;
+            force_stop_display = false;
+            request_play_flag  = true;
+            xSemaphoreGive(fileLoaderSemaphore);
+        }
+    } else if (effId != effect_id) {
+        pendingFilePath    = "";
+        pending_effect     = (int8_t)effId;
+        force_stop_display = false;
+        request_play_flag  = true;
+        xSemaphoreGive(fileLoaderSemaphore);
+    }
     return true;
 }
 

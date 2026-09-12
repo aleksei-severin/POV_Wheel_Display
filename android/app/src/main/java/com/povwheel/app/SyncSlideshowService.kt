@@ -166,7 +166,13 @@ class SyncSlideshowService : Service() {
                 val effId = if (name.startsWith("@e")) name.removePrefix("@e").toIntOrNull() else null
                 for (c in clients.values) {
                     if (c.link.value != Link.Ready) continue
-                    runCatching { if (effId != null) c.effect(effId) else c.play(name) }
+                    // syncTick, не play()/effect(): не должен гасить автономный
+                    // ход слайдшоу на колесе — та же причина, что и во ViewModel
+                    // (см. WheelVm.startGroupTicker), только здесь ещё важнее:
+                    // если это соединение тоже пропадёт (Bluetooth выключили,
+                    // саму службу убила система), колесу продолжать самому
+                    // ровно за счёт того, что этот тикер его не разоружал.
+                    runCatching { if (effId != null) c.syncTick(null, effId) else c.syncTick(name) }
                 }
                 delay(cfg.intervalMs.toLong())
             }
