@@ -1,6 +1,7 @@
 package com.povwheel.app.ui
 
 import android.graphics.Bitmap
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -109,6 +110,7 @@ internal fun LibraryTab(
     val curWheel by vm.current.collectAsState()
     val wheels by vm.wheels.collectAsState()
     val syncPartnersMap by vm.syncPartners.collectAsState()
+    val slideIntervalMap by vm.slideIntervalMs.collectAsState()
     val pendingSyncDelete by vm.pendingSyncDelete.collectAsState()
 
     val hasSel = vm.currentClient()?.hello?.hasAlbumSel == true
@@ -124,18 +126,40 @@ internal fun LibraryTab(
     var slideCycle by remember { mutableStateOf(0) }
     var confirmDelete by remember { mutableStateOf(false) }
     var intervalDialog by remember { mutableStateOf(false) }
-    // Локальный интервал: пока пользователь не трогал — следуем за устройством.
-    var secsLocal by remember { mutableStateOf(-1) }
-    val slideSecs = if (secsLocal > 0) secsLocal else (tele.slideSecs.takeIf { it in 1..300 } ?: 10)
 
     // Партнёры (два и больше), отмеченные (пока не запущено) в режиме выбора
     // слайдшоу, и общий с ними список файлов (имя+размер совпадают у всех).
     var pickedPartners by remember { mutableStateOf<Set<String>>(emptySet()) }
     var commonNames by remember { mutableStateOf<Set<String>>(emptySet()) }
 
+    // Интервал — ОДНО значение что для синхронного, что для обычного показа
+    // (см. комментарий у [WheelVm.slideIntervalMs]): экран берёт его из этой
+    // общей, на уровне ViewModel, карты, а не из `tele.slideSecs` (собственного
+    // показания ЭТОГО колеса, которое синхронный показ никогда не обновляет —
+    // он двигает кадры сам, минуя `OP_ALBUM`). Раз это уже реактивное значение
+    // на уровне ViewModel, а не локальное состояние композиции — оно не
+    // теряется ни при возврате из режима выбора, ни при остановке показа, ни
+    // при свайпе на другое колесо и обратно.
+    val slideSecs = curWheel?.let { slideIntervalMap[it] }?.let { it / 1000 }
+        ?: (tele.slideSecs.takeIf { it in 1..300 } ?: 10)
+
+    // Общий выход из режима выбора (удаление/слайдшоу) — то же самое, что и
+    // кнопка Cancel снизу, чтобы не держать логику в двух местах.
+    fun cancelSelection() {
+        mode = LibMode.NORMAL
+        checks = emptySet()
+        pickedPartners = emptySet()
+    }
+    // Пока открыт чекбоксовый режим (удаление или подбор слайдшоу), одно
+    // нажатие системной кнопки «назад» должно вести себя как Cancel, а не
+    // закрывать приложение — сам режим никак не отражён в системном back stack
+    // (это просто состояние экрана), так что без этого перехватчика назад
+    // сразу выходил бы из активности.
+    BackHandler(enabled = mode != LibMode.NORMAL) { cancelSelection() }
+
     // Сменили колесо или библиотека уехала из-под режима — выходим из него.
     LaunchedEffect(curWheel) {
-        mode = LibMode.NORMAL; checks = emptySet(); secsLocal = -1; slideCycle = 0
+        mode = LibMode.NORMAL; checks = emptySet(); slideCycle = 0
         pickedPartners = emptySet(); commonNames = emptySet()
     }
     LaunchedEffect(mode, files) {
@@ -272,7 +296,7 @@ internal fun LibraryTab(
             LibMode.DELETE -> ActionBar(
                 label = "Delete " + checks.size, danger = true, enabled = checks.isNotEmpty(),
                 onAction = { confirmDelete = true },
-                onCancel = { mode = LibMode.NORMAL; checks = emptySet() }
+                onCancel = { cancelSelection() }
             )
             LibMode.SLIDESHOW -> Column {
                 // Выбор партнёров доступен сразу, без отдельного диалога — тап
@@ -296,7 +320,7 @@ internal fun LibraryTab(
                         else vm.startSlideshow(slideSecs, checks, allNames)
                         mode = LibMode.NORMAL; pickedPartners = emptySet()
                     },
-                    onCancel = { mode = LibMode.NORMAL; checks = emptySet(); pickedPartners = emptySet() }
+                    onCancel = { cancelSelection() }
                 )
             }
             LibMode.NORMAL -> {}
@@ -320,7 +344,7 @@ internal fun LibraryTab(
         body = "How long each animation stays on screen before the next one.",
         initial = slideSecs, unit = "s", min = 1, max = 300,
         onDismiss = { intervalDialog = false },
-        onSave = { secsLocal = it; vm.setSlideInterval(it); intervalDialog = false }
+        onSave = { vm.setSlideInterval(it); intervalDialog = false }
     )
 
     val pending = pendingSyncDelete

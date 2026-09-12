@@ -150,12 +150,34 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     private class SyncGroup(val members: List<String>, var files: List<String>, var intervalMs: Int) {
         var index = -1
         var job: kotlinx.coroutines.Job? = null
+        // Общие для группы поля — пороги оборотов, диапазон авто-яркости и
+        // весь Color Correction (гамма/насыщенность/контраст/баланс RGB) —
+        // общий «источник правды», по которому решаем, действительно ли
+        // что-то поменялось (не важно, с какого колеса группы) и надо ли
+        // разослать новое значение остальным. -1 — ещё ни разу не выставляли.
+        var bmin = -1; var bmax = -1; var rpmOn = -1; var rpmOff = -1
+        var gammaX100 = -1; var satX100 = -1; var contrastX10 = -1
+        var rgX10 = -1; var ggX10 = -1; var bgX10 = -1
     }
     /** По адресу — группа, если это колесо сейчас с кем-то синхронизировано.
      *  Все адреса группы указывают на один и тот же объект. */
     private val syncGroups = HashMap<String, SyncGroup>()
     /** Адрес → остальные адреса его группы, для реактивного UI. */
     val syncPartners = MutableStateFlow<Map<String, List<String>>>(emptyMap())
+    /**
+     * Адрес → интервал слайдшоу, мс — ОДНО значение что для синхронного, что
+     * для обычного показа, а не два разных: `setSlideInterval` пишет сюда при
+     * каждой смене независимо от того, идёт ли сейчас синхронный показ, и
+     * экран читает интервал отсюда всегда, а не из `tele.slideSecs`
+     * (собственного показания устройства, которое синхронный показ никогда не
+     * обновляет — он двигает кадры сам, минуя `OP_ALBUM`). Пока группа жива,
+     * запись общая для всех её участников, так что смена на ЛЮБОМ из колёс
+     * группы сразу видна на экране ЛЮБОГО другого. Не снимается ни в
+     * [endSync], ни где-либо ещё: это ПОСЛЕДНЕЕ использованное значение для
+     * данного адреса, и оно обязано остаться таким и после остановки показа —
+     * следующий запуск (синхронный или нет) продолжает именно с него.
+     */
+    val slideIntervalMs = MutableStateFlow<Map<String, Int>>(emptyMap())
 
     data class PendingSyncDelete(val names: List<String>, val partners: List<Pair<String, String>>)
     /** Удаление на синхронизированном колесе задело общий файл — ждём ответа,
@@ -191,6 +213,8 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         group.job?.cancel()
         for (m in group.members) syncGroups.remove(m)
         syncPartners.value = syncPartners.value - group.members.toSet()
+        // slideIntervalMs НЕ трогаем — см. комментарий у него: это последнее
+        // использованное значение, оно должно пережить остановку показа.
     }
 
     /** Токен эффекта («@e3») → его номер, иначе null (значит это имя файла). */
@@ -198,28 +222,60 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         if (isSlideEffect(token)) token.removePrefix("@e").toIntOrNull() else null
 
     /**
-     * Скопировать пороги оборотов (start/stop speed) и диапазон авто-яркости
-     * с текущего колеса на [targets]. Оба (или все) дисплеи синхронного показа
-     * должны разгораться, гаснуть и притемняться на одной и той же скорости —
-     * иначе на одном картинка уже идёт (или уже погасла), а на другом ещё нет
-     * при одном и том же км/ч. Остальное (угол, гамма, баланс, реверс лучей —
-     * калибровка именно этого физического корпуса) не трогаем и не читаем.
+     * Скопировать пороги оборотов (start/stop speed), диапазон авто-яркости и
+     * весь Color Correction (гамма/насыщенность/контраст/баланс RGB) с
+     * текущего колеса на [targets]. Все дисплеи синхронного показа должны не
+     * только разгораться/гаснуть/притемняться на одной скорости, но и
+     * выглядеть одинаково — иначе один и тот же кадр читается по-разному на
+     * двух колёсах одного велосипеда. Угол, окружность колеса и реверс лучей —
+     * это калибровка конкретного физического крепления/корпуса, их не трогаем
+     * и не читаем.
      */
-    private fun syncRpmAndBrightness(targets: List<String>, src: Settings) {
+    private fun syncGroupFields(targets: List<String>, src: Settings) {
         for (to in targets) {
             val c = clients[to] ?: continue
             viewModelScope.launch {
                 val base = runCatching { c.getSettings() }.getOrNull() ?: settingsByAddr[to] ?: return@launch
                 if (base.bmin == src.bmin && base.bmax == src.bmax &&
-                    base.rpmOn == src.rpmOn && base.rpmOff == src.rpmOff) return@launch
+                    base.rpmOn == src.rpmOn && base.rpmOff == src.rpmOff &&
+                    base.gammaX100 == src.gammaX100 && base.satX100 == src.satX100 &&
+                    base.contrastX10 == src.contrastX10 && base.rgX10 == src.rgX10 &&
+                    base.ggX10 == src.ggX10 && base.bgX10 == src.bgX10) return@launch
                 val merged = base.copy(
-                    bmin = src.bmin, bmax = src.bmax, rpmOn = src.rpmOn, rpmOff = src.rpmOff
+                    bmin = src.bmin, bmax = src.bmax, rpmOn = src.rpmOn, rpmOff = src.rpmOff,
+                    gammaX100 = src.gammaX100, satX100 = src.satX100, contrastX10 = src.contrastX10,
+                    rgX10 = src.rgX10, ggX10 = src.ggX10, bgX10 = src.bgX10
                 )
                 runCatching { c.setSettings(merged); c.save() }
                 settingsByAddr[to] = merged
                 if (current.value == to) settings.value = merged
             }
         }
+    }
+
+    /**
+     * Пороги оборотов, диапазон авто-яркости или Color Correction группы
+     * поменялись (не важно, с какого именно колеса — [src] это настройки
+     * того колеса, что сейчас `current`) — сверяем с тем, что группа уже
+     * разослала в прошлый раз, и если правда поменялось, рассылаем остальным
+     * участникам и запоминаем как текущее групповое. Вызывается и при старте
+     * показа (тогда `-1` в группе гарантированно не совпадёт, и рассылка/
+     * запоминание пройдёт всегда), и из [pushSettings] на каждую последующую
+     * авторитетную запись — так что смену любого из этих полей на ЛЮБОМ
+     * колесе группы во время показа сразу подхватывают все остальные.
+     */
+    private fun applyGroupSyncedFields(group: SyncGroup, src: Settings) {
+        if (group.bmin == src.bmin && group.bmax == src.bmax &&
+            group.rpmOn == src.rpmOn && group.rpmOff == src.rpmOff &&
+            group.gammaX100 == src.gammaX100 && group.satX100 == src.satX100 &&
+            group.contrastX10 == src.contrastX10 && group.rgX10 == src.rgX10 &&
+            group.ggX10 == src.ggX10 && group.bgX10 == src.bgX10) return
+        group.bmin = src.bmin; group.bmax = src.bmax
+        group.rpmOn = src.rpmOn; group.rpmOff = src.rpmOff
+        group.gammaX100 = src.gammaX100; group.satX100 = src.satX100; group.contrastX10 = src.contrastX10
+        group.rgX10 = src.rgX10; group.ggX10 = src.ggX10; group.bgX10 = src.bgX10
+        val addr = current.value
+        syncGroupFields(group.members.filter { it != addr }, src)
     }
 
     /**
@@ -241,7 +297,8 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         val group = SyncGroup(members, list, ms)
         for (m in members) syncGroups[m] = group
         syncPartners.value = syncPartners.value + members.associateWith { m -> members - m }
-        if (settingsLoaded.value) syncRpmAndBrightness(others, settings.value)
+        slideIntervalMs.value = slideIntervalMs.value + members.associateWith { ms }
+        if (settingsLoaded.value) applyGroupSyncedFields(group, settings.value)
         group.job = viewModelScope.launch {
             while (isActive) {
                 if (group.files.isEmpty()) break
@@ -1459,12 +1516,30 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
 
     fun stopSlideshow() = onTargets { it.album(false, 0) }.also { say("Slideshow stopped") }
 
-    /** Интервал: если слайдшоу идёт — устройство подхватит на лету, не сбрасывая позицию.
-     *  На синхронизированной паре меняет общий таймер на телефоне — тоже без сброса позиции. */
+    /**
+     * Интервал слайдшоу. [slideIntervalMs] запоминает его для этого адреса
+     * ВСЕГДА, синхронный показ идёт или нет, — это и есть то единственное
+     * значение, которое экран показывает и предлагает дальше (см. комментарий
+     * у [slideIntervalMs]): смена во время синхронного показа обязана остаться
+     * в силе и после его остановки, а не откатиться к тому, что было раньше.
+     *
+     * Если колесо сейчас в группе — дополнительно двигаем общий таймер
+     * телефона (`group.intervalMs`, единственная корутина шлёт всем сразу, так
+     * что тайминг и без того один) и разносим то же число по ВСЕМ участникам
+     * группы, с какого бы из них ни поменяли. Если обычный (не синхронный)
+     * показ уже идёт на устройстве — оно подхватит новый интервал на лету, не
+     * сбрасывая позицию.
+     */
     fun setSlideInterval(secs: Int) {
+        val addr = current.value ?: return
         val ms = (secs * 1000).coerceIn(1000, 300000)
-        val group = current.value?.let { syncGroups[it] }
-        if (group != null) { group.intervalMs = ms; return }
+        val group = syncGroups[addr]
+        if (group != null) {
+            group.intervalMs = ms
+            slideIntervalMs.value = slideIntervalMs.value + group.members.associateWith { ms }
+        } else {
+            slideIntervalMs.value = slideIntervalMs.value + (addr to ms)
+        }
         onTargets { c -> if (c.tele.value.slideshow) c.album(true, ms) }
     }
     /** Переименовать колесо [addr]. Требует связи — имя пишется на устройство. */
@@ -1597,6 +1672,11 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             return
         }
         queueSettingsWrite(s, save = true)
+        // Идёт синхронный показ — rpm-пороги, диапазон авто-яркости и Color
+        // Correction общие для всей группы (см. applyGroupSyncedFields): смену
+        // любого из них на ЭТОМ колесе — не важно, с какого из группы — сразу
+        // подхватывают и остальные участники.
+        current.value?.let { syncGroups[it] }?.let { applyGroupSyncedFields(it, s) }
     }
 
     fun saveSettings() {
