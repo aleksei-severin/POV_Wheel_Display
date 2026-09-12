@@ -137,15 +137,41 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     // ------------------------------------------------------- синхронизация слайдшоу
     //
     // Колёса не умеют говорить друг с другом напрямую, поэтому единственные
-    // часы — телефон: корутина в startSyncedSlideshow() раз в интервал шлёт
-    // OP_PLAY (или OP_EFFECT — см. ниже) на ВСЕ адреса группы сразу,
-    // независимо от того, крутится ли колесо. OP_PLAY грузит кадр в PSRAM вне
-    // зависимости от power_state (см. loadFrameFromFile в прошивке), поэтому
-    // неподвижное колесо всё равно получает верный файл и покажет то же самое
-    // в ту же секунду, как начнёт вращаться, — а не то, на чём само
-    // остановилось. Группа — два и больше колёс: с двумя устройствами и не
-    // разгонишься дальше пары, но у велосипеда бывает и третье (запасное,
-    // прицеп) — список, а не пара, ничего не усложняет.
+    // часы — телефон: корутина (`group.job`) раз в интервал шлёт OP_PLAY (или
+    // OP_EFFECT) на ВСЕ адреса группы сразу, через СВОИ, уже открытые во
+    // ViewModel соединения — участники обязаны быть Ready, иначе их и выбрать
+    // нельзя (см. otherReady на экране), так что соединение есть железно.
+    //
+    // На каждом колесе заводить вместо этого его же собственное штатное
+    // `OP_ALBUM`-слайдшоу и дать им считать самим — короткое время и было
+    // устроено именно так (ради того, чтобы показ переживал даже смерть
+    // самого сервиса), но это ломает синхронизацию по-другому и хуже: порядок
+    // файлов в `OP_ALBUM` строится из `savedFiles` — сырого порядка обхода
+    // LittleFS на КАЖДОМ колесе (см. updateFileList() в прошивке), а он ничем
+    // не гарантированно совпадает между двумя независимо прошитыми/залитыми
+    // устройствами. Один и тот же ОТБОР файлов превращался в РАЗНЫЙ порядок
+    // показа — то есть колёса не расходились со временем, а с первого же
+    // переключения показывали разные картинки. Явный `play(name)`/`effect(id)`
+    // с телефона называет файл по ИМЕНИ, а не по индексу в чужом списке, так
+    // что порядок на устройстве в принципе ни при чём — это и есть жёсткая,
+    // гарантированно совпадающая синхронизация, а не мягкая.
+    //
+    // Плата за это та же, что и раньше: показ живёт, пока жив тикер. Пока жив
+    // экран (ViewModel) — тикер здесь, на её соединениях. Как только Activity
+    // закрывают (WheelVm.onCleared()), тикер передаётся в SyncSlideshowService:
+    // она подключается к участникам С НУЛЯ и продолжает слать те же команды
+    // своими соединениями — специально ПОСЛЕ того, как ViewModel уже отпустила
+    // свои (см. её комментарий): второе, параллельное соединение к ещё занятому
+    // этой ViewModel адресу — вещь ненадёжная (Bluetooth не держит два
+    // по-настоящему разных ACL-канала к одному устройству с одного телефона),
+    // и именно так выглядела предыдущая поломка «показ не запускается вовсе».
+    // Если экран открывают заново, пока служба уже ведёт показ сама,
+    // `restoreSyncStateIfNeeded` просит её вернуть тикер обратно сюда — опять
+    // же по той же причине: держать оба соединения разом нельзя.
+    //
+    // Группа — два и больше колёс: с двумя устройствами и не разгонишься
+    // дальше пары, но у велосипеда бывает и третье (запасное, прицеп) —
+    // список, а не пара, ничего не усложняет.
 
     private class SyncGroup(val members: List<String>, var files: List<String>, var intervalMs: Int) {
         var index = -1
@@ -164,6 +190,10 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     private val syncGroups = HashMap<String, SyncGroup>()
     /** Адрес → остальные адреса его группы, для реактивного UI. */
     val syncPartners = MutableStateFlow<Map<String, List<String>>>(emptyMap())
+    /** Адреса, для которых уже пробовали восстановить состояние группы из
+     *  SyncSlideshowService в этом запуске ViewModel (см. restoreSyncStateIfNeeded) —
+     *  once per address, дальше состояние уже ведёт сама реактивная логика. */
+    private val restoredSyncFor = HashSet<String>()
     /**
      * Адрес → интервал слайдшоу, мс — ОДНО значение что для синхронного, что
      * для обычного показа, а не два разных: `setSlideInterval` пишет сюда при
@@ -207,7 +237,9 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     }
 
     /** Прекратить синхронизацию, в которой участвует [addr] (если есть) —
-     *  снимает всю группу, не только этот адрес. */
+     *  снимает всю группу, не только этот адрес, останавливает тикер (свой,
+     *  если он ещё здесь, либо служебный — см. SyncSlideshowService.stop) и
+     *  гасит уведомление. */
     private fun endSync(addr: String?) {
         val group = addr?.let { syncGroups[it] } ?: return
         group.job?.cancel()
@@ -215,11 +247,77 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         syncPartners.value = syncPartners.value - group.members.toSet()
         // slideIntervalMs НЕ трогаем — см. комментарий у него: это последнее
         // использованное значение, оно должно пережить остановку показа.
+        SyncSlideshowService.stop(ctx)
     }
 
     /** Токен эффекта («@e3») → его номер, иначе null (значит это имя файла). */
     private fun slideEffectId(token: String): Int? =
         if (isSlideEffect(token)) token.removePrefix("@e").toIntOrNull() else null
+
+    /** Тикер группы: раз в интервал шлёт OP_PLAY/OP_EFFECT на все адреса
+     *  группы разом через ИХ СОБСТВЕННЫЕ, уже открытые соединения этой
+     *  ViewModel — см. комментарий в начале секции про то, почему именно так,
+     *  а не через OP_ALBUM на каждом колесе по отдельности. Молча пропускает
+     *  временно не-Ready участников — они подхватят показ, как только
+     *  переподключатся, следующим же тиком. */
+    private fun startGroupTicker(group: SyncGroup) {
+        group.job?.cancel()
+        group.job = viewModelScope.launch {
+            while (isActive) {
+                if (group.files.isEmpty()) break
+                group.index = (group.index + 1).let { if (it >= group.files.size) 0 else it }
+                val name = group.files[group.index]
+                val effId = slideEffectId(name)
+                for (a in group.members) {
+                    clients[a]?.takeIf { it.link.value == Link.Ready }?.let { c ->
+                        runCatching { if (effId != null) c.effect(effId) else c.play(name) }
+                    }
+                }
+                delay(group.intervalMs.toLong())
+            }
+        }
+    }
+
+    /**
+     * Отражение группы синхронного показа для [addr] могло не пережить
+     * закрытие приложения — сама ViewModel новая, `syncGroups` пуст. Источник
+     * правды теперь не SharedPreferences, а сама [SyncSlideshowService]: пока
+     * жив процесс (а именно это и означает «служба пережила закрытие
+     * приложения»), она хранит состав/отбор/интервал последней активной
+     * группы в памяти — надёжнее файла настроек, который остался бы верным и
+     * тогда, когда службу давно убили вместе с процессом, и мы бы ожили показ
+     * без единого способа проверить, что он ещё правда идёт (`OP_PLAY`, в
+     * отличие от `OP_ALBUM`, не оставляет на устройстве никакого флага,
+     * который телефон мог бы потом перепросить).
+     *
+     * Если служба что-то помнит для этого адреса — забираем тикер обратно
+     * сюда: она отпускает СВОИ соединения (см. releaseTicking и комментарий в
+     * начале секции про то, почему второе соединение к тому же адресу
+     * ненадёжно), и как только это подтверждено, здесь заводится обычный
+     * тикер на соединениях этой ViewModel; заодно подключаемся к остальным
+     * участникам группы, которых сама эта ViewModel ещё не открывала.
+     * Однократно на адрес за время жизни ViewModel — дальше состоянием
+     * заведуют сами [startSyncedSlideshow]/[endSync].
+     */
+    private fun restoreSyncStateIfNeeded(addr: String) {
+        if (!restoredSyncFor.add(addr)) return
+        if (syncGroups.containsKey(addr)) return
+        val tracked = SyncSlideshowService.trackedGroupFor(addr) ?: return
+        val group = SyncGroup(tracked.members, tracked.files, tracked.intervalMs)
+        for (m in tracked.members) syncGroups[m] = group
+        syncPartners.value = syncPartners.value + tracked.members.associateWith { m -> tracked.members - m }
+        slideIntervalMs.value = slideIntervalMs.value + tracked.members.associateWith { tracked.intervalMs }
+        viewModelScope.launch {
+            SyncSlideshowService.releaseTicking(ctx)
+            withTimeoutOrNull(1500) { while (SyncSlideshowService.isDrivingAddress(addr)) delay(50) }
+            startGroupTicker(group)
+            for (m in tracked.members) {
+                if (m != addr && clients[m] == null) {
+                    connect(m, prefs.getString("name_" + m, "POV wheel")!!)
+                }
+            }
+        }
+    }
 
     /**
      * Скопировать пороги оборотов (start/stop speed), диапазон авто-яркости и
@@ -280,10 +378,11 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
 
     /**
      * Запустить синхронное слайдшоу текущего колеса с [partners] (два и
-     * больше адресов). Часы — телефон: одна корутина шлёт OP_PLAY/OP_EFFECT на
-     * все адреса группы разом, поэтому последовательность и тайминг
-     * гарантированно общие — `checked.toList()` это один и тот же список
-     * объектов для всех сторон.
+     * больше адресов). [checked] — общие для всех участников файлы плюс
+     * токены эффектов `@eN`; телефон сам гонит их по кругу через явные
+     * `play(name)`/`effect(id)` на все адреса разом (см. [startGroupTicker] и
+     * комментарий в начале секции про то, почему не `OP_ALBUM` на каждом
+     * колесе по отдельности).
      */
     fun startSyncedSlideshow(partners: Set<String>, delaySecs: Int, checked: Set<String>) {
         val addr = current.value ?: return
@@ -299,25 +398,18 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         syncPartners.value = syncPartners.value + members.associateWith { m -> members - m }
         slideIntervalMs.value = slideIntervalMs.value + members.associateWith { ms }
         if (settingsLoaded.value) applyGroupSyncedFields(group, settings.value)
-        group.job = viewModelScope.launch {
-            while (isActive) {
-                if (group.files.isEmpty()) break
-                group.index = (group.index + 1).let { if (it >= group.files.size) 0 else it }
-                val name = group.files[group.index]
-                val effId = slideEffectId(name)
-                for (a in group.members) {
-                    clients[a]?.takeIf { it.link.value == Link.Ready }?.let { c ->
-                        runCatching { if (effId != null) c.effect(effId) else c.play(name) }
-                    }
-                }
-                delay(group.intervalMs.toLong())
-            }
-        }
+        startGroupTicker(group)
+        val names = members.map { m -> wheels.value.firstOrNull { it.address == m }?.name ?: m }
+        SyncSlideshowService.track(ctx, members, names, list, ms)
         say("Synced slideshow started")
     }
 
     /** Остановить синхронное слайдшоу И погасить ленту на ВСЕХ колёсах группы —
-     *  нажатие Stop не должно требовать повторного нажатия на каждом. */
+     *  нажатие Stop не должно требовать повторного нажатия на каждом.
+     *  [endSync] уже отменяет тикер (свой или служебный) и просит
+     *  [SyncSlideshowService] разослать стоп; следующий цикл дублирует
+     *  `stop()` через соединения этой ViewModel как подстраховку — повторный
+     *  `stop()` на уже остановленном колесе безвреден. */
     fun stopSyncedSlideshow(addr: String) {
         val group = syncGroups[addr] ?: return
         val members = group.members
@@ -667,7 +759,8 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 rebuildWheels()
                 // Соседнее колесо вышло на связь — тихо прогреваем кэш, чтобы
                 // свайп на него открывал библиотеку сразу, а не с задержкой.
-                if (lk == Link.Ready) prefetchWheel(addr) else prefetched.remove(addr)
+                if (lk == Link.Ready) { prefetchWheel(addr); restoreSyncStateIfNeeded(addr) }
+                else prefetched.remove(addr)
             } }
             launch { c.tele.collect { rebuildWheels() } }
         }
@@ -675,6 +768,15 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         reconnectJobs.remove(addr)?.cancel()
         rebuildWheels()
         viewModelScope.launch {
+            // SyncSlideshowService могла подключиться к этому же адресу сама,
+            // пока экран был закрыт (см. комментарий в начале секции про
+            // синхронизацию слайдшоу) — второе, параллельное соединение с
+            // этого же телефона ненадёжно, поэтому просим её отпустить и
+            // недолго ждём подтверждения, прежде чем пробовать сами.
+            if (SyncSlideshowService.isDrivingAddress(addr)) {
+                SyncSlideshowService.releaseTicking(ctx)
+                withTimeoutOrNull(1500) { while (SyncSlideshowService.isDrivingAddress(addr)) delay(50) }
+            }
             val ok = c.connect()
             connected.value = clients.values.toList()
             rebuildWheels()
@@ -1492,6 +1594,27 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         return if (kept.isEmpty()) fileNames.toSet() else kept.toSet()
     }
 
+    /** Отбор, готовый уйти в `BleClient.album()`. [overflowed] — оба списка,
+     *  include и exclude, длиннее, чем одна ATT-посылка выдержит (~20 имён);
+     *  тогда шлём "все файлы" и вызывающий решает, стоит ли об этом сказать. */
+    private data class AlbumSelection(
+        val mode: Int, val names: List<String>, val effectMask: Int, val overflowed: Boolean
+    )
+
+    /** [checked] (имена файлов + токены эффектов `@eN`) → [AlbumSelection]:
+     *  маска эффектов плюс include/exclude-список файлов, тот что короче. */
+    private fun albumSelectionFor(checked: Set<String>, fileNames: List<String>): AlbumSelection {
+        val effMask = slideEffectTokens.foldIndexed(0) { i, m, t -> if (t in checked) m or (1 shl i) else m }
+        val incl = fileNames.filter { it in checked }
+        val excl = fileNames.filter { it !in checked }
+        return when {
+            excl.isEmpty() -> AlbumSelection(0, emptyList(), effMask, false)   // exclude нечего = все файлы
+            incl.size <= excl.size && incl.size <= 20 -> AlbumSelection(1, incl, effMask, false)
+            excl.size <= 20 -> AlbumSelection(0, excl, effMask, false)
+            else -> AlbumSelection(0, emptyList(), effMask, true)
+        }
+    }
+
     /** Запустить слайдшоу с отмеченным [checked] (имена файлов + токены эффектов). */
     fun startSlideshow(delaySecs: Int, checked: Set<String>, fileNames: List<String>) {
         if (checked.isEmpty()) { say("Tick at least one item"); return }
@@ -1499,19 +1622,10 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         current.value?.let {
             prefs.edit().putString(slideSelKey(it), checked.joinToString(",")).apply()
         }
-        val effMask = slideEffectTokens.foldIndexed(0) { i, m, t -> if (t in checked) m or (1 shl i) else m }
-        val incl = fileNames.filter { it in checked }
-        val excl = fileNames.filter { it !in checked }
-        // Одна ATT-посылка — до ~20 имён файлов; шлём тот список, что короче.
-        val (mode, names) = when {
-            excl.isEmpty() -> 0 to emptyList()              // exclude нечего = все файлы
-            incl.size <= excl.size && incl.size <= 20 -> 1 to incl
-            excl.size <= 20 -> 0 to excl
-            else -> { say("Too many files to pick one by one — all files shown"); 0 to emptyList<String>() }
-        }
+        val sel = albumSelectionFor(checked, fileNames)
         val ms = (delaySecs * 1000).coerceIn(1000, 300000)
-        onTargets { it.album(true, ms, mode, names, effMask) }
-        say("Slideshow started")
+        onTargets { it.album(true, ms, sel.mode, sel.names, sel.effectMask) }
+        say(if (sel.overflowed) "Too many files to pick one by one — all files shown" else "Slideshow started")
     }
 
     fun stopSlideshow() = onTargets { it.album(false, 0) }.also { say("Slideshow stopped") }
@@ -1523,24 +1637,29 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      * у [slideIntervalMs]): смена во время синхронного показа обязана остаться
      * в силе и после его остановки, а не откатиться к тому, что было раньше.
      *
-     * Если колесо сейчас в группе — дополнительно двигаем общий таймер
-     * телефона (`group.intervalMs`, единственная корутина шлёт всем сразу, так
-     * что тайминг и без того один) и разносим то же число по ВСЕМ участникам
-     * группы, с какого бы из них ни поменяли. Если обычный (не синхронный)
-     * показ уже идёт на устройстве — оно подхватит новый интервал на лету, не
-     * сбрасывая позицию.
+     * Если колесо сейчас в группе — просто меняем `group.intervalMs`: тикер
+     * (см. [startGroupTicker]) читает его заново на каждом обороте, слать
+     * никому ничего отдельно не нужно. Разносим то же число по всем
+     * участникам группы для экрана, с какого бы из них ни поменяли, и
+     * обновляем копию в [SyncSlideshowService] на случай будущей передачи
+     * тикера ей (см. комментарий в начале секции). Если обычный (не
+     * синхронный) показ уже идёт на устройстве — оно подхватит новый
+     * интервал на лету через `OP_ALBUM`, как и раньше.
      */
     fun setSlideInterval(secs: Int) {
         val addr = current.value ?: return
         val ms = (secs * 1000).coerceIn(1000, 300000)
         val group = syncGroups[addr]
         if (group != null) {
+            // Тикер (см. startGroupTicker) читает group.intervalMs заново на
+            // каждом обороте — менять здесь больше нечего рассылать.
             group.intervalMs = ms
             slideIntervalMs.value = slideIntervalMs.value + group.members.associateWith { ms }
+            SyncSlideshowService.updateConfig(group.files, ms)
         } else {
             slideIntervalMs.value = slideIntervalMs.value + (addr to ms)
+            onTargets { c -> if (c.tele.value.slideshow) c.album(true, ms) }
         }
-        onTargets { c -> if (c.tele.value.slideshow) c.album(true, ms) }
     }
     /** Переименовать колесо [addr]. Требует связи — имя пишется на устройство. */
     fun renameWheel(addr: String, name: String, onDone: (String) -> Unit) {
@@ -1717,8 +1836,14 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 if (group.files.isEmpty()) {
                     endSync(addr)
                     say("Synced slideshow stopped — no shared files left")
-                } else if (group.index >= group.files.size) {
-                    group.index = -1
+                } else {
+                    // Группа продолжает идти без удалённых файлов — тикер
+                    // (см. startGroupTicker) читает group.files заново на
+                    // каждом обороте, рассылать отдельно нечего; служебной
+                    // копии конфигурации (на случай будущей передачи тикера
+                    // в SyncSlideshowService) тоже сообщаем.
+                    if (group.index >= group.files.size) group.index = -1
+                    SyncSlideshowService.updateConfig(group.files, group.intervalMs)
                 }
                 if (shared.isNotEmpty()) {
                     val partners = group.members.filter { it != addr }.map { p ->
@@ -1815,8 +1940,29 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
 
     override fun onCleared() {
         stopScan()
+        handOffActiveSyncGroups()
         disconnectAll()
         synchronized(clipMem) { clipMem.clear() }
         super.onCleared()
+    }
+
+    /**
+     * Приложение закрывается — соединений (и тикеров) у этой ViewModel сейчас
+     * не станет. Каждую ещё активную группу синхронного показа передаём
+     * [SyncSlideshowService]: она подключится к участникам с нуля и продолжит
+     * слать те же команды сама (см. комментарий в начале секции про
+     * синхронизацию слайдшоу). Вызывается ДО [disconnectAll] — а сама служба
+     * всё равно выжидает короткую паузу перед тем как подключаться, так что
+     * порядок здесь не критичен, лишь бы оба шага произошли.
+     */
+    private fun handOffActiveSyncGroups() {
+        val seen = HashSet<SyncGroup>()
+        for (group in syncGroups.values) {
+            if (!seen.add(group)) continue
+            group.job?.cancel()
+            val names = group.members.map { m -> wheels.value.firstOrNull { it.address == m }?.name ?: m }
+            SyncSlideshowService.track(ctx, group.members, names, group.files, group.intervalMs)
+            SyncSlideshowService.takeOverTicking(ctx)
+        }
     }
 }

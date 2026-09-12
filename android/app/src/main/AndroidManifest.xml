@@ -17,6 +17,14 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"
         android:maxSdkVersion="30" />
 
+    <!-- SyncSlideshowService keeps a synced show running after the app is closed —
+         it needs its own foreground-service grant (connectedDevice: it's talking to
+         the wheels over BLE, not doing media/location/etc.) and, on 13+, permission
+         to actually show its "still running" notification. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
 
     <application
@@ -36,5 +44,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Keeps a synced slideshow ticking after the app is closed — see the
+             class doc in SyncSlideshowService.kt. -->
+        <service
+            android:name=".SyncSlideshowService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
     </application>
 </manifest>

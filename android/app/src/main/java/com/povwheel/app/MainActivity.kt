@@ -150,7 +150,22 @@ private fun Gate(vm: WheelVm) {
         btOn = vm.bluetoothReady()
     }
 
-    LaunchedEffect(Unit) { if (!granted) permLauncher.launch(needed) }
+    // Уведомление SyncSlideshowService (синхронный показ, переживающий закрытие
+    // приложения) необязательно для самой функции — без разрешения сервис всё
+    // равно поднимается foreground, просто молча, — поэтому его спрашиваем
+    // отдельно и не блокируем экран, если откажут.
+    val notifLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) {}
+
+    LaunchedEffect(Unit) {
+        if (!granted) permLauncher.launch(needed)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            !hasPerms(ctx, arrayOf(Manifest.permission.POST_NOTIFICATIONS))
+        ) {
+            notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
 
     // Bluetooth могут выключить прямо во время работы. Без этого пользователь
     // оставался на списке колёс, где каждое действие молча не срабатывает.

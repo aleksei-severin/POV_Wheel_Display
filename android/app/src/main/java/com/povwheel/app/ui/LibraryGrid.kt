@@ -221,6 +221,7 @@ internal fun LibraryTab(
                     freeText = if (fs.total > 0)
                         String.format("%.1f MB free", fs.free / 1048576.0) else "",
                     slideshowOn = tele.slideshow || activePartners.isNotEmpty(),
+                    syncedOn = activePartners.isNotEmpty(),
                     selecting = mode == LibMode.SLIDESHOW,
                     // hasSel → можно сделать слайдшоу из одних эффектов, файлы не нужны.
                     enabled = tele.slideshow || activePartners.isNotEmpty() || files.isNotEmpty() || hasSel,
@@ -309,9 +310,9 @@ internal fun LibraryTab(
                 )
                 val synced = pickedPartners.isNotEmpty()
                 ActionBar(
-                    label = if (synced) "▶ Start synced slideshow" else "▶ Start slideshow",
+                    label = if (synced) "▶ Start sync slideshow" else "▶ Start slideshow",
                     danger = false, enabled = checks.isNotEmpty(),
-                    // Длинная надпись «Start synced slideshow» должна уместиться в
+                    // Длинная надпись «Start sync slideshow» должна уместиться в
                     // одну строку — расширяем кнопку действия за счёт Cancel.
                     cancelWeight = if (synced) 0.7f else 1f,
                     actionWeight = if (synced) 1.6f else 1f,
@@ -371,6 +372,7 @@ internal fun LibraryTab(
 private fun LibraryHeader(
     freeText: String,          // свободное место на флеше — справа от «Library»
     slideshowOn: Boolean,
+    syncedOn: Boolean,         // идущий показ — синхронный (другая надпись на Stop)
     selecting: Boolean,
     enabled: Boolean,
     playing: Boolean,          // играет отдельная анимация/эффект (не слайдшоу)
@@ -435,7 +437,7 @@ private fun LibraryHeader(
                 .padding(horizontal = 12.dp, vertical = 7.dp)
         ) {
             Text(
-                if (slideshowOn) "■ Stop slideshow" else "Slideshow",
+                if (!slideshowOn) "Slideshow" else if (syncedOn) "■ Stop sync slideshow" else "■ Stop slideshow",
                 style = MaterialTheme.typography.labelLarge,
                 color = fg
             )
