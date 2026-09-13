@@ -59,13 +59,28 @@ bool peripherals_active = false;               // true когда включён
 RTC_DATA_ATTR bool force_stop_display = false;
 volatile uint32_t last_dcdc_off_time = 0;
 volatile uint32_t last_dcdc_on_time  = 0;      // Момент включения питания (защита от раннего выключения)
-// Последняя ПОДТВЕРЖДЁННАЯ активность: запрос Play или реально раскрутившееся колесо.
-// Отдельно от last_dcdc_on_time: вибродатчик срабатывает от любой тряски, и если
-// считать каждую попытку раскрутки активностью, устройство в рюкзаке не уснёт никогда.
+// Последняя ПОДТВЕРЖДЁННАЯ активность: запрос Play, реально раскрутившееся
+// колесо, или нарочитая серия толчков (см. vib_burst_event ниже). Отдельно от
+// last_dcdc_on_time: вибродатчик срабатывает от любой тряски, и если считать
+// каждую попытку раскрутки активностью, устройство в рюкзаке не уснёт никогда
+// — но настоящая серия в 20 толчков за секунду это уже не случайный толчок, а
+// тот же жест, что признан таковым при пробуждении из глубокого сна.
 static uint32_t last_motion_ms = 0;
 volatile uint32_t last_web_activity_time = 0;  // Отслеживание активности в Web UI
 volatile bool     wakeup_event       = false;  // Импульс с вибродатчика
 volatile bool     request_play_flag  = false;
+
+// Подряд идущие импульсы вибродатчика в скользящем окне VIB_WAKE_WINDOW_MS —
+// тот же порог "нарочитой тряски", что фильтрует случайные толчки при
+// пробуждении из глубокого сна (см. vib_wake_hits в setup()), только здесь
+// применяется, пока чип уже не спит: колесо разбужено (после серии при
+// пробуждении, кнопкой, или ещё бодрствует после предыдущего показа) и ждёт
+// вращения или подключения по BLE. vib_burst_hits/vib_burst_last_us — рабочее
+// состояние счётчика, трогает только ISR; vib_burst_event — однобитный флаг
+// для loop(), выставляется, когда порог набран.
+volatile uint8_t  vib_burst_hits    = 0;
+volatile uint32_t vib_burst_last_us = 0;
+volatile bool     vib_burst_event   = false;
 
 volatile float last_lux_value = 0.0f;          // Последнее усреднённое показание ALS-PT19 (лк)
 
@@ -357,6 +372,22 @@ static PowerCache pwr_cache;
 void IRAM_ATTR vibrationInterruptHandler() {
     if (power_state == PWR_OFF) {
         wakeup_event = true;
+    }
+
+    // Серия толчков за VIB_WAKE_WINDOW_MS — см. комментарий у vib_burst_hits
+    // выше. FALLING, а не CHANGE (как раньше): считаем ровно по одному разу на
+    // физический толчок, тем же способом, что и порог при пробуждении из
+    // глубокого сна, а не по два раза на каждый (LOW и обратно в HIGH).
+    // Пауза длиннее окна обнуляет счёт — это уже не та же тряска, а новая.
+    uint32_t now = micros();
+    if ((uint32_t)(now - vib_burst_last_us) > (uint32_t)VIB_WAKE_WINDOW_MS * 1000UL) {
+        vib_burst_hits = 0;
+    }
+    vib_burst_last_us = now;
+    if (vib_burst_hits < 0xFF) vib_burst_hits++;
+    if (vib_burst_hits >= VIB_WAKE_HITS_REQUIRED) {
+        vib_burst_event = true;
+        vib_burst_hits  = 0;   // следующая серия считается заново
     }
 }
 
@@ -2960,7 +2991,7 @@ void setup() {
         attachInterruptArg(digitalPinToInterrupt(HALL_PIN[i]), hallInterruptHandler,
                            (void*)i, FALLING);
     }
-    attachInterrupt(digitalPinToInterrupt(PIN_VIBRATION), vibrationInterruptHandler, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PIN_VIBRATION), vibrationInterruptHandler, FALLING);
 
     // Замеряем питание ДО первого прохода loop(): автомат смотрит на
     // pwr_cache.usb, и без этого первую секунду он считал бы, что кабеля нет,
@@ -3070,6 +3101,21 @@ void loop() {
     if (wakeup_event) {
         wakeup_event = false;
         vibration = true;
+    }
+
+    // --- Нарочитая серия толчков продлевает окно ожидания перед сном ---
+    // До сих пор тряска в этом окне (60 с простоя / 5 мин с подключённым BLE
+    // до enterDeepSleep() ниже) никак его не продлевала: last_motion_ms
+    // трогает только реально раскрутившееся колесо или Play, как раз чтобы
+    // случайные толчки в рюкзаке не держали чип бодрым вечно (см. комментарий
+    // у last_motion_ms). Но настоящая серия в VIB_WAKE_HITS_REQUIRED толчков
+    // за VIB_WAKE_WINDOW_MS — тот же самый жест, который уже отличают от
+    // случайного толчка при пробуждении из глубокого сна, так что здесь он
+    // тоже засчитывается как подтверждённая активность.
+    if (vib_burst_event) {
+        vib_burst_event = false;
+        last_motion_ms  = now_ms;
+        webLog("[SYS] Vibration burst detected, sleep timer reset");
     }
 
     // =================== АВТОМАТ ПИТАНИЯ ===================
