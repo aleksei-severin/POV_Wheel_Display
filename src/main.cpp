@@ -15,6 +15,7 @@
 #include "esp_system.h"
 #include "esp_sleep.h"
 #include "esp_task_wdt.h"
+#include <sys/time.h>
 
 // Экспортируем сервер из network.cpp для добавления нового эндпоинта
 extern AsyncWebServer server;
@@ -1923,6 +1924,19 @@ static void powerRailUpAndBlank(uint8_t en_pin) {
     for (int i = 0; i < 3; i++) blankAllLEDs_DMA();
 }
 
+// 240 МГц нужны ровно там, где счёт идёт на микросекунды — заливка кадра и
+// очередь DMA в fillSectorIntoBuffer() во время PWR_FULL. Вне рендеринга это
+// просто впустую крутящиеся на максимуме ядра: без CONFIG_PM_ENABLE в этой
+// сборке (см. sdkconfig — динамическое масштабирование частоты выключено)
+// частота CPU иначе всегда фиксирована на 240 МГц, и это доминирует над
+// потреблением BLE-адвертайзинга на порядок. 80 МГц ничего не портит на шинах:
+// у ESP32-S3 APB держится на 80 МГц что при 240, что при 160, что при 80 МГц
+// CPU (делится только множитель ядра, не APB) — SPI/DMA к SK9822, BLE и Wi-Fi
+// работают на том же самом тактировании независимо от этого переключения.
+static void setCpuFreqForPower(PowerState st) {
+    setCpuFrequencyMhz(st == PWR_FULL ? 240 : 80);
+}
+
 // Переключение ступеней питания. Вызывать ТОЛЬКО из loop().
 static void applyPowerState(PowerState target) {
     // Пока подключён USB, силовая часть не поднимается ни по какому поводу.
@@ -1933,6 +1947,7 @@ static void applyPowerState(PowerState target) {
 
     switch (target) {
         case PWR_OFF:
+            setCpuFreqForPower(PWR_OFF);
             // Сначала снимаем флаг — renderingTask прекращает трогать SPI,
             // затем гасим диоды, и только потом снимаем питание.
             power_state = PWR_OFF;
@@ -1952,6 +1967,7 @@ static void applyPowerState(PowerState target) {
             break;
 
         case PWR_SPINUP:
+            setCpuFreqForPower(PWR_SPINUP);
             if (power_state == PWR_FULL) {
                 // Обороты упали — гасим лучи 2–6, первый оставляем под питанием
                 power_state = PWR_SPINUP;
@@ -1972,6 +1988,10 @@ static void applyPowerState(PowerState target) {
             break;
 
         case PWR_FULL:
+            // На полную частоту переходим ДО подъёма шины: fillSectorIntoBuffer()
+            // и очередь DMA должны застать CPU уже на 240 МГц, а не в процессе
+            // переключения.
+            setCpuFreqForPower(PWR_FULL);
             // Колесо реально раскрутилось — это подтверждённая активность
             last_dcdc_on_time = millis();
             last_motion_ms    = last_dcdc_on_time;
@@ -2001,6 +2021,17 @@ static void applyPowerState(PowerState target) {
 // вибрация уже ПОСЛЕ того как маску починили) проходит эту проверку
 // насквозь и обрабатывается как обычно.
 RTC_DATA_ATTR static bool vib_stuck_wait = false;
+
+// Счётчик подряд идущих пробуждений именно вибродатчиком (см.
+// VIB_WAKE_HITS_REQUIRED в config.h) — единичный толчок не должен стоить
+// полного boot. Обнуляется любым настоящим пробуждением: кнопкой или тем
+// же вибро, когда порог наконец набран, — а также если с прошлого толчка
+// прошло больше VIB_WAKE_WINDOW_MS (см. vib_wake_last_ms ниже).
+RTC_DATA_ATTR static uint8_t  vib_wake_hits     = 0;
+// Момент предыдущего засчитанного толчка, мс от gettimeofday() (то же время,
+// что и у часов — см. Wall Clock). millis() здесь не годится: он обнуляется
+// на каждом глубоком сне, а нам нужен интервал МЕЖДУ снами.
+RTC_DATA_ATTR static uint64_t vib_wake_last_ms  = 0;
 
 // Дебаунс одного пина: ждём устойчивый HIGH хотя бы stable_ms, но не дольше
 // timeout_ms. Возвращает true, если отпустило. Один мгновенный digitalRead()
@@ -2682,6 +2713,35 @@ void setup() {
         }
     }
 
+    // --- Фильтр "чихов": один толчок вибродатчика не будит по-настоящему ---
+    // См. VIB_WAKE_HITS_REQUIRED/VIB_WAKE_WINDOW_MS в config.h. Пробуждение
+    // кнопкой (одной или вместе с вибро) и пробуждение вибрацией во время
+    // предзаряда (см. batt_trickle_mode ниже — там это единственный способ
+    // достучаться до разряженного колеса) в счётчике не участвуют и
+    // сбрасывают его.
+    if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT1) {
+        uint64_t ext1_status  = esp_sleep_get_ext1_wakeup_status();
+        bool     woke_by_btn  = (ext1_status & (1ULL << PIN_BUTTON))    != 0;
+        bool     woke_by_vib  = (ext1_status & (1ULL << PIN_VIBRATION)) != 0;
+        if (woke_by_vib && !woke_by_btn && !batt_trickle_mode) {
+            struct timeval tv;
+            gettimeofday(&tv, nullptr);
+            uint64_t now_ms = (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)tv.tv_usec / 1000ULL;
+            // Пауза с прошлого толчка длиннее окна — это не та же тряска,
+            // считаем заново с этого толчка как с первого.
+            if (now_ms - vib_wake_last_ms > VIB_WAKE_WINDOW_MS) vib_wake_hits = 0;
+            vib_wake_last_ms = now_ms;
+            if (++vib_wake_hits < VIB_WAKE_HITS_REQUIRED) {
+                // Ещё не набрали порог — тот же дешёвый путь, что и при
+                // починке залипшего датчика: проверить, отпущен ли сейчас
+                // вибродатчик, и снова заснуть, не поднимая систему.
+                bool vib_ok = waitPinReleased(PIN_VIBRATION, 20, VIB_UNSTUCK_DEBOUNCE_MS);
+                armWakeSourcesAndSleep(vib_ok);   // не возвращается
+            }
+        }
+        vib_wake_hits = 0;   // порог набран, разбудила кнопка, или идёт предзаряд
+    }
+
     // --- Транспортный режим: разбираемся ДО всего остального ---
     // Проверка стоит здесь, а не ниже, потому что при неподтверждённом
     // пробуждении (кнопку задели, а не удержали) мы обязаны уснуть обратно
@@ -2921,6 +2981,13 @@ void setup() {
         webLog("[BLE] Setup failed, raising Wi-Fi as a fallback");
         pending_wifi_on = true;
     }
+
+    // Инициализация закончена — переходим на 80 МГц (см. setCpuFreqForPower):
+    // до сих пор частота стояла на полных 240 МГц, чтобы монтирование
+    // LittleFS, поднятие BLE и т.п. не тормозить. Если колесо уже крутится к
+    // этому моменту (пробуждение по тряске на ходу), первый же проход loop()
+    // сам поднимет частоту обратно через applyPowerState(PWR_FULL).
+    setCpuFreqForPower(PWR_OFF);
 }
 
 // =====================================================================
