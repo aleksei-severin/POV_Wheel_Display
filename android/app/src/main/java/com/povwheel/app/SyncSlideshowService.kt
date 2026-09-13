@@ -249,8 +249,14 @@ class SyncSlideshowService : Service() {
     private fun buildNotification(): Notification {
         val mgr = getSystemService(NotificationManager::class.java)
         if (mgr.getNotificationChannel(CHANNEL_ID) == null) {
+            // MIN, а не LOW: это уведомление обязано существовать (foreground
+            // service того требует — иначе система убивает процесс через
+            // несколько секунд после старта), но пользователю сам факт работы
+            // синхронизации неинтересен. MIN — самый тихий уровень, который
+            // Android вообще допускает для него: ни значка в статус-баре, ни
+            // всплытия, свёрнуто в конец шторки под "Show silent notifications".
             mgr.createNotificationChannel(
-                NotificationChannel(CHANNEL_ID, "Sync slideshow", NotificationManager.IMPORTANCE_LOW)
+                NotificationChannel(CHANNEL_ID, "Sync slideshow", NotificationManager.IMPORTANCE_MIN)
             )
         }
         val stopIntent = PendingIntent.getService(
@@ -270,7 +276,7 @@ class SyncSlideshowService : Service() {
             .setContentIntent(openIntent)
             .addAction(0, "Stop", stopIntent)
             .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setPriority(NotificationCompat.PRIORITY_MIN)
             .build()
     }
 }
