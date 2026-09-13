@@ -2513,6 +2513,23 @@ static int slideSequencePositionOf(const String& name, int effId) {
 //
 // Возвращает false, если файл не нашёлся на флеше (список эффектов, в
 // отличие от файлов, фиксирован прошивкой и всегда "существует").
+// НЕ ставит request_play_flag, в отличие от OP_PLAY/OP_EFFECT — и это не
+// упущение: fileLoaderTask() грузит pendingFilePath/pending_effect по
+// одному лишь семафору, request_play_flag ему вообще не нужен.
+// request_play_flag — это отдельный сигнал "перед нами настоящий, только что
+// поступивший запрос показа", по которому loop() (1) считает его
+// ПОДТВЕРЖДЁННОЙ активностью для таймера простоя (last_motion_ms/
+// last_play_ms) и (2) пытается поднять DCDC1 из PWR_OFF, чтобы измерить
+// обороты (play_pending). Автотик синхронной группы прилетает каждый
+// интервал слайдшоу САМ ПО СЕБЕ, без участия человека и независимо от того,
+// крутится ли колесо вообще — если бы он тоже поднимал этот флаг,
+// неподвижное колесо в составе группы никогда не доходило бы ни до PWR_OFF
+// (откат PWR_SPINUP → PWR_OFF в loop() требует now_ms - last_play_ms > 10000,
+// то есть 10 с БЕЗ обновлений last_play_ms — а тик прилетает как раз каждый
+// интервал слайдшоу, обычно короче, и держал бы last_play_ms свежим
+// бесконечно), ни тем более до глубокого сна, вдобавок раз за разом напрасно
+// поднимая арм 1 на неподвижном колесе. Контент всё равно подгружается —
+// просто без этих двух побочных эффектов.
 bool syncTick(const String& name, int effId) {
     if (name.length()) {
         if (!LittleFS.exists("/" + name)) return false;
@@ -2528,14 +2545,12 @@ bool syncTick(const String& name, int effId) {
             pendingFilePath    = "/" + name;
             pending_last_file  = name;
             force_stop_display = false;
-            request_play_flag  = true;
             xSemaphoreGive(fileLoaderSemaphore);
         }
     } else if (effId != effect_id) {
         pendingFilePath    = "";
         pending_effect     = (int8_t)effId;
         force_stop_display = false;
-        request_play_flag  = true;
         xSemaphoreGive(fileLoaderSemaphore);
     }
     return true;
