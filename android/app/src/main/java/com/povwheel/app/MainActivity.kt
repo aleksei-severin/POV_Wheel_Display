@@ -80,11 +80,29 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    override fun onDestroy() {
-        // Выход из приложения не должен оставлять открытыми полдюжины соединений.
-        if (isFinishing) vm.disconnectAll()
-        super.onDestroy()
+    // Единственная Activity в приложении, так что её onStart/onStop и есть
+    // «приложение вышло на передний план» / «свернули» — ProcessLifecycleOwner
+    // здесь не нужен. Простое сворачивание (Home, переключение на другое
+    // приложение) НЕ разбирает дерево Compose и не зовёт vm.onCleared() —
+    // сама ViewModel продолжает жить и держать свои соединения как ни в чём
+    // не бывало; см. WheelVm.enterBackground/enterForeground и класс
+    // WheelConnectivityService про то, зачем тогда всё равно нужна служба.
+    override fun onStart() {
+        super.onStart()
+        vm.enterForeground()
     }
+
+    override fun onStop() {
+        super.onStop()
+        vm.enterBackground()
+    }
+
+    // Закрытие соединений при выходе — забота WheelVm.onCleared() (она сама
+    // приходит из super.onDestroy() через очистку ViewModelStore), не этой
+    // Activity: onCleared() сначала передаёт их фоновым службам и только потом
+    // отключается сама (см. её комментарий) — самостоятельный disconnectAll()
+    // здесь опустошил бы clients раньше, чем службы успели бы получить
+    // подсказку по адресам.
 }
 
 /** Есть ли уже выданное разрешение — чтобы не спрашивать заново на каждом запуске. */

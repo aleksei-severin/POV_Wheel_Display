@@ -13,7 +13,7 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
-import androidx.core.content.ContextCompat
+import androidx.core.app.NotificationManagerCompat
 import com.povwheel.app.ble.BleClient
 import com.povwheel.app.ble.Link
 import kotlinx.coroutines.CoroutineScope
@@ -34,15 +34,15 @@ import kotlinx.coroutines.launch
  *
  * Обычно (экран открыт) сама она НИЧЕГО не шлёт и никуда не подключается —
  * тикер живёт во ViewModel, на её же, уже открытых соединениях. Служба лишь
- * ЗАПОМИНАЕТ состав/отбор/интервал последней активной группы ([track]) и
- * показывает уведомление. Как только `WheelVm.onCleared()` замечает, что
- * приложение закрывается, она просит службу взять тикер на себя
- * ([takeOverTicking]) — и вот тогда служба подключается к участникам с нуля и
- * продолжает слать те же команды сама. Если экран потом открывают заново и
- * успешно подключаются хотя бы к одному участнику, ViewModel просит службу
- * отпустить тикер обратно ([releaseTicking]) — служба гасит СВОИ соединения
- * (ничего не разослав, показ на колёсах не трогаем), и тикер возвращается во
- * ViewModel.
+ * ЗАПОМИНАЕТ состав/отбор/интервал последней активной группы ([track]) — само
+ * запоминание уже не требует её запуска, это просто statics, живущие пока жив
+ * процесс. Как только `WheelVm.onCleared()` замечает, что приложение
+ * закрывается, она просит службу взять тикер на себя ([takeOverTicking]) — и
+ * вот тогда служба подключается к участникам с нуля и продолжает слать те же
+ * команды сама. Если экран потом открывают заново и успешно подключаются хотя
+ * бы к одному участнику, ViewModel просит службу отпустить тикер обратно
+ * ([releaseTicking]) — служба гасит СВОИ соединения (ничего не разослав, показ
+ * на колёсах не трогаем), и тикер возвращается во ViewModel.
  *
  * Ключевое правило, ради которого всё это разделение: НИКОГДА не пытаться
  * подключиться к адресу, который в этот момент уже подключён во ViewModel
@@ -52,6 +52,18 @@ import kotlinx.coroutines.launch
  * «Synced slideshow started» показывался, а колесо ничего не получало) —
  * когда более ранняя версия этой службы пыталась подключаться сама сразу
  * при старте, не дожидаясь, пока экран отпустит то же самое соединение.
+ *
+ * Уведомление — живой индикатор, а не флаг «пользователь нажал Start»: оно
+ * показывается РОВНО когда у группы реально на связи два участника и больше,
+ * и прячется, как только их снова меньше двух (одно из колёс заснуло/вышло из
+ * радиуса) — независимо от того, кто в этот момент ведёт тикер. Пока ведёт
+ * ViewModel (экран открыт), решение принимает она сама через [setLiveVisible]
+ * — обычным `Notification`, безо всякого foreground-статуса службы, которой
+ * в этот момент даже не обязательно быть живой. Как только тикер переходит
+ * сюда ([startDriving]), решение переходит вместе с ним — [updateNotificationVisibility]
+ * дальше делает то же самое через startForeground/stopForeground, потому что
+ * здесь показ уже обязан быть foreground (иначе Android убьёт службу за
+ * несколько секунд простоя без него).
  */
 class SyncSlideshowService : Service() {
 
@@ -67,7 +79,6 @@ class SyncSlideshowService : Service() {
         private const val CHANNEL_ID = "sync_slideshow"
         private const val NOTIF_ID = 42
 
-        private const val ACTION_TRACK = "com.povwheel.app.sync.TRACK"
         private const val ACTION_TAKE_OVER = "com.povwheel.app.sync.TAKE_OVER"
         private const val ACTION_RELEASE = "com.povwheel.app.sync.RELEASE"
         private const val ACTION_STOP = "com.povwheel.app.sync.STOP"
@@ -82,13 +93,13 @@ class SyncSlideshowService : Service() {
          *  помнит о нём) — второе соединение к нему сейчас небезопасно. */
         fun isDrivingAddress(addr: String): Boolean = addr in drivingMembers
 
-        /** Запомнить состав группы и поднять уведомление — без подключения,
-         *  тикер пока (или уже снова) ведёт ViewModel сама. */
-        fun track(ctx: Context, members: List<String>, names: List<String>, files: List<String>, intervalMs: Int) {
+        /**
+         * Запомнить состав группы — просто statics, живущие пока жив процесс.
+         * НЕ запускает и не трогает саму службу и НЕ показывает уведомление:
+         * пока ведёт ViewModel, ей самой ничего из этого не нужно (см. класс).
+         */
+        fun track(members: List<String>, names: List<String>, files: List<String>, intervalMs: Int) {
             tracked = TrackedGroup(members, names, files, intervalMs)
-            ContextCompat.startForegroundService(
-                ctx, Intent(ctx, SyncSlideshowService::class.java).apply { action = ACTION_TRACK }
-            )
         }
 
         /** Обновить отбор/интервал уже запомненной группы — на лету, без
@@ -118,6 +129,64 @@ class SyncSlideshowService : Service() {
         fun stop(ctx: Context) {
             ctx.startService(Intent(ctx, SyncSlideshowService::class.java).apply { action = ACTION_STOP })
         }
+
+        /**
+         * Показать (или спрятать) живое уведомление синхронного показа —
+         * ПОКА тикер ведёт ViewModel, то есть службе для этого не обязательно
+         * быть запущена вовсе: обычный `Notification`, не связанный ни с каким
+         * foreground-статусом. [namesIfLive] — участники, реально на связи
+         * ([Link.Ready]), числом два и больше; null — меньше двух, уведомление
+         * прячем. Как только тикер переходит службе ([startDriving]), эту же
+         * запись (тот же канал/id) начинает вести она сама, через
+         * [updateNotificationVisibility] — двух одновременных писателей в
+         * один и тот же момент не бывает по построению: пока ViewModel жива и
+         * зовёт это, служба ещё не забирала у неё соединения (см. класс).
+         */
+        fun setLiveVisible(ctx: Context, namesIfLive: List<String>?) {
+            val mgr = ctx.getSystemService(NotificationManager::class.java)
+            ensureChannel(mgr)
+            if (namesIfLive == null) {
+                mgr.cancel(NOTIF_ID)
+            } else {
+                NotificationManagerCompat.from(ctx).notify(NOTIF_ID, buildNotification(ctx, namesIfLive))
+            }
+        }
+
+        private fun ensureChannel(mgr: NotificationManager) {
+            if (mgr.getNotificationChannel(CHANNEL_ID) == null) {
+                // MIN, а не LOW: пользователю сам факт синхронизации не так
+                // важен, чтобы всплывать или показывать значок в статус-баре —
+                // MIN сворачивает уведомление в конец шторки, под "Show silent
+                // notifications", но не убирает его как таковое (обязательное
+                // условие для живущей foreground-службы, когда она есть).
+                mgr.createNotificationChannel(
+                    NotificationChannel(CHANNEL_ID, "Sync slideshow", NotificationManager.IMPORTANCE_MIN)
+                )
+            }
+        }
+
+        private fun buildNotification(ctx: Context, names: List<String>): Notification {
+            ensureChannel(ctx.getSystemService(NotificationManager::class.java))
+            val stopIntent = PendingIntent.getService(
+                ctx, 0,
+                Intent(ctx, SyncSlideshowService::class.java).apply { action = ACTION_STOP },
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+            val openIntent = PendingIntent.getActivity(
+                ctx, 0,
+                Intent(ctx, MainActivity::class.java),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+            return NotificationCompat.Builder(ctx, CHANNEL_ID)
+                .setContentTitle("Sync slideshow running")
+                .setContentText(names.joinToString(" ↔ "))
+                .setSmallIcon(R.mipmap.ic_launcher)
+                .setContentIntent(openIntent)
+                .addAction(0, "Stop", stopIntent)
+                .setOngoing(true)
+                .setPriority(NotificationCompat.PRIORITY_MIN)
+                .build()
+        }
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -128,7 +197,6 @@ class SyncSlideshowService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_TRACK -> startForegroundCompat(buildNotification())
             ACTION_TAKE_OVER -> startDriving()
             ACTION_RELEASE -> stopDriving(sendStop = false)
             ACTION_STOP -> doStop()
@@ -145,18 +213,27 @@ class SyncSlideshowService : Service() {
     private fun startDriving() {
         val group = tracked ?: return
         if (driveJob?.isActive == true || drivingMembers.isNotEmpty()) return
+        // Обязана стать foreground сразу — иначе Android убьёт службу в
+        // течение нескольких секунд после startForegroundService(). Заметность
+        // самого уведомления решает refreshDriving()/updateNotificationVisibility
+        // по факту того, сколько участников РЕАЛЬНО на связи — это здесь
+        // единственное отступление от правила, и то временное: доля секунды,
+        // пока идёт первое подключение, когда Android требует показать хоть что-то.
+        startForegroundCompat(buildNotification(this, group.names))
         driveJob = scope.launch {
             delay(600)
             val adapter = (getSystemService(BLUETOOTH_SERVICE) as BluetoothManager).adapter
             for (a in group.members) {
                 if (clients.containsKey(a)) continue
                 val dev = try { adapter.getRemoteDevice(a) } catch (e: Exception) { continue }
-                clients[a] = BleClient(applicationContext, dev)
+                val c = BleClient(applicationContext, dev)
+                c.onLinkLost = { scope.launch { refreshDriving() } }
+                clients[a] = c
             }
             clients.values
                 .map { c -> launch { if (c.link.value != Link.Ready) runCatching { c.connect() } } }
                 .joinAll()
-            drivingMembers = clients.filterValues { it.link.value == Link.Ready }.keys
+            refreshDriving()
             var index = -1
             while (isActive) {
                 val cfg = tracked ?: break
@@ -179,21 +256,45 @@ class SyncSlideshowService : Service() {
         }
     }
 
+    /** Пересчитывает, кто из участников сейчас реально на связи, и поправляет
+     *  видимость уведомления по этому факту. Вызывается после каждой попытки
+     *  подключения и на каждый обрыв ([BleClient.onLinkLost]) — то есть именно
+     *  тогда, когда true-состояние группы могло измениться. */
+    private fun refreshDriving() {
+        drivingMembers = clients.filterValues { it.link.value == Link.Ready }.keys
+        updateNotificationVisibility()
+    }
+
+    /** Показывает уведомление, когда у группы два участника и больше реально
+     *  на связи, и прячет его иначе — не останавливая саму службу: она обязана
+     *  продолжать сканирование/тикер и после того, как один из участников
+     *  отвалился, поэтому это [stopForeground], а не [stopSelf]. */
+    private fun updateNotificationVisibility() {
+        val group = tracked
+        if (group != null && drivingMembers.size >= 2) {
+            startForegroundCompat(buildNotification(this, group.names))
+        } else {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        }
+    }
+
     /** Отменяет и паузу-перед-подключением, и сам тикер (см. [driveJob]),
      *  закрывает СВОИ соединения — и, если [sendStop], сначала гасит показ
-     *  на них ([BleClient.stop]). Останавливать саму службу/уведомление не
-     *  входит в её обязанности — это делает [doStop] отдельно. */
+     *  на них ([BleClient.stop]). Всегда завершает саму службу: экран уже
+     *  забирает управление обратно (см. WheelVm.enterForeground/connect), и
+     *  держать её живой без дела до следующего takeOverTicking незачем. */
     private fun stopDriving(sendStop: Boolean) {
         driveJob?.cancel(); driveJob = null
         val toClose = ArrayList(clients.values)
         clients.clear()
         drivingMembers = emptySet()
-        if (toClose.isEmpty()) return
+        stopForeground(STOP_FOREGROUND_REMOVE)
         scope.launch {
             for (c in toClose) {
                 if (sendStop && c.link.value == Link.Ready) runCatching { c.stop() }
                 c.close()
             }
+            stopSelf()
         }
     }
 
@@ -224,6 +325,7 @@ class SyncSlideshowService : Service() {
                     }
                 }.joinAll()
             }
+            NotificationManagerCompat.from(this@SyncSlideshowService).cancel(NOTIF_ID)
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         }
@@ -244,39 +346,5 @@ class SyncSlideshowService : Service() {
         } else {
             startForeground(NOTIF_ID, notification)
         }
-    }
-
-    private fun buildNotification(): Notification {
-        val mgr = getSystemService(NotificationManager::class.java)
-        if (mgr.getNotificationChannel(CHANNEL_ID) == null) {
-            // MIN, а не LOW: это уведомление обязано существовать (foreground
-            // service того требует — иначе система убивает процесс через
-            // несколько секунд после старта), но пользователю сам факт работы
-            // синхронизации неинтересен. MIN — самый тихий уровень, который
-            // Android вообще допускает для него: ни значка в статус-баре, ни
-            // всплытия, свёрнуто в конец шторки под "Show silent notifications".
-            mgr.createNotificationChannel(
-                NotificationChannel(CHANNEL_ID, "Sync slideshow", NotificationManager.IMPORTANCE_MIN)
-            )
-        }
-        val stopIntent = PendingIntent.getService(
-            this, 0,
-            Intent(this, SyncSlideshowService::class.java).apply { action = ACTION_STOP },
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-        val openIntent = PendingIntent.getActivity(
-            this, 0,
-            Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Sync slideshow running")
-            .setContentText((tracked?.names ?: emptyList()).joinToString(" ↔ "))
-            .setSmallIcon(R.mipmap.ic_launcher)
-            .setContentIntent(openIntent)
-            .addAction(0, "Stop", stopIntent)
-            .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_MIN)
-            .build()
     }
 }

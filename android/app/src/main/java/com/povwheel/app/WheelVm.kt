@@ -264,6 +264,30 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         SyncSlideshowService.stop(ctx)
     }
 
+    /**
+     * Видимость уведомления синхронного показа — только пока эта ViewModel
+     * (экран открыт) сама ведёт группу [addr]. Показывает его РОВНО когда у
+     * группы реально на связи ([Link.Ready], а не просто «числится в группе»)
+     * два участника и больше — не когда пользователь нажал «Start», а когда
+     * синхронизация действительно идёт. Один участник онлайн (второе колесо
+     * ещё не проснулось/спит) — уведомления нет; как только их снова стало
+     * два — оно появляется само, без отдельного действия пользователя.
+     * Вызывается из коллектора [BleClient.link] на каждое изменение связи
+     * ЛЮБОГО участника — пересчитывает состояние группы целиком, так что не
+     * важно, чей именно `link` сейчас поменялся.
+     *
+     * Пока группу ведёт [SyncSlideshowService] (экран закрыт), видимость
+     * решает она сама, тем же правилом, через свой updateNotificationVisibility —
+     * это единственное место, где решение принимает ViewModel.
+     */
+    private fun updateSyncNotification(addr: String) {
+        val group = syncGroups[addr] ?: return
+        val readyNames = group.members
+            .filter { clients[it]?.link?.value == Link.Ready }
+            .map { m -> wheels.value.firstOrNull { it.address == m }?.name ?: m }
+        SyncSlideshowService.setLiveVisible(ctx, if (readyNames.size >= 2) readyNames else null)
+    }
+
     /** Токен эффекта («@e3») → его номер, иначе null (значит это имя файла). */
     private fun slideEffectId(token: String): Int? =
         if (isSlideEffect(token)) token.removePrefix("@e").toIntOrNull() else null
@@ -442,7 +466,8 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         armGroupFallback(members, list, ms)
         startGroupTicker(group)
         val names = members.map { m -> wheels.value.firstOrNull { it.address == m }?.name ?: m }
-        SyncSlideshowService.track(ctx, members, names, list, ms)
+        SyncSlideshowService.track(members, names, list, ms)
+        updateSyncNotification(addr)
         say("Synced slideshow started")
     }
 
@@ -666,6 +691,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      * иначе показать «подключаемся» и запустить соединение.
      */
     fun openWheel(addr: String, name: String) {
+        setIgnored(addr, false)
         val c = clients[addr]
         if (c != null && c.link.value == Link.Ready) selectWheel(addr)
         else {
@@ -806,8 +832,27 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         if (known.add(addr)) prefs.edit().putStringSet("known", known).apply()
     }
 
+    /**
+     * Адреса, которые сканирование НЕ должно само подключать (см. [onSeenAgain]
+     * и комментарий там про автоподключение к любому впервые увиденному
+     * колесу). Единственный, кто сюда попадает, — [forget]: колесо продолжает
+     * рекламировать себя и без этого флага переподключилось бы обратно в
+     * течение секунды после «Forget», сделав кнопку бессмысленной. Тап по
+     * строке (см. [openWheel]) снимает флаг — раз пользователь сам попросил
+     * это колесо, автоподключение к нему снова уместно.
+     */
+    private fun isIgnored(addr: String): Boolean =
+        (prefs.getStringSet("ignored", emptySet()) ?: emptySet()).contains(addr)
+
+    private fun setIgnored(addr: String, v: Boolean) {
+        val ignored = prefs.getStringSet("ignored", emptySet())!!.toMutableSet()
+        val changed = if (v) ignored.add(addr) else ignored.remove(addr)
+        if (changed) prefs.edit().putStringSet("ignored", ignored).apply()
+    }
+
     fun forget(addr: String) {
         disconnect(addr)
+        setIgnored(addr, true)
         val known = prefs.getStringSet("known", emptySet())!!.toMutableSet()
         known.remove(addr)
         val edit = prefs.edit().putStringSet("known", known).remove("name_" + addr)
@@ -862,6 +907,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 // свайп на него открывал библиотеку сразу, а не с задержкой.
                 if (lk == Link.Ready) { prefetchWheel(addr); restoreSyncStateIfNeeded(addr); nudgeGroupSync(addr) }
                 else prefetched.remove(addr)
+                updateSyncNotification(addr)
             } }
             launch { c.tele.collect { rebuildWheels() } }
         }
@@ -869,14 +915,23 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         reconnectJobs.remove(addr)?.cancel()
         rebuildWheels()
         viewModelScope.launch {
-            // SyncSlideshowService могла подключиться к этому же адресу сама,
-            // пока экран был закрыт (см. комментарий в начале секции про
-            // синхронизацию слайдшоу) — второе, параллельное соединение с
-            // этого же телефона ненадёжно, поэтому просим её отпустить и
-            // недолго ждём подтверждения, прежде чем пробовать сами.
+            // SyncSlideshowService или WheelConnectivityService могли подключиться
+            // к этому же адресу сами, пока экран был закрыт или свёрнут (см.
+            // комментарий в начале секции про синхронизацию слайдшоу и класс
+            // WheelConnectivityService) — второе, параллельное соединение с
+            // этого же телефона ненадёжно, поэтому просим их отпустить и
+            // недолго ждём подтверждения, прежде чем пробовать сами. Обычно
+            // (см. enterForeground) это уже сделано заранее и здесь — просто
+            // проверка вхолостую, но connect() зовут и другие пути (тап по
+            // строке, openLastWheel, авто-подключение по рекламе), которым
+            // такой явной подготовки не досталось.
             if (SyncSlideshowService.isDrivingAddress(addr)) {
                 SyncSlideshowService.releaseTicking(ctx)
                 withTimeoutOrNull(1500) { while (SyncSlideshowService.isDrivingAddress(addr)) delay(50) }
+            }
+            if (WheelConnectivityService.isDrivingAddress(addr)) {
+                WheelConnectivityService.release(ctx)
+                withTimeoutOrNull(1500) { while (WheelConnectivityService.isDrivingAddress(addr)) delay(50) }
             }
             val ok = c.connect()
             connected.value = clients.values.toList()
@@ -1005,13 +1060,22 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * Колесо, которого мы ждём, снова в эфире — значит оно уже проснулось, и
-     * это куда более надёжный повод для попытки, чем слепой таймер. Именно этот
-     * случай и есть основной: колесо засыпает через минуту простоя, а хозяин
-     * встряхивает его когда придётся.
+     * Колесо в эфире — подключаемся сами, не дожидаясь тапа по строке. Раньше
+     * это было исключением: автоподключение работало только для уже известных
+     * колёс ([wantConnected] заполняет только [connect], то есть осознанный
+     * выбор пользователя), а впервые увиденное просто лежало в списке, пока
+     * его не тронут руками. Колесо у велосипеда — не случайный чужой маячок
+     * (фильтр сканирования уже отсеял всё, кроме нашего сервиса), и ждать тап
+     * незачем: единственная причина НЕ подключаться сама — [isIgnored], то
+     * есть колесо, которое только что явно забыли ([forget]) и оно ещё не
+     * успело перестать рекламировать себя.
+     *
+     * Тот же путь и для уже известного, но отвалившегося колеса: оно снова в
+     * эфире — значит проснулось, и это куда более надёжный повод для попытки,
+     * чем слепой таймер (см. [onLinkLost]).
      */
     private fun onSeenAgain(addr: String) {
-        if (!wantConnected.contains(addr)) return
+        if (isIgnored(addr)) return
         val lk = clients[addr]?.link?.value
         if (lk == Link.Ready || lk == Link.Connecting) return
         reconnectJobs[addr]?.cancel()
@@ -2092,6 +2156,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         btStateReceiver = null
         stopScan()
         handOffActiveSyncGroups()
+        handOffConnectivity()
         disconnectAll()
         synchronized(clipMem) { clipMem.clear() }
         super.onCleared()
@@ -2112,8 +2177,84 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             if (!seen.add(group)) continue
             group.job?.cancel()
             val names = group.members.map { m -> wheels.value.firstOrNull { it.address == m }?.name ?: m }
-            SyncSlideshowService.track(ctx, group.members, names, group.files, group.intervalMs)
+            SyncSlideshowService.track(group.members, names, group.files, group.intervalMs)
             SyncSlideshowService.takeOverTicking(ctx)
         }
+    }
+
+    /**
+     * То же самое, но для ВСЕХ остальных, не синхронных, колёс — иначе
+     * закрытие приложения бросало их без единого способа переподключиться
+     * (см. класс [WheelConnectivityService]: скан + автоподключение по тем же
+     * правилам, что и здесь, только без экрана). Участников синхронной группы
+     * не передаём сюда — их уже забрал [handOffActiveSyncGroups], и служба
+     * связи сама пропускает любой адрес, у которого есть трекнутая группа
+     * ([SyncSlideshowService.trackedGroupFor]), чтобы не подключаться к нему
+     * второй раз параллельно.
+     *
+     * [hint] — адреса, что были на связи прямо перед закрытием: их можно
+     * пробовать подключить сразу по MAC, не дожидаясь свежей рекламы (колесо
+     * рекламу не шлёт, пока подключено, — см. комментарий в rebuildWheels).
+     * Остальные известные/увиденные колёса подхватит собственное сканирование
+     * службы, как только они дадут о себе знать.
+     *
+     * Если колёс никогда не было (пустой install), службу вообще не поднимаем —
+     * нечего сторожить.
+     */
+    private fun handOffConnectivity() {
+        val known = prefs.getStringSet("known", emptySet()) ?: emptySet()
+        if (known.isEmpty() && wantConnected.isEmpty()) return
+        val syncMembers = syncGroups.keys
+        val hint = clients.filterKeys { it !in syncMembers }
+            .filterValues { it.link.value == Link.Ready }
+            .keys.toList()
+        WheelConnectivityService.takeOver(ctx, hint)
+    }
+
+    /**
+     * Экран снова на переднем плане. Если [WheelConnectivityService] всё это
+     * время сторожила колёса сама (приложение было закрыто, не просто
+     * свёрнуто) — забираем управление обратно: просим её отпустить свои
+     * соединения, недолго ждём подтверждения (та же причина, что и у
+     * [SyncSlideshowService] — два параллельных GATT-соединения к одному
+     * адресу с одного телефона ненадёжны) и явно подключаемся сами к тому, что
+     * она держала, не дожидаясь свежей рекламы (подключённое колесо не
+     * рекламирует себя). Своё собственное сканирование эта ViewModel не
+     * останавливала на время простого сворачивания (см. [enterBackground]) —
+     * `startScan()` здесь безвредна и на этот случай, и как страховка, если
+     * что-то всё же остановило её раньше.
+     */
+    fun enterForeground() {
+        if (!WheelConnectivityService.isBusy()) return
+        viewModelScope.launch {
+            val held = WheelConnectivityService.snapshotDriving()
+            WheelConnectivityService.release(ctx)
+            withTimeoutOrNull(1500) { while (WheelConnectivityService.isBusy()) delay(50) }
+            startScan()
+            for (addr in held) {
+                if (clients[addr]?.link?.value != Link.Ready) {
+                    connect(addr, prefs.getString("name_" + addr, "POV wheel") ?: "POV wheel")
+                }
+            }
+        }
+    }
+
+    /**
+     * Экран свернули (кнопка Home, переключение на другое приложение) — САМА
+     * ViewModel продолжает жить и держать свои соединения ровно как и раньше
+     * (Compose не разбирает дерево при простой остановке Activity, только при
+     * уничтожении), так что здесь ничего не отключаем и не передаём. Единственная
+     * задача — поднять [WheelConnectivityService] в режиме простого ожидания
+     * (без своего сканирования и подключений, только уведомление): Android
+     * глушит фоновое BLE-сканирование и может убить процесс целиком, если у
+     * приложения нет ни одной foreground-службы, — а без этого исчезал бы сам
+     * смысл автоподключения «даже когда телефон свёрнут». Если процесс всё же
+     * будет уничтожен по-настоящему, дойдёт до [onCleared], и служба сама
+     * перейдёт из ожидания в полноценный поиск (см. [handOffConnectivity]).
+     */
+    fun enterBackground() {
+        val known = prefs.getStringSet("known", emptySet()) ?: emptySet()
+        if (known.isEmpty() && wantConnected.isEmpty()) return
+        WheelConnectivityService.standby(ctx)
     }
 }

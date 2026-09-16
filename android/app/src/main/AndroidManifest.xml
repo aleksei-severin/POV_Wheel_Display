@@ -51,5 +51,13 @@
             android:name=".SyncSlideshowService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
+
+        <!-- Keeps scanning/auto-connecting to any wheel while the app is
+             backgrounded or closed — see the class doc in
+             WheelConnectivityService.kt. -->
+        <service
+            android:name=".WheelConnectivityService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
     </application>
 </manifest>
