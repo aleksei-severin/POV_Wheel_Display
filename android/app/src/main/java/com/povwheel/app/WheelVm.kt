@@ -208,6 +208,55 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      *  SyncSlideshowService в этом запуске ViewModel (см. restoreSyncStateIfNeeded) —
      *  once per address, дальше состояние уже ведёт сама реактивная логика. */
     private val restoredSyncFor = HashSet<String>()
+
+    // ---- Состав группы синхронного показа, переживающий убийство процесса ----
+    //
+    // SyncSlideshowService.tracked (см. класс там) — это statics самого
+    // процесса: они переживают закрытие Activity (ViewModel.onCleared()
+    // успевает передать ей тикер), но НЕ переживают, если систему убьёт сам
+    // процесс целиком, — а именно так Android обычно и убирает надолго
+    // свёрнутое приложение (LMK по памяти, батарейные менеджеры некоторых
+    // прошивок), в отличие от штатного закрытия задачи. onCleared() в этом
+    // случае просто не вызывается — Android не обещает его вызвать при убийстве
+    // процесса, только при управляемом уничтожении ViewModelStore. Ни один
+    // сервис тогда не поднимается вообще, оба колеса остаются каждое на своём
+    // автономном ходу (armGroupFallback), и без общего источника правды со
+    // временем расходятся по ФАЗЕ — при этом каждое из них продолжает
+    // переключаться на одном и том же интервале, поэтому со стороны это
+    // выглядит как «переключается синхронно, а показывает разное».
+    //
+    // Чтобы новый процесс (следующий открытый экран) мог немедленно
+    // восстановить группу, не дожидаясь, пока пользователь заново нажмёт
+    // Start, состав/отбор/интервал последней активной группы дублируются сюда,
+    // в SharedPreferences — при каждом изменении, теми же местами кода, что
+    // уже обновляют SyncSlideshowService.track()/updateConfig(). restoreSyncStateIfNeeded
+    // читает эту копию, когда SyncSlideshowService ничего не помнит (то есть
+    // процесс был убит и это первый запуск ViewModel после этого).
+    private fun persistSyncGroup(group: SyncGroup) {
+        prefs.edit()
+            .putString("syncgroup_members", group.members.joinToString(","))
+            .putString("syncgroup_files", group.files.joinToString(","))
+            .putInt("syncgroup_interval", group.intervalMs)
+            .apply()
+    }
+
+    private fun clearPersistedSyncGroup() {
+        prefs.edit()
+            .remove("syncgroup_members").remove("syncgroup_files").remove("syncgroup_interval")
+            .apply()
+    }
+
+    private data class PersistedSyncGroup(val members: List<String>, val files: List<String>, val intervalMs: Int)
+
+    private fun loadPersistedSyncGroup(): PersistedSyncGroup? {
+        val members = prefs.getString("syncgroup_members", null)
+            ?.split(",")?.filter { it.isNotEmpty() } ?: return null
+        val files = prefs.getString("syncgroup_files", null)
+            ?.split(",")?.filter { it.isNotEmpty() } ?: return null
+        if (members.size < 2 || files.isEmpty()) return null
+        val ms = prefs.getInt("syncgroup_interval", 10000)
+        return PersistedSyncGroup(members, files, ms)
+    }
     /**
      * Адрес → интервал слайдшоу, мс — ОДНО значение что для синхронного, что
      * для обычного показа, а не два разных: `setSlideInterval` пишет сюда при
@@ -262,6 +311,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         // slideIntervalMs НЕ трогаем — см. комментарий у него: это последнее
         // использованное значение, оно должно пережить остановку показа.
         SyncSlideshowService.stop(ctx)
+        clearPersistedSyncGroup()
     }
 
     /**
@@ -322,38 +372,59 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
 
     /**
      * Отражение группы синхронного показа для [addr] могло не пережить
-     * закрытие приложения — сама ViewModel новая, `syncGroups` пуст. Источник
-     * правды теперь не SharedPreferences, а сама [SyncSlideshowService]: пока
-     * жив процесс (а именно это и означает «служба пережила закрытие
-     * приложения»), она хранит состав/отбор/интервал последней активной
-     * группы в памяти — надёжнее файла настроек, который остался бы верным и
-     * тогда, когда службу давно убили вместе с процессом, и мы бы ожили показ
-     * без единого способа проверить, что он ещё правда идёт (`OP_PLAY`, в
-     * отличие от `OP_ALBUM`, не оставляет на устройстве никакого флага,
-     * который телефон мог бы потом перепросить).
+     * закрытие приложения — сама ViewModel новая, `syncGroups` пуст. Два
+     * источника, в порядке предпочтения:
      *
-     * Если служба что-то помнит для этого адреса — забираем тикер обратно
-     * сюда: она отпускает СВОИ соединения (см. releaseTicking и комментарий в
-     * начале секции про то, почему второе соединение к тому же адресу
-     * ненадёжно), и как только это подтверждено, здесь заводится обычный
-     * тикер на соединениях этой ViewModel; заодно подключаемся к остальным
-     * участникам группы, которых сама эта ViewModel ещё не открывала.
-     * Однократно на адрес за время жизни ViewModel — дальше состоянием
-     * заведуют сами [startSyncedSlideshow]/[endSync].
+     * 1. [SyncSlideshowService] — пока жив процесс (а именно это и означает
+     *    «служба пережила закрытие приложения»), она хранит состав/отбор/
+     *    интервал последней активной группы в памяти, обновлённый вплоть до
+     *    самого последнего изменения. Если служба что-то помнит для этого
+     *    адреса — забираем тикер обратно сюда: она отпускает СВОИ соединения
+     *    (см. releaseTicking и комментарий в начале секции про то, почему
+     *    второе соединение к тому же адресу ненадёжно), и как только это
+     *    подтверждено, здесь заводится обычный тикер на соединениях этой
+     *    ViewModel.
+     *
+     * 2. Копия в SharedPreferences ([loadPersistedSyncGroup]) — на случай,
+     *    если процесс был не штатно закрыт, а убит целиком (LMK, батарейный
+     *    менеджер прошивки): тогда ViewModel.onCleared() не вызывается вовсе,
+     *    ни один сервис не поднимается, и SyncSlideshowService ничего не
+     *    помнит, хотя показ должен был продолжаться. Без этой копии оба
+     *    колеса так и остались бы каждое на своём автономном ходу навсегда —
+     *    до тех пор, пока пользователь не нажмёт Start заново, — вместо того
+     *    чтобы просто снова оказаться в группе, как только оба окажутся на
+     *    связи. Здесь никого не нужно ни о чём просить отпустить: раз служба
+     *    ничего не помнит, значит она и не подключалась.
+     *
+     * В обоих случаях подключаемся заодно к остальным участникам группы,
+     * которых сама эта ViewModel ещё не открывала. Однократно на адрес за
+     * время жизни ViewModel — дальше состоянием заведуют сами
+     * [startSyncedSlideshow]/[endSync].
      */
     private fun restoreSyncStateIfNeeded(addr: String) {
         if (!restoredSyncFor.add(addr)) return
         if (syncGroups.containsKey(addr)) return
-        val tracked = SyncSlideshowService.trackedGroupFor(addr) ?: return
-        val group = SyncGroup(tracked.members, tracked.files, tracked.intervalMs)
-        for (m in tracked.members) syncGroups[m] = group
-        syncPartners.value = syncPartners.value + tracked.members.associateWith { m -> tracked.members - m }
-        slideIntervalMs.value = slideIntervalMs.value + tracked.members.associateWith { tracked.intervalMs }
+        val fromService = SyncSlideshowService.trackedGroupFor(addr)
+        val members: List<String>
+        val files: List<String>
+        val ms: Int
+        if (fromService != null) {
+            members = fromService.members; files = fromService.files; ms = fromService.intervalMs
+        } else {
+            val persisted = loadPersistedSyncGroup()?.takeIf { addr in it.members } ?: return
+            members = persisted.members; files = persisted.files; ms = persisted.intervalMs
+        }
+        val group = SyncGroup(members, files, ms)
+        for (m in members) syncGroups[m] = group
+        syncPartners.value = syncPartners.value + members.associateWith { m -> members - m }
+        slideIntervalMs.value = slideIntervalMs.value + members.associateWith { ms }
         viewModelScope.launch {
-            SyncSlideshowService.releaseTicking(ctx)
-            withTimeoutOrNull(1500) { while (SyncSlideshowService.isDrivingAddress(addr)) delay(50) }
+            if (fromService != null) {
+                SyncSlideshowService.releaseTicking(ctx)
+                withTimeoutOrNull(1500) { while (SyncSlideshowService.isDrivingAddress(addr)) delay(50) }
+            }
             startGroupTicker(group)
-            for (m in tracked.members) {
+            for (m in members) {
                 if (m != addr && clients[m] == null) {
                     connect(m, prefs.getString("name_" + m, "POV wheel")!!)
                 }
@@ -467,6 +538,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         startGroupTicker(group)
         val names = members.map { m -> wheels.value.firstOrNull { it.address == m }?.name ?: m }
         SyncSlideshowService.track(members, names, list, ms)
+        persistSyncGroup(group)
         updateSyncNotification(addr)
         say("Synced slideshow started")
     }
@@ -1859,6 +1931,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             group.intervalMs = ms
             slideIntervalMs.value = slideIntervalMs.value + group.members.associateWith { ms }
             SyncSlideshowService.updateConfig(group.files, ms)
+            persistSyncGroup(group)
             for (m in group.members) {
                 clients[m]?.takeIf { it.link.value == Link.Ready }?.let { c ->
                     viewModelScope.launch { runCatching { c.album(true, ms) } }
@@ -2056,6 +2129,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                     // SyncSlideshowService) тоже сообщаем.
                     if (group.index >= group.files.size) group.index = -1
                     SyncSlideshowService.updateConfig(group.files, group.intervalMs)
+                    persistSyncGroup(group)
                     armGroupFallback(group.members, group.files, group.intervalMs)
                 }
                 if (shared.isNotEmpty()) {

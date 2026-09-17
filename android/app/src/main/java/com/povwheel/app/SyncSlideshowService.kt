@@ -83,6 +83,10 @@ class SyncSlideshowService : Service() {
         private const val ACTION_RELEASE = "com.povwheel.app.sync.RELEASE"
         private const val ACTION_STOP = "com.povwheel.app.sync.STOP"
 
+        /** Пауза между попытками подтянуть участника, который всё ещё не Ready —
+         *  см. [reconnectLoop]. */
+        private const val RECONNECT_RETRY_MS = 10_000L
+
         @Volatile private var tracked: TrackedGroup? = null
         @Volatile private var drivingMembers: Set<String> = emptySet()
 
@@ -222,18 +226,12 @@ class SyncSlideshowService : Service() {
         startForegroundCompat(buildNotification(this, group.names))
         driveJob = scope.launch {
             delay(600)
-            val adapter = (getSystemService(BLUETOOTH_SERVICE) as BluetoothManager).adapter
-            for (a in group.members) {
-                if (clients.containsKey(a)) continue
-                val dev = try { adapter.getRemoteDevice(a) } catch (e: Exception) { continue }
-                val c = BleClient(applicationContext, dev)
-                c.onLinkLost = { scope.launch { refreshDriving() } }
-                clients[a] = c
-            }
+            connectMissingMembers()
             clients.values
                 .map { c -> launch { if (c.link.value != Link.Ready) runCatching { c.connect() } } }
                 .joinAll()
             refreshDriving()
+            launch { reconnectLoop() }
             var index = -1
             while (isActive) {
                 val cfg = tracked ?: break
@@ -253,6 +251,55 @@ class SyncSlideshowService : Service() {
                 }
                 delay(cfg.intervalMs.toLong())
             }
+        }
+    }
+
+    /** Заводит клиента для каждого участника группы, для которого его ещё нет
+     *  ([clients] дальше живёт до самого [stopDriving]/[doStop]) — сам
+     *  connectGatt не запускает, только создаёт объект и вешает [BleClient.onLinkLost].
+     *  Вызывается и при первом запуске ([startDriving]), и повторно из
+     *  [reconnectLoop] на случай, если сюда попали до того, как первый вызов
+     *  вообще успел отработать. */
+    @SuppressLint("MissingPermission")
+    private fun connectMissingMembers() {
+        val group = tracked ?: return
+        val adapter = (getSystemService(BLUETOOTH_SERVICE) as BluetoothManager).adapter
+        for (a in group.members) {
+            if (clients.containsKey(a)) continue
+            val dev = try { adapter.getRemoteDevice(a) } catch (e: Exception) { continue }
+            val c = BleClient(applicationContext, dev)
+            c.onLinkLost = { scope.launch { refreshDriving() } }
+            clients[a] = c
+        }
+    }
+
+    /**
+     * Повторяет попытку подключения к участникам, которые ещё (или уже) не
+     * Ready. Единственная попытка при старте [startDriving] исходила из того,
+     * что колесо либо уже в эфире, либо не наша забота — но самый обычный
+     * повод для передачи тикера сюда (ViewModel закрылась, потому что колёса
+     * заснули) — это ровно тот случай, когда колесо ещё СПИТ в момент этого
+     * первого подключения: BLE-стек и реклама поднимаются не мгновенно после
+     * пробуждения. Без повтора такое колесо оставалось бы вне тиков до самого
+     * doStop/следующего takeOverTicking — крутило бы свой автономный запасной
+     * ход (WheelVm.armGroupFallback), с тем же интервалом, но расходясь по
+     * фазе с остальными участниками, которые тикер всё это время получают, —
+     * снаружи это выглядит как «переключается синхронно, показывает разное».
+     * Фиксированный интервал, без экспоненциального роста, как у
+     * WheelVm.onLinkLost на экране: участников здесь единицы, а не десятки
+     * экранов сразу, так что телефон от этого заметно не греется.
+     */
+    private suspend fun CoroutineScope.reconnectLoop() {
+        while (isActive) {
+            delay(RECONNECT_RETRY_MS)
+            val group = tracked ?: break
+            connectMissingMembers()
+            val toRetry = group.members.mapNotNull { a ->
+                clients[a]?.takeIf { it.link.value != Link.Ready && it.link.value != Link.Connecting }
+            }
+            if (toRetry.isEmpty()) continue
+            toRetry.map { c -> launch { runCatching { c.connect() } } }.joinAll()
+            refreshDriving()
         }
     }
 
@@ -311,6 +358,15 @@ class SyncSlideshowService : Service() {
         val toClose = ArrayList(clients.values)
         clients.clear()
         drivingMembers = emptySet()
+        // Единственный путь, которым Stop может прийти, пока сам процесс с
+        // ViewModel мёртв целиком (кнопка в уведомлении) — WheelVm.endSync()
+        // тогда не выполнится и не почистит свою копию состава группы в
+        // SharedPreferences (см. WheelVm.persistSyncGroup/clearPersistedSyncGroup);
+        // без этой чистки следующий запуск приложения посчитал бы, что группа
+        // всё ещё должна идти, и воскресил бы её сам, вопреки явному Stop.
+        getSharedPreferences("pov", MODE_PRIVATE).edit()
+            .remove("syncgroup_members").remove("syncgroup_files").remove("syncgroup_interval")
+            .apply()
         scope.launch {
             if (wasDriving) {
                 for (c in toClose) { if (c.link.value == Link.Ready) runCatching { c.stop() }; c.close() }
