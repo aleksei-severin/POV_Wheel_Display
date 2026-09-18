@@ -247,7 +247,13 @@ class SyncSlideshowService : Service() {
                     // если это соединение тоже пропадёт (Bluetooth выключили,
                     // саму службу убила система), колесу продолжать самому
                     // ровно за счёт того, что этот тикер его не разоружал.
-                    runCatching { if (effId != null) c.syncTick(null, effId) else c.syncTick(name) }
+                    //
+                    // launch, не прямой suspend-вызов — та же причина, что и в
+                    // WheelVm.startGroupTicker: рассылка по очереди отдавала
+                    // задержку/таймаут (до 8 с) одного просевшего соединения
+                    // остальным участникам цикла, что и читалось как
+                    // периодическое расхождение показа при исправной связи.
+                    launch { runCatching { if (effId != null) c.syncTick(null, effId) else c.syncTick(name) } }
                 }
                 delay(cfg.intervalMs.toLong())
             }
