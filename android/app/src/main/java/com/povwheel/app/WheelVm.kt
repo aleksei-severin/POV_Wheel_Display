@@ -1997,13 +1997,40 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         getConverted: suspend (UpItem, Int) -> Converter.Result,
         cachedPreviews: MutableSet<Uri>,
         radioMutex: Mutex
-    ) {
+    ) = coroutineScope {
         val s = session(addr)
+        // Держит именно ЭТО колесо на связи своим собственным 5-минутным
+        // таймером простоя (idle_limit_ms в main.cpp) на всё время его участия
+        // в заливке — не только пока в него реально льются байты. Конвертация
+        // — чистое CPU-время на телефоне, ни одного байта по радио; а при
+        // синхронной заливке на несколько колёс сюда добавляется ожидание
+        // своей очереди на [radioMutex] — оба случая легко растягиваются за
+        // 5 минут на большой пачке файлов, и колесо, к которому в этот момент
+        // ничего не шло, засыпало посреди загрузки. Прошивка нарочно не
+        // считает активностью OP_TELE/OP_FRAG (см. handleCmd в povble.cpp —
+        // иначе забытая открытая вкладка держала бы колесо бодрым вечно), а
+        // fsInfo() — обычная команда, которая идёт в счёт, и заодно не
+        // бесполезная: свежее свободное место и так нужно для проверки,
+        // влезает ли следующий файл.
+        val keepAliveJob = launch {
+            while (isActive) {
+                delay(90_000)
+                val c = client(addr) ?: continue
+                if (c.link.value == Link.Ready) {
+                    runCatching { c.fsInfo() }.getOrNull()?.let {
+                        fsInfoByAddr[addr] = it
+                        if (current.value == addr) fsInfo.value = it
+                    }
+                }
+            }
+        }
+
         val remaining = jobs.toMutableList()
         var ok = 0
         var skip = 0
         var fail = 0
 
+        try {
         for (item in jobs) {
             val c = client(addr)
             if (c == null || c.link.value != Link.Ready) {
@@ -2124,6 +2151,9 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         // Тостом сообщаем только когда всё прошло чисто — иначе строка статуса
         // под самой сеткой и так на виду, повторять её всплывающим тостом незачем.
         if (fail == 0) say((client(addr)?.hello?.name ?: addr) + ": " + msg)
+        } finally {
+            keepAliveJob.cancel()
+        }
     }
 
     private fun fmtKb(bytes: Long): String = when {
