@@ -1,6 +1,8 @@
 import com.android.build.api.variant.impl.VariantOutputImpl
+import java.io.ByteArrayOutputStream
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
+import java.time.temporal.ChronoUnit
 
 plugins {
     id("com.android.application")
@@ -11,8 +13,47 @@ plugins {
 // конфигурацию, чтобы все выходы одной сборки назывались одинаково.
 // Импорты обязательны: в скрипте Kotlin DSL идентификатор java занят
 // расширением Gradle для Java-плагина, и java.time.* оттуда не разрешается.
-val buildStamp: String = LocalDateTime.now()
-    .format(DateTimeFormatter.ofPattern("yyyy-MM-dd-HH-mm"))
+val buildTime: LocalDateTime = LocalDateTime.now()
+val buildStamp: String = buildTime.format(DateTimeFormatter.ofPattern("yyyy-MM-dd-HH-mm"))
+
+/** Короткий хеш HEAD, плюс «-dirty», если в дереве есть незакоммиченные правки —
+ *  тогда APK не соответствует ровно ни одному коммиту, и это стоит видеть сразу,
+ *  а не гадать при жалобе на баг, который уже могли починить. "nogit" — если
+ *  сборка идёт вне git-репозитория (например, распакованный архив исходников). */
+fun gitDescribe(): String {
+    fun run(vararg cmd: String): String {
+        val out = ByteArrayOutputStream()
+        val result = project.exec {
+            commandLine(*cmd)
+            standardOutput = out
+            errorOutput = ByteArrayOutputStream()
+            isIgnoreExitValue = true
+        }
+        return if (result.exitValue == 0) out.toString().trim() else ""
+    }
+    val hash = run("git", "rev-parse", "--short=8", "HEAD").ifEmpty { return "nogit" }
+    // Пathspec ".." — это android/ (скрипт выполняется из android/app): грязный
+    // флаг должен отражать несохранённые правки самого приложения, а не любую
+    // незакоммиченную мелочь в прошивке где-то в остальном репозитории.
+    val dirty = run("git", "status", "--porcelain", "--", "..").isNotEmpty()
+    return hash + (if (dirty) "-dirty" else "")
+}
+val gitStamp: String = gitDescribe()
+
+// android.versionName — то самое поле, которое Android показывает в «Инфо о
+// приложении» как версию. Раньше это была статичная «1.0» на все сборки —
+// после установки поверх новой не было способа отличить её от предыдущей, не
+// сверяя дату файла APK (которая теряется при пересылке). Формат — дата-время
+// сборки (тот же buildStamp, что и в имени APK, — так эти два места нельзя
+// перепутать) плюс короткий git-хеш: по нему сразу видно, какой коммит внутри.
+val appVersionName: String = buildStamp + "+" + gitStamp
+
+// android.versionCode обязан расти от сборки к сборке (Android иначе не даёт
+// поставить APK поверх более новой версии через штатный апдейт). Минуты от
+// фиксированной эпохи — простое монотонное число, влезающее в Int (переполнит
+// Int32 нескоро: 2^31 минут — это больше четырёх тысяч лет).
+val versionEpoch: LocalDateTime = LocalDateTime.of(2024, 1, 1, 0, 0)
+val appVersionCode: Int = ChronoUnit.MINUTES.between(versionEpoch, buildTime).toInt()
 
 android {
     namespace = "com.povwheel.app"
@@ -22,8 +63,8 @@ android {
         applicationId = "com.povwheel.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = appVersionCode
+        versionName = appVersionName
     }
 
     buildTypes {

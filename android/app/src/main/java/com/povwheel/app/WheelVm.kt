@@ -31,7 +31,11 @@ import com.povwheel.app.convert.Converter
 import com.povwheel.app.convert.Fit
 import com.povwheel.app.convert.PreviewClip
 import com.povwheel.app.convert.PreviewClips
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -39,6 +43,8 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
@@ -342,12 +348,80 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     private fun slideEffectId(token: String): Int? =
         if (isSlideEffect(token)) token.removePrefix("@e").toIntOrNull() else null
 
+    private val SYNC_TICK_RETRIES = 3
+    private val SYNC_TICK_RETRY_DELAY_MS = 150L
+
+    /**
+     * Один OP_SYNC_TICK с короткими повторами при неудаче.
+     *
+     * Раньше неудачный тик (таймаут, отказ радио — обычное дело на движущемся
+     * велосипеде, где у одного колеса связь то и дело проседает) просто тонул
+     * в `runCatching` и терялся молча. Это выглядело безобидно (следующий тик
+     * придёт через интервал), но на деле НЕ так: `group.index` в тикере — это
+     * ОБЩИЙ на группу счётчик позиции, он в любом случае уходит на следующий
+     * пункт при следующем витке, независимо от того, применилось ли текущее
+     * значение на КОНКРЕТНОМ колесе. Так одна потерянная посылка навсегда
+     * сдвигала это колесо на шаг назад относительно остальных участников — не
+     * "отстало на секунду и догонит", а "теперь и дальше показывает не то",
+     * пока не переподключится ([nudgeGroupSync] подтягивает только тогда).
+     * Именно так выглядит жалоба "синхронное слайдшоу включено, оба дисплея
+     * онлайн, а показывают разное" — без единого явного сбоя связи, который
+     * можно было бы заметить по статусу подключения.
+     *
+     * Три попытки с короткой паузой между ними укладываются в малую долю даже
+     * минимального интервала слайдшоу (1 с) и не мешают следующему тику: тот
+     * всё равно посылает АКТУАЛЬНОЕ на тот момент значение `group.index`, а не
+     * повторяет устаревшее.
+     */
+    private suspend fun sendSyncTick(c: BleClient, name: String, effId: Int?) {
+        repeat(SYNC_TICK_RETRIES) { attempt ->
+            val ok = runCatching { if (effId != null) c.syncTick(null, effId) else c.syncTick(name) }.isSuccess
+            if (ok || attempt == SYNC_TICK_RETRIES - 1) return
+            delay(SYNC_TICK_RETRY_DELAY_MS)
+        }
+    }
+
+    /** Верхняя граница ожидания в [waitUntilApplied] — колесо, которое не
+     *  подтвердило смену за это время (отвалилось, заснуло, застряло),
+     *  просто пропускается: групповой показ не должен зависать навсегда
+     *  из-за одного участника. */
+    private val SYNC_APPLY_TIMEOUT_MS = 8000L
+
+    /**
+     * Ждёт (не дольше [SYNC_APPLY_TIMEOUT_MS]), чтобы КАЖДЫЙ из [members]
+     * реально показал именно [name] (или эффект [effId]) — по телеметрии
+     * (`tele.file`/`tele.effect`): прошивка выставляет `currentDisplayFile`
+     * только когда файл ДЕЙСТВИТЕЛЬНО дочитан (см. `currentDisplayFile = path`
+     * в конце `loadFrameFromFile()`, main.cpp/network.cpp), а не в момент,
+     * когда его попросили показать. Без этого ожидания тикер отсчитывал бы
+     * следующий интервал по своим часам, даже если чьё-то колесо ещё грузит
+     * ТЕКУЩИЙ файл дольше самого интервала — рассинхрон копился бы тик за
+     * тиком (на движущемся велосипеде со слабой связью это уже к третьему-
+     * четвёртому переключению даёт разницу в несколько картинок) и никогда
+     * не выправлялся бы сам. Колесо, не подтвердившее смену вовремя, просто
+     * не задерживает остальных — следующий тик всё равно пришлёт ему
+     * АКТУАЛЬНОЕ на тот момент имя, а не то, что оно пропустило.
+     */
+    private suspend fun waitUntilApplied(members: List<String>, name: String, effId: Int?) {
+        withTimeoutOrNull(SYNC_APPLY_TIMEOUT_MS) {
+            members.mapNotNull { addr -> clients[addr] }
+                .map { c ->
+                    async {
+                        runCatching {
+                            c.tele.first { t -> if (effId != null) t.effect == effId else t.effect == 0 && t.file == name }
+                        }
+                    }
+                }
+                .awaitAll()
+        }
+    }
+
     /** Тикер группы: раз в интервал шлёт OP_PLAY/OP_EFFECT на все адреса
      *  группы разом через ИХ СОБСТВЕННЫЕ, уже открытые соединения этой
      *  ViewModel — см. комментарий в начале секции про то, почему именно так,
      *  а не через OP_ALBUM на каждом колесе по отдельности. Молча пропускает
      *  временно не-Ready участников — они подхватят показ, как только
-     *  переподключатся, следующим же тиком. */
+     *  переподключятся, следующим же тиком. */
     private fun startGroupTicker(group: SyncGroup) {
         group.job?.cancel()
         group.job = viewModelScope.launch {
@@ -356,26 +430,35 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 group.index = (group.index + 1).let { if (it >= group.files.size) 0 else it }
                 val name = group.files[group.index]
                 val effId = slideEffectId(name)
-                for (a in group.members) {
-                    clients[a]?.takeIf { it.link.value == Link.Ready }?.let { c ->
-                        // syncTick — не play()/effect(): те гасят автономный ход
-                        // слайдшоу на колесе (см. комментарий в начале секции и
-                        // syncTick() в прошивке), а он должен остаться вооружён
-                        // на случай, если телефон пропадёт без предупреждения.
-                        //
-                        // launch, а не прямой suspend-вызов: request() ждёт ответа
-                        // до 8 с, и один и тот же цикл раньше слал тики ПО ОЧЕРЕДИ
-                        // — просевшее соединение с одним колесом (на велосипеде
-                        // обычно заднее, хуже видит телефон через раму/корпус)
-                        // задерживало отправку СЛЕДУЮЩЕМУ участнику, у которого
-                        // связь была в порядке. Со стороны это читалось как
-                        // «то синхронно, то показывает разное, то снова
-                        // синхронно» — ровно вслед за колебаниями качества связи
-                        // одного колеса, хотя оба всё время оставались Ready.
-                        // Параллельная рассылка убирает эту наведённую задержку.
-                        launch { runCatching { if (effId != null) c.syncTick(null, effId) else c.syncTick(name) } }
-                    }
+                val readyMembers = group.members.filter { clients[it]?.link?.value == Link.Ready }
+                for (a in readyMembers) {
+                    val c = clients[a]!!
+                    // syncTick — не play()/effect(): те гасят автономный ход
+                    // слайдшоу на колесе (см. комментарий в начале секции и
+                    // syncTick() в прошивке), а он должен остаться вооружён
+                    // на случай, если телефон пропадёт без предупреждения.
+                    //
+                    // launch, а не прямой suspend-вызов: request() ждёт ответа
+                    // до 8 с, и один и тот же цикл раньше слал тики ПО ОЧЕРЕДИ
+                    // — просевшее соединение с одним колесом (на велосипеде
+                    // обычно заднее, хуже видит телефон через раму/корпус)
+                    // задерживало отправку СЛЕДУЮЩЕМУ участнику, у которого
+                    // связь была в порядке. Со стороны это читалось как
+                    // «то синхронно, то показывает разное, то снова
+                    // синхронно» — ровно вслед за колебаниями качества связи
+                    // одного колеса, хотя оба всё время оставались Ready.
+                    // Параллельная рассылка убирает эту наведённую задержку.
+                    // sendSyncTick — то же лекарство от того же симптома,
+                    // но для ОДНОЙ неудачной посылки, а не для очереди целиком.
+                    launch { sendSyncTick(c, name, effId) }
                 }
+                // Держим текущий пункт на экране хотя бы intervalMs, но не
+                // короче — сначала ждём, чтобы ВСЕ участники реально его
+                // показали (см. waitUntilApplied), и только потом отсчитываем
+                // сам интервал. Иначе холостая гонка «отправили и пошли
+                // дальше» именно и накапливает рассинхрон, который сама эта
+                // функция должна устранять.
+                waitUntilApplied(readyMembers, name, effId)
                 delay(group.intervalMs.toLong())
             }
         }
@@ -461,9 +544,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         val c = clients[addr] ?: return
         val name = group.files[group.index]
         val effId = slideEffectId(name)
-        viewModelScope.launch {
-            runCatching { if (effId != null) c.syncTick(null, effId) else c.syncTick(name) }
-        }
+        viewModelScope.launch { sendSyncTick(c, name, effId) }
     }
 
     /**
@@ -626,6 +707,11 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     private var pollJob: kotlinx.coroutines.Job? = null
     private var scanStopJob: kotlinx.coroutines.Job? = null
     private var btStateReceiver: BroadcastReceiver? = null
+    // Объявлено ДО init: инициализатор `= null` идущей ниже переменной иначе
+    // выполнился бы уже ПОСЛЕ startConnectSweep() (см. её же порядок в init) —
+    // Kotlin прогоняет инициализаторы полей и блоки init строго в текстовом
+    // порядке — и затирал бы обратно в null только что запущенную задачу.
+    private var connectSweepJob: kotlinx.coroutines.Job? = null
 
     init {
         // Тик устаревания. Без него строка «видели 3 с назад» так и висит
@@ -639,6 +725,62 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         found.value = knownDevices()
         rebuildWheels()
         registerBtStateReceiver()
+        startConnectSweep()
+    }
+
+    /**
+     * Пробует подключиться к КАЖДОМУ известному колесу без связи — считай что
+     * сразу при старте (первый проход отложен лишь на 50 мс — см. комментарий
+     * внутри, — а не до момента, когда колесо засветится сканом) и затем
+     * регулярно, страховкой к [onSeenAgain]. Специально БЕЗ проверки [WheelEntry.reachable]
+     * (то есть без ожидания, что колесо уже засветилось сканом): `connect()`
+     * открывает GATT напрямую по MAC-адресу — ровно так же, как
+     * [openLastWheel] всегда подключала последнее колесо, ни разу не дожидаясь
+     * рекламного пакета, — и это и есть единственный способ начать попытку
+     * СРАЗУ после открытия приложения, а не только когда/если повезёт поймать
+     * рекламу. Колесо не в радиусе просто получит отказ по таймауту (~20 с,
+     * см. [openLastWheel]) и будет переспрошено на следующем проходе.
+     *
+     * `connect()` безопасно звать повторно — для Connecting/Ready он выходит
+     * сразу же, ничего не задваивая, так что частый тик ничего не стоит для
+     * уже подключённых/подключающихся колёс.
+     */
+    private fun startConnectSweep() {
+        if (connectSweepJob?.isActive == true) return
+        connectSweepJob = viewModelScope.launch {
+            // Обязательная задержка ПЕРЕД первым проходом, а не после: launch
+            // на Dispatchers.Main.immediate, вызванный уже с главного потока
+            // (как здесь, из init), выполняется СИНХРОННО вплоть до первой
+            // настоящей точки приостановки. Без неё тело цикла — и, значит,
+            // весь connect() с записью в clients/wantConnected/watchJobs и
+            // конструированием BleClient — отработало бы прямо ВНУТРИ
+            // конструктора WheelVm, до того как отработали инициализаторы
+            // полей, объявленных ниже по файлу (например, uploadSessions и
+            // соседей в разделе заливки) — то есть на ещё не до конца
+            // построенном объекте. Ровно поэтому тикер устаревания чуть выше
+            // тоже начинает с delay(), а не с самого дела. delay(), в отличие
+            // от yield(), гарантированно уходит через таймер и не может
+            // схлопнуться в синхронный вызов на immediate-диспетчере.
+            delay(50)
+            while (true) {
+                for (w in wheels.value) {
+                    // Проверяем ЖИВОЕ состояние клиента, а не снимок w.link из
+                    // wheels.value: тот мог устареть на доли секунды между
+                    // пересборкой списка и этой строкой. connect() для уже
+                    // готового клиента синхронно зовёт selectWheel(addr) —
+                    // это ПРАВИЛЬНО для тапа по строке (пользователь явно так
+                    // и просил), но регулярный фоновый тик не должен вслед за
+                    // устаревшим снимком вырывать экран из-под того, что
+                    // человек прямо сейчас смотрит (например, ход синхронной
+                    // заливки на другом колесе).
+                    val live = clients[w.address]?.link?.value
+                    if (live == Link.Ready || live == Link.Connecting) continue
+                    if (isIgnored(w.address)) continue
+                    connect(w.address, w.name)
+                }
+                delay(4000)
+            }
+        }
     }
 
     /**
@@ -701,7 +843,8 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     /** Пересобрать [wheels]. Дёшево: колёс единицы, а не сотни. */
     private fun rebuildWheels() {
         val now = System.currentTimeMillis()
-        val known = prefs.getStringSet("known", emptySet()) ?: emptySet()
+        val order = knownOrder()
+        val known = order.toHashSet()
         val byAddr = LinkedHashMap<String, WheelEntry>()
 
         for (f in found.value) {
@@ -741,19 +884,47 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             )
         }
 
-        // Порядок: сначала живые, потом слышимые, потом всё остальное. Внутри
-        // группы — по имени, а НЕ по уровню сигнала: сортировка по RSSI
-        // переставляла строки под пальцем на каждом пакете рекламы.
+        // Порядок — по тому, когда колесо стало известным ([knownOrder]),
+        // и НИКОГДА по статусу связи: строка раньше перескакивала местами
+        // при каждом подключении/обрыве (живые — в начало, offline — в
+        // конец), и в шапке с двумя-тремя колёсами это выглядело так, будто
+        // порядок вообще случаен. Новое известное колесо всегда уходит в
+        // конец ([markKnown]) и остаётся там, пока его не забудут. Ещё не
+        // известные (увидены сканом, но подключение впервые ещё не начато)
+        // идут следом, по имени — их там доли секунды, markKnown срабатывает
+        // уже на первой попытке автоподключения (см. [onSeenAgain]).
         wheels.value = byAddr.values.sortedWith(
             compareBy(
-                { when (it.link) {
-                    Link.Ready -> 0; Link.Connecting -> 1
-                    else -> if (it.stale) 3 else 2
-                } },
+                { val i = order.indexOf(it.address); if (i < 0) Int.MAX_VALUE else i },
                 { it.name.lowercase() },
                 { it.address }
             )
         )
+    }
+
+    /**
+     * Порядок «известных» колёс — устойчивый, не связанный со статусом связи:
+     * вновь известное всегда дописывается в КОНЕЦ ([markKnown]), а порядок
+     * уже известных не меняется, пока их не забудут ([forget]). Раньше это
+     * был `Set<String>` в prefs — Set не хранит порядок вставки, и строка в
+     * шапке экрана перестраивалась то так, то этак просто от пересохранения.
+     * Хранится строкой с разделителем, тем же приёмом, что и
+     * `syncgroup_members` ([persistSyncGroup]).
+     */
+    private fun knownOrder(): List<String> {
+        val raw = prefs.getString("known_order", null)
+        if (raw != null) return if (raw.isEmpty()) emptyList() else raw.split(",")
+        // Миграция со старого Set<String>, один раз: там порядка никогда не
+        // было, поэтому сортируем по имени — не идеально, но хотя бы
+        // детерминированно, а не «как повезёт хешу», и дальше уже не дёргается.
+        val old = prefs.getStringSet("known", emptySet()) ?: emptySet()
+        val migrated = old.sortedBy { (prefs.getString("name_" + it, null) ?: it).lowercase() }
+        saveKnownOrder(migrated)
+        return migrated
+    }
+
+    private fun saveKnownOrder(order: List<String>) {
+        prefs.edit().putString("known_order", order.joinToString(",")).apply()
     }
 
     fun bluetoothReady(): Boolean = adapter?.isEnabled == true
@@ -773,14 +944,28 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      * Открыть колесо по тапу в строке: если оно уже на связи — просто показать,
      * иначе показать «подключаемся» и запустить соединение.
      */
+    /**
+     * Тап по строке колеса.
+     *
+     * Уже на связи — просто показать. Иначе подключение и так само пытается
+     * идти (см. [startConnectSweep]) — тап лишь подталкивает его немедленно,
+     * не дожидаясь ближайшего тика. Экран при этом уводим на это колесо
+     * ТОЛЬКО если сейчас не на чем оставаться (ничего не открыто, либо
+     * открытое само не на связи) — иначе тап по офлайн-соседу или по тому, с
+     * которым только пытается установиться связь, распахивал бы пустой
+     * IdleContent взамен уже живой картинки активного дисплея, хотя
+     * показывать там пока нечего и, возможно, никогда не будет (колесо вне
+     * радиуса). `connect()` сама разберётся, показывать ли экран, как только
+     * реально подключится (см. её же комментарий про свободный экран).
+     */
     fun openWheel(addr: String, name: String) {
         setIgnored(addr, false)
         val c = clients[addr]
-        if (c != null && c.link.value == Link.Ready) selectWheel(addr)
-        else {
+        if (c != null && c.link.value == Link.Ready) { selectWheel(addr); return }
+        connect(addr, name)
+        if (current.value == null || clients[current.value]?.link?.value != Link.Ready) {
             current.value = addr
             prefs.edit().putString("last_wheel", addr).apply()
-            connect(addr, name)
         }
     }
 
@@ -809,11 +994,16 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
 
     /**
      * Свайп между колёсами: +1 — следующее, −1 — предыдущее, по кругу. Список —
-     * достижимые колёса ([WheelEntry.reachable]) в том же порядке, что в строке.
-     * Меньше двух — свайп ничего не делает.
+     * колёса реально НА СВЯЗИ ([Link.Ready]), в том же порядке, что в строке
+     * шапки. Не просто «достижимые» ([WheelEntry.reachable] — это ещё и
+     * Connecting, и просто увиденное сканом): подключение к соседнему колесу
+     * теперь и так идёт само по себе (см. [startConnectSweep]), а свайп на
+     * то, что ещё не подключилось, распахивал бы пустой IdleContent взамен
+     * живой картинки — свайпаться должно иметь смысл только между тем, что
+     * уже реально можно показать. Меньше двух — свайп ничего не делает.
      */
     fun cycleWheel(dir: Int) {
-        val list = wheels.value.filter { it.reachable }
+        val list = wheels.value.filter { it.link == Link.Ready }
         if (list.size < 2) return
         val i = list.indexOfFirst { it.address == current.value }.coerceAtLeast(0)
         val next = list[(i + dir).mod(list.size)]
@@ -909,10 +1099,11 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         prefs.edit().putString("name_" + addr, name).apply()
     }
 
-    /** Пользователь сам выбрал это колесо — вот теперь оно «известное». */
+    /** Пользователь сам выбрал это колесо — вот теперь оно «известное».
+     *  Новое — в конец [knownOrder]; уже известное своё место не меняет. */
     private fun markKnown(addr: String) {
-        val known = prefs.getStringSet("known", emptySet())!!.toMutableSet()
-        if (known.add(addr)) prefs.edit().putStringSet("known", known).apply()
+        val order = knownOrder()
+        if (addr !in order) saveKnownOrder(order + addr)
     }
 
     /**
@@ -936,13 +1127,13 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     fun forget(addr: String) {
         disconnect(addr)
         setIgnored(addr, true)
-        val known = prefs.getStringSet("known", emptySet())!!.toMutableSet()
-        known.remove(addr)
-        val edit = prefs.edit().putStringSet("known", known).remove("name_" + addr)
+        saveKnownOrder(knownOrder() - addr)
+        val edit = prefs.edit().remove("name_" + addr)
         if (prefs.getString("last_wheel", null) == addr) edit.remove("last_wheel")
         edit.apply()
         nameCache.remove(addr)
         filesByAddr.remove(addr); fsInfoByAddr.remove(addr); settingsByAddr.remove(addr)
+        uploadSessions.remove(addr); recomputeUploadBusyAddrs()
         prefs.edit().remove(magnetLockKey(addr)).apply()
         found.value = found.value.filter { it.address != addr }
         rebuildWheels()
@@ -950,10 +1141,8 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
 
     /** Колёса, виденные раньше: список не пуст ещё до того, как поиск что-то найдёт. */
     @SuppressLint("MissingPermission")
-    fun knownDevices(): List<Found> {
-        val known = prefs.getStringSet("known", emptySet()) ?: emptySet()
-        return known.map { Found(it, prefs.getString("name_" + it, "POV wheel")!!, -127, 0L) }
-    }
+    fun knownDevices(): List<Found> =
+        knownOrder().map { Found(it, prefs.getString("name_" + it, "POV wheel")!!, -127, 0L) }
 
     // ------------------------------------------------------------ соединение
 
@@ -1316,6 +1505,20 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     //
     //  viewModelScope живёт, пока жив экран устройства, поэтому переключение
     //  вкладок и поворот экрана заливку больше не трогают.
+    //
+    //  СОСТОЯНИЕ — НА КОЛЕСО, А НЕ ОДНО НА ВСЕХ. Раньше upItems/upStatus/
+    //  upProgress/upBusy и т. д. были одним общим MutableStateFlow на всё
+    //  приложение — тем самым, который показывает библиотека ТЕКУЩЕГО
+    //  открытого колеса. Заливка на колесо A и свайп на экран колеса B, пока
+    //  она идёт, показывали заливку и на B тоже — B ничего не грузили, а его
+    //  плитка всё равно рисовала жёлтые ячейки и сматывающийся ободок чужой
+    //  передачи. [UploadSession] — правильная единица состояния: один объект
+    //  на адрес, со своими items/status/progress/busy, и экран каждого колеса
+    //  видит только свою сессию (см. upItems и соседей ниже — теперь это
+    //  вычисляемые свойства от [current]). Синхронная заливка (см.
+    //  [startUpload]) поэтому не «одалживает» чужую сессию, а заводит СВОЮ на
+    //  каждой из выбранных партнёрских плиток — вот что и рисует независимый
+    //  прогресс на каждой странице.
     // =================================================================
     /**
      * Один выбранный для заливки файл со СВОИМИ параметрами конвертации. Пачку
@@ -1338,23 +1541,64 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         val ready: Boolean = false         // тип определён и постер отрисован
     )
 
-    val upItems    = MutableStateFlow<List<UpItem>>(emptyList())
-    val upSel      = MutableStateFlow(0)       // индекс превью, чьи настройки правит ряд пилюль
-    val upStatus   = MutableStateFlow("Waiting for a file…")
-    val upKind     = MutableStateFlow(0)       // 0 обычный, 1 успех, 2 ошибка
-    val upProgress = MutableStateFlow(-1f)
-    val upBusy     = MutableStateFlow(false)
-    /** Uri файла, который льётся прямо сейчас — его ячейка в сетке рисует
-     *  сматывающийся ободок по [upProgress]. null — ничего не льётся. */
-    val upCurrentUri = MutableStateFlow<Uri?>(null)
+    /** Заливка одного колеса: своя очередь, свой статус, свой прогресс. См.
+     *  комментарий выше — раньше это было одно состояние на всё приложение. */
+    private class UploadSession {
+        val items    = MutableStateFlow<List<UpItem>>(emptyList())
+        val sel      = MutableStateFlow(0)
+        val status   = MutableStateFlow("Waiting for a file…")
+        val kind     = MutableStateFlow(0)
+        val progress = MutableStateFlow(-1f)
+        val busy     = MutableStateFlow(false)
+        val currentUri = MutableStateFlow<Uri?>(null)
+        val selClip  = MutableStateFlow<PreviewClip?>(null)
+        /** Другие колёса, на которые уйдёт та же пачка (см. [startUpload]) —
+         *  живёт до нажатия Upload, редактируется только на странице-источнике. */
+        val syncTargets = MutableStateFlow<Set<String>>(emptySet())
+        var selClipJob: kotlinx.coroutines.Job? = null
+        var prepJob: kotlinx.coroutines.Job? = null
+    }
 
+    private val uploadSessions = HashMap<String, UploadSession>()
+    private val noWheelUploadSession = UploadSession()   // заглушка, пока ни одно колесо не открыто
+    private fun session(addr: String?): UploadSession =
+        if (addr == null) noWheelUploadSession else uploadSessions.getOrPut(addr) { UploadSession() }
+
+    /** Идёт ли заливка хоть на ОДНОМ колесе — этим гасят LOW_LATENCY-поиск
+     *  (делит радио с заливкой) и держат экран разбуженным, независимо от
+     *  того, чья именно страница открыта сейчас. */
+    val anyUploadBusy = MutableStateFlow(false)
+    /** Адреса колёс, чью очередь заливки сейчас лучше не трогать: либо в неё
+     *  уже что-то льётся, либо на ней лежит СВОЙ, ещё не отправленный набор
+     *  файлов. Экран берёт отсюда список тех, кого можно предложить в
+     *  партнёры синхронной заливки (см. [startUpload]) — иначе выбор второго
+     *  колеса в разгар его собственной заливки затёр бы её. */
+    val uploadBusyAddrs = MutableStateFlow<Set<String>>(emptySet())
+    private fun recomputeUploadBusyAddrs() {
+        anyUploadBusy.value = uploadSessions.values.any { it.busy.value }
+        uploadBusyAddrs.value = uploadSessions.filterValues { it.busy.value || it.items.value.isNotEmpty() }.keys
+    }
+
+    // ---- Свойства для ТЕКУЩЕГО (открытого) колеса — их и читает экран ----
+    val upItems: StateFlow<List<UpItem>> get() = session(current.value).items
+    val upSel: StateFlow<Int> get() = session(current.value).sel
+    val upStatus: StateFlow<String> get() = session(current.value).status
+    val upKind: StateFlow<Int> get() = session(current.value).kind
+    val upProgress: StateFlow<Float> get() = session(current.value).progress
+    val upBusy: StateFlow<Boolean> get() = session(current.value).busy
+    /** Uri файла, который льётся прямо сейчас на ЭТО колесо — его ячейка в
+     *  сетке рисует сматывающийся ободок по [upProgress]. null — ничего не льётся. */
+    val upCurrentUri: StateFlow<Uri?> get() = session(current.value).currentUri
     /** Анимированное превью ВЫБРАННОЙ ячейки сетки. Остальные остаются статичными
      *  постерами — держать в памяти клипы всех тридцати файлов ни к чему. */
-    val upSelClip  = MutableStateFlow<PreviewClip?>(null)
-    private var selClipJob: kotlinx.coroutines.Job? = null
-
-    /** Фоновая подготовка превью. Новый выбор файлов отменяет прошлую. */
-    private var prepJob: kotlinx.coroutines.Job? = null
+    val upSelClip: StateFlow<PreviewClip?> get() = session(current.value).selClip
+    /** Отмеченные партнёры синхронной заливки для очереди, стоящей на этой
+     *  странице прямо сейчас (см. [SyncTargetsRow]-подобный ряд в UploadStrip). */
+    val upSyncTargets: StateFlow<Set<String>> get() = session(current.value).syncTargets
+    fun toggleUpSyncTarget(addr: String) {
+        val s = session(current.value)
+        s.syncTargets.value = if (addr in s.syncTargets.value) s.syncTargets.value - addr else s.syncTargets.value + addr
+    }
 
     private val converter by lazy { Converter(ctx) }
 
@@ -1362,26 +1606,32 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     // мелко (34…104 dp), так что больше не нужно.
     private val POSTER_PX = 200
 
-    /** Выбрали файлы — строим пачку и запускаем фоновую подготовку превью. */
+    /** Выбрали файлы — строим пачку и запускаем фоновую подготовку превью.
+     *  Пачка ложится в сессию ТОГО колеса, чья страница открыта сейчас: именно
+     *  оно и есть источник — тут же настраиваются кадрирование/fps/длина и
+     *  отсюда, при желании, пачка ещё и разлетится на других колёс. */
     fun onFilesPicked(picked: List<Uri>) {
         if (picked.isEmpty()) return
-        prepJob?.cancel()
-        selClipJob?.cancel()
-        upSelClip.value = null
-        upItems.value = emptyList()
-        upSel.value = 0
-        upProgress.value = -1f
-        upStatus.value = "Reading " + picked.size + " file(s)…"
-        upKind.value = 0
+        val addr = current.value ?: return
+        val s = session(addr)
+        s.prepJob?.cancel()
+        s.selClipJob?.cancel()
+        s.selClip.value = null
+        s.items.value = emptyList()
+        s.sel.value = 0
+        s.progress.value = -1f
+        s.status.value = "Reading " + picked.size + " file(s)…"
+        s.kind.value = 0
         viewModelScope.launch {
-            val items = withContext(Dispatchers.IO) {
+            val list = withContext(Dispatchers.IO) {
                 picked.map { UpItem(it, converter.displayName(it)) }
             }
-            upItems.value = items
-            upStatus.value = if (items.size > 1) items.size.toString() + " files selected. Press Upload."
-                             else items[0].name + " ready. Press Upload."
-            upKind.value = 1
-            startPrep(items.indices.toList())
+            s.items.value = list
+            recomputeUploadBusyAddrs()
+            s.status.value = if (list.size > 1) list.size.toString() + " files selected. Press Upload."
+                             else list[0].name + " ready. Press Upload."
+            s.kind.value = 1
+            startPrep(addr, list.indices.toList())
         }
     }
 
@@ -1390,13 +1640,19 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      * одной, чтобы не грузить процессор всей пачкой сразу. Тип (видео/картинка)
      * и длительность ролика проставляются раньше постера: ряд пилюль должен
      * знать, показывать ли fps/длину, ещё до готовности превью.
+     *
+     * [addr] передаётся явно, а не берётся из [current]: подготовка растянута
+     * на много `await`, и пока она идёт, пользователь вполне может свайпнуть
+     * на другое колесо — превью обязаны дописаться в ТУ сессию, откуда пачка
+     * пришла, а не в ту, что случайно окажется открыта к моменту готовности.
      */
-    private fun startPrep(indices: List<Int>) {
-        prepJob?.cancel()
-        prepJob = viewModelScope.launch {
+    private fun startPrep(addr: String, indices: List<Int>) {
+        val s = session(addr)
+        s.prepJob?.cancel()
+        s.prepJob = viewModelScope.launch {
             for (i in indices) {
                 if (!isActive) break
-                val item0 = upItems.value.getOrNull(i) ?: continue
+                val item0 = s.items.value.getOrNull(i) ?: continue
                 val u = item0.uri
                 if (!item0.ready) {
                     val kind = withContext(Dispatchers.IO) {
@@ -1408,17 +1664,17 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                     }
                     val isVid = kind == Converter.Kind.VIDEO
                     val dur = if (isVid) withContext(Dispatchers.IO) { converter.videoDurationSec(u) } else 0.0
-                    updateByUri(u) {
+                    updateByUri(addr, u) {
                         it.copy(isVideo = isVid, anim = kind != Converter.Kind.IMAGE, srcDur = dur,
-                            lengthSec = if (isVid && !it.lenTouched) defaultLengthSec(it.fps, dur)
+                            lengthSec = if (isVid && !it.lenTouched) defaultLengthSec(addr, it.fps, dur)
                                         else it.lengthSec)
                     }
                 }
-                val fit = upItems.value.firstOrNull { it.uri == u }?.fit ?: Fit.CROP
+                val fit = s.items.value.firstOrNull { it.uri == u }?.fit ?: Fit.CROP
                 val poster = withContext(Dispatchers.Default) { converter.posterOf(u, fit, POSTER_PX) }
-                updateByUri(u) { it.copy(poster = poster, ready = true) }
+                updateByUri(addr, u) { it.copy(poster = poster, ready = true) }
                 // Готова выбранная ячейка — заводим её анимированное превью.
-                if (upItems.value.getOrNull(upSel.value)?.uri == u) refreshSelClip()
+                if (s.items.value.getOrNull(s.sel.value)?.uri == u) refreshSelClip(addr)
             }
         }
     }
@@ -1428,278 +1684,461 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      * для неё: держать в памяти по клипу на каждый из тридцати возможных файлов
      * незачем, а именно эту ячейку пользователь сейчас и разглядывает.
      */
-    private fun refreshSelClip() {
-        selClipJob?.cancel()
-        val cur = upItems.value.getOrNull(upSel.value)
+    private fun refreshSelClip(addr: String) {
+        val s = session(addr)
+        s.selClipJob?.cancel()
+        val cur = s.items.value.getOrNull(s.sel.value)
         // Прежний клип не утилизируем — его ещё может рисовать ячейка; освободит
         // сборщик. Один клип за раз, счёт идёт на мегабайты, не на десятки.
-        upSelClip.value = null
+        s.selClip.value = null
         if (cur == null || !cur.ready || !cur.anim) return
         val uri = cur.uri
         val fit = cur.fit
-        selClipJob = viewModelScope.launch {
+        s.selClipJob = viewModelScope.launch {
             val clip = withContext(Dispatchers.Default) {
                 runCatching {
                     converter.previewClip(uri, fit, PreviewClips.UPLOAD_PX, PreviewClips.UPLOAD_FRAMES)
                 }.getOrNull()
             }
-            val now = upItems.value.getOrNull(upSel.value)
+            val now = s.items.value.getOrNull(s.sel.value)
             if (isActive && now != null && now.uri == uri && now.fit == fit) {
-                upSelClip.value = clip
+                s.selClip.value = clip
             } else {
                 clip?.recycle()   // не показан — освобождаем сразу
             }
         }
     }
 
-    private fun updateByUri(uri: Uri, f: (UpItem) -> UpItem) {
-        val cur = upItems.value
+    private fun updateByUri(addr: String, uri: Uri, f: (UpItem) -> UpItem) {
+        val s = session(addr)
+        val cur = s.items.value
         val i = cur.indexOfFirst { it.uri == uri }
         if (i < 0) return
-        upItems.value = cur.toMutableList().also { it[i] = f(it[i]) }
+        s.items.value = cur.toMutableList().also { it[i] = f(it[i]) }
     }
 
-    private fun updateSel(f: (UpItem) -> UpItem) {
-        val cur = upItems.value
-        val i = upSel.value
+    private fun updateSel(addr: String, f: (UpItem) -> UpItem) {
+        val s = session(addr)
+        val cur = s.items.value
+        val i = s.sel.value
         if (i !in cur.indices) return
-        upItems.value = cur.toMutableList().also { it[i] = f(it[i]) }
+        s.items.value = cur.toMutableList().also { it[i] = f(it[i]) }
     }
 
     fun selectUpItem(i: Int) {
-        if (i in upItems.value.indices) { upSel.value = i; refreshSelClip() }
+        val addr = current.value ?: return
+        val s = session(addr)
+        if (i in s.items.value.indices) { s.sel.value = i; refreshSelClip(addr) }
     }
 
     /** Убрать один файл из пачки. */
     fun removeUpItem(i: Int) {
-        val cur = upItems.value
+        val addr = current.value ?: return
+        val s = session(addr)
+        val cur = s.items.value
         if (i !in cur.indices) return
         val next = cur.toMutableList().also { it.removeAt(i) }
-        upItems.value = next
-        upSel.value = upSel.value.coerceIn(0, maxOf(0, next.size - 1))
+        s.items.value = next
+        s.sel.value = s.sel.value.coerceIn(0, maxOf(0, next.size - 1))
         if (next.isEmpty()) {
-            upStatus.value = "Waiting for a file…"
-            upKind.value = 0
+            s.status.value = "Waiting for a file…"
+            s.kind.value = 0
         }
-        refreshSelClip()
+        recomputeUploadBusyAddrs()
+        refreshSelClip(addr)
     }
 
     /** Смена кадрирования выбранного файла — перерисовываем его превью. */
     fun setFit(f: Int) {
-        updateSel { it.copy(fit = f) }
-        val u = upItems.value.getOrNull(upSel.value)?.uri ?: return
+        val addr = current.value ?: return
+        updateSel(addr) { it.copy(fit = f) }
+        val u = session(addr).items.value.getOrNull(session(addr).sel.value)?.uri ?: return
         viewModelScope.launch {
             val poster = withContext(Dispatchers.Default) { converter.posterOf(u, f, POSTER_PX) }
             // Если кадрирование за это время снова сменили — отдаём ход более
             // свежей отрисовке, а не подсовываем устаревшую.
-            updateByUri(u) { if (it.fit == f) it.copy(poster = poster) else it }
+            updateByUri(addr, u) { if (it.fit == f) it.copy(poster = poster) else it }
         }
-        refreshSelClip()
+        refreshSelClip(addr)
     }
 
-    fun setBackMirror(v: Boolean) = updateSel { it.copy(mirror = v) }
+    fun setBackMirror(v: Boolean) {
+        val addr = current.value ?: return
+        updateSel(addr) { it.copy(mirror = v) }
+    }
 
     /** Длина по умолчанию для данного fps: весь ролик, но не больше, чем влезает
-     *  в PSRAM. Потолок — по числу кадров, поэтому в секундах он зависит от fps. */
-    private fun defaultLengthSec(fps: Int, srcDur: Double): Double {
-        val cap = fsInfo.value.maxFrames.toDouble() / fps
+     *  в PSRAM. Потолок — по числу кадров, поэтому в секундах он зависит от fps.
+     *  Кадровый потолок берём из кэша ИМЕННО этого колеса — у партнёров
+     *  синхронной заливки он может быть другим (см. [startUpload]), редактор
+     *  же всегда один, на странице-источнике. */
+    private fun defaultLengthSec(addr: String, fps: Int, srcDur: Double): Double {
+        val cap = (fsInfoByAddr[addr] ?: FsInfo()).maxFrames.toDouble() / fps
         return maxOf(0.5, minOf(if (srcDur > 0) srcDur else cap, cap))
     }
 
-    fun setFps(n: Int) = updateSel {
-        val cap = fsInfo.value.maxFrames.toDouble() / n
-        // Длину руками не трогали — ведём за fps, и вверх и вниз. Тронутую
-        // оставляем, но ужимаем, если перестала влезать. Правило то же, что в вебе.
-        val len = if (!it.lenTouched || it.lengthSec > cap) defaultLengthSec(n, it.srcDur) else it.lengthSec
-        it.copy(fps = n, lengthSec = len)
+    fun setFps(n: Int) {
+        val addr = current.value ?: return
+        updateSel(addr) {
+            val cap = (fsInfoByAddr[addr] ?: FsInfo()).maxFrames.toDouble() / n
+            // Длину руками не трогали — ведём за fps, и вверх и вниз. Тронутую
+            // оставляем, но ужимаем, если перестала влезать. Правило то же, что в вебе.
+            val len = if (!it.lenTouched || it.lengthSec > cap) defaultLengthSec(addr, n, it.srcDur) else it.lengthSec
+            it.copy(fps = n, lengthSec = len)
+        }
     }
 
-    fun setLength(v: Double) = updateSel {
-        // coerceIn(min,max) бросает при min > max, а потолок на забитом флеше
-        // падает ниже половины секунды.
-        val cap = fsInfo.value.maxFrames.toDouble() / it.fps
-        it.copy(lengthSec = if (cap <= 0.5) 0.5 else v.coerceIn(0.5, cap), lenTouched = true)
+    fun setLength(v: Double) {
+        val addr = current.value ?: return
+        updateSel(addr) {
+            // coerceIn(min,max) бросает при min > max, а потолок на забитом флеше
+            // падает ниже половины секунды.
+            val cap = (fsInfoByAddr[addr] ?: FsInfo()).maxFrames.toDouble() / it.fps
+            it.copy(lengthSec = if (cap <= 0.5) 0.5 else v.coerceIn(0.5, cap), lenTouched = true)
+        }
     }
 
     /** Скопировать настройки выбранного файла на все остальные в пачке. */
     fun applyUpSettingsToAll() {
-        val s = upItems.value.getOrNull(upSel.value) ?: return
+        val addr = current.value ?: return
+        val s = session(addr)
+        val sel = s.items.value.getOrNull(s.sel.value) ?: return
         val changedFit = ArrayList<Int>()
-        upItems.value = upItems.value.mapIndexed { i, item ->
-            if (item.fit != s.fit) changedFit.add(i)
+        s.items.value = s.items.value.mapIndexed { i, item ->
+            if (item.fit != sel.fit) changedFit.add(i)
             val len = if (item.isVideo) {
-                val cap = fsInfo.value.maxFrames.toDouble() / s.fps
-                if (s.lengthSec > cap || cap <= 0.5) defaultLengthSec(s.fps, item.srcDur) else s.lengthSec
+                val cap = (fsInfoByAddr[addr] ?: FsInfo()).maxFrames.toDouble() / sel.fps
+                if (sel.lengthSec > cap || cap <= 0.5) defaultLengthSec(addr, sel.fps, item.srcDur) else sel.lengthSec
             } else item.lengthSec
             item.copy(
-                fit = s.fit, mirror = s.mirror,
-                fps = if (item.isVideo) s.fps else item.fps,
+                fit = sel.fit, mirror = sel.mirror,
+                fps = if (item.isVideo) sel.fps else item.fps,
                 lengthSec = len,
-                lenTouched = if (item.isVideo) s.lenTouched else item.lenTouched
+                lenTouched = if (item.isVideo) sel.lenTouched else item.lenTouched
             )
         }
         if (changedFit.isNotEmpty()) {
-            val pending = upItems.value.indices.filter { !upItems.value[it].ready }
-            startPrep((changedFit + pending).distinct().sorted())
+            val pending = s.items.value.indices.filter { !s.items.value[it].ready }
+            startPrep(addr, (changedFit + pending).distinct().sorted())
         }
     }
 
+    /**
+     * Запускает заливку очереди, стоящей на ТЕКУЩЕЙ странице, — и, если в этой
+     * же сессии отмечены партнёры синхронной заливки ([toggleUpSyncTarget]),
+     * той же пачкой файлов на них тоже. Источник — просто первый среди равных:
+     * у каждой цели (включая само исходное колесо) заводится своя копия
+     * очереди в её собственной [UploadSession] и свой независимый проход по
+     * файлам — так у каждой цели своя картинка «что льётся прямо сейчас»,
+     * своя скорость и свой список «уже есть / не влезло», и они не ждут друг
+     * друга барьером на каждом файле: колесо с плохим сигналом просто отстаёт
+     * само по себе, не придерживая остальных (та же причина, по которой
+     * рассылка тиков синхронного слайдшоу ушла от последовательного цикла —
+     * см. [startGroupTicker]).
+     */
     fun startUpload() {
-        if (upBusy.value) return
-        val list = upItems.value
-        if (list.isEmpty()) { upStatus.value = "Select a file first."; upKind.value = 2; return }
+        val origin = current.value ?: return
+        val originSession = session(origin)
+        if (originSession.busy.value) return
+        val jobs = originSession.items.value
+        if (jobs.isEmpty()) { originSession.status.value = "Select a file first."; originSession.kind.value = 2; return }
+        if (client(origin)?.link?.value != Link.Ready) {
+            originSession.status.value = "Not connected."; originSession.kind.value = 2; return
+        }
 
-        // Адрес, а не сам объект: авто-переподключение создаёт НОВЫЙ BleClient,
-        // и захваченная на всю пачку ссылка указывала бы на закрытый.
-        val targetAddrs = listOfNotNull(readyClient()?.address)
-        if (targetAddrs.isEmpty()) { upStatus.value = "Not connected."; upKind.value = 2; return }
-
-        // Пачку снимаем целиком СЕЙЧАС. Настройки у каждого файла свои и лежат в
-        // неизменяемом UpItem, а ряд пилюль всё равно заблокирован, пока upBusy, —
-        // так что правка настроек на уже идущую заливку не влияет.
-        val jobs = list.toList()
+        // Партнёров берём по адресу, а не по объекту клиента: авто-переподключение
+        // создаёт НОВЫЙ BleClient, и захваченная на всю пачку ссылка указывала бы
+        // на закрытый. Отфильтровываем тех, кто успел отвалиться или у кого уже
+        // есть своя, ещё не отправленная очередь — трогать её нельзя.
+        val extra = originSession.syncTargets.value.filter {
+            client(it)?.link?.value == Link.Ready && session(it).items.value.isEmpty()
+        }
+        val targetAddrs = (listOf(origin) + extra).distinct()
 
         // Сканирование и заливка делят одно радио: LOW_LATENCY-поиск поверх
         // передачи отбирает у неё эфир. Экран списка колёс сам возобновит
-        // поиск, когда заливка кончится.
+        // поиск, когда заливка кончится везде (см. [anyUploadBusy]).
         stopScan()
 
-        upBusy.value = true
-        upKind.value = 0
         viewModelScope.launch {
-            // Свежий fs_info: место во флеше могло измениться. Потолок кадров
-            // устройство считает от ПОЛНОГО объёма PSRAM (играет всегда одна
-            // анимация), так что он не зависит от того, что сейчас на ободе.
-            runCatching { currentClient()?.fsInfo()?.let { fsInfo.value = it } }
-            val jobMaxFrames = fsInfo.value.maxFrames
-            var ok = 0
-            var fail = 0
-            // Uri тех файлов, что не уехали ни на одно колесо. По окончании в
-            // сетке остаются только они — успешные убираем, чтобы можно было
-            // повторить одной кнопкой, не разбираясь заново, что не долилось.
-            val failedUris = ArrayList<Uri>()
-            for (item in jobs) {
-                val label = item.name
-                upCurrentUri.value = item.uri
-                try {
-                    upStatus.value = label + " — converting…"
-                    upProgress.value = -1f
-                    val res = withContext(Dispatchers.Default) {
+            // Свежие fs_info/list по КАЖДОЙ цели — место на флеше и содержимое
+            // библиотеки могли измениться с прошлого раза, и у разных колёс они
+            // никак не обязаны совпадать. Потолок кадров устройство считает от
+            // ПОЛНОГО объёма PSRAM (играет всегда одна анимация), так что он не
+            // зависит от того, что сейчас на ободе, — только от самого колеса.
+            coroutineScope {
+                for (addr in targetAddrs) launch infoFetch@{
+                    val c = client(addr) ?: return@infoFetch
+                    runCatching { c.fsInfo() }.getOrNull()?.let {
+                        fsInfoByAddr[addr] = it; if (current.value == addr) fsInfo.value = it
+                    }
+                    runCatching { c.list() }.getOrNull()?.let {
+                        filesByAddr[addr] = it; if (current.value == addr) files.value = it
+                    }
+                }
+            }
+            val validTargets = targetAddrs.filter { client(it)?.link?.value == Link.Ready }
+            if (validTargets.isEmpty()) {
+                originSession.status.value = "Not connected."; originSession.kind.value = 2
+                return@launch
+            }
+
+            // У каждой цели — своя копия очереди и свой прогресс с этого момента.
+            for (addr in validTargets) {
+                val s = session(addr)
+                s.items.value = jobs
+                s.sel.value = 0
+                // Аниматированный клип, оставшийся от РЕДАКТИРОВАНИЯ до нажатия
+                // Upload (см. refreshSelClip — она заводит его только для того,
+                // что было выбрано тапом на панели настроек, независимо от
+                // индекса), обязательно сбросить здесь. Иначе он переживает
+                // reset sel в 0 выше: sel.value=0 меняет, КАКАЯ ячейка теперь
+                // "выбранная" (и, значит, получает pendingClip), но сам клип
+                // в selClip остаётся старым — от совсем другого файла, который
+                // пользователь разглядывал перед заливкой. Раз ничто во время
+                // самой заливки не вызывает refreshSelClip повторно (это делают
+                // только onFilesPicked/selectUpItem/removeUpItem/setFit — все
+                // редактирование, а не сам процесс отправки), этот старый клип
+                // виден на ячейке с бегущим ободком до конца всей пачки — то
+                // есть один и тот же превью-ролик независимо от того, какой
+                // файл льётся на самом деле именно сейчас.
+                s.selClipJob?.cancel()
+                s.selClip.value = null
+                s.currentUri.value = null
+                s.progress.value = -1f
+                s.status.value = "Starting…"
+                s.kind.value = 0
+                s.busy.value = true
+            }
+            recomputeUploadBusyAddrs()
+
+            // Оба (или больше) целевых линка держим быстрыми — заливка правда
+            // идёт на все разом; «мягким» становится только колесо, случайно
+            // подключённое, но не участвующее в этой пачке.
+            focusUploadLinks(validTargets.toSet())
+
+            // Конвертация — дорогая (median cut по десяткам тысяч пикселей на
+            // кадр), а у большинства пар колёс потолок кадров совпадает, так что
+            // результат делят все цели с одинаковым maxFrames. Кэш и общий
+            // прогресс конвертации — на весь вызов, конвертируем каждую пару
+            // (файл, потолок) ровно один раз.
+            val convCache = HashMap<Pair<Uri, Int>, Deferred<Converter.Result>>()
+            val targetsByCap = validTargets.groupBy { (fsInfoByAddr[it] ?: FsInfo()).maxFrames }
+            val cachedPreviews = HashSet<Uri>()
+
+            suspend fun getConverted(item: UpItem, cap: Int): Converter.Result {
+                val key = item.uri to cap
+                val deferred = convCache.getOrPut(key) {
+                    val sharers = targetsByCap[cap].orEmpty()
+                    async(Dispatchers.Default) {
                         converter.convert(
-                            item.uri, item.fit, jobMaxFrames,
+                            item.uri, item.fit, cap,
                             Converter.VideoOpts(item.fps, item.lengthSec),
                             item.mirror,
                             object : Converter.Progress {
-                                override fun stage(text: String) { upStatus.value = label + " — " + text }
+                                override fun stage(text: String) {
+                                    sharers.forEach { session(it).status.value = item.name + " — " + text }
+                                }
                                 override fun frames(done: Int, total: Int) {
-                                    upStatus.value = label + " — converting " + done + "/" + total +
-                                        " frames (" + (done * 100 / maxOf(total, 1)) + "%)"
-                                    upProgress.value = done.toFloat() / maxOf(total, 1)
+                                    sharers.forEach { a ->
+                                        val s = session(a)
+                                        s.status.value = item.name + " — converting " + done + "/" + total +
+                                            " frames (" + (done * 100 / maxOf(total, 1)) + "%)"
+                                        s.progress.value = done.toFloat() / maxOf(total, 1)
+                                    }
                                 }
                             }
                         )
                     }
-                    res.warning?.let { say(it) }
-                    val crc = withContext(Dispatchers.Default) { Ani6.crc32(res.data) }
+                }
+                return deferred.await()
+            }
 
-                    var sentTo = 0
-                    for (addr in targetAddrs) {
-                        // Клиента ищем по адресу на каждом шаге: за время
-                        // конвертации связь могла оборваться и восстановиться
-                        // уже другим объектом.
-                        val c = client(addr)
-                        if (c == null || c.link.value != Link.Ready) continue
-                        // Второе подключённое колесо (если есть) — на «мягкий»
-                        // линк: два активных BLE-соединения делят радио телефона,
-                        // без этого заливка шла ~20 вместо ~110 кБ/с.
-                        focusUploadLink(addr)
-                        try {
-                            val wire = withContext(Dispatchers.Default) {
-                                Ani6.encodeForWire(res.data, c.hello?.hasDeflate ?: false)
-                            }
-                            val ratio = res.data.size.toDouble() / maxOf(wire.bytes.size, 1)
-                            val started = System.currentTimeMillis()
-                            c.upload(res.fileName, wire.bytes, res.data.size, crc, wire.compressed) { p ->
-                                upProgress.value = p.sent.toFloat() / maxOf(p.totalWire, 1L)
-                                val kb = p.sent / 1024
-                                val tot = p.totalWire / 1024
-                                val secs = (System.currentTimeMillis() - started) / 1000.0
-                                val rate = if (secs > 0.4) (p.sent / 1024.0 / secs) else 0.0
-                                upStatus.value = label + " — " +
-                                    (p.sent * 100 / maxOf(p.totalWire, 1L)) + "%  ·  " +
-                                    kb + " / " + tot + " kB" +
-                                    (if (wire.compressed) String.format("  ·  x%.1f smaller", ratio) else "") +
-                                    (if (rate > 0) String.format("  ·  %.0f kB/s", rate) else "")
-                            }
-                            sentTo++
-                        } catch (e: kotlinx.coroutines.CancellationException) {
-                            throw e
-                        } catch (e: Throwable) {
-                            // Неудача на одном колесе не должна отменять успех
-                            // на остальных и не делает файл непринятым.
-                            say((c.hello?.name ?: addr) + ": " + (e.message ?: "upload failed"))
-                        }
-                    }
-                    if (sentTo > 0) {
-                        ok++
-                        // Уехал хотя бы на одно колесо — рендерим и кладём в кэш
-                        // компактное превью, пока доступ к исходнику ещё жив.
-                        cachePreview(item, res.fileName)
-                        // ...и сразу переносим ячейку из «ждёт заливки» в библиотеку:
-                        // сначала показываем новый файл, потом убираем жёлтую ячейку.
-                        runCatching { currentClient()?.let { files.value = it.list() } }
-                        upItems.value = upItems.value.filter { it.uri != item.uri }
-                        upSel.value = upSel.value.coerceIn(0, maxOf(0, upItems.value.size - 1))
-                        refreshSelClip()
-                    } else { fail++; failedUris.add(item.uri) }
-                } catch (e: kotlinx.coroutines.CancellationException) {
-                    // Отмену пробрасываем: иначе цикл продолжал бы крутиться
-                    // после смерти scope, дописывая в мёртвые соединения.
-                    throw e
-                } catch (e: Throwable) {
-                    // Throwable, а не Exception: длинная анимация — это 8 МБ
-                    // исходника плюс столько же под сжатый поток, и
-                    // OutOfMemoryError здесь вполне достижим. Он наследуется от
-                    // Error, мимо catch(Exception) проходил насквозь и ронял
-                    // приложение вместо сообщения об ошибке.
-                    fail++
-                    failedUris.add(item.uri)
-                    val why = e.message?.takeIf { it.isNotBlank() } ?: e::class.java.simpleName
-                    upStatus.value = label + " — failed: " + why
-                    upKind.value = 2
+            // Радио у телефона одно на оба соединения — параллельны только
+            // независимые ПРОХОДЫ целей и конвертация (CPU, см. getConverted
+            // выше), а сама передача байт по BLE — нет: без общего замка два
+            // одновременных upload() делят один радиомодуль пополам-и-хуже
+            // (неуправляемо, в зависимости от качества каждой связи, а не
+            // поровну), и то колесо, чей сигнал слабее, могло реально почти
+            // не продвигаться, пока другое улетало вперёд по всей очереди —
+            // именно это и читалось как «жёлтый ободок навсегда завис на
+            // одном и том же файле», хотя на самом деле файл просто и правда
+            // ещё не долился. radioMutex превращает это в явные ПО ОЧЕРЕДИ
+            // передачи вместо непредсказуемой делёжки эфира — так у каждой
+            // цели прогресс её текущего файла реально движется, пока её ход,
+            // а не имитирует движение чужим трафиком.
+            val radioMutex = Mutex()
+            coroutineScope {
+                for (addr in validTargets) launch {
+                    runUploadTarget(addr, jobs, ::getConverted, cachedPreviews, radioMutex)
                 }
             }
-            upProgress.value = -1f
-            upCurrentUri.value = null
-            upBusy.value = false
+
             restoreUploadLinks()   // все колёса обратно на быстрый линк
-            if (fail == 0) {
-                val msg = if (ok == 1) "Uploaded." else ok.toString() + " files uploaded."
-                upStatus.value = msg
-                upKind.value = 1
-                upItems.value = emptyList()
-                upSel.value = 0
-                // Полоса заливки уже скрылась (очередь пуста) — сообщаем тостом.
-                say(msg)
-            } else {
-                upStatus.value = ok.toString() + " uploaded, " + fail + " failed."
-                upKind.value = 2
-                // В сетке оставляем только незагруженные.
-                upItems.value = upItems.value.filter { it.uri in failedUris }
-                upSel.value = 0
-            }
-            refreshSelClip()
-            refreshFiles()
         }
     }
 
-    /** Перед заливкой на [addr]: его линк — быстрый, все прочие подключённые —
-     *  «мягкие». Два активных BLE-соединения на один радиомодуль телефона делят
-     *  эфир, из-за чего скорость на активное колесо падала впятеро. */
-    private suspend fun focusUploadLink(addr: String?) {
+    /**
+     * Проводит ОДНУ цель через всю пачку [jobs] от начала до конца, независимо
+     * от того, как идут дела у остальных целей той же заливки (см. [startUpload]).
+     * Свою очередь, статус и прогресс ведёт только в СВОЕЙ [UploadSession] —
+     * соседняя страница узнаёт о заливке только если она сама входит в число
+     * целей. [getConverted] — общий с другими целями кэш конвертации по
+     * (файл, потолок кадров); [cachedPreviews] — общий набор «превью уже
+     * отрендерено», чтобы не строить один и тот же клип для каждой цели заново;
+     * [radioMutex] — общий на всю заливку замок вокруг самой передачи байт по
+     * BLE (см. комментарий в [startUpload]), без него прогресс на более
+     * слабой связи выглядел зависшим на одном файле, пока сильная связь
+     * забирала себе почти весь эфир.
+     */
+    private suspend fun runUploadTarget(
+        addr: String,
+        jobs: List<UpItem>,
+        getConverted: suspend (UpItem, Int) -> Converter.Result,
+        cachedPreviews: MutableSet<Uri>,
+        radioMutex: Mutex
+    ) {
+        val s = session(addr)
+        val remaining = jobs.toMutableList()
+        var ok = 0
+        var skip = 0
+        var fail = 0
+
+        for (item in jobs) {
+            val c = client(addr)
+            if (c == null || c.link.value != Link.Ready) {
+                fail++
+                s.status.value = item.name + " — lost connection"; s.kind.value = 2
+                remaining.remove(item); s.items.value = remaining.toList()
+                continue
+            }
+            s.currentUri.value = item.uri
+            s.progress.value = -1f
+            s.status.value = item.name + " — converting…"
+
+            val cap = (fsInfoByAddr[addr] ?: FsInfo()).maxFrames
+            val res = try {
+                getConverted(item, cap)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                // Throwable, а не Exception: длинная анимация — это 8 МБ исходника
+                // плюс столько же под сжатый поток, и OutOfMemoryError здесь вполне
+                // достижим. Он наследуется от Error, мимо catch(Exception) проходил
+                // насквозь и ронял приложение вместо сообщения об ошибке.
+                fail++
+                val why = e.message?.takeIf { it.isNotBlank() } ?: e::class.java.simpleName
+                s.status.value = item.name + " — failed: " + why; s.kind.value = 2
+                remaining.remove(item); s.items.value = remaining.toList()
+                continue
+            }
+            res.warning?.let { say(it) }
+
+            // «Уже есть» — то же имя (оно у ANI6 детерминировано от исходного
+            // файла, см. Ani6.buildFileName) И тот же размер: библиотека этого
+            // колеса уже содержит ровно то, что мы собрались туда лить.
+            val existing = filesByAddr[addr] ?: emptyList()
+            val dup = existing.firstOrNull { it.name == res.fileName }
+            if (dup != null && dup.size == res.data.size.toLong()) {
+                ok++; skip++
+                s.status.value = item.name + " — already there, skipped"; s.kind.value = 1
+                remaining.remove(item); s.items.value = remaining.toList()
+                continue
+            }
+
+            // Разные колёса — разное свободное место на флеше; переливаемый файл
+            // может влезть на одно и не влезть на другое.
+            val fs = fsInfoByAddr[addr] ?: FsInfo()
+            val freeAfter = fs.free + (dup?.size ?: 0L)   // старый файл того же имени будет перезаписан
+            if (res.data.size > freeAfter) {
+                fail++
+                s.status.value = item.name + " — doesn't fit (" + fmtKb(res.data.size.toLong()) +
+                    " > " + fmtKb(freeAfter) + " free)"
+                s.kind.value = 2
+                remaining.remove(item); s.items.value = remaining.toList()
+                continue
+            }
+
+            try {
+                val crc = withContext(Dispatchers.Default) { Ani6.crc32(res.data) }
+                val wire = withContext(Dispatchers.Default) {
+                    Ani6.encodeForWire(res.data, c.hello?.hasDeflate ?: false)
+                }
+                val ratio = res.data.size.toDouble() / maxOf(wire.bytes.size, 1)
+                val label = item.name
+                // Сама передача — под общим radioMutex (см. комментарии в
+                // startUpload/runUploadTarget): пока эфир занят другой целью,
+                // статус честно говорит об этом, а не показывает 0%/тишину,
+                // которую легко принять за зависание.
+                if (radioMutex.isLocked) s.status.value = label + " — waiting for radio…"
+                radioMutex.withLock {
+                    val started = System.currentTimeMillis()
+                    c.upload(res.fileName, wire.bytes, res.data.size, crc, wire.compressed) { p ->
+                        s.progress.value = p.sent.toFloat() / maxOf(p.totalWire, 1L)
+                        val kb = p.sent / 1024
+                        val tot = p.totalWire / 1024
+                        val secs = (System.currentTimeMillis() - started) / 1000.0
+                        val rate = if (secs > 0.4) (p.sent / 1024.0 / secs) else 0.0
+                        s.status.value = label + " — " +
+                            (p.sent * 100 / maxOf(p.totalWire, 1L)) + "%  ·  " +
+                            kb + " / " + tot + " kB" +
+                            (if (wire.compressed) String.format("  ·  x%.1f smaller", ratio) else "") +
+                            (if (rate > 0) String.format("  ·  %.0f kB/s", rate) else "")
+                    }
+                }
+                ok++
+                val fl = existing.toMutableList()
+                if (dup != null) fl.remove(dup)
+                fl.add(DevFile(res.fileName, res.data.size.toLong()))
+                filesByAddr[addr] = fl
+                fsInfoByAddr[addr] = fs.copy(free = fs.free - res.data.size + (dup?.size ?: 0L))
+                if (current.value == addr) { files.value = fl; fsInfo.value = fsInfoByAddr[addr]!! }
+                // Рендерим и кладём в кэш компактное превью, пока доступ к
+                // исходнику ещё жив — один раз на файл, не на каждую цель.
+                if (cachedPreviews.add(item.uri)) cachePreview(item, res.fileName)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                fail++
+                say((c.hello?.name ?: addr) + ": " + (e.message ?: "upload failed"))
+                s.status.value = item.name + " — failed: " + (e.message ?: "upload failed"); s.kind.value = 2
+            }
+            remaining.remove(item)
+            s.items.value = remaining.toList()
+            s.sel.value = s.sel.value.coerceIn(0, maxOf(0, remaining.size - 1))
+        }
+
+        s.progress.value = -1f
+        s.currentUri.value = null
+        s.busy.value = false
+        val msg = when {
+            fail > 0 -> ok.toString() + " uploaded, " + fail + " failed."
+            skip > 0 && ok > skip -> (ok - skip).toString() + " uploaded, " + skip + " already there."
+            skip > 0 -> "Already there — nothing to upload."
+            ok == 1 -> "Uploaded."
+            else -> ok.toString() + " files uploaded."
+        }
+        s.status.value = msg
+        s.kind.value = if (fail > 0) 2 else 1
+        recomputeUploadBusyAddrs()
+        // Тостом сообщаем только когда всё прошло чисто — иначе строка статуса
+        // под самой сеткой и так на виду, повторять её всплывающим тостом незачем.
+        if (fail == 0) say((client(addr)?.hello?.name ?: addr) + ": " + msg)
+    }
+
+    private fun fmtKb(bytes: Long): String = when {
+        bytes >= 1_048_576 -> String.format("%.1f MB", bytes / 1_048_576.0)
+        else -> (bytes / 1024).coerceAtLeast(1L).toString() + " kB"
+    }
+
+    /** Перед заливкой: линки всех целей [targets] — быстрые, все прочие
+     *  подключённые (в этой заливке не участвующие) — «мягкие». Два активных
+     *  BLE-соединения на один радиомодуль телефона делят эфир, из-за чего
+     *  скорость на активное колесо падала впятеро. */
+    private suspend fun focusUploadLinks(targets: Set<String>) {
         val cs = clients.values.toList()
         if (cs.size < 2) return
-        for (c in cs) if (c.link.value == Link.Ready) c.setLowPower(c.address != addr)
+        for (c in cs) if (c.link.value == Link.Ready) c.setLowPower(c.address !in targets)
     }
 
     private suspend fun restoreUploadLinks() {
@@ -1887,13 +2326,57 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      * предупреждения, — колесо не застынет на последнем кадре, а продолжит
      * крутить ЭТУ ЖЕ последовательность по собственным часам, слегка теряя
      * точную фазу со временем, но не содержимое.
+     *
+     * [sel.names] здесь может быть заметно длиннее, чем у обычного показа
+     * ([albumSelectionFor] режет include/exclude по 20 файлам, беря то, что
+     * короче) — синхронный отбор всегда include и ничем не подрезан заранее
+     * (см. комментарий у [syncAlbumSelection]). ОДНА запись характеристики
+     * OP_ALBUM, в отличие от чтения списка/превью, на кадры не режется — весь
+     * список имён обязан влезть в неё целиком, а MTU у разных подключений
+     * запросто разный. Без этой подрезки большой общий отбор (а с недавним
+     * добавлением синхронной ЗАЛИВКИ — как раз тот случай, когда на оба
+     * колеса разом заливают целую библиотеку) рвал саму запись символа —
+     * `writeCharacteristic` отказывал ещё до эфира, `album(start)` тихо тонул
+     * в `runCatching`, и колесо, на котором до этого не крутилось вовсе
+     * ничего, никогда не получало `slideshowActive = true`. Дальше КАЖДЫЙ
+     * `OP_SYNC_TICK` на него отвечал `ST_STATE` и терялся без следа — колесо
+     * просто застывало на том, что показывало до нажатия Start, пока
+     * остальные участники группы переключались по расписанию: снаружи это
+     * выглядит ровно как «синхронное слайдшоу включено, оба дисплея онлайн, а
+     * показывают разное». Резать список, а не рисковать самой командой —
+     * можно себе позволить: жёсткая синхронизация (см. [startGroupTicker])
+     * посылает имена по одному, этим ограничением не связана и всё равно
+     * остаётся источником истины, пока телефон рядом; урезанный запасной ход
+     * нужен только на случай, если он пропадёт.
      */
     private fun armGroupFallback(members: List<String>, files: List<String>, ms: Int) {
         val sel = syncAlbumSelection(files.toSet())
         for (m in members) {
             clients[m]?.takeIf { it.link.value == Link.Ready }?.let { c ->
-                viewModelScope.launch { runCatching { c.album(true, ms, sel.mode, sel.names, sel.effectMask) } }
+                val safeNames = fitNamesToOneWrite(sel.names, c.payloadSize)
+                viewModelScope.launch { runCatching { c.album(true, ms, sel.mode, safeNames, sel.effectMask) } }
             }
+        }
+    }
+
+    /**
+     * Обрезает [names] по фактическому байтовому бюджету ОДНОЙ ATT-записи
+     * OP_ALBUM у конкретного соединения — по одному клиенту, а не одним
+     * числом на всех (см. комментарий у [armGroupFallback]: MTU
+     * согласовывается на каждое соединение отдельно, и у двух колёс он
+     * не обязан совпасть). 11 байт — несократимая часть кадра: 2 байта
+     * заголовка самого запроса (опкод+seq, см. `BleClient.requestUnlocked`)
+     * плюс 9 байт полей `album()` (start, delay, listMode, count, хвостовая
+     * маска эффектов) до и после списка имён. На каждое оставшееся имя —
+     * его длина в байтах плюс один байт этой длины.
+     */
+    private fun fitNamesToOneWrite(names: List<String>, payloadSize: Int): List<String> {
+        var budget = payloadSize - 11
+        return names.takeWhile { n ->
+            val cost = 1 + n.toByteArray(Charsets.US_ASCII).size
+            if (cost > budget) return@takeWhile false
+            budget -= cost
+            true
         }
     }
 
@@ -2287,8 +2770,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      * нечего сторожить.
      */
     private fun handOffConnectivity() {
-        val known = prefs.getStringSet("known", emptySet()) ?: emptySet()
-        if (known.isEmpty() && wantConnected.isEmpty()) return
+        if (knownOrder().isEmpty() && wantConnected.isEmpty()) return
         val syncMembers = syncGroups.keys
         val hint = clients.filterKeys { it !in syncMembers }
             .filterValues { it.link.value == Link.Ready }
@@ -2338,8 +2820,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      * перейдёт из ожидания в полноценный поиск (см. [handOffConnectivity]).
      */
     fun enterBackground() {
-        val known = prefs.getStringSet("known", emptySet()) ?: emptySet()
-        if (known.isEmpty() && wantConnected.isEmpty()) return
+        if (knownOrder().isEmpty() && wantConnected.isEmpty()) return
         WheelConnectivityService.standby(ctx)
     }
 }

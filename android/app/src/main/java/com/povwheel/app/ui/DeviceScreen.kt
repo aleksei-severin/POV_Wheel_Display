@@ -88,15 +88,19 @@ fun DeviceScreen(vm: WheelVm) {
 
     // Поиск идёт всё время, пока открыт экран, и снимается уходом с него: колесо
     // обычно будят уже после того, как достали телефон. Кроме времени заливки —
-    // она делит одно радио с LOW_LATENCY-поиском.
-    val upBusy by vm.upBusy.collectAsState()
+    // она делит одно радио с LOW_LATENCY-поиском. Смотрим на заливку ЛЮБОГО
+    // колеса (не только открытого сейчас): синхронная заливка (см.
+    // WheelVm.startUpload) может в этот момент идти на соседнюю страницу.
+    val upBusy by vm.anyUploadBusy.collectAsState()
     DisposableEffect(upBusy) {
         if (!upBusy) vm.startScan()
         onDispose { vm.stopScan() }
     }
 
-    // Свайп влево/вправо по контенту — следующее/предыдущее колесо по кругу.
-    val canSwipe = wheels.count { it.reachable } >= 2
+    // Свайп влево/вправо по контенту — следующее/предыдущее колесо по кругу,
+    // только среди реально подключённых (см. WheelVm.cycleWheel) — свайп на
+    // офлайн-соседа вёл бы на пустой IdleContent.
+    val canSwipe = wheels.count { it.link == Link.Ready } >= 2
     val scope = rememberCoroutineScope()
     val dragX = remember { Animatable(0f) }
 
@@ -348,20 +352,21 @@ private fun WheelStrip(vm: WheelVm, wheels: List<WheelEntry>, current: String?) 
     }
 }
 
+/** Сторона квадрата-слота под индикатор связи в [WheelName] — один и тот же
+ *  для спиннера и для точки, чтобы плитка не меняла ширину при смене
+ *  статуса (см. комментарий там). Спиннер — самый крупный из индикаторов,
+ *  под него и подгоняется размер слота. */
+private val WHEEL_DOT_SLOT = 11.dp
+
 @Composable
 private fun WheelName(vm: WheelVm, w: WheelEntry, selected: Boolean) {
     var renaming by remember { mutableStateOf(false) }
     val cs = MaterialTheme.colorScheme
 
-    // К колесу можно подключиться: оно в эфире, но связи ещё нет.
-    val connectable = w.link != Link.Ready && w.link != Link.Connecting &&
-        !w.stale && w.rssi != Int.MIN_VALUE
-
     val nameColor = when {
         selected             -> cs.primary
         w.link == Link.Ready -> cs.onSurface
-        connectable          -> cs.onSurface
-        else                 -> cs.onSurfaceVariant   // серый: неактивно / не в эфире
+        else                 -> cs.onSurfaceVariant   // серый: не на связи
     }
 
     Row(
@@ -376,15 +381,23 @@ private fun WheelName(vm: WheelVm, w: WheelEntry, selected: Boolean) {
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(5.dp)
     ) {
-        when {
-            w.link == Link.Connecting ->
-                CircularProgressIndicator(Modifier.size(11.dp), strokeWidth = 1.5.dp, color = Warn)
-            w.link == Link.Ready ->
-                Box(Modifier.size(7.dp).clip(CircleShape).background(if (selected) cs.primary else Ok))
-            // значок «можно подключиться» — полое кольцо в акцентном цвете
-            connectable ->
-                Box(Modifier.size(8.dp).clip(CircleShape).border(1.5.dp, Accent, CircleShape))
-            else -> Spacer(Modifier.size(0.dp))
+        // Индикатор — всегда один и тот же по размеру слот (см. WHEEL_DOT_SLOT):
+        // раньше вместо него в состоянии "не в эфире" стоял Spacer(0.dp), и
+        // плитка на глазах сужалась и расширялась при каждой смене статуса —
+        // само подключение к соседним колёсам постоянно дёргало их ширину.
+        // Подключение больше не нужно инициировать тапом (см. WheelVm —
+        // startConnectSweep/onSeenAgain пробуют сами), поэтому здесь всего
+        // три состояния, без отдельного "можно подключиться": Ready — зелёная
+        // точка, Connecting — вращающийся индикатор, иначе — красная точка.
+        Box(Modifier.size(WHEEL_DOT_SLOT), contentAlignment = Alignment.Center) {
+            when (w.link) {
+                Link.Connecting ->
+                    CircularProgressIndicator(Modifier.size(WHEEL_DOT_SLOT), strokeWidth = 1.5.dp, color = Warn)
+                Link.Ready ->
+                    Box(Modifier.size(7.dp).clip(CircleShape).background(if (selected) cs.primary else Ok))
+                else ->
+                    Box(Modifier.size(7.dp).clip(CircleShape).background(Danger))
+            }
         }
         Text(
             w.name,

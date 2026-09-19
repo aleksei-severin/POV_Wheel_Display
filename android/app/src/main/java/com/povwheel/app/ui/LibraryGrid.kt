@@ -112,11 +112,17 @@ internal fun LibraryTab(
     val syncPartnersMap by vm.syncPartners.collectAsState()
     val slideIntervalMap by vm.slideIntervalMs.collectAsState()
     val pendingSyncDelete by vm.pendingSyncDelete.collectAsState()
+    val uploadBusyAddrs by vm.uploadBusyAddrs.collectAsState()
 
     val hasSel = vm.currentClient()?.hello?.hasAlbumSel == true
     val allNames = files.map { it.name }
     // Другие колёса, с которыми прямо сейчас можно синхронизировать слайдшоу.
     val otherReady = wheels.filter { it.link == Link.Ready && it.address != curWheel }
+    // Те же, но ещё и без своей заливки — только на них имеет смысл предлагать
+    // расшарить текущую пачку (см. UploadStrip): колесо с уже идущей или
+    // ждущей своей заливкой трогать нельзя, WheelVm.startUpload сам отсеет
+    // такое же, здесь только не предлагаем его в списке.
+    val otherUploadTargets = otherReady.filter { it.address !in uploadBusyAddrs }
     val activePartners = curWheel?.let { syncPartnersMap[it] } ?: emptyList()
 
     var mode by remember { mutableStateOf(LibMode.NORMAL) }
@@ -250,7 +256,7 @@ internal fun LibraryTab(
             }
 
             if (items.isNotEmpty()) item(key = "upload", span = { GridItemSpan(maxLineSpan) }) {
-                UploadStrip(vm)
+                UploadStrip(vm, otherUploadTargets)
             }
 
             items(cells.size, key = { cellKey(cells[it]) }) { i ->
@@ -729,9 +735,16 @@ private fun StoredDisc(vm: WheelVm, f: DevFile) {
  * Настройки и запуск заливки ждущих файлов. Появляется над сеткой, пока в ней
  * есть жёлтые превью. Всё дорогое (декод, полярная выборка, median cut) считает
  * телефон; на колесо уходит готовый ANI6, сжатый DEFLATE.
+ *
+ * Пока пачка ещё не ушла, здесь же можно отметить [others] — другие колёса на
+ * связи, свободные от собственной заливки, — и та же пачка при нажатии Upload
+ * уйдёт и на них (WheelVm.startUpload). У каждого отмеченного колеса своя
+ * доступная память и своя уже залитая библиотека, поэтому именно на нём, при
+ * заливке, решается — влезает ли файл и нет ли его там уже; здесь это не
+ * проверяется заранее.
  */
 @Composable
-private fun UploadStrip(vm: WheelVm) {
+private fun UploadStrip(vm: WheelVm, others: List<WheelEntry>) {
     val fs by vm.fsInfo.collectAsState()
     val items by vm.upItems.collectAsState()
     val sel by vm.upSel.collectAsState()
@@ -739,6 +752,7 @@ private fun UploadStrip(vm: WheelVm) {
     val statusKind by vm.upKind.collectAsState()
     val progress by vm.upProgress.collectAsState()
     val busy by vm.upBusy.collectAsState()
+    val syncTargets by vm.upSyncTargets.collectAsState()
     if (items.isEmpty()) return
     val selIdx = sel.coerceIn(0, items.size - 1)
     val cur = items[selIdx]
@@ -750,10 +764,29 @@ private fun UploadStrip(vm: WheelVm) {
             .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(14.dp))
             .padding(12.dp)
     ) {
+        // Выбор партнёров синхронной заливки — доступен, пока пачка ещё не
+        // уходит: как только заливка начнётся, у каждого партнёра появится
+        // своя, уже неотменяемая очередь (см. runUploadTarget), выбор дальше
+        // менять поздно.
+        if (!busy && others.isNotEmpty()) {
+            SyncTargetsRow(
+                others = others,
+                picked = syncTargets,
+                onToggle = { a -> vm.toggleUpSyncTarget(a) }
+            )
+            Spacer(Modifier.height(6.dp))
+        }
+
         Button(
             onClick = hapticClick { vm.startUpload() }, enabled = !busy,
             modifier = Modifier.fillMaxWidth()
-        ) { Text(if (busy) "Working…" else "↑ Convert & upload (" + items.size + ")") }
+        ) {
+            Text(
+                if (busy) "Working…"
+                else "↑ Convert & upload (" + items.size + ")" +
+                    (if (syncTargets.isNotEmpty()) " ×" + (1 + syncTargets.size) else "")
+            )
+        }
 
         Spacer(Modifier.height(8.dp))
         Text(

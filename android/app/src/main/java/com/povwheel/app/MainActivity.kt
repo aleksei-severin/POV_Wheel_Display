@@ -62,7 +62,7 @@ class MainActivity : ComponentActivity() {
                 // тогда, когда нужнее всего. Погасший экран подвешивает очередь
                 // BLE на середине файла, и устройство обрывает передачу по
                 // своему сторожу молчания.
-                val upBusy by vm.upBusy.collectAsState()
+                val upBusy by vm.anyUploadBusy.collectAsState()
                 val fw by vm.fwProgress.collectAsState()
                 val view = LocalView.current
                 val keepAwake = upBusy || fw != null

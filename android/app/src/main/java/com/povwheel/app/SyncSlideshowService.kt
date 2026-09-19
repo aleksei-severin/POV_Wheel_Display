@@ -22,9 +22,11 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Держит уведомление синхронного показа и подхватывает тикер (явные
@@ -199,6 +201,38 @@ class SyncSlideshowService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    /** Один OP_SYNC_TICK с короткими повторами — см. WheelVm.sendSyncTick,
+     *  та же причина: `index` здесь общий на группу счётчик, и одиночный
+     *  неудачный тик (обычное дело на движущемся велосипеде) без повтора
+     *  навсегда сдвигал бы ровно ЭТО колесо на шаг назад относительно
+     *  остальных участников, вместо того чтобы просто досчитать через долю
+     *  секунды в пределах того же интервала. */
+    private suspend fun sendSyncTick(c: BleClient, name: String, effId: Int?) {
+        repeat(3) { attempt ->
+            val ok = runCatching { if (effId != null) c.syncTick(null, effId) else c.syncTick(name) }.isSuccess
+            if (ok || attempt == 2) return
+            delay(150)
+        }
+    }
+
+    /** См. WheelVm.waitUntilApplied — та же причина: без ожидания подтверждения
+     *  по телеметрии (`currentDisplayFile` в прошивке меняется только когда
+     *  файл ДЕЙСТВИТЕЛЬНО дочитан) тикер отсчитывал бы интервал по своим
+     *  часам, даже если чьё-то колесо ещё грузит текущий файл дольше самого
+     *  интервала — рассинхрон копился бы тик за тиком. 8 с — тот же потолок:
+     *  колесо, не успевшее вовремя, просто не задерживает остальных. */
+    private suspend fun waitUntilApplied(members: Collection<BleClient>, name: String, effId: Int?) {
+        withTimeoutOrNull(8000L) {
+            members.map { c ->
+                launch {
+                    runCatching {
+                        c.tele.first { t -> if (effId != null) t.effect == effId else t.effect == 0 && t.file == name }
+                    }
+                }
+            }.joinAll()
+        }
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_TAKE_OVER -> startDriving()
@@ -239,8 +273,8 @@ class SyncSlideshowService : Service() {
                 index = (index + 1).let { if (it >= cfg.files.size) 0 else it }
                 val name = cfg.files[index]
                 val effId = if (name.startsWith("@e")) name.removePrefix("@e").toIntOrNull() else null
-                for (c in clients.values) {
-                    if (c.link.value != Link.Ready) continue
+                val readyClients = clients.values.filter { it.link.value == Link.Ready }
+                for (c in readyClients) {
                     // syncTick, не play()/effect(): не должен гасить автономный
                     // ход слайдшоу на колесе — та же причина, что и во ViewModel
                     // (см. WheelVm.startGroupTicker), только здесь ещё важнее:
@@ -253,8 +287,15 @@ class SyncSlideshowService : Service() {
                     // задержку/таймаут (до 8 с) одного просевшего соединения
                     // остальным участникам цикла, что и читалось как
                     // периодическое расхождение показа при исправной связи.
-                    launch { runCatching { if (effId != null) c.syncTick(null, effId) else c.syncTick(name) } }
+                    // sendSyncTick — то же самое лекарство, но для ОДНОЙ
+                    // неудачной посылки: без повтора она тихо теряется, и это
+                    // колесо навсегда остаётся на шаг позади остальных.
+                    launch { sendSyncTick(c, name, effId) }
                 }
+                // Держим пункт на экране хотя бы intervalMs, но не короче —
+                // сначала ждём подтверждения от ВСЕХ (см. waitUntilApplied),
+                // и только потом отсчитываем сам интервал.
+                waitUntilApplied(readyClients, name, effId)
                 delay(cfg.intervalMs.toLong())
             }
         }
