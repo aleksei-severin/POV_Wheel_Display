@@ -64,8 +64,9 @@ class MainActivity : ComponentActivity() {
                 // своему сторожу молчания.
                 val upBusy by vm.anyUploadBusy.collectAsState()
                 val fw by vm.fwProgress.collectAsState()
+                val povBusy by vm.povVideo.busy.collectAsState()
                 val view = LocalView.current
-                val keepAwake = upBusy || fw != null
+                val keepAwake = upBusy || fw != null || povBusy
                 DisposableEffect(keepAwake) {
                     view.keepScreenOn = keepAwake
                     onDispose { view.keepScreenOn = false }

@@ -131,7 +131,7 @@ internal object VideoFrames {
      * Надёжность даёт крупная миниатюра ([THUMB_LONG]) и выравнивание по яркости
      * в [diff] — пути декода у эталона (MMR, софт) и кадра (MediaCodec + GL) разные.
      */
-    private fun matchRotation(ref: OThumb, frame: OThumb, hint: Int): Int {
+    internal fun matchRotation(ref: OThumb, frame: OThumb, hint: Int): Int {
         val hintN = ((hint % 360) + 360) % 360
         val refMean = meanOf(ref)
 

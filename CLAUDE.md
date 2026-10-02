@@ -339,7 +339,7 @@ Frames can come from a generator instead of a file — that is the only way `Spe
 | [include/povble.h](include/povble.h) | BLE protocol: opcodes, packed structs. Mirrored byte-for-byte by `android/…/ble/Proto.kt` |
 | [data/index.html](data/index.html) | Web UI served from LittleFS (also does image→polar conversion in-browser) |
 | [android/](android/) | Android app (Kotlin/Compose). The primary UI; see `android/README.md` |
-| [tools/pov_fps_blend/](tools/pov_fps_blend/) | Offline PowerShell tool for filming the wheel: blends high-speed phone footage into one frame per 1/6 turn, synced by the piezo tick tone on the audio track (handles slow-motion clips). Not part of the firmware build; videos there are git-ignored. See its `README.txt` |
+| [tools/pov_fps_blend/](tools/pov_fps_blend/) | Offline PowerShell tool for filming the wheel: blends high-speed phone footage into one frame per 1/6 turn, synced by the piezo tick tone on the audio track (handles slow-motion clips). Not part of the firmware build; videos there are git-ignored. See its `README.txt`. **The same renderer is built into the Android app** (`android/…/povvideo/`, card "Render POV Video" under Color Correction): `PovTicks.kt` is a line-for-line port of the C# `PovTicks` and must stay in step with it |
 
 ### BLE Transport (default), Wi-Fi (opt-in)
 

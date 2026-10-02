@@ -25,6 +25,15 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Render POV Video saves its result next to the original in DCIM. From Android 10
+         that goes through MediaStore without any permission; before, it is a plain file. -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+    <!-- Only asked for if the gallery hands back a video without a read grant. -->
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
 
     <application

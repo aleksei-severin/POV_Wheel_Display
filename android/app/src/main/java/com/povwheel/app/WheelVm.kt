@@ -101,6 +101,9 @@ data class WheelEntry(
 class WheelVm(app: Application) : AndroidViewModel(app) {
 
     private val ctx: Context get() = getApplication()
+
+    /** «Render POV Video» — склейка видео колеса по тикам, см. povvideo/. */
+    val povVideo = com.povwheel.app.povvideo.PovVideoController(app, viewModelScope)
     private val btManager get() = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val adapter: BluetoothAdapter? get() = btManager.adapter
 
@@ -2750,6 +2753,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     }
 
     override fun onCleared() {
+        povVideo.shutdown()
         btStateReceiver?.let { try { ctx.unregisterReceiver(it) } catch (_: Exception) {} }
         btStateReceiver = null
         stopScan()

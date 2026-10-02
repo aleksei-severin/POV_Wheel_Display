@@ -258,6 +258,10 @@ private fun MainContent(vm: WheelVm, tele: Tele, online: Boolean) {
                 }
             }
         }
+        item(key = "povvideo", span = { GridItemSpan(maxLineSpan) }) {
+            // Рендер POV-видео прямо на телефоне — см. PovVideoCard.
+            SettingCard { PovVideoCard(vm.povVideo) }
+        }
         item(key = "maint", span = { GridItemSpan(maxLineSpan) }) {
             SettingCard {
                 // Только кнопки, без заголовка — карточка по высоте как «Magnet
