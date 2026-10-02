@@ -1,0 +1,2 @@
+# cmd.exe надёжно читает .bat только с окончаниями строк CRLF.
+*.bat text eol=crlf
