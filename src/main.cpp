@@ -2,6 +2,7 @@
 #include "network.h"
 #include "effects.h"
 #include "povble.h"
+#include "beeper.h"
 #include <WiFi.h>
 
 #include <Arduino.h>
@@ -459,6 +460,12 @@ void IRAM_ATTR hallInterruptHandler(void* arg) {
     last_hall_idx   = (uint8_t)k;
     last_hall_time  = now;
     hall_seq++;
+
+    // Тон пьезо на проход луча мимо магнита — пока запитаны все шесть лучей.
+    // Само событие уже значит «колесо крутится»; светится ли лента (загрузка
+    // файла, выдержки перед розжигом) — не важно. В PWR_SPINUP работает один
+    // датчик из шести, и там тона нет.
+    if (power_state == PWR_FULL) beeperTrigger();
 
     if (hallSemaphore) {
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
@@ -3000,6 +3007,10 @@ void setup() {
     // loopTask (Arduino loop) работает на Core 1 с приоритетом 1 и вытесняется
     // renderingTask во время вращения — отписываем его от Task WDT.
     esp_task_wdt_delete(xTaskGetCurrentTaskHandle());
+
+    // Пьезо — до прерываний Холла: ISR зовёт beeperTrigger(), и к первому
+    // событию таймер отключения тона уже должен существовать.
+    beeperInit();
 
     // Прерывания: шесть датчиков Холла + вибродатчик
     for (uint32_t i = 0; i < HALL_COUNT; i++) {

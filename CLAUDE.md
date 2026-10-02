@@ -334,6 +334,7 @@ Frames can come from a generator instead of a file — that is the only way `Spe
 | [src/povble.cpp](src/povble.cpp) | **BLE GATT control — the default transport.** Command dispatch, telemetry, upload with inflate, OTA |
 | [src/network.cpp](src/network.cpp) | WiFi (AP+STA), AsyncWebServer, file upload/playback, OTA, mDNS, web log — **opt-in, off at boot** |
 | [src/effects.cpp](src/effects.cpp) | Procedural effects: generator task, frame buffers, the six effects |
+| [src/beeper.cpp](src/beeper.cpp) | Piezo tick on every Hall event in `PWR_FULL` (LEDC + GPIO-matrix bridge) |
 | [include/config.h](include/config.h) | Pin map, display geometry, RPM thresholds, globals |
 | [include/povble.h](include/povble.h) | BLE protocol: opcodes, packed structs. Mirrored byte-for-byte by `android/…/ble/Proto.kt` |
 | [data/index.html](data/index.html) | Web UI served from LittleFS (also does image→polar conversion in-browser) |
@@ -458,6 +459,16 @@ POST /upload            # Multipart upload of .bin file to LittleFS
 
 ALS-PT19 photodiode with a 12 kΩ load on `PIN_ADC_LIGHT` (IO9), sampled every 100 ms in `loop()` with a 10-sample moving average. `ALS_MV_AT_1000LX` (2400 mV) maps ADC millivolts to lux; brightness is scaled between `min_brightness` and `max_brightness` over 0…`LUX_FULL_SCALE`. The sensor is powered from DCDC1, so readings are only taken when `power_state != PWR_OFF`; otherwise the last value is held. Live lux is shown in the web UI next to the brightness slider for calibration.
 
+### Piezo Tick
+
+A piezo between IO1 and IO2 sounds `PIEZO_FREQ_HZ` (18 kHz) for `PIEZO_BEEP_US` (5 ms) on every accepted Hall event — one tick per arm passing the magnet — **whenever `power_state == PWR_FULL`**, i.e. while all six arms are powered. A Hall event already means the wheel is turning, so there is no separate speed check, and whether the strip is lit is deliberately irrelevant: the tick runs through slideshow load gaps and the render holds. In `PWR_SPINUP` only one sensor of six is powered, and it stays silent there.
+
+- **Bridge drive, 6.6 V peak-to-peak.** One LEDC channel (timer 3, channel 7, APB clock — stays 80 MHz across the 80/240 MHz CPU switch) feeds IO1 directly and IO2 through the GPIO matrix with `out_inv` — exact antiphase, no skew between two channels.
+- **The tone is gated in the GPIO matrix, not by stopping LEDC.** A stopped LEDC channel sits at one idle level, so the inverted pin would hold a constant 3.3 V across the piezo. The timer runs all the time and `beeperTrigger()` reroutes both pins between the LEDC signal and `SIG_GPIO_OUT_IDX` (output register 0 for both) with the ROM `esp_rom_gpio_connect_out_signal` — flash-free, ISR-safe. Silence = both pins LOW.
+- **Switch-off is an `esp_timer` one-shot** (`esp_timer_stop`/`start_once` are in IRAM and spinlock-protected, callable from the ISR). The callback runs on Core 0 and only disconnects if `beep_end` has actually passed under `beep_mux`, so an event arriving right at the boundary extends the tone instead of cutting it. Events come every `10000/RPM` ms, so ticks would only merge above ~2000 RPM.
+- **Boot self-test (`beeperSelfTest()`), logged as `[SYS] Piezo self-test OK: … Hz, antiphase, 5.0 ms, load N` or `[ERR] Piezo self-test FAIL: …`.** Both pins run with the input buffer enabled, so `GPIO_IN` reads the real pad level while the test fires the same `beeperTrigger()` and waits for the same timer. During a tone exactly one pin is HIGH, in silence both are LOW. **Antiphase is judged by the longest both-HIGH run (< 1/8 period), never by "zero both-HIGH samples"**: the piezo is a capacitor *between* the pins and slows both edges, so with it fitted ~40 of ~4500 samples (1.1 µs each) read both-HIGH at the edges of a perfectly working bridge — a non-inverted IO2 would give runs of half a period. `load N` is that edge-overlap count and doubles as an "is anything attached" check: it read exactly 0 on IO4/IO5 in an earlier wiring where nothing produced sound.
+- **This project never calls `Serial.begin()`, and with `ARDUINO_USB_MODE=1` the core doesn't either** (`app_main` only does it for `!ARDUINO_USB_MODE`) — `Serial.print` silently goes nowhere. Logs are `webLog` only (BLE `OP_LOGS` / `/logs`); a temporary serial diagnostic needs its own `Serial.begin()`.
+
 ## Key Configuration (config.h)
 
 ```c
@@ -481,6 +492,8 @@ ALS-PT19 photodiode with a 12 kΩ load on `PIN_ADC_LIGHT` (IO9), sampled every 1
 #define PIN_ADC_VBAT        7    // ADC1_CH6, 1:2 divider
 #define PIN_CHG_STAT        8    // IP2312U D2: HIGH = charge complete
 #define PIN_ADC_LIGHT       9    // ADC1_CH8, ALS-PT19
+#define PIN_PIEZO_A         1    // piezo, bridge-driven with IO2 (antiphase)
+#define PIN_PIEZO_B         2
 #define HALL_PIN_LIST  {13, 21, 14, 18, 17, 16}   // Hall 1..6, numbered along rotation
 ```
 
