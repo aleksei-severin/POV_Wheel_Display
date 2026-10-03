@@ -17,11 +17,18 @@ import android.view.Surface
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
+import kotlin.math.max
 
 /**
- * GLES 3.0 для рендера POV-видео: кольцо последних кадров — слои одного текстурного
- * массива, склейка окна — один проход шейдера по этим слоям, результат — в поверхность
+ * GLES 3.0 для рендера POV-видео: кольцо последних кадров — слои текстурных массивов,
+ * склейка окна — один проход шейдера по этим слоям, результат — в поверхность
  * видеокодировщика.
+ *
+ * Кольцо хранит кадры в YUV 4:2:0 (BT.709): яркость — R8 в полном разрешении, цвет —
+ * RG8 в половинном. 1.5 байта на пиксель вместо 4 у RGBA — так в память видеокарты
+ * помещается кольцо в разрешении исходника, хоть 4K. Результат кодируется в тот же
+ * 4:2:0, так что потерь нет; шейдер склейки переводит кадры обратно в RGB до отсечки
+ * шума и максимума по каналам.
  *
  * Ориентация: кадр декодера рисуется через матрицу SurfaceTexture (в ней кроп и
  * вертикальный флип видеокадра), так что на поверхности кодировщика он стоит так же, как
@@ -49,10 +56,16 @@ internal class PovGl {
 
     // ---- программы ----
     private val progCopy: Int
+    private val progStoreY: Int
+    private val progStoreUV: Int
     private val progPresent: Int
     private val progBlend: Int
     private val aPosCopy: Int
     private val uStCopy: Int
+    private val aPosY: Int
+    private val uStY: Int
+    private val aPosUV: Int
+    private val uStUV: Int
     private val aPosPresent: Int
     private val aPosBlend: Int
     private val uCap: Int
@@ -69,7 +82,10 @@ internal class PovGl {
     var w = 0; private set
     var h = 0; private set
     var cap = 0; private set
-    private var ringTex = 0
+    private var uvW = 0
+    private var uvH = 0
+    private var ringY = 0
+    private var ringUV = 0
     private var resTex = 0
     private val fbo = IntArray(1)
 
@@ -92,6 +108,12 @@ internal class PovGl {
         progCopy = build(VS_EXT, FS_EXT)
         aPosCopy = GLES20.glGetAttribLocation(progCopy, "aPos")
         uStCopy = GLES20.glGetUniformLocation(progCopy, "uSt")
+        progStoreY = build(VS_EXT, FS_EXT_Y)
+        aPosY = GLES20.glGetAttribLocation(progStoreY, "aPos")
+        uStY = GLES20.glGetUniformLocation(progStoreY, "uSt")
+        progStoreUV = build(VS_EXT, FS_EXT_UV)
+        aPosUV = GLES20.glGetAttribLocation(progStoreUV, "aPos")
+        uStUV = GLES20.glGetUniformLocation(progStoreUV, "uSt")
         progPresent = build(VS_2D, FS_2D)
         aPosPresent = GLES20.glGetAttribLocation(progPresent, "aPos")
         progBlend = build(VS_300, FS_BLEND)
@@ -105,6 +127,9 @@ internal class PovGl {
         uLo = GLES20.glGetUniformLocation(progBlend, "uLo")
         uHi = GLES20.glGetUniformLocation(progBlend, "uHi")
         uW = GLES20.glGetUniformLocation(progBlend, "uW")
+        GLES20.glUseProgram(progBlend)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(progBlend, "uY"), 0)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(progBlend, "uUV"), 1)
         GLES20.glGenFramebuffers(1, fbo, 0)
         check("init")
     }
@@ -116,25 +141,37 @@ internal class PovGl {
         return v[0]
     }
 
+    /** Наибольшая сторона текстуры на этом GPU. */
+    fun maxTextureSize(): Int {
+        val v = IntArray(1)
+        GLES20.glGetIntegerv(GLES20.GL_MAX_TEXTURE_SIZE, v, 0)
+        return max(2048, v[0])
+    }
+
     /**
-     * Кольцо [cap] кадров [w]×[h] и текстура результата. false — не хватило памяти
-     * видеокарты (вызывающий уменьшит размер и попробует снова).
+     * Кольцо [cap] кадров [w]×[h] (Y — R8, Cb/Cr — RG8 вдвое меньше по каждой стороне) и
+     * текстура результата. false — не хватило памяти видеокарты (вызывающий уменьшит
+     * размер и попробует снова).
      */
     fun allocate(w: Int, h: Int, cap: Int): Boolean {
         freeTextures()
         while (GLES20.glGetError() != GLES20.GL_NO_ERROR) { /* сброс прежних ошибок */ }
-        val t = IntArray(2)
-        GLES20.glGenTextures(2, t, 0)
-        ringTex = t[0]; resTex = t[1]
-        GLES20.glBindTexture(GLES30.GL_TEXTURE_2D_ARRAY, ringTex)
-        GLES30.glTexStorage3D(GLES30.GL_TEXTURE_2D_ARRAY, 1, GLES30.GL_RGBA8, w, h, cap)
+        val t = IntArray(3)
+        GLES20.glGenTextures(3, t, 0)
+        ringY = t[0]; ringUV = t[1]; resTex = t[2]
+        val cw = (w + 1) / 2; val chh = (h + 1) / 2
+        GLES20.glBindTexture(GLES30.GL_TEXTURE_2D_ARRAY, ringY)
+        GLES30.glTexStorage3D(GLES30.GL_TEXTURE_2D_ARRAY, 1, GLES30.GL_R8, w, h, cap)
+        texParams(GLES30.GL_TEXTURE_2D_ARRAY)
+        GLES20.glBindTexture(GLES30.GL_TEXTURE_2D_ARRAY, ringUV)
+        GLES30.glTexStorage3D(GLES30.GL_TEXTURE_2D_ARRAY, 1, GLES30.GL_RG8, cw, chh, cap)
         texParams(GLES30.GL_TEXTURE_2D_ARRAY)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, resTex)
         GLES30.glTexStorage2D(GLES20.GL_TEXTURE_2D, 1, GLES30.GL_RGBA8, w, h)
         texParams(GLES20.GL_TEXTURE_2D)
         val e = GLES20.glGetError()
         if (e != GLES20.GL_NO_ERROR) { freeTextures(); return false }
-        this.w = w; this.h = h; this.cap = cap
+        this.w = w; this.h = h; this.cap = cap; uvW = cw; uvH = chh
         return true
     }
 
@@ -163,12 +200,18 @@ internal class PovGl {
         surfaceTexture.getTransformMatrix(stMatrix)
     }
 
-    /** Текущий кадр декодера → слой кольца. */
+    /**
+     * Текущий кадр декодера → слой кольца: яркость в полном разрешении, цвет — в половинном
+     * (линейная выборка в центре каждого блока 2×2 и есть среднее четырёх пикселей).
+     */
     fun storeFrame(layer: Int) {
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbo[0])
-        GLES30.glFramebufferTextureLayer(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, ringTex, 0, layer)
+        GLES30.glFramebufferTextureLayer(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, ringY, 0, layer)
         GLES20.glViewport(0, 0, w, h)
-        drawOes()
+        drawOes(progStoreY, aPosY, uStY)
+        GLES30.glFramebufferTextureLayer(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, ringUV, 0, layer)
+        GLES20.glViewport(0, 0, uvW, uvH)
+        drawOes(progStoreUV, aPosUV, uStUV)
     }
 
     /**
@@ -184,7 +227,7 @@ internal class PovGl {
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbo[0])
         GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, t[0], 0)
         GLES20.glViewport(0, 0, tw, th)
-        drawOes()
+        drawOes(progCopy, aPosCopy, uStCopy)
         val buf = ByteBuffer.allocateDirect(tw * th * 4).order(ByteOrder.nativeOrder())
         GLES20.glReadPixels(0, 0, tw, th, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buf)
         GLES20.glDeleteTextures(1, t, 0)
@@ -214,7 +257,10 @@ internal class PovGl {
         GLES20.glViewport(0, 0, w, h)
         GLES20.glUseProgram(progBlend)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-        GLES20.glBindTexture(GLES30.GL_TEXTURE_2D_ARRAY, ringTex)
+        GLES20.glBindTexture(GLES30.GL_TEXTURE_2D_ARRAY, ringY)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+        GLES20.glBindTexture(GLES30.GL_TEXTURE_2D_ARRAY, ringUV)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glUniform1i(uCap, cap)
         GLES20.glUniform1i(uJ0, j0)
         GLES20.glUniform1i(uN, n)
@@ -244,6 +290,8 @@ internal class PovGl {
         runCatching { GLES20.glDeleteFramebuffers(1, fbo, 0) }
         runCatching { GLES20.glDeleteTextures(1, intArrayOf(oesTex), 0) }
         runCatching { GLES20.glDeleteProgram(progCopy) }
+        runCatching { GLES20.glDeleteProgram(progStoreY) }
+        runCatching { GLES20.glDeleteProgram(progStoreUV) }
         runCatching { GLES20.glDeleteProgram(progPresent) }
         runCatching { GLES20.glDeleteProgram(progBlend) }
         runCatching { decoderSurface.release() }
@@ -263,20 +311,21 @@ internal class PovGl {
     // ------------------------------------------------------------------ детали
 
     private fun freeTextures() {
-        val t = IntArray(2)
+        val t = IntArray(3)
         var n = 0
-        if (ringTex != 0) t[n++] = ringTex
+        if (ringY != 0) t[n++] = ringY
+        if (ringUV != 0) t[n++] = ringUV
         if (resTex != 0) t[n++] = resTex
         if (n > 0) runCatching { GLES20.glDeleteTextures(n, t, 0) }
-        ringTex = 0; resTex = 0
+        ringY = 0; ringUV = 0; resTex = 0
     }
 
-    private fun drawOes() {
-        GLES20.glUseProgram(progCopy)
+    private fun drawOes(prog: Int, aPos: Int, uSt: Int) {
+        GLES20.glUseProgram(prog)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTex)
-        GLES20.glUniformMatrix4fv(uStCopy, 1, false, stMatrix, 0)
-        drawQuad(aPosCopy)
+        GLES20.glUniformMatrix4fv(uSt, 1, false, stMatrix, 0)
+        drawQuad(aPos)
     }
 
     private fun drawQuad(aPos: Int) {
@@ -392,6 +441,37 @@ internal class PovGl {
             "varying vec2 vUV;\n" +
             "void main() { gl_FragColor = texture2D(uTex, vUV); }\n"
 
+        // Кадр декодера → яркость BT.709 (слой R8 кольца).
+        const val FS_EXT_Y =
+            "#extension GL_OES_EGL_image_external : require\n" +
+            "#ifdef GL_FRAGMENT_PRECISION_HIGH\n" +
+            "precision highp float;\n" +
+            "#else\n" +
+            "precision mediump float;\n" +
+            "#endif\n" +
+            "uniform samplerExternalOES uTex;\n" +
+            "varying vec2 vUV;\n" +
+            "void main() {\n" +
+            "  vec3 c = texture2D(uTex, vUV).rgb;\n" +
+            "  gl_FragColor = vec4(dot(c, vec3(0.2126, 0.7152, 0.0722)), 0.0, 0.0, 1.0);\n" +
+            "}\n"
+
+        // Кадр декодера → цветоразность BT.709 со сдвигом 0.5 (слой RG8 вдвое меньше).
+        const val FS_EXT_UV =
+            "#extension GL_OES_EGL_image_external : require\n" +
+            "#ifdef GL_FRAGMENT_PRECISION_HIGH\n" +
+            "precision highp float;\n" +
+            "#else\n" +
+            "precision mediump float;\n" +
+            "#endif\n" +
+            "uniform samplerExternalOES uTex;\n" +
+            "varying vec2 vUV;\n" +
+            "void main() {\n" +
+            "  vec3 c = texture2D(uTex, vUV).rgb;\n" +
+            "  float y = dot(c, vec3(0.2126, 0.7152, 0.0722));\n" +
+            "  gl_FragColor = vec4((c.b - y) / 1.8556 + 0.5, (c.r - y) / 1.5748 + 0.5, 0.0, 1.0);\n" +
+            "}\n"
+
         const val VS_2D =
             "attribute vec2 aPos;\n" +
             "varying vec2 vUV;\n" +
@@ -427,7 +507,8 @@ internal class PovGl {
             "precision highp float;\n" +
             "precision highp int;\n" +
             "precision highp sampler2DArray;\n" +
-            "uniform sampler2DArray uRing;\n" +
+            "uniform sampler2DArray uY;\n" +
+            "uniform sampler2DArray uUV;\n" +
             "uniform int uCap;\n" +
             "uniform int uJ0;\n" +
             "uniform int uN;\n" +
@@ -444,7 +525,9 @@ internal class PovGl {
             "  for (int k = 0; k < 12; k++) acc[k] = vec3(0.0);\n" +
             "  for (int i = 0; i < uN; i++) {\n" +
             "    int layer = (uJ0 + i) % uCap;\n" +
-            "    vec3 c = texture(uRing, vec3(vUV, float(layer))).rgb;\n" +
+            "    float yy = texture(uY, vec3(vUV, float(layer))).r;\n" +
+            "    vec2 cc = texture(uUV, vec3(vUV, float(layer))).rg - 0.5;\n" +
+            "    vec3 c = clamp(vec3(yy + 1.5748 * cc.y, yy - 0.1873 * cc.x - 0.4681 * cc.y, yy + 1.8556 * cc.x), 0.0, 1.0);\n" +
             "    if (uLut == 1) c *= vec3(greaterThan(c, vec3(uBlack)));\n" +
             "    for (int k = 0; k < 12; k++) {\n" +
             "      if (uW[k] <= 0.0 || i < uLo[k] || i > uHi[k]) continue;\n" +

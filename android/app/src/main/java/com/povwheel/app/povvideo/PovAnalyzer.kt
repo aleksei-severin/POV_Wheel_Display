@@ -53,7 +53,6 @@ class PovAnalysis(
     val videoMime: String,
     /** Во сколько раз файл медленнее реального времени (1 — обычная съёмка). */
     val slow: Double,
-    val toneHz: Double,
     val tracks: List<TickTrack>,
     /** Метки времени кадров, мкс от первого кадра, по возрастанию. */
     val ptsUs: LongArray,
@@ -73,8 +72,9 @@ internal class DecodedAudio(
     val channels: Int,
     /** Время первого сэмпла, мкс по шкале контейнера. */
     val startUs: Long,
-    /** Моно, −1..1 — для детектора. */
-    val mono: FloatArray?,
+    /** Для детектора: −1..1, [detChannels] каналов вперемешку (не больше двух). */
+    val det: FloatArray?,
+    val detChannels: Int,
     /** Чередующиеся каналы, 16 бит — для звука результата. */
     val pcm: ShortArray?,
     val frames: Int
@@ -82,16 +82,15 @@ internal class DecodedAudio(
 
 internal object PovAnalyzer {
 
-    // Параметры — те же, что по умолчанию у скрипта.
-    const val BEEP_FREQ = 18000.0        // пьезо прошивки (PIEZO_FREQ_HZ)
-    const val BEEP_FREQ_OLD = 17000.0    // прежняя прошивка
-    private const val BEEP_MS = 5.0
-    private const val SNR_DB = 8.0
-    private const val TONAL_DB = 6.0
-    private const val SIDE_HZ = 700.0
+    // Параметры — те же, что по умолчанию у скрипта. Чирп — как в прошивке (PIEZO_CHIRP_*).
+    const val CHIRP_LO_HZ = 15000.0
+    const val CHIRP_HI_HZ = 20000.0
+    const val CHIRP_SEC = 0.015
+    private const val CHIRP_FADE_SEC = 0.0015
     private const val MIN_REV_MS = 80.0
     private const val MIN_RPM = 90.0
     const val MIN_FPS = 10.0
+    const val MIN_WIN_FRAMES = 4         // = PovRenderer.MIN_WIN_FRAMES, -MinWindowFrames скрипта
     private const val BEEPS_PER_REV = 6
     private const val ARMS = 6
     private const val PER_BEEP = ARMS / BEEPS_PER_REV
@@ -137,47 +136,42 @@ internal object PovAnalyzer {
         if (cancelled()) throw InterruptedException()
 
         step("Decoding audio…")
-        val audio = decodeAudio(ctx, uri, wantMono = true, wantPcm = false, cancelled = cancelled)
+        val audio = decodeAudio(ctx, uri, wantDet = true, wantPcm = false, cancelled = cancelled)
             ?: throw NoAudio()
         if (cancelled()) throw InterruptedException()
-        val mono = audio.mono!!
+        val det = audio.det!!
         val offsetSec = (audio.startUs - videoStartUs) / 1e6
 
         // Подсказка о замедлении — частота съёмки из метаданных против частоты файла.
         val hint = if (captureFps > 0 && fileFps > 0) (captureFps / fileFps).roundToInt() else 0
         val slowTry = ArrayList<Double>()
         for (k in intArrayOf(hint, 1, 4, 8, 2)) if (k >= 1 && !slowTry.contains(k.toDouble())) slowTry.add(k.toDouble())
-        val freqTry = doubleArrayOf(BEEP_FREQ, BEEP_FREQ_OLD)
 
-        // Перебор замедлений и частот тона: звук «разгоняется» объявлением частоты
-        // дискретизации в k раз выше (тот же asetrate, что в скрипте), тики ищутся с
-        // обычными параметрами. Первое сочетание, где нашлось ≥ 4 оборотов, — берём.
+        // Перебор замедлений: звук «разгоняется» объявлением частоты дискретизации в k раз
+        // выше (тот же asetrate, что в скрипте), чирпы ищутся с обычными параметрами. Первое
+        // замедление, где нашлось ≥ 4 оборотов, — берём.
         val tried = ArrayList<String>()
         var best = -1
         var bestTracks: List<TickTrack> = emptyList()
+        var bestInfo: PovChirp.Result? = null
         var slow = slowTry[0]
-        var tone = freqTry[0]
-        var candidates = 0
-        outer@ for (k in slowTry) {
+        for (k in slowTry) {
+            if (cancelled()) throw InterruptedException()
             val srEff = (audio.sampleRate * k).roundToInt()
-            for (f in freqTry) {
-                if (cancelled()) throw InterruptedException()
-                if (srEff / 2.0 < f + SIDE_HZ + 100) {
-                    tried.add(fmt("  %s Hz, slow ×%s: audio too narrow (%d Hz) — skipped", num(f), num(k), audio.sampleRate))
-                    continue
-                }
-                step("Looking for " + num(f / 1000) + " kHz ticks" + (if (k > 1) " (slow motion ×" + num(k) + ")" else "") + "…")
-                val det = PovTicks()
-                val cand = det.detect(mono, srEff, f, SIDE_HZ, BEEP_MS, SNR_DB, TONAL_DB, minPeriod, maxPeriod, cancelled)
-                if (cancelled()) throw InterruptedException()
-                val tr = det.grid(cand, maxPeriod, 0.25, 0.5, 5, 0.5, 2 * BEEPS_PER_REV)
-                // Времена — по шкале файла: растягиваем в k раз и сдвигаем на начало звука.
-                val fileTracks = tr.map { t -> TickTrack(DoubleArray(t.times.size) { t.times[it] * k + offsetSec }, t.real) }
-                val iv = fileTracks.sumOf { it.times.size - 1 }
-                tried.add(fmt("  %s Hz, slow ×%s (in file %s Hz, tick %s ms): %d intervals", num(f), num(k), num(f / k), num(BEEP_MS * k), iv))
-                if (iv > best) { best = iv; bestTracks = fileTracks; slow = k; tone = f; candidates = cand.size / 3 }
-                if (iv >= 4 * BEEPS_PER_REV) break@outer
+            if (srEff * 0.47 - CHIRP_LO_HZ < 1000) {
+                tried.add(fmt("  slow ×%s: audio too narrow (%d Hz) — skipped", num(k), audio.sampleRate))
+                continue
             }
+            step("Looking for sync chirps" + (if (k > 1) " (slow motion ×" + num(k) + ")" else "") + "…")
+            val r = PovChirp(CHIRP_LO_HZ, CHIRP_HI_HZ, CHIRP_SEC, CHIRP_FADE_SEC)
+                .run(det, audio.detChannels, srEff, minPeriod, maxPeriod, 2 * BEEPS_PER_REV, cancelled)
+            // Времена — по шкале файла: растягиваем в k раз и сдвигаем на начало звука.
+            val fileTracks = r.tracks.map { t -> TickTrack(DoubleArray(t.times.size) { t.times[it] * k + offsetSec }, t.real, t.dir) }
+            val iv = fileTracks.sumOf { it.times.size - 1 }
+            tried.add(fmt("  slow ×%s (in file %s–%s kHz, chirp %s ms): %d intervals",
+                num(k), num(CHIRP_LO_HZ / k / 1000), num(CHIRP_HI_HZ / k / 1000), num(CHIRP_SEC * 1000 * k), iv))
+            if (iv > best) { best = iv; bestTracks = fileTracks; slow = k; bestInfo = r }
+            if (iv >= 4 * BEEPS_PER_REV) break
         }
 
         step("Planning…")
@@ -185,7 +179,7 @@ internal object PovAnalyzer {
         val coverEnd = durationSec
         val tracks = bestTracks.mapNotNull { t ->
             val idx = t.times.indices.filter { t.times[it] >= 0 && t.times[it] <= coverEnd }
-            if (idx.size < 2) null else TickTrack(DoubleArray(idx.size) { t.times[idx[it]] }, BooleanArray(idx.size) { t.real[idx[it]] })
+            if (idx.size < 2) null else TickTrack(DoubleArray(idx.size) { t.times[idx[it]] }, BooleanArray(idx.size) { t.real[idx[it]] }, t.dir)
         }
 
         // Разметка: отрисовка (интервалы между тиками) и всё остальное (кадры как есть).
@@ -242,8 +236,14 @@ internal object PovAnalyzer {
         if (captureFps > 0 && hint >= 2) rep.add(fmt("  captured at %s fps — looks like slow motion ×%d", num2(captureFps), hint))
         if (tried.size > 1) rep.addAll(tried)
         if (slow > 1) rep.add(fmt("Slow motion ×%s: rpm and intervals below are real; segment times are in the file's own time; the result plays in real time.", num(slow)))
-        if (best > 0 && tone != freqTry[0]) rep.add("Ticks found at " + num(tone) + " Hz — recorded with the older firmware.")
-        rep.add(fmt("Tick candidates: %d; rendering segments: %d", candidates, tracks.size))
+        val info = bestInfo
+        rep.add(fmt("Tick candidates: %d; rendering segments: %d", info?.candidates ?: 0, tracks.size))
+        val w = info?.weights
+        if (info != null && w != null && info.bandLo > 0) {
+            val how = when (info.hyp) { "equal" -> "all bands equal"; "presence" -> "where the band is heard"; "learned" -> "learned from ticks"; else -> info.hyp }
+            rep.add(fmt("  chirp heard at %s–%s kHz; band weights %s (%s)", num(info.bandLo / 1000), num(info.bandHi / 1000),
+                w.joinToString(" ") { String.format(Locale.US, "%.2f", it) }, how))
+        }
         tracks.forEachIndexed { i, t ->
             val ts = t.times
             var rMin = Double.MAX_VALUE; var rMax = 0.0
@@ -252,23 +252,34 @@ internal object PovAnalyzer {
                 rMin = min(rMin, rpm); rMax = max(rMax, rpm)
             }
             val filled = t.real.count { !it }
-            rep.add(fmt("  segment %d: %s–%s s, %d tick intervals (%d filled in), %d..%d rpm",
-                i + 1, num3(ts.first()), num3(ts.last()), ts.size - 1, filled, rMin.roundToInt(), rMax.roundToInt()))
+            rep.add(fmt("  segment %d: %s–%s s, %d tick intervals (%d filled in), %d..%d rpm, sweep %s",
+                i + 1, num3(ts.first()), num3(ts.last()), ts.size - 1, filled, rMin.roundToInt(), rMax.roundToInt(),
+                if (t.dir < 0) "down (rear wheel or spinning backwards)" else "up"))
         }
         val natives = segs.filter { it.native && it.t1 - it.t0 > 0 }
         if (natives.isNotEmpty())
             rep.add("  no ticks, frames kept as recorded: " + natives.joinToString(", ") { num3(it.t0) + "–" + num3(it.t1) + " s" })
         rep.add(fmt("Blended frames (sweeps): %d", sweeps) +
             if (fpsSplit > 0) fmt(" — %d intervals longer than 1/%s s were split to keep ≥ %s fps", fpsSplit, num(MIN_FPS), num(MIN_FPS)) else "")
+        // Медленная съёмка: прорисовка короче MIN_WIN_FRAMES кадров — окно склейки шире её.
+        val ivs = ArrayList<Double>()
+        for (t in tracks) for (k in 1 until t.times.size) ivs.add(t.times[k] - t.times[k - 1])
+        if (ivs.isNotEmpty()) {
+            ivs.sort()
+            val framesPerSweep = ivs[ivs.size / 2] * fileFps
+            if (framesPerSweep < MIN_WIN_FRAMES)
+                rep.add(fmt("  a sweep is only ~%s frames: blend windows widened to %d frames (~%s sweeps) to close the gaps the camera's shutter leaves. Film at 120–240 fps for crisp results.",
+                    num(Math.rint(framesPerSweep * 10) / 10), MIN_WIN_FRAMES, num(Math.rint(MIN_WIN_FRAMES / framesPerSweep * 10) / 10)))
+        }
         if (tracks.isEmpty()) {
-            rep.add("No rendering found — no tick tone on the audio (the piezo only ticks while the strip is lit).")
+            rep.add("No rendering found — no sync chirps on the audio (the piezo only chirps while all six arms are powered).")
         } else {
             rep.add(fmt("Result: %s s at %s fps%s", num2(durationSec / slow), num2(fileFps * slow),
                 if (slow > 1) " (real time)" else ""))
         }
 
         return PovAnalysis(
-            uri, name, relPath, codedW, codedH, rotation, fileFps, durationSec, videoBps, vi.mime, slow, tone,
+            uri, name, relPath, codedW, codedH, rotation, fileFps, durationSec, videoBps, vi.mime, slow,
             tracks, pts, videoStartUs, plan, sweeps, rep
         )
     }
@@ -345,9 +356,14 @@ internal object PovAnalyzer {
         } finally { runCatching { ex.release() } }
     }
 
-    /** Декодирует звуковую дорожку целиком (моно для детектора и/или 16-битный PCM). */
+    /**
+     * Декодирует звуковую дорожку целиком: для детектора — float, не больше двух каналов
+     * вперемешку (стерео не сводится в моно: два микрофона телефона на 15–20 кГц бывают в
+     * противофазе, и сумма гасила бы чирп — детектор складывает их по энергиям); и/или
+     * 16-битный PCM всех каналов.
+     */
     fun decodeAudio(
-        ctx: Context, uri: Uri, wantMono: Boolean, wantPcm: Boolean,
+        ctx: Context, uri: Uri, wantDet: Boolean, wantPcm: Boolean,
         cancelled: () -> Boolean
     ): DecodedAudio? {
         val ex = MediaExtractor()
@@ -370,9 +386,10 @@ internal object PovAnalyzer {
             c.configure(fmt, null, null, 0)
             c.start()
             var isFloat = false
-            var mono = FloatArray(if (wantMono) 1 shl 20 else 0)
+            var det = FloatArray(if (wantDet) 1 shl 20 else 0)
             var pcm = ShortArray(if (wantPcm) 1 shl 20 else 0)
-            var nMono = 0
+            var nDet = 0
+            var detCh = 0
             var nPcm = 0
             val info = MediaCodec.BufferInfo()
             var inEos = false
@@ -407,42 +424,40 @@ internal object PovAnalyzer {
                     val ob = c.getOutputBuffer(oi)!!.order(ByteOrder.nativeOrder())
                     ob.position(info.offset); ob.limit(info.offset + info.size)
                     val chn = max(1, ch)
+                    val dch = min(chn, 2)                 // детектору — первые два канала
+                    if (wantDet && detCh == 0) detCh = dch
                     if (isFloat) {
                         val fb = ob.asFloatBuffer()
                         val frames = fb.remaining() / chn
-                        if (wantMono && nMono + frames > mono.size) mono = mono.copyOf(max(mono.size * 2, nMono + frames))
+                        if (wantDet && nDet + frames * dch > det.size) det = det.copyOf(max(det.size * 2, nDet + frames * dch))
                         if (wantPcm && nPcm + frames * chn > pcm.size) pcm = pcm.copyOf(max(pcm.size * 2, nPcm + frames * chn))
                         for (f in 0 until frames) {
-                            var s = 0f
                             for (k in 0 until chn) {
                                 val v = fb.get()
-                                s += v
                                 if (wantPcm) pcm[nPcm++] = (v.coerceIn(-1f, 1f) * 32767f).toInt().toShort()
+                                if (wantDet && k < dch) det[nDet++] = v
                             }
-                            if (wantMono) mono[nMono++] = s / chn
                         }
                     } else {
                         val sb = ob.asShortBuffer()
                         val frames = sb.remaining() / chn
-                        if (wantMono && nMono + frames > mono.size) mono = mono.copyOf(max(mono.size * 2, nMono + frames))
+                        if (wantDet && nDet + frames * dch > det.size) det = det.copyOf(max(det.size * 2, nDet + frames * dch))
                         if (wantPcm && nPcm + frames * chn > pcm.size) pcm = pcm.copyOf(max(pcm.size * 2, nPcm + frames * chn))
                         for (f in 0 until frames) {
-                            var s = 0f
                             for (k in 0 until chn) {
                                 val v = sb.get()
-                                s += v
                                 if (wantPcm) pcm[nPcm++] = v
+                                if (wantDet && k < dch) det[nDet++] = v / 32768f
                             }
-                            if (wantMono) mono[nMono++] = s / chn / 32768f
                         }
                     }
                 }
                 c.releaseOutputBuffer(oi, false)
             }
-            val frames = if (wantMono) nMono else nPcm / max(1, ch)
+            val frames = if (wantDet) nDet / max(1, detCh) else nPcm / max(1, ch)
             return DecodedAudio(
                 sr, max(1, ch), startUs,
-                if (wantMono) mono.copyOf(nMono) else null,
+                if (wantDet) det.copyOf(nDet) else null, max(1, detCh),
                 if (wantPcm) pcm.copyOf(nPcm) else null,
                 frames
             )

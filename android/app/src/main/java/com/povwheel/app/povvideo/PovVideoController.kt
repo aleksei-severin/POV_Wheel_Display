@@ -75,7 +75,7 @@ class PovVideoController(private val app: Application, private val scope: Corout
             } catch (e: SecurityException) {
                 _state.value = State.Failed("The gallery did not share this video with the app. Allow access to videos and try again.", null, uri)
             } catch (e: PovAnalyzer.NoAudio) {
-                _state.value = State.Failed("This video has no sound track — the tick tone is what tells the sweeps apart.", null)
+                _state.value = State.Failed("This video has no sound track — the sync chirps are what tell the sweeps apart.", null)
             } catch (e: Throwable) {
                 _state.value = State.Failed("Could not read this video: " + (e.message ?: e.javaClass.simpleName), null)
             } finally {

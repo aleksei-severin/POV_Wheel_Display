@@ -33,20 +33,26 @@ import kotlin.math.sqrt
  * переменная. Метки времени — настоящие, делённые на замедление, так что slow motion выходит
  * в реальном времени.
  *
- * Разрешение — не больше 1080p: кольцо держит в памяти видеокарты десятки кадров, и в 4K
- * это гигабайты.
+ * Разрешение результата — как у исходника. Кольцо держит в памяти видеокарты десятки
+ * кадров, поэтому хранит их в YUV 4:2:0 (1.5 байта на пиксель вместо 4 у RGBA): кадр 4K —
+ * 12 МБ, а не 33. Результат кодируется в тот же 4:2:0, так что это ничего не стоит.
+ * Меньше исходника — только если кодировщик телефона такого размера не умеет или кольцо
+ * не помещается в память; тогда [Result] это показывает.
  */
 internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis) {
 
     class Result(val frames: Int, val width: Int, val height: Int)
 
     private companion object {
-        const val MAX_LONG = 1920
-        const val MAX_SHORT = 1080
-        const val RING_BUDGET = 384L shl 20   // байт на кольцо кадров в памяти видеокарты
+        const val RING_BUDGET = 512L shl 20   // байт на кольцо кадров в памяти видеокарты
+        const val MAX_BPS = 120e6             // потолок битрейта (и не выше, чем умеет кодировщик)
         const val BLACK_LEVEL = 16            // отсечка шума, как -BlackLevel по умолчанию
         const val SPREAD = 1.0                // разнос шести окон (CheckerSpread)
         const val SHORT_FRAC = 0.15           // см. Windows в скрипте
+        // Окно не короче стольких кадров (-MinWindowFrames скрипта): на съёмке 60 к/с с
+        // выдержкой короче 1/fps прорисовка в ~2 кадра оставляет провалы между клиньями, а
+        // соседние прорисовки закрывают их кадрами с другой фазой выдержки.
+        const val MIN_WIN_FRAMES = PovAnalyzer.MIN_WIN_FRAMES
         const val MODE_LIGHTEN = 0
     }
 
@@ -65,7 +71,7 @@ internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis)
                 val tLen = p.segT[si]
                 val fl = floor(tLen + 1e-9).toInt()
                 var len = if (tLen - fl < SHORT_FRAC) fl else fl + 1
-                if (len < 1) len = 1
+                if (len < MIN_WIN_FRAMES) len = MIN_WIN_FRAMES
                 for (k in 0 until 6) {
                     val c = p.segT0[si] + tLen / 2 + (k - 2.5) / 6.0 * SPREAD * tLen
                     val s = c - len / 2.0
@@ -131,14 +137,21 @@ internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis)
             extractor.selectTrack(vTrack)
             vFmt.setInteger(MediaFormat.KEY_ROTATION, 0)   // крутит контейнер, не декодер
 
-            // ---- GL и кольцо: размер — до 1080p, и чтобы кольцо влезло в бюджет ----
+            // ---- GL и кольцо: размер исходника, если его умеют кодировщик и видеокарта ----
             val g = PovGl()
             gl = g
             if (cap > g.maxLayers()) throw IllegalStateException("rotation too slow for this phone's GPU (needs $cap frames in memory)")
             val cw = max(2, a.codedW)
             val ch = max(2, a.codedH)
-            var scale = min(1.0, min(MAX_LONG.toDouble() / max(cw, ch), MAX_SHORT.toDouble() / min(cw, ch)))
-            val bytes = cw * scale * ch * scale * 4.0 * cap
+            var scale = 1.0
+            val caps = encoderCaps()
+            if (caps != null) {
+                // кодировщик не умеет такой размер (8K в H.264) — наибольший, что умеет, с той же пропорцией
+                while (scale > 0.2 && !caps.isSizeSupported(even(cw * scale), even(ch * scale))) scale *= 0.95
+            }
+            scale = min(scale, g.maxTextureSize().toDouble() / max(cw, ch))
+            // кольцо: Y на каждый пиксель + Cb/Cr на четверть — 1.5 байта; плюс результат RGBA
+            val bytes = cw * scale * ch * scale * (1.5 * cap + 4.0)
             if (bytes > RING_BUDGET) scale *= sqrt(RING_BUDGET / bytes)
             var ok = false
             for (attempt in 0 until 6) {
@@ -367,6 +380,13 @@ internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis)
 
     private data class Enc(val codec: MediaCodec, val w: Int, val h: Int)
 
+    /** Возможности H.264-кодировщика по умолчанию (размеры, битрейт); null — не узнать. */
+    private fun encoderCaps(): MediaCodecInfo.VideoCapabilities? = runCatching {
+        val c = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        try { c.codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC).videoCapabilities }
+        finally { runCatching { c.release() } }
+    }.getOrNull()
+
     /**
      * Битрейт результата — от исходника, а не от размера кадра. Прежняя формула
      * w·h·fps·0.1 на ролике 1080p 240 к/с давала 47 Мбит/с против 18 у самого исходника,
@@ -374,7 +394,8 @@ internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis)
      * исходника: при уменьшении кадра чуть больше на пиксель (степень 0.75 — мелкий кадр
      * плотнее по деталям), при замедленной съёмке в slow раз больше в секунду (кадров в
      * секунду результата во столько же раз больше). HEVC/AV1/VP9 на тех же битах лучше
-     * H.264 — исходнику в них даётся фора в полтора раза.
+     * H.264 — исходнику в них даётся фора в полтора раза. Потолок — MAX_BPS и то, что
+     * кодировщик принимает (4K-исходник с телефона — 70+ Мбит/с).
      */
     private fun targetBitrate(w: Int, h: Int, outFps: Double): Int {
         val outPix = w.toDouble() * h
@@ -382,7 +403,8 @@ internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis)
         var bps = if (a.videoBps > 0 && srcPix > 0) a.videoBps * (outPix / srcPix).pow(0.75) * a.slow
                   else outPix * min(outFps, 60.0) * 0.15   // битрейт исходника неизвестен
         if (a.videoMime in setOf("video/hevc", "video/av01", "video/x-vnd.on2.vp9")) bps *= 1.5
-        return bps.coerceIn(4e6, 50e6).toInt()
+        val top = encoderCaps()?.bitrateRange?.upper?.toDouble()?.let { min(it, MAX_BPS) } ?: MAX_BPS
+        return bps.coerceIn(min(4e6, top), top).toInt()
     }
 
     /** H.264 с входом-поверхностью; если кодировщик капризничает — проще параметры. */
@@ -467,7 +489,7 @@ internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis)
     }
 
     private fun speedUpAudio(cancelled: () -> Boolean): AudioOut? {
-        val au = PovAnalyzer.decodeAudio(ctx, a.uri, wantMono = false, wantPcm = true, cancelled = cancelled) ?: return null
+        val au = PovAnalyzer.decodeAudio(ctx, a.uri, wantDet = false, wantPcm = true, cancelled = cancelled) ?: return null
         var pcm = au.pcm ?: return null
         var ch = au.channels
         if (ch > 2) {   // AAC здесь — моно или стерео

@@ -91,7 +91,7 @@ fun PovVideoCard(ctrl: PovVideoController) {
 
         when (val s = st) {
             is State.Idle -> Hint(
-                "Pick a video of the spinning wheel recorded with its 18 kHz tick tone. " +
+                "Pick a video of the spinning wheel recorded with sound (the wheel chirps at 15–20 kHz on every sweep). " +
                     "Every 1/6 turn becomes one clean frame; the result is saved to the gallery next to the original."
             )
 
@@ -136,11 +136,22 @@ fun PovVideoCard(ctrl: PovVideoController) {
             is State.Done -> {
                 Text("Saved to the gallery:", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
                 Text(s.path, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
+                // Размеры — как видит зритель (с поворотом из метаданных); меньше исходника
+                // результат бывает, только если кодировщик или память видеокарты не тянут.
+                val rot90 = s.a.rotation == 90 || s.a.rotation == 270
+                val ow = if (rot90) s.h else s.w; val oh = if (rot90) s.w else s.h
+                val iw = if (rot90) s.a.codedH else s.a.codedW; val ih = if (rot90) s.a.codedW else s.a.codedH
+                val reduced = s.w.toLong() * s.h < s.a.codedW.toLong() * s.a.codedH * 0.98
                 Text(
-                    s.w.toString() + "×" + s.h + " · " + String.format(Locale.US, "%.1f", s.a.durationSec / s.a.slow) +
+                    ow.toString() + "×" + oh + " · " + String.format(Locale.US, "%.1f", s.a.durationSec / s.a.slow) +
                         " s · rendered in " + mmss(s.seconds),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (reduced) Text(
+                    "Smaller than the original " + iw + "×" + ih + ": this phone's video encoder or GPU memory can't handle the full size.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     val u = s.uri

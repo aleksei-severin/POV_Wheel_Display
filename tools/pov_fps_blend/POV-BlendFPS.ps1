@@ -16,9 +16,10 @@
     Режим -AudioSync: колесо крутится не с постоянной скоростью, поэтому фиксированное N
     либо не хватает, чтобы дисплей прорисовался целиком (остаются разрывы), либо склеивает
     больше одной прорисовки (наложение). Вместо фиксированного N скрипт берёт границы
-    прорисовок со звуковой дорожки: прошивка пищит пьезо (18 кГц, 5 мс) на каждом
-    срабатывании датчика Холла, пока лента светится, — то есть когда каждый из шести лучей
-    проходит мимо магнита, 6 раз за оборот (-BeepsPerRev).
+    прорисовок со звуковой дорожки: прошивка подаёт на пьезо чирп (свип 15 -> 20 кГц за
+    15 мс, на заднем колесе — 20 -> 15) на каждом срабатывании датчика Холла, пока запитаны
+    все шесть лучей, — то есть когда каждый из лучей проходит мимо магнита, 6 раз за оборот
+    (-BeepsPerRev).
 
     Лучей шесть, и каждый красит свой сектор в 60 градусов одновременно с остальными, так
     что полный круг картинки готов ровно за 1/6 оборота — ровно за интервал между двумя
@@ -30,11 +31,12 @@
     каждая прорисовка представлена своей засветкой, повторённой на столько кадров, сколько
     она реально заняла по времени.
 
-    Тики на записи тихие (10-20 дБ над фоном), их громкость гуляет в пределах оборота
-    (пьезо стоит на вращающейся плате) и после каждого комната звенит отражениями, поэтому
-    детектор не пороговый: согласованный фильтр на тон, локальный фон, проверка
-    тональности, период по автокорреляции и сетка тиков по фазе, которая достраивает
-    пропущенные тики и не замечает случайных (подробно — в комментарии перед $PovSource).
+    Чирпы на записи тихие, их громкость гуляет в пределах оборота (пьезо стоит на
+    вращающейся плате, и два из шести за оборот почти не слышны), после каждого комната
+    звенит отражениями, а щелчки механики громче самих чирпов. Поэтому детектор не
+    пороговый: согласованный фильтр по форме чирпа в пяти полосах, трекер, который ищет
+    сразу всю серию тиков с гладким периодом и достраивает пропущенные, и сглаживание
+    (подробно — в комментарии перед $PovSource).
 
     Пока тиков нет (колесо ещё не рисует, пауза, уже остановилось), кадры идут как есть, в
     исходной частоте — снижать её там незачем, на видео обычное вращение. И ни один
@@ -83,36 +85,31 @@
 
 .PARAMETER AudioSync
     Включает режим автоматической синхронизации по звуку (см. описание выше) вместо
-    ручного -TargetFps. Требует аудиодорожку с тиками синхро-датчика (по умолчанию
-    18 кГц, 6 на оборот).
+    ручного -TargetFps. Требует аудиодорожку с чирпами синхро-датчика (15-20 кГц, 15 мс,
+    6 на оборот).
 
 .PARAMETER SlowMo
     Замедленная съёмка (slow motion): во сколько раз файл медленнее реального времени.
     По умолчанию auto. Смартфон сохраняет slow motion, растягивая и видео, и звук: при
-    замедлении в 4 раза кадры, снятые на 120 к/с, идут как 30 к/с, а тон тика 18 кГц
-    опускается до 4.5 кГц и длится 20 мс. В режиме auto скрипт ищет тики при замедлении
+    замедлении в 4 раза кадры, снятые на 120 к/с, идут как 30 к/с, а чирп 15-20 кГц
+    опускается до 3.75-5 кГц и длится 60 мс. В режиме auto скрипт ищет тики при замедлении
     1, 4, 8 и 2 (первым — то, что подсказывают метаданные файла, если подсказывают) и
     берёт то, при котором они нашлись. Можно задать число явно, например -SlowMo 4.
     Результат всегда в реальном времени: замедление снимается и с видео, и со звука
     (звук возвращается к исходной высоте). -Start/-Duration — по шкале исходного файла.
 
+.PARAMETER ChirpLoHz
+    Нижняя частота чирпа синхро-датчика, Гц (PIEZO_CHIRP_F_LO_HZ прошивки). По умолчанию 15000.
+
+.PARAMETER ChirpHiHz
+    Верхняя частота чирпа, Гц (PIEZO_CHIRP_F_HI_HZ). По умолчанию 20000. Свип идёт вверх или
+    вниз — детектор ищет оба направления сам.
+
+.PARAMETER ChirpMs
+    Длительность чирпа, мс (PIEZO_CHIRP_US / 1000). По умолчанию 15.
+
 .PARAMETER BeepFreq
-    Частота тика синхро-датчика, Гц. По умолчанию 18000: пьезо прошивки (PIEZO_FREQ_HZ);
-    если тиков на ней нет, скрипт пробует и 17000 (записи с прежней прошивкой). Заданная
-    явно частота — единственная, без перебора.
-
-.PARAMETER BeepMs
-    Длительность тика, мс (PIEZO_BEEP_US). По умолчанию 5 — это длина окна согласованного
-    фильтра: оно даёт наилучшее отношение сигнал/шум именно для тона такой длины.
-
-.PARAMETER BeepSnrDb
-    Насколько пик тона должен быть выше локального фона (медиана за ±250 мс), дБ. По
-    умолчанию 8. На test17khz.mp4 тики — 10-35 дБ над фоном, шум — до ~12. Выше — меньше
-    ложных кандидатов, но больше пропусков (их достраивает трекер); ниже — наоборот.
-
-.PARAMETER BeepTonalDb
-    Насколько тон должен быть громче соседних полос (±700 Гц), дБ. По умолчанию 6: тик —
-    узкий тон, а щелчки механики и шум широкополосные и в соседних полосах так же громки.
+    Только с -LegacyClickDetect: центр полосы, где искать щелчок, Гц. По умолчанию 2800.
 
 .PARAMETER MinRpm
     Нижняя граница оборотов, при которых колесо рисует, об/мин. По умолчанию 90 (прошивка
@@ -143,6 +140,15 @@
     полосах у бывших стыков, остальное как при обычной склейке; 0 — обычная склейка. На
     быстром вращении, когда прорисовка короче нескольких кадров, малый разнос округляется
     до нуля.
+
+.PARAMETER MinWindowFrames
+    Окно склейки не короче стольких кадров, даже если прорисовка короче. По умолчанию 4.
+    Камера пишет кадр не всё время между кадрами (выдержка короче 1/fps), и на медленной
+    съёмке — 60 к/с, прорисовка в 1.8 кадра — склейка одной прорисовки остаётся с
+    провалами между клиньями. Изображение колеса неподвижно, поэтому окно в несколько
+    прорисовок закрывает их кадрами с другой фазой выдержки. Цена — анимация и движение
+    камеры смазываются сильнее. На съёмке 120-240 к/с прорисовка и так длиннее, и
+    параметр ни на что не влияет; 1 — склеивать строго по прорисовке.
 
 .PARAMETER CheckerCell
     Размер клетки в пикселях для -CheckerMode ordered и random. По умолчанию 2. Мельче
@@ -230,14 +236,15 @@ param(
 
     [switch]$AudioSync,
     [string]$SlowMo = "auto",
-    [double]$BeepFreq = 18000,
-    [double]$BeepMs = 5,
-    [double]$BeepSnrDb = 8,
-    [double]$BeepTonalDb = 6,
+    [double]$ChirpLoHz = 15000,
+    [double]$ChirpHiHz = 20000,
+    [double]$ChirpMs = 15,
+    [double]$BeepFreq = 2800,
     [double]$MinRevMs = 80,
     [double]$MinRpm = 90,
     [double]$MinFps = 10,
     [int]$CheckerCell = 2,
+    [int]$MinWindowFrames = 4,
     [double]$CheckerSpread = 1,
     [ValidateSet('random', 'ordered', 'blend')]
     [string]$CheckerMode = 'blend',
@@ -441,36 +448,40 @@ function Get-Median {
     return ([double]$s[$m - 1] + [double]$s[$m]) / 2.0
 }
 
-# --- Детектор тиков синхро-датчика и рендер (для -AudioSync) ---
+# --- Детектор чирпов синхро-датчика и рендер (для -AudioSync) ---
 #
-# Прошивка пищит пьезо (PIEZO_FREQ_HZ = 18 кГц, прежде 17, 5 мс) на каждом принятом событии датчика
-# Холла, пока лента светится, — то есть когда очередной луч проходит мимо магнита,
-# -BeepsPerRev раз за оборот. На реальной записи (test17khz.mp4) тик — это всего 10-20 дБ
-# над фоном, его громкость гуляет в пределах оборота (пьезо стоит на вращающейся плате и
-# то смотрит в микрофон, то отвёрнуто — часть тиков почти не слышна), а после каждого
-# тика комната ещё 20-40 мс звенит отражениями. Порог по громкости в полосе (silencedetect)
-# на такой записи находил 100 «тиков» из ~460, вперемешку с отражениями. Поэтому детектор
-# свой, в четыре шага (код на C# ниже, PovTicks):
-#   1. Согласованный фильтр: демодуляция на -BeepFreq (и ±50 Гц — тон стоит не ровно на
-#      номинале, а пьезо вращается) с окном ровно в длину тика (-BeepMs) — наилучшее
-#      отношение сигнал/шум для 5-мс тона.
-#   2. Кандидат — локальный пик огибающей выше ЛОКАЛЬНОГО фона (25-й процентиль за
-#      ±250 мс) на -BeepSnrDb и громче соседних полос (±700 Гц) на -BeepTonalDb: тик —
-#      узкий тон, а щелчки механики широкополосные и в соседних полосах так же громки.
-#   3. Период — по автокорреляции огибающей: её дают все тики вместе, и тихие тоже,
-#      поэтому пропуски и лишние кандидаты на неё почти не влияют, а удвоенного периода
-#      она не выбирает. В пределах ±0.55 периода остаётся сильнейший кандидат — так уходят
-#      хвосты отражений.
-#   4. Сетка по фазе: φ(t) = ∫dt/T — накопленное число периодов; каждый кандидат голосует
-#      своей дробной фазой за сдвиг сетки. Где голоса согласны (круговое среднее ≥ 0.5 в
-#      окне ±0.25 с) — идёт отрисовка, где случайны — шум. Тики — где фаза со сдвигом
-#      проходит целое число; края участка — где 5 из 6 тиков подтверждены кандидатами.
-#      Сетка гладкая по построению: окна склейки получаются ровно по 60° поворота, хотя
-#      датчики стоят не идеально через 60°.
-#   Трекер «от кандидата к кандидату», как и пороговый детектор, на этой записи рвался на
-#   быстром вращении (тики через 23 мс, половина тихие) и цеплялся за двойной период.
-#   Сетка по фазе устойчива во всей полосе 16 950 - 17 100 Гц: на test17khz.mp4 одна
-#   отрисовка 3.248-18.39 с, на записях без тиков (200.MP4, 120.mp4, 100 100.MP4) — ни одной.
+# Прошивка подаёт на пьезо линейный чирп (PIEZO_CHIRP_*: 15 -> 20 кГц за 15 мс, плавные края
+# по 1.5 мс; при rotation_dir < 0 — 20 -> 15) на каждом событии датчика Холла, пока запитаны
+# все шесть лучей, — -BeepsPerRev раз за оборот. Что видно на записях (1_sweep.mp4,
+# 2_sweep.mp4), и что из этого следует для детектора (код на C# ниже, PovChirp):
+#   * У пьезо два резонанса, ~17.5 и ~19.5 кГц: почти вся энергия чирпа приходит двумя
+#     горбами по ~2 мс, остальная часть свипа на 10-20 дБ тише, а фаза между горбами
+#     зависит от отражений. Поэтому согласованный фильтр не один на весь чирп, а пять — по
+#     куску на полосу в 1 кГц, и складываются их энергии: когерентный фильтр расщеплял пик
+#     на лепестки через 3-7 мс, и время тика прыгало между ними.
+#   * Шум перед фильтром отбеливается по частотам (20-й перцентиль за ±0.5 с — чирп проходит
+#     каждую полосу за доли своего периода), полосы взвешиваются: поровну, «где полоса
+#     звучит» (частота всплесков) и, вторым проходом, по найденным тикам. Срезанная
+#     микрофоном или кодеком полоса получает вес 0 и не разбавляет остальные шумом.
+#   * Отражения от стола и стен приходят через 4-7 мс: статистика сглаживается окном 4 мс,
+#     прямой звук и эхо сливаются в один пик.
+#   * Обратный шаблон (свип в другую сторону) отвечает и на настоящий чирп (30-40 %), а
+#     щелчки — удары, хлопки, трещотка втулки — дают отклик обоим. Отсюда вычитание доли
+#     обратного отклика и ослабление там, где есть энергия ниже полосы чирпа (6-13 кГц):
+#     пьезо там молчит, широкополосный щелчок — нет.
+#   * Два из шести чирпов за оборот почти не слышны (пьезо вращается и часть оборота
+#     смотрит от камеры). Порог по каждому тику тут бессилен, поэтому трекер ищет сразу всю
+#     серию: динамическое программирование по кандидатам с априорной гладкостью интервалов
+#     (колесо не меняет скорость скачком), явными пропусками и штрафом за энергию на 1/2,
+#     1/3 и 2/3 интервала — иначе ряд «каждый третий тик» без единого пропуска выигрывал у
+#     полного.
+#   * Итоговые тики — локальная квадратичная регрессия по ±6 тикам: окно склейки должно
+#     покрывать ровно 1/6 оборота, а это гладкая функция времени; разброс отдельных тиков
+#     (эхо, неровная расстановка датчиков) — шум.
+# Проверено на 1_sweep.mp4 / 2_sweep.mp4 (тики по всей длине отрисовки, 184-299 и 191-343
+# об/мин) и на них же с подмешанным белым шумом: +10 дБ к фону полосы — 44-83 % тиков на
+# месте; +20 дБ — трека нет, но и ложного нет. Срез полосы выше 17 кГц — трек находится по
+# остатку 15-17 кГц, хотя и не целиком.
 #
 # Рендер — тоже свой (PovRender): ffmpeg декодирует ролик ОДИН раз в поток кадров
 # постоянной частоты, C# склеивает окна и пропускает кадры вне отрисовки как есть,
@@ -484,440 +495,802 @@ using System.Diagnostics;
 using System.IO;
 using System.Text;
 
-public static class PovTicks {
-    public static double[] Envelope(float[] x, int sr, double f, int win, int hop) {
-        int n = x.Length;
-        int m = n / hop;
-        double[] env = new double[m];
-        double w = 2.0 * Math.PI * f / sr;
-        double cr = 1, ci = 0, dr = Math.Cos(w), di = -Math.Sin(w);
-        double[] re = new double[win], im = new double[win];
-        double sr_ = 0, si = 0;
-        int half = win / 2;
-        for (int i = 0; i < n; i++) {
-            double vr = x[i] * cr, vi = x[i] * ci;
-            int k = i % win;
-            sr_ += vr - re[k]; si += vi - im[k];
-            re[k] = vr; im[k] = vi;
-            double t = cr * dr - ci * di; ci = cr * di + ci * dr; cr = t;
-            if ((i & 1023) == 0) { double nn = Math.Sqrt(cr * cr + ci * ci); cr /= nn; ci /= nn; }
-            int c = i - half;
-            if (c >= 0 && c % hop == 0) { int j = c / hop; if (j < m) env[j] = 2.0 * Math.Sqrt(sr_ * sr_ + si * si) / win; }
-        }
-        return env;
+// Детектор чирпов синхро-датчика (прошивка: include/config.h, PIEZO_CHIRP_*): согласованный
+// фильтр по форме чирпа + трекер серии тиков + сглаживание. Перенесён в Android строка в строку:
+// android/…/povvideo/PovChirp.kt — правки делать в обоих.
+public static class PovChirp {
+    // ---- сигнал прошивки ----
+    public static double FLo = 15000, FHi = 20000, Dur = 0.015, Fade = 0.0015;
+
+    // ---- настройки ----
+    public static int Seg = 5;                  // кусков шаблона (полос по (FHi−FLo)/Seg)
+    public static double SmoothStatSec = 0.004; // сглаживание статистики (прямой звук + эхо)
+    public static double NmsSec = 0.005;        // радиус подавления соседних пиков
+    public static double EvRef = 2.5;           // уровень статистики, при котором тик «нейтрален» для трекера
+    public static double OppThr = 5.0, OppK = 0.5; // обратный отклик выше OppThr — вычитается его доля OppK
+    public static double ClickLo = 6000, ClickHi = 13000, ClickThr = 4.0;
+    public static double MissPen = 0.4;         // штраф за пропущенный тик
+    public static double StartPen = 2.0;        // штраф за начало трека
+    public static double TransBonus = 0.4;      // за переход (уравнивает полную частоту с кратной)
+    public static double IgnoreTolSec = 0.0015, IgnoreK = 1.0;
+    public static int MaxSkip = 8;              // пропусков подряд внутри трека
+    public static int Beam = 12;                // состояний трекера на кандидата
+    public static double JitterSec = 0.0005;    // разброс времени тика
+    public static double AccTyp = 6.0;          // типичное угловое ускорение колеса, рад/с²
+    public static double HallSpread = 0.012;    // разброс интервалов от расстановки датчиков
+    public static double MinScore = 10.0;       // минимальный счёт трека
+    public static double OppDirK = 4.0;         // трек обратного направления — счёт ≥ OppDirK·MinScore
+    public static int SmoothHalf = 6;           // сглаживание тиков: ±тиков
+    public static double BridgeSec = 2.0;       // сращивание соседних треков
+
+    public class Track {
+        public double[] Times; public bool[] Real; public int Dir;
+        public double Score; public double SnrDb; public int Detected; public double ResidMs;
+    }
+    public class Result {
+        public List<Track> Tracks = new List<Track>();
+        public int Candidates, Detected;
+        public double[] Weights;      // веса полос снизу вверх
+        public string Hyp = "";       // какие веса выиграли
+        public double BandLo, BandHi; // где чирп слышен (вес ≥ 0.1), Гц
+        public string Diag = "";
     }
 
-    static double Db(double v) { return 20.0 * Math.Log10(Math.Max(v, 1e-12)); }
-
-    // Фон — 25-й процентиль огибающей за ±250 мс, а не медиана: на быстром вращении
-    // тики идут через 23 мс, отражения каждого звенят 20-40 мс, и огибающая почти не
-    // опускается до настоящего шума — медиана мерила хвосты самих тиков и занижала их
-    // превышение над фоном. Нижний процентиль берёт провалы между ними.
-    const double FloorPct = 0.25;
-    // Самый длинный провал согласия, который сращивается в одну отрисовку, с.
-    const double BridgeSec = 2.0;
-    // Огибающая и период последнего Detect — для StartOf и Grid.
-    static double[] A_e0, A_per;
-    static double A_pStep, A_hs;
-    static int A_win, A_sr;
-
-    // Начало тика по пику огибающей i. Огибающая тона после окна его же длины —
-    // треугольник: подъём от половины до вершины занимает половину длины тона, и
-    // полувысота на подъёме — это начало тона. Ищем ближайшее пересечение половины
-    // назад от вершины, но не дальше половины тона + 1.5 мс: при частых тиках (через
-    // 23 мс на 400 об/мин) раньше этого лежит звенящий хвост предыдущего тика, и
-    // «самое раннее пересечение за 10 мс», как было, прилипало к нему — ошибка до
-    // полупериода, и сетка на быстром вращении разваливалась. Не нашли — вершина
-    // минус половина тона.
-    static double StartOf(int i) {
-        double[] e0 = A_e0;
-        int back = Math.Max(1, (int)Math.Round((A_win / 2.0 / A_sr + 0.0015) / A_hs));
-        double halfAmp = e0[i] * 0.5;
-        for (int k = i; k > Math.Max(0, i - back); k--) {
-            if (e0[k - 1] < halfAmp) {
-                double prev = e0[k - 1];
-                double frac = (e0[k] - prev) > 0 ? (halfAmp - prev) / (e0[k] - prev) : 0;
-                if (frac < 0) frac = 0; if (frac > 1) frac = 1;
-                return (k - 1 + frac) * A_hs;
+    // ================================================================ FFT
+    static void Fft(double[] re, double[] im, int n, bool inverse) {
+        for (int i = 1, j = 0; i < n; i++) {
+            int bit = n >> 1;
+            for (; (j & bit) != 0; bit >>= 1) j ^= bit;
+            j ^= bit;
+            if (i < j) { double t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+        }
+        for (int len = 2; len <= n; len <<= 1) {
+            double ang = 2 * Math.PI / len * (inverse ? 1 : -1);
+            int h = len >> 1;
+            for (int k = 0; k < h; k++) {
+                double cr = Math.Cos(ang * k), ci = Math.Sin(ang * k);
+                for (int i = k; i < n; i += len) {
+                    int b = i + h;
+                    double xr = re[b] * cr - im[b] * ci, xi = re[b] * ci + im[b] * cr;
+                    re[b] = re[i] - xr; im[b] = im[i] - xi; re[i] += xr; im[i] += xi;
+                }
             }
         }
-        return i * A_hs - A_win / 2.0 / A_sr;
+        if (inverse) { double s = 1.0 / n; for (int i = 0; i < n; i++) { re[i] *= s; im[i] *= s; } }
     }
 
-    // Тройки [t, snr, T]: t — начало тика, с от первого сэмпла; snr — пик над
-    // локальным фоном, дБ; T — локальный период по автокорреляции, с (0 — не виден).
-    public static double[] Detect(float[] x, int sr, double f0, double sideHz, double tickMs,
-                                  double snrDb, double tonalDb, double minPeriod, double maxPeriod) {
-        int hop = Math.Max(1, sr / 4000);
-        double hs = (double)hop / sr;
-        int win = Math.Max(8, (int)Math.Round(sr * tickMs / 1000.0));
-        // Три канала через 50 Гц, берём наибольший: тон на записи стоит не ровно на
-        // PIEZO_FREQ_HZ (делитель LEDC дробный, пьезо вращается — доплер), а расстройка
-        // на 50-75 Гц уже стоит согласованному фильтру 1-2 дБ — на тихом участке этого
-        // хватало, чтобы трек рвался. Главный лепесток окна 5 мс — ±200 Гц, так что три
-        // канала покрывают ±125 Гц почти без потерь.
-        double[] e0 = Envelope(x, sr, f0, win, hop);
-        double[] eA = Envelope(x, sr, f0 - 50, win, hop);
-        double[] eB = Envelope(x, sr, f0 + 50, win, hop);
-        for (int i = 0; i < e0.Length; i++) e0[i] = Math.Max(e0[i], Math.Max(eA[i], eB[i]));
-        eA = null; eB = null;
-        double[] eL = Envelope(x, sr, f0 - sideHz, win, hop);
-        double[] eH = Envelope(x, sr, f0 + sideHz, win, hop);
-        int m = e0.Length;
-        if (m < 16) return new double[0];
-        double[] d0 = new double[m], ds = new double[m];
-        for (int i = 0; i < m; i++) { d0[i] = Db(e0[i]); ds[i] = Db(Math.Max(eL[i], eH[i])); }
+    // ================================================================ базовая полоса
+    // Полоса чирпа сдвигается к нулю, фильтруется и прореживается до ~8 кГц: дальше всё
+    // считается на комплексном сигнале в 6 раз реже исходного.
+    class Band {
+        public int Sr, D, L, Ns, Hs; public double Fc, Fsb, HiEff, T0, WinPow; public double[] H, Win;
+    }
 
-        int step = Math.Max(1, (int)Math.Round(0.010 / hs));
-        int halfW = Math.Max(1, (int)(0.25 / hs));
-        int sub = Math.Max(1, (int)Math.Round(0.002 / hs));
-        int g = m / step + 1;
-        double[] floorC = new double[g];
-        List<double> tmp = new List<double>();
-        for (int q = 0; q < g; q++) {
-            int c = q * step, a = Math.Max(0, c - halfW), b = Math.Min(m - 1, c + halfW);
-            tmp.Clear();
-            for (int j = a; j <= b; j += sub) tmp.Add(d0[j]);
-            tmp.Sort();
-            floorC[q] = tmp.Count > 0 ? tmp[(int)(tmp.Count * FloorPct)] : -240;
+    static Band MakeBand(int sr) {
+        var b = new Band();
+        b.Sr = sr;
+        b.HiEff = Math.Min(FHi, 0.47 * sr);
+        if (b.HiEff - FLo < 1000) return null;
+        b.Fc = 0.5 * (FLo + b.HiEff);
+        double half = 0.5 * (b.HiEff - FLo) + 500;
+        b.D = Math.Max(1, (int)Math.Floor(sr / (2 * half + 2000)));
+        b.Fsb = (double)sr / b.D;
+        // ФНЧ до прореживания: пропускание ±half, задерживание с Fsb − half (там уже наложение)
+        double tw = Math.Max(500, b.Fsb - 2 * half);
+        int L = (int)Math.Ceiling(3.5 * sr / tw) | 1;
+        double fcut = 0.5 * b.Fsb / sr;
+        b.L = L; b.H = new double[L];
+        double sum = 0;
+        for (int k = 0; k < L; k++) {
+            double m = k - (L - 1) / 2.0;
+            double sinc = m == 0 ? 2 * fcut : Math.Sin(2 * Math.PI * fcut * m) / (Math.PI * m);
+            b.H[k] = sinc * (0.54 - 0.46 * Math.Cos(2 * Math.PI * k / (L - 1)));
+            sum += b.H[k];
         }
+        for (int k = 0; k < L; k++) b.H[k] /= sum;
+        b.T0 = (L - 1) / 2.0 / sr;
+        // короткое окно (~2 мс) для оценки шума по частотам
+        int ns = 8; while (ns * 2 <= b.Fsb * 0.0025) ns *= 2;
+        b.Ns = ns; b.Hs = ns / 2; b.Win = new double[ns]; b.WinPow = 0;
+        for (int k = 0; k < ns; k++) { b.Win[k] = 0.5 - 0.5 * Math.Cos(2 * Math.PI * (k + 0.5) / ns); b.WinPow += b.Win[k] * b.Win[k]; }
+        return b;
+    }
 
-        A_e0 = e0; A_win = win; A_sr = sr; A_hs = hs;
-
-        int per1 = Math.Max(1, (int)Math.Round(0.001 / hs));
-        int m1 = m / per1;
-        double[] ex = new double[m1];
-        for (int k = 0; k < m1; k++) {
-            double mx = 0;
-            for (int j = k * per1; j < (k + 1) * per1; j++) {
-                double v = d0[j] - floorC[Math.Min(g - 1, j / step)] - 3.0;
-                if (v > mx) mx = v;
+    // x — nch каналов вперемешку, берётся канал ch.
+    static void Demod(float[] x, int nch, int ch, Band b, out float[] zr, out float[] zi) {
+        int n = x.Length / nch;
+        int m = (n - b.L) / b.D;
+        if (m < 1) { zr = new float[0]; zi = new float[0]; return; }
+        zr = new float[m]; zi = new float[m];
+        double w = 2 * Math.PI * b.Fc / b.Sr;
+        int chunk = 1 << 16;
+        var mr = new double[chunk + b.L]; var mi = new double[chunk + b.L];
+        for (int o = 0; o < m; ) {
+            int cnt = Math.Min(chunk / b.D, m - o);
+            int s0 = o * b.D, len = (cnt - 1) * b.D + b.L;
+            for (int k = 0; k < len; k++) {
+                int idx = s0 + k; double v = x[idx * nch + ch]; double ph = w * idx;
+                mr[k] = v * Math.Cos(ph); mi[k] = -v * Math.Sin(ph);
             }
-            ex[k] = mx;
+            for (int q = 0; q < cnt; q++) {
+                double ar = 0, ai = 0; int bs = q * b.D;
+                for (int k = 0; k < b.L; k++) { double h = b.H[k]; ar += h * mr[bs + k]; ai += h * mi[bs + k]; }
+                zr[o + q] = (float)(2 * ar); zi[o + q] = (float)(2 * ai);
+            }
+            o += cnt;
         }
+    }
 
-        // Период ищем с запасом на 25 % сверх прорисовки на -MinRpm: прошивка гасит
-        // ленту не мгновенно (выдержка 400 мс), и последние тики перед остановкой
-        // приходят чуть реже; без запаса конец отрисовки обрезался.
-        int minLag = Math.Max(2, (int)Math.Floor(minPeriod * 1000));
-        int maxLag = Math.Max(minLag + 2, (int)Math.Ceiling(maxPeriod * 1250));
-        int pStep = 100, pHalf = 300;
-        int pg = m1 / pStep + 1;
-        double[] perC = new double[pg];
-        double[] R = new double[maxLag + 2];
-        for (int q = 0; q < pg; q++) {
-            int c = q * pStep, a = Math.Max(0, c - pHalf), b = Math.Min(m1 - 1, c + pHalf);
-            double e2 = 0;
-            for (int i = a; i <= b; i++) e2 += ex[i] * ex[i];
-            perC[q] = 0;
-            if (e2 < 1e-9 || b - a < 2 * maxLag) continue;
-            double rmax = 0;
-            for (int L = minLag - 1; L <= maxLag + 1; L++) {
+    // ================================================================ шум по частотам
+    // Фон по бинам короткого окна: 20-й перцентиль мощности за ±0.5 с на сетке ~64 мс.
+    // Чирп проходит каждый бин за доли его периода, поэтому нижний перцентиль — шум.
+    class Noise { public int Bins, GridStep, GridN; public double[] Floor; }
+
+    static Noise MeasureNoise(float[] zr, float[] zi, Band b) {
+        var nz = new Noise();
+        int ns = b.Ns, hs = b.Hs;
+        int frames = Math.Max(0, (zr.Length - ns) / hs + 1);
+        nz.Bins = ns;
+        var P = new float[frames * ns];
+        var re = new double[ns]; var im = new double[ns];
+        for (int f = 0; f < frames; f++) {
+            int o = f * hs;
+            for (int k = 0; k < ns; k++) { re[k] = zr[o + k] * b.Win[k]; im[k] = zi[o + k] * b.Win[k]; }
+            Fft(re, im, ns, false);
+            for (int k = 0; k < ns; k++) P[f * ns + k] = (float)(re[k] * re[k] + im[k] * im[k]);
+        }
+        double frameSec = hs / b.Fsb;
+        int win = (int)Math.Round(0.5 / frameSec);
+        nz.GridStep = Math.Max(1, (int)Math.Round(0.064 / frameSec));
+        nz.GridN = frames / nz.GridStep + 1;
+        nz.Floor = new double[nz.GridN * ns];
+        var tmp = new List<float>();
+        for (int g = 0; g < nz.GridN; g++) {
+            int c = g * nz.GridStep, a = Math.Max(0, c - win), e = Math.Min(frames - 1, c + win);
+            for (int k = 0; k < ns; k++) {
+                tmp.Clear();
+                for (int f = a; f <= e; f++) tmp.Add(P[f * ns + k]);
+                double v = 0;
+                if (tmp.Count > 0) { tmp.Sort(); v = tmp[(int)(0.2 * (tmp.Count - 1))]; }
+                nz.Floor[g * ns + k] = v / 0.223 / b.WinPow;   // σ² на отсчёт (20-й перцентиль экспоненты — 0.223 среднего)
+            }
+        }
+        return nz;
+    }
+
+    // ================================================================ шаблон
+    static double Envelope(double t) {
+        if (t <= 0 || t >= Dur) return 0;
+        if (t < Fade) return 0.5 - 0.5 * Math.Cos(Math.PI * t / Fade);
+        if (t > Dur - Fade) return 0.5 - 0.5 * Math.Cos(Math.PI * (Dur - t) / Fade);
+        return 1;
+    }
+
+    // Комплексный шаблон в базовой полосе; фаза — как в прошивке: φ(t) = f0·t + c·t²/2.
+    static void Template(Band b, bool up, out double[] tr, out double[] ti) {
+        int lt = (int)Math.Ceiling(Dur * b.Fsb) + 1;
+        tr = new double[lt]; ti = new double[lt];
+        double f0 = up ? FLo : FHi, c = (up ? 1 : -1) * (FHi - FLo) / Dur;
+        for (int n = 0; n < lt; n++) {
+            double t = n / b.Fsb;
+            double ph = 2 * Math.PI * ((f0 - b.Fc) * t + 0.5 * c * t * t);
+            double a = (f0 + c * t) > b.HiEff ? 0 : Envelope(t);
+            tr[n] = a * Math.Cos(ph); ti[n] = a * Math.Sin(ph);
+        }
+    }
+
+    // Полоса j (снизу вверх) — абсолютные частоты.
+    static void BandOf(int j, out double fa, out double fb) {
+        double w = (FHi - FLo) / Seg; fa = FLo + j * w; fb = fa + w;
+    }
+
+    // ================================================================ согласованный фильтр по кускам
+    // Шаблон режется по времени на Seg кусков — у линейного чирпа это полосы по (FHi−FLo)/Seg.
+    // Каждый кусок — свой согласованный фильтр на отбелённом сигнале, а складываются ЭНЕРГИИ
+    // кусков, не комплексные отклики. Причина — пьезо: почти вся энергия чирпа приходит двумя
+    // узкими «горбами» у его резонансов (~17.5 и ~19.5 кГц), и фаза между ними зависит от
+    // отражений в комнате. Когерентный фильтр по всему чирпу складывал их то в плюс, то в
+    // минус — пик расщеплялся на лепестки через 3–7 мс, и тик «прыгал» между ними.
+    // Результат — out[dir·Seg + j] (dir 0 — вверх, j — полоса снизу вверх): энергия куска,
+    // нормированная к шуму (чистый шум — в среднем 1); null — полоса выше записи.
+    static void MatchSeg(float[] zr, float[] zi, Band b, Noise nz, float[][] acc) {
+        int n = zr.Length;
+        double[] t0r, t0i, t1r, t1i;
+        Template(b, true, out t0r, out t0i);
+        Template(b, false, out t1r, out t1i);
+        int lt = t0r.Length;
+        int N = 1024; while (N < 4 * lt) N *= 2;
+        int B = N - lt + 1;
+        var Tr = new double[2 * Seg][]; var Ti = new double[2 * Seg][];
+        for (int dir = 0; dir < 2; dir++) {
+            double[] sr = dir == 0 ? t0r : t1r, si = dir == 0 ? t0i : t1i;
+            for (int m = 0; m < Seg; m++) {
+                int j = dir == 0 ? m : Seg - 1 - m;     // кусок m по времени — полоса j по частоте
+                int q = dir * Seg + j;
+                double fa, fb; BandOf(j, out fa, out fb);
+                if (fb > b.HiEff + 1) continue;
+                Tr[q] = new double[N]; Ti[q] = new double[N];
+                int a = (int)Math.Round(m * (double)lt / Seg), e = (int)Math.Round((m + 1) * (double)lt / Seg);
+                for (int k = a; k < e; k++) { Tr[q][k] = sr[k]; Ti[q][k] = si[k]; }
+                Fft(Tr[q], Ti[q], N, false);
+                if (acc[q] == null) acc[q] = new float[n];
+            }
+        }
+        int ns = nz.Bins;
+        var u0 = new int[N]; var uf = new double[N];
+        for (int k = 0; k < N; k++) {
+            double f = (k < N / 2 ? k : k - N) * b.Fsb / N;
+            double u = f / b.Fsb * ns; if (u < 0) u += ns;
+            int a = (int)Math.Floor(u); uf[k] = u - a; u0[k] = a % ns;
+        }
+        var Zr = new double[N]; var Zi = new double[N]; var Yr = new double[N]; var Yi = new double[N];
+        var G = new double[N]; var sig = new double[ns]; var med = new double[ns];
+        double frameSec = b.Hs / b.Fsb;
+        for (int s = 0; s < n; s += B) {
+            int cnt = Math.Min(B, n - s);
+            Array.Clear(Zr, 0, N); Array.Clear(Zi, 0, N);
+            for (int k = 0; k < N && s + k < n; k++) { Zr[k] = zr[s + k]; Zi[k] = zi[s + k]; }
+            Fft(Zr, Zi, N, false);
+            // шум в середине блока, с полом (цифровая тишина там, где кодек срезал полосу)
+            int g = (int)Math.Round((s + cnt / 2.0) / b.Fsb / frameSec / nz.GridStep);
+            g = Math.Max(0, Math.Min(nz.GridN - 1, g));
+            for (int k = 0; k < ns; k++) { sig[k] = nz.Floor[g * ns + k]; med[k] = sig[k]; }
+            Array.Sort(med);
+            double floorMin = Math.Max(1e-30, med[ns / 2] * 1e-3);
+            for (int k = 0; k < ns; k++) if (sig[k] < floorMin) sig[k] = floorMin;
+            for (int k = 0; k < N; k++) {
+                int a = u0[k], c = (a + 1) % ns;
+                G[k] = 1.0 / (sig[a] * (1 - uf[k]) + sig[c] * uf[k]);
+            }
+            for (int q = 0; q < 2 * Seg; q++) {
+                if (Tr[q] == null) continue;
+                double[] tr = Tr[q], ti = Ti[q];
+                double norm = 0;
+                for (int k = 0; k < N; k++) {
+                    // Z · conj(T) · G; шум на выходе — Σ|T|²·G / N
+                    Yr[k] = (Zr[k] * tr[k] + Zi[k] * ti[k]) * G[k];
+                    Yi[k] = (Zi[k] * tr[k] - Zr[k] * ti[k]) * G[k];
+                    norm += (tr[k] * tr[k] + ti[k] * ti[k]) * G[k];
+                }
+                norm /= N;
+                if (norm <= 0) continue;
+                Fft(Yr, Yi, N, true);
+                float[] dst = acc[q];
+                double inv = 1.0 / norm;
+                for (int k = 0; k < cnt; k++) dst[s + k] += (float)((Yr[k] * Yr[k] + Yi[k] * Yi[k]) * inv);
+            }
+        }
+    }
+
+    // ================================================================ щелчки
+    // Удар, хлопок, стук стойки, трещотка втулки — широкополосные: дают скачок энергии и НИЖЕ
+    // полосы чирпа, где пьезо не звучит вовсе. Отношение энергии ClickLo–ClickHi к её фону
+    // (20-й перцентиль за ±0.5 с), максимум по всей длине возможного чирпа — на сетке отсчётов
+    // базовой полосы. Где оно выше ClickThr, отклик фильтра делится на него.
+    static double[] ClickSpan(float[] x, int nch, int sr, Band b, int nOut) {
+        if (ClickHi > 0.45 * sr) return null;
+        int frame = Math.Max(1, (int)Math.Round(0.001 * sr));      // кадр 1 мс
+        int nf = x.Length / nch / frame;
+        if (nf < 10) return null;
+        var en = new double[nf];
+        double a1 = Math.Exp(-2 * Math.PI * ClickHi / sr), a0 = Math.Exp(-2 * Math.PI * ClickLo / sr);
+        for (int ch = 0; ch < nch; ch++) {
+            double h1 = 0, h2 = 0, l1 = 0, l2 = 0;
+            for (int f = 0; f < nf; f++) {
                 double s = 0;
-                for (int i = a; i + L <= b; i++) s += ex[i] * ex[i + L];
-                R[L] = s / e2;
-                if (L >= minLag && L <= maxLag && R[L] > rmax) rmax = R[L];
-            }
-            for (int L = minLag; L <= maxLag; L++) {
-                if (R[L] >= 0.65 * rmax && R[L] >= R[L - 1] && R[L] >= R[L + 1]) {
-                    // Парабола по трём точкам — период точнее миллисекундного шага
-                    // лага: по нему дальше накапливается фаза сетки тиков.
-                    double den = R[L - 1] - 2 * R[L] + R[L + 1];
-                    double dl = den < 0 ? 0.5 * (R[L - 1] - R[L + 1]) / den : 0;
-                    if (dl < -0.5) dl = -0.5; if (dl > 0.5) dl = 0.5;
-                    perC[q] = (L + dl) / 1000.0;
-                    break;
+                for (int k = 0; k < frame; k++) {
+                    double v = x[(f * frame + k) * nch + ch];
+                    h1 = a1 * h1 + (1 - a1) * v; h2 = a1 * h2 + (1 - a1) * h1;   // ФНЧ ClickHi (2 порядок)
+                    l1 = a0 * l1 + (1 - a0) * v; l2 = a0 * l2 + (1 - a0) * l1;   // ФНЧ ClickLo
+                    double bp = h2 - l2;
+                    s += bp * bp;
                 }
+                en[f] += s;
             }
         }
-        A_per = perC; A_pStep = pStep / 1000.0;
-
-        int r = Math.Max(1, (int)(minPeriod / 2 / hs));
-        List<double> ct = new List<double>(), cs = new List<double>(), cp = new List<double>();
-        for (int i = 1; i < m - 1; i++) {
-            double v = d0[i];
-            double fl = floorC[Math.Min(g - 1, i / step)];
-            if (v - fl < snrDb) continue;
-            if (v - ds[i] < tonalDb) continue;
-            bool isMax = true;
-            int lo = Math.Max(0, i - r), hi = Math.Min(m - 1, i + r);
-            for (int j = lo; j <= hi; j++) { if (d0[j] > v || (d0[j] == v && j < i)) { isMax = false; break; } }
-            if (!isMax) continue;
-            ct.Add(StartOf(i)); cs.Add(v - fl);
-            cp.Add(perC[Math.Min(pg - 1, (int)Math.Round(i * hs * 1000 / pStep))]);
+        int win = 500, step = 64, gn = nf / step + 1;
+        var floor = new double[gn]; var tmp = new List<double>();
+        for (int g = 0; g < gn; g++) {
+            int c = g * step; tmp.Clear();
+            for (int f = Math.Max(0, c - win); f <= Math.Min(nf - 1, c + win); f += 2) tmp.Add(en[f]);
+            tmp.Sort(); floor[g] = Math.Max(1e-30, tmp[(int)(0.2 * (tmp.Count - 1))] / 0.223);
         }
-
-        int n = ct.Count;
-        int[] ord = new int[n];
-        for (int i = 0; i < n; i++) ord[i] = i;
-        double[] csa = cs.ToArray();
-        Array.Sort(ord, (a, b) => csa[b].CompareTo(csa[a]));
-        List<double> acc = new List<double>();
-        bool[] keep = new bool[n];
-        foreach (int i in ord) {
-            double T = cp[i] > 0 ? cp[i] : maxPeriod;
-            double rad = 0.55 * T;
-            int pos = acc.BinarySearch(ct[i]);
-            if (pos < 0) pos = ~pos;
-            bool ok = true;
-            if (pos < acc.Count && acc[pos] - ct[i] < rad) ok = false;
-            if (pos > 0 && ct[i] - acc[pos - 1] < rad) ok = false;
-            if (ok) { acc.Insert(pos, ct[i]); keep[i] = true; }
+        var ratio = new float[nf];
+        for (int f = 0; f < nf; f++) ratio[f] = (float)(en[f] / floor[Math.Min(gn - 1, f / step)]);
+        int span = (int)Math.Ceiling(Dur * 1000) + 4;
+        double[] mx = SlidingMax(ratio, span / 2 + 1);
+        var res = new double[nOut];
+        for (int i = 0; i < nOut; i++) {
+            double t = i / b.Fsb + b.T0;
+            int f = (int)Math.Round(t * 1000 + span / 2.0 - 2);
+            res[i] = mx[Math.Max(0, Math.Min(nf - 1, f))];
         }
-        List<double> kt = new List<double>(), ks = new List<double>(), kp = new List<double>();
-        for (int i = 0; i < n; i++) if (keep[i]) { kt.Add(ct[i]); ks.Add(cs[i]); kp.Add(cp[i]); }
-
-        bool changed = true;
-        while (changed) {
-            changed = false;
-            for (int j = 1; j < kt.Count; j++) {
-                double T = 0.5 * (kp[j] + kp[j - 1]);
-                if (T <= 0) continue;
-                if (kt[j] - kt[j - 1] >= 0.8 * T) continue;
-                double eDropJ = 9, eDropPrev = 9;
-                if (j + 1 < kt.Count) { double q = (kt[j + 1] - kt[j - 1]) / T; eDropJ = Math.Abs(q - Math.Round(q)); if (Math.Round(q) < 1) eDropJ = 9; }
-                if (j - 2 >= 0) { double q = (kt[j] - kt[j - 2]) / T; eDropPrev = Math.Abs(q - Math.Round(q)); if (Math.Round(q) < 1) eDropPrev = 9; }
-                if (Math.Min(eDropJ, eDropPrev) > 0.25) continue;
-                int del = eDropJ <= eDropPrev ? j : j - 1;
-                kt.RemoveAt(del); ks.RemoveAt(del); kp.RemoveAt(del);
-                changed = true;
-                break;
-            }
-        }
-
-        List<double> outL = new List<double>();
-        for (int i = 0; i < kt.Count; i++) { outL.Add(kt[i]); outL.Add(ks[i]); outL.Add(kp[i]); }
-        return outL.ToArray();
+        return res;
     }
 
-    static double Median(List<double> v) {
-        if (v.Count == 0) return 0;
-        v.Sort();
-        return v[v.Count / 2];
+    // Скользящий максимум в окне ±w.
+    static double[] SlidingMax(float[] a, int w) {
+        int n = a.Length; var res = new double[n];
+        var dq = new int[n]; int h = 0, tl = 0, next = 0;
+        for (int i = 0; i < n; i++) {
+            int hi = Math.Min(n - 1, i + w);
+            while (next <= hi) { while (tl > h && a[dq[tl - 1]] <= a[next]) tl--; dq[tl++] = next; next++; }
+            while (dq[h] < i - w) h++;
+            res[i] = a[dq[h]];
+        }
+        return res;
     }
 
-    // Сетка тиков по фазе. Период T(t) — из автокорреляции (последний Detect): она
-    // держит его по всем тикам сразу, и тихим тоже, так что пропуски и лишние
-    // кандидаты на него почти не влияют, а двойного периода она не выбирает. Фаза
-    // φ(t) = ∫dt/T — накопленное число периодов. Каждый кандидат голосует за сдвиг
-    // сетки своей дробной фазой; круговое среднее голосов в окне ±win даёт сдвиг θ(t),
-    // а длина среднего вектора R — насколько голоса согласны. У настоящих тиков фазы
-    // кучные (R ~ 0.7-0.9), у шума — случайные (R ~ 1/√n), так что R ≥ minR и есть
-    // признак отрисовки. Тики — где φ(t) − θ(t) проходит целое число.
-    // Возвращает пары [t, есть кандидат рядом 1 / достроен 0], треки через [-1, -1],
-    // и в конце — диагностику R на сетке 50 мс: [-2, n, R0, R1, ...].
-    public static double[] Grid(double[] trip, double minPeriod, double maxPeriod,
-                                double winSec, double minR, int minVotes, double minTrackSec, int minTicks) {
-        List<double> res = new List<double>();
-        if (A_per == null || A_per.Length < 2) return res.ToArray();
-        int nc = trip.Length / 3;
-        double[] ct = new double[nc], cw = new double[nc];
-        for (int i = 0; i < nc; i++) { ct[i] = trip[3 * i]; cw[i] = Math.Min(20.0, Math.Max(1.0, trip[3 * i + 1] - 4.0)); }
-
-        // Период на сетке A_pStep: медиана по пяти соседним (одиночный выброс
-        // автокорреляции — удвоенный период — не должен сбить фазу), нули — нет периода.
-        int pg = A_per.Length;
-        double[] per = new double[pg];
-        List<double> tmp = new List<double>();
-        for (int q = 0; q < pg; q++) {
-            tmp.Clear();
-            for (int j = Math.Max(0, q - 2); j <= Math.Min(pg - 1, q + 2); j++) if (A_per[j] > 0) tmp.Add(A_per[j]);
-            per[q] = tmp.Count >= 3 ? Median(tmp) : 0;
+    // ================================================================ статистика направления
+    // Взвешенная сумма энергий полос (веса по полосам снизу вверх): шум — в среднем 1.
+    static float[] Combine(float[][] seg, double[] w, int dir) {
+        float[] res = null; double ws = 0;
+        for (int j = 0; j < Seg; j++) {
+            float[] a = seg[(dir > 0 ? 0 : Seg) + j];
+            if (a == null || w[j] <= 0) continue;
+            if (res == null) res = new float[a.Length];
+            float wj = (float)w[j];
+            for (int i = 0; i < a.Length; i++) res[i] += wj * a[i];
+            ws += w[j];
         }
+        if (res == null) return null;
+        // Шум взвешенной суммы тем «хвостатее», чем меньше полос реально участвует:
+        // M_eff = (Σw)²/Σw². Отклонение от среднего пересчитывается к случаю равных весов по
+        // всем полосам, чтобы один порог EvRef значил одно и то же при любых весах — иначе
+        // гипотеза с весом на одной полосе выигрывала бы за счёт шумовых пиков.
+        double w2 = 0; int nAll = 0;
+        for (int j = 0; j < Seg; j++) { if (seg[(dir > 0 ? 0 : Seg) + j] == null) continue; nAll++; if (w[j] > 0) w2 += w[j] * w[j]; }
+        double meff = ws * ws / w2;
+        float k = (float)Math.Sqrt(meff / Math.Max(1, nAll));
+        float inv = (float)(1 / ws);
+        for (int i = 0; i < res.Length; i++) res[i] = 1 + (res[i] * inv - 1) * k;
+        return res;
+    }
 
-        double dt = 0.001;
-        double tEnd = pg * A_pStep;
-        int nf = (int)(tEnd / dt) + 1;
-        double[] phi = new double[nf];
-        bool[] valid = new bool[nf];
-        Func<double, double> Phi = (double t) => {
-            double kf = t / dt;
-            int k0 = (int)Math.Floor(kf);
-            if (k0 < 0) return phi[0];
-            if (k0 >= nf - 1) return phi[nf - 1];
-            return phi[k0] + (phi[k0 + 1] - phi[k0]) * (kf - k0);
-        };
-        double[] vc = new double[nc], vs = new double[nc];
-        double gStep = 0.05;
-        int ng = (int)(tEnd / gStep) + 1;
-        double[] th = new double[ng], Rg = new double[ng];
-        int[] cnt = new int[ng];
-        bool[] good = new bool[ng], on = new bool[ng];
-        Func<int, double> PerAt = (int q) => per[Math.Min(pg - 1, (int)Math.Round(q * gStep / A_pStep))];
-        int holeMax = (int)Math.Round(BridgeSec / gStep);
-
-        // Два прохода: во втором — с периодом, исправленным в провалах (см. ниже).
-        for (int pass = 0; pass < 2; pass++) {
-            // Фаза на сетке 1 мс.
-            for (int k = 1; k < nf; k++) {
-                double t = k * dt;
-                double qf = t / A_pStep;
-                int q0 = Math.Min(pg - 1, (int)Math.Floor(qf)), q1 = Math.Min(pg - 1, q0 + 1);
-                double fr = qf - q0;
-                double T;
-                if (per[q0] > 0 && per[q1] > 0) T = per[q0] + (per[q1] - per[q0]) * fr;
-                else T = per[q0] > 0 ? per[q0] : per[q1];
-                valid[k] = T > 0;
-                if (T <= 0) T = maxPeriod;
-                phi[k] = phi[k - 1] + dt / T;
-            }
-
-            // Голоса кандидатов: дробная фаза как угол.
-            for (int i = 0; i < nc; i++) {
-                double a = 2 * Math.PI * Phi(ct[i]);
-                vc[i] = cw[i] * Math.Cos(a); vs[i] = cw[i] * Math.Sin(a);
-            }
-            // Круговое среднее на сетке 50 мс. Окно — не меньше 3.5 периодов, чтобы и на
-            // медленном вращении (100 мс между тиками) в него попадало 7 голосов.
-            for (int q = 0; q < ng; q++) {
-                double tc = q * gStep;
-                int pq = Math.Min(pg - 1, (int)Math.Round(tc / A_pStep));
-                double w = Math.Max(winSec, 3.5 * per[pq]);
-                int lo = Array.BinarySearch(ct, tc - w); if (lo < 0) lo = ~lo;
-                int hi = Array.BinarySearch(ct, tc + w); if (hi < 0) hi = ~hi; else hi++;
-                double sc = 0, ss = 0, sw = 0;
-                for (int i = lo; i < hi; i++) { sc += vc[i]; ss += vs[i]; sw += cw[i]; }
-                cnt[q] = hi - lo;
-                Rg[q] = sw > 0 ? Math.Sqrt(sc * sc + ss * ss) / sw : 0;
-                th[q] = Math.Atan2(ss, sc);
-            }
-
-            // Маска отрисовки на сетке: согласие голосов, их число и наличие периода.
-            for (int q = 0; q < ng; q++) {
-                int k = Math.Min(nf - 1, (int)Math.Round(q * gStep / dt));
-                good[q] = Rg[q] >= minR && cnt[q] >= minVotes && valid[k];
-                on[q] = good[q];
-            }
-            if (pass == 1) break;
-
-            // Провал согласия, где тики утонули в шуме (телефон далеко, возня с ним в руках):
-            // автокорреляция там случайная, и период внутри провала скачет, хотя колесо
-            // крутится как крутилось. Если обороты на краях провала совпадают (±15 %), а сам
-            // он не длиннее BridgeSec, период внутри заменяется прямой между краями, и всё
-            // считается заново. Окажись это настоящей паузой (лента гаснет на время
-            // загрузки файла), вреда нет: склеиваются те же тёмные кадры.
-            // Обороты на краях — медиана периода по уверенным узлам (согласие ≥ 0.7) в
-            // секунде до провала и после: у самого края узлы ещё «включены», но
-            // автокорреляция там уже ошибается (на 18khz.mp4 — 36 мс вместо 46). Такие узлы
-            // с явно чужим периодом присоединяются к провалу и исправляются вместе с ним.
-            Func<int, int, double> EdgePer = (int from, int to) => {
-                List<double> pv = new List<double>();
-                for (int j = Math.Max(0, from); j <= Math.Min(ng - 1, to); j++)
-                    if (good[j] && Rg[j] >= 0.7 && PerAt(j) > 0) pv.Add(PerAt(j));
-                return pv.Count >= 3 ? Median(pv) : 0;
-            };
-            int edgeN = (int)Math.Round(1.0 / gStep), extN = (int)Math.Round(0.5 / gStep);
-            bool patched = false;
-            for (int q = 0; q < ng; ) {
-                if (on[q]) { q++; continue; }
-                int a = q; while (q < ng && !on[q]) q++;
-                if (a == 0 || q >= ng || q - a > holeMax) continue;
-                double pa = EdgePer(a - edgeN, a - 1), pb = EdgePer(q, q + edgeN - 1);
-                if (pa <= 0) pa = PerAt(a - 1);
-                if (pb <= 0) pb = PerAt(q);
-                if (pa <= 0 || pb <= 0 || Math.Abs(pa / pb - 1) > 0.15) continue;
-                int a2 = a, q2 = q;
-                while (a2 > 1 && a - a2 < extN && Math.Abs(PerAt(a2 - 1) / pa - 1) > 0.15) a2--;
-                while (q2 < ng - 1 && q2 - q < extN && Math.Abs(PerAt(q2) / pb - 1) > 0.15) q2++;
-                if (q2 - a2 > holeMax) continue;
-                int ia = Math.Min(pg - 1, (int)Math.Round((a2 - 1) * gStep / A_pStep));
-                int ib = Math.Min(pg - 1, (int)Math.Round(q2 * gStep / A_pStep));
-                for (int j = ia + 1; j < ib; j++) { per[j] = pa + (pb - pa) * (j - ia) / (double)(ib - ia); patched = true; }
-            }
-            if (!patched) break;
+    // Статистика для трекера: прямой отклик минус часть обратного (из-за двух резонансов пьезо
+    // и эха обратный шаблон отвечает и на настоящий чирп — 30–40 % прямого в пределах длины
+    // чирпа, и из этой «тени» трекер обратного направления собирал целые ложные треки),
+    // ослабленная на щелчках и сглаженная окном SmoothStatSec — прямой звук и отражения от
+    // стола и стен (4–7 мс позже) сливаются в один пик.
+    // Порог «нейтрального» тика EvRef общий: статистика нормирована к шуму. Подстраивать его по
+    // самой записи пробовал — медиана + k·MAD, медиана пиков: шум реальных записей далёк от
+    // гауссова, тики сдвигают оценку, и порог то душил настоящие тики, то пропускал треки из
+    // чистого шума.
+    static double[] Statistic(float[] z, float[] opp, double[] click, Band b) {
+        int n = z.Length;
+        int ow = (int)Math.Ceiling(Dur * b.Fsb);
+        double[] om = SlidingMax(opp, ow);
+        var e = new double[n];
+        for (int i = 0; i < n; i++) {
+            e[i] = z[i] - OppK * Math.Max(0, om[i] - OppThr);
+            if (click != null) { double c = click[i]; if (c > ClickThr) e[i] *= ClickThr / c; }
         }
-        // Сращивание провалов: не длиннее BridgeSec, период внутри непрерывен (±15 % от
-        // краёв) — после исправления выше это все провалы с совпадающими краями. Настоящую
-        // долгую паузу так не срастить: без тиков период на её краях разный или отсутствует.
-        for (int q = 0; q < ng; ) {
-            if (on[q]) { q++; continue; }
-            int a = q; while (q < ng && !on[q]) q++;
-            if (a == 0 || q >= ng || q - a > holeMax) continue;
-            double pa = PerAt(a - 1), pb = PerAt(q);
-            if (pa <= 0 || pb <= 0 || Math.Abs(pa / pb - 1) > 0.15) continue;
-            double pm = 0.5 * (pa + pb);
-            bool cont = true;
-            for (int j = a; j < q; j++) { double pj = PerAt(j); if (pj <= 0 || Math.Abs(pj / pm - 1) > 0.15) { cont = false; break; } }
-            if (cont) for (int j = a; j < q; j++) on[j] = true;
+        int hw = Math.Max(0, (int)Math.Round(0.5 * SmoothStatSec * b.Fsb));
+        var es = new double[n];
+        double acc = 0; int cnt = 0;
+        for (int i = 0; i < Math.Min(n, hw); i++) { acc += e[i]; cnt++; }
+        for (int i = 0; i < n; i++) {
+            if (i + hw < n) { acc += e[i + hw]; cnt++; }
+            if (i - hw - 1 >= 0) { acc -= e[i - hw - 1]; cnt--; }
+            es[i] = acc / cnt;
         }
-        for (int q = 0; q < ng; ) {
-            if (!on[q]) { q++; continue; }
-            int a = q; while (q < ng && on[q]) q++;
-            int b = q - 1;
-            double t0 = a * gStep, t1 = b * gStep;
-            if (t1 - t0 < minTrackSec) continue;
-            // Сдвиг сетки θ — развёрнутый вдоль участка по надёжным узлам (согласие
-            // голосов выше порога), в сращенных провалах — по прямой между краями.
-            double[] thu = new double[b - a + 1];
-            int lastGood = -1;
-            for (int j = 0; j < thu.Length; j++) {
-                if (!good[a + j]) continue;
-                if (lastGood < 0) { thu[j] = th[a + j]; }
-                else {
-                    double d = th[a + j] - th[a + lastGood];
-                    while (d > Math.PI) d -= 2 * Math.PI;
-                    while (d < -Math.PI) d += 2 * Math.PI;
-                    thu[j] = thu[lastGood] + d;
-                    for (int u = lastGood + 1; u < j; u++) thu[u] = thu[lastGood] + d * (u - lastGood) / (j - lastGood);
+        return es;
+    }
+
+    // ================================================================ кандидаты
+    class Cand { public double T, E, V; public int Idx; }
+
+    static double Ev(double e, double evRef) { return Math.Max(-1.5, Math.Min(4.0, Math.Log(Math.Max(e, 1e-9) / evRef))); }
+
+    static List<Cand> Candidates(double[] es, Band b, double evRef) {
+        int n = es.Length;
+        int r = Math.Max(1, (int)Math.Round(NmsSec * b.Fsb));
+        double thr = 0.8 * evRef;
+        var res = new List<Cand>();
+        for (int i = 1; i < n - 1; i++) {
+            double v = es[i];
+            if (v < thr || v < es[i - 1] || v < es[i + 1]) continue;
+            bool mx = true;
+            for (int j = Math.Max(0, i - r); j <= Math.Min(n - 1, i + r); j++) {
+                if (es[j] > v || (es[j] == v && j < i)) { mx = false; break; }
+            }
+            if (!mx) continue;
+            double den = es[i - 1] - 2 * v + es[i + 1];
+            double d = den < 0 ? 0.5 * (es[i - 1] - es[i + 1]) / den : 0;
+            if (d < -0.5) d = -0.5; if (d > 0.5) d = 0.5;
+            var c = new Cand();
+            c.T = (i + d) / b.Fsb + b.T0; c.E = v / evRef; c.Idx = i; c.V = Ev(v, evRef);
+            res.Add(c);
+        }
+        return res;
+    }
+
+    // ================================================================ трекер
+    // Динамическое программирование по кандидатам: путь максимизирует сумму свидетельств тиков
+    // плюс априорную гладкость интервалов (колесо не меняет скорость скачком). Состояние —
+    // (тик, предыдущий тик), пропуски тиков — явные переходы со штрафом. Счёт не ниже нуля в
+    // начале (StartPen) — треки сами находят начало и конец; лучший трек вынимается, его время
+    // занимается, и всё повторяется.
+    class St { public int Cand, Prev, Skip, Ticks; public double I, S; }
+
+    static double Sigma(double I, int m) {
+        // разброс отношения соседних интервалов: время тиков + ускорение колеса + датчики
+        double sj = 1.41 * JitterSec / (I * (m + 1));
+        double sa = AccTyp * I * I * (m + 1) / (Math.PI / 3);
+        return Math.Sqrt(sj * sj + sa * sa + HallSpread * HallSpread);
+    }
+
+    static double EvAt(double[] es, Band b, double evRef, double t) {
+        int c = (int)Math.Round((t - b.T0) * b.Fsb), r = (int)Math.Round(IgnoreTolSec * b.Fsb);
+        double mx = 0;
+        for (int i = Math.Max(0, c - r); i <= Math.Min(es.Length - 1, c + r); i++) if (es[i] > mx) mx = es[i];
+        return Ev(mx, evRef);
+    }
+
+    // Энергия, которую переход t0 → t0 + (m+1)·I оставил без внимания: тик-подобные пики на
+    // 1/2, 1/3 и 2/3 каждого подынтервала. Без этого трекер охотно брал кратный период: два
+    // из шести чирпов за оборот приходят заметно тише (пьезо крутится вместе с колесом и часть
+    // оборота смотрит от камеры), и ряд «каждый третий тик» выглядел безупречным — ни одного
+    // пропуска, — тогда как полный ряд платил за два пропуска на оборот.
+    static double Ignored(double[] es, Band b, double evRef, double t0, double I, int m) {
+        double s = 0;
+        for (int k = 0; k <= m; k++) {
+            double bs = t0 + k * I;
+            s += Math.Max(0, EvAt(es, b, evRef, bs + I / 2)) + Math.Max(0, EvAt(es, b, evRef, bs + I / 3))
+               + Math.Max(0, EvAt(es, b, evRef, bs + 2 * I / 3));
+        }
+        return IgnoreK * s;
+    }
+
+    static List<int[]> TrackAll(List<Cand> cs, double[] es, Band b, double evRef, double minP, double maxP, int minTicks, out List<double> scores) {
+        var paths = new List<int[]>();
+        scores = new List<double>();
+        int K = cs.Count;
+        var alive = new bool[K];
+        for (int i = 0; i < K; i++) alive[i] = true;
+        for (int iter = 0; iter < 64; iter++) {
+            var states = new List<St>();
+            var beam = new List<int>[K];
+            int best = -1; double bestS = double.NegativeInfinity;
+            for (int j = 0; j < K; j++) {
+                beam[j] = new List<int>();
+                if (!alive[j]) continue;
+                var cand = new List<St>();
+                var st0 = new St(); st0.Cand = j; st0.Prev = -1; st0.Ticks = 1; st0.S = cs[j].V - StartPen;
+                cand.Add(st0);
+                for (int i = j - 1; i >= 0; i--) {
+                    double dt = cs[j].T - cs[i].T;
+                    if (dt > (MaxSkip + 1) * maxP) break;
+                    if (!alive[i] || dt < 0.8 * minP) continue;
+                    foreach (int si in beam[i]) {
+                        St p = states[si];
+                        if (p.I == 0) {
+                            if (dt < minP || dt > maxP) continue;
+                            var ns = new St(); ns.Cand = j; ns.Prev = si; ns.Ticks = p.Ticks + 1; ns.I = dt;
+                            ns.S = p.S + cs[j].V - 1.0 - Ignored(es, b, evRef, cs[i].T, dt, 0);
+                            cand.Add(ns);
+                            continue;
+                        }
+                        int m = (int)Math.Round(dt / p.I) - 1;
+                        if (m < 0 || m > MaxSkip) continue;
+                        double I = dt / (m + 1);
+                        if (I < minP || I > maxP * 1.25) continue;
+                        double q = Math.Log(I / p.I) / Sigma(p.I, m);
+                        if (Math.Abs(q) > 8) continue;
+                        var s2 = new St(); s2.Cand = j; s2.Prev = si; s2.Skip = m; s2.Ticks = p.Ticks + m + 1; s2.I = I;
+                        s2.S = p.S + cs[j].V + TransBonus - m * MissPen - 1.5 * Math.Log(1 + q * q / 3)
+                             - Ignored(es, b, evRef, cs[i].T, I, m);
+                        cand.Add(s2);
+                    }
                 }
-                lastGood = j;
-            }
-            if (lastGood < 0) continue;
-            for (int j = lastGood + 1; j < thu.Length; j++) thu[j] = thu[lastGood];
-            Func<double, double> Theta = (double t) => {
-                double qf = (t - t0) / gStep;
-                if (qf <= 0) return thu[0];
-                if (qf >= thu.Length - 1) return thu[thu.Length - 1];
-                int q0 = (int)Math.Floor(qf);
-                return thu[q0] + (thu[q0 + 1] - thu[q0]) * (qf - q0);
-            };
-            // Тики — пересечения целых ψ(t) = φ(t) − θ(t)/2π, с расширением на полсекунды
-            // за края маски: окно голосования размывает их, настоящие края уточняются ниже.
-            List<double> tk = new List<double>();
-            double ts = Math.Max(0, t0 - winSec), te = Math.Min(tEnd, t1 + winSec);
-            double prevPsi = Phi(ts) - Theta(ts) / (2 * Math.PI);
-            for (double t = ts + dt; t <= te; t += dt) {
-                double psi = Phi(t) - Theta(t) / (2 * Math.PI);
-                if (Math.Floor(psi) > Math.Floor(prevPsi)) {
-                    double target = Math.Floor(psi);
-                    double f = (target - prevPsi) / (psi - prevPsi);
-                    tk.Add(t - dt + f * dt);
+                // порядок однозначный и при равном счёте — тот же, что у порта на Kotlin
+                cand.Sort((p1, p2) => p2.S != p1.S ? p2.S.CompareTo(p1.S) : p1.Prev != p2.Prev ? p1.Prev.CompareTo(p2.Prev) : p1.Skip.CompareTo(p2.Skip));
+                for (int q = 0; q < Math.Min(Beam, cand.Count); q++) {
+                    states.Add(cand[q]);
+                    beam[j].Add(states.Count - 1);
+                    if (cand[q].S > bestS) { bestS = cand[q].S; best = states.Count - 1; }
                 }
-                prevPsi = psi;
             }
-            if (tk.Count < 2) continue;
-            // У каждого тика — есть ли кандидат в ±15 % периода.
-            bool[] hit = new bool[tk.Count];
-            for (int j = 0; j < tk.Count; j++) {
-                double Tj = j + 1 < tk.Count ? tk[j + 1] - tk[j] : tk[j] - tk[j - 1];
-                int pos = Array.BinarySearch(ct, tk[j]);
-                if (pos < 0) pos = ~pos;
-                for (int c = Math.Max(0, pos - 1); c <= Math.Min(nc - 1, pos); c++) if (Math.Abs(ct[c] - tk[j]) <= 0.15 * Tj) hit[j] = true;
-            }
-            // Края: отрисовка начинается там, где из шести тиков подряд хотя бы пять
-            // подтверждены кандидатами, а первые три из них — подряд (так же и конец):
-            // одиночный шумовой кандидат за настоящим концом не продлевает трек.
-            int s0 = -1, s1 = -1;
-            for (int j = 0; j + 6 <= tk.Count; j++) {
-                int h = 0; for (int u = j; u < j + 6; u++) if (hit[u]) h++;
-                if (h < 5) continue;
-                for (int u = j; u + 2 < tk.Count; u++) if (hit[u] && hit[u + 1] && hit[u + 2]) { s0 = u; break; }
-                break;
-            }
-            for (int j = tk.Count - 6; j >= 0; j--) {
-                int h = 0; for (int u = j; u < j + 6; u++) if (hit[u]) h++;
-                if (h < 5) continue;
-                for (int u = j + 5; u - 2 >= 0; u--) if (hit[u] && hit[u - 1] && hit[u - 2]) { s1 = u; break; }
-                break;
-            }
-            // Совсем короткий «трек» — случайное совпадение в шуме, а не отрисовка.
-            if (s0 < 0 || s1 - s0 < minTicks) continue;
-            for (int j = s0; j <= s1; j++) { res.Add(tk[j]); res.Add(hit[j] ? 1 : 0); }
-            res.Add(-1); res.Add(-1);
+            if (best < 0 || bestS < MinScore) break;
+            var path = new List<int>();
+            for (int si = best; si >= 0; si = states[si].Prev) path.Add(si);
+            path.Reverse();
+            var tickIdx = new List<int>();
+            foreach (int si in path) { tickIdx.Add(states[si].Cand); tickIdx.Add(states[si].Skip); }
+            int first = states[path[0]].Cand, last = states[path[path.Count - 1]].Cand;
+            double ta = cs[first].T - 0.5 * minP, tb = cs[last].T + 0.5 * minP;
+            for (int i = 0; i < K; i++) if (cs[i].T >= ta && cs[i].T <= tb) alive[i] = false;
+            if (states[best].Ticks - 1 < minTicks) continue;
+            paths.Add(tickIdx.ToArray());
+            scores.Add(bestS);
         }
-        res.Add(-2); res.Add(ng);
-        for (int q = 0; q < ng; q++) res.Add(Rg[q]);
-        return res.ToArray();
+        return paths;
+    }
+
+    // ================================================================ сглаживание
+    // Путь трекера → равномерная по углу сетка тиков: локальная взвешенная квадратичная
+    // регрессия времени по номеру тика (±SmoothHalf тиков) с отсевом выбросов. Окно склейки
+    // должно покрывать ровно 1/6 оборота, а это гладкая функция времени: разброс отдельных
+    // тиков (эхо, неровная расстановка датчиков) — шум, а не сигнал.
+    class RawTrack { public int[] N, Idx; public double[] T, W, E; public int Dir; public double Score; }
+
+    static RawTrack FromPath(int[] path, List<Cand> cs, int dir, double score) {
+        var rt = new RawTrack(); int k = path.Length / 2;
+        rt.N = new int[k]; rt.T = new double[k]; rt.W = new double[k]; rt.E = new double[k]; rt.Idx = new int[k];
+        int n = 0;
+        for (int i = 0; i < k; i++) {
+            if (i > 0) n += path[2 * i + 1] + 1;
+            Cand c = cs[path[2 * i]];
+            rt.N[i] = n; rt.T[i] = c.T; rt.E[i] = c.E; rt.W[i] = Math.Min(c.E, 40.0); rt.Idx[i] = c.Idx;
+        }
+        rt.Dir = dir; rt.Score = score;
+        return rt;
+    }
+
+    static double[] Fit(RawTrack rt, double[] rw, int n) {
+        int H = SmoothHalf;
+        double s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, y0 = 0, y1 = 0, y2 = 0; int cnt = 0;
+        for (int k = 0; k < rt.N.Length; k++) {
+            int d = rt.N[k] - n;
+            if (d < -H || d > H) continue;
+            double u = Math.Abs(d) / (H + 1.0), tc = 1 - u * u * u, w = tc * tc * tc * rt.W[k] * rw[k];
+            if (w <= 0) continue;
+            double y = rt.T[k];
+            s0 += w; s1 += w * d; s2 += w * d * d; s3 += w * d * d * d; s4 += w * d * d * d * d;
+            y0 += w * y; y1 += w * d * y; y2 += w * d * d * y; cnt++;
+        }
+        if (cnt >= 4) {
+            double det = s0 * (s2 * s4 - s3 * s3) - s1 * (s1 * s4 - s3 * s2) + s2 * (s1 * s3 - s2 * s2);
+            if (Math.Abs(det) > 1e-12 * Math.Max(1, s0 * s2 * s4)) {
+                double a = (y0 * (s2 * s4 - s3 * s3) - s1 * (y1 * s4 - s3 * y2) + s2 * (y1 * s3 - s2 * y2)) / det;
+                return new double[] { a };
+            }
+        }
+        if (cnt >= 2) {
+            double det = s0 * s2 - s1 * s1;
+            if (det > 1e-12) return new double[] { (y0 * s2 - s1 * y1) / det };
+        }
+        return null;
+    }
+
+    static Track Smooth(RawTrack rt) {
+        int k = rt.N.Length;
+        var rw = new double[k];
+        for (int i = 0; i < k; i++) rw[i] = 1;
+        for (int it = 0; it < 3; it++) {
+            var ab = new double[k];
+            for (int i = 0; i < k; i++) { double[] f = Fit(rt, rw, rt.N[i]); ab[i] = f == null ? 0 : Math.Abs(rt.T[i] - f[0]); }
+            var srt = (double[])ab.Clone(); Array.Sort(srt);
+            double s = Math.Max(1.4826 * srt[k / 2], JitterSec);
+            for (int i = 0; i < k; i++) { double u = ab[i] / (6 * s); rw[i] = u >= 1 ? 0 : (1 - u * u) * (1 - u * u); }
+        }
+        int n0 = rt.N[0], n1 = rt.N[k - 1];
+        var tr = new Track();
+        tr.Times = new double[n1 - n0 + 1]; tr.Real = new bool[n1 - n0 + 1];
+        int ki = 0;
+        for (int n = n0; n <= n1; n++) {
+            double[] f = Fit(rt, rw, n);
+            double t;
+            if (f != null) t = f[0];
+            else {
+                while (ki + 1 < k && rt.N[ki + 1] <= n) ki++;
+                int kb = Math.Min(k - 1, ki + 1);
+                t = rt.N[kb] == rt.N[ki] ? rt.T[ki] : rt.T[ki] + (rt.T[kb] - rt.T[ki]) * (n - rt.N[ki]) / (double)(rt.N[kb] - rt.N[ki]);
+            }
+            tr.Times[n - n0] = t;
+        }
+        for (int i = 1; i < tr.Times.Length; i++) if (tr.Times[i] <= tr.Times[i - 1]) tr.Times[i] = tr.Times[i - 1] + 1e-4;
+        double esum = 0, rs = 0; int det = 0;
+        for (int i = 0; i < k; i++) {
+            if (rw[i] <= 0) continue;
+            tr.Real[rt.N[i] - n0] = true; esum += rt.E[i]; det++;
+            double d = rt.T[i] - tr.Times[rt.N[i] - n0]; rs += d * d;
+        }
+        tr.Dir = rt.Dir; tr.Score = rt.Score; tr.Detected = det;
+        tr.SnrDb = det > 0 ? 10 * Math.Log10(esum / det) : 0;
+        tr.ResidMs = det > 0 ? Math.Sqrt(rs / det) * 1000 : 0;
+        return tr;
+    }
+
+    // ================================================================ сборка треков
+    // Сильные треки первыми, пересечения с уже принятыми отрезаются. Основное направление — по
+    // сумме счёта; обратное (колесо крутили назад, заднее колесо в кадре) допускается, но только
+    // отчётливое: слабый трек обратного направления — почти всегда отклик обратного шаблона на
+    // шум или на эхо настоящих чирпов.
+    static List<Track> Resolve(List<Track> all, int minTicks) {
+        all.Sort((p1, p2) => p2.Score != p1.Score ? p2.Score.CompareTo(p1.Score) : p1.Times[0].CompareTo(p2.Times[0]));
+        double su = 0, sdn = 0;
+        foreach (Track t in all) { if (t.Dir > 0) su += t.Score; else sdn += t.Score; }
+        int mainDir = su >= sdn ? 1 : -1;
+        all.RemoveAll(t => t.Dir != mainDir && t.Score < OppDirK * MinScore);
+        var acc = new List<Track>();
+        foreach (Track t in all) {
+            int bestA = -1, bestB = -1, a = -1;
+            for (int i = 0; i <= t.Times.Length; i++) {
+                bool free = i < t.Times.Length;
+                if (free) foreach (Track q in acc) if (t.Times[i] >= q.Times[0] - 0.005 && t.Times[i] <= q.Times[q.Times.Length - 1] + 0.005) { free = false; break; }
+                if (free) { if (a < 0) a = i; }
+                else if (a >= 0) { if (i - a > bestB - bestA) { bestA = a; bestB = i; } a = -1; }
+            }
+            if (bestA < 0 || bestB - bestA - 1 < minTicks) continue;
+            if (bestA > 0 || bestB < t.Times.Length) {
+                var nt = new Track(); nt.Dir = t.Dir; nt.Score = t.Score; nt.SnrDb = t.SnrDb; nt.ResidMs = t.ResidMs;
+                nt.Times = new double[bestB - bestA]; nt.Real = new bool[bestB - bestA];
+                Array.Copy(t.Times, bestA, nt.Times, 0, bestB - bestA); Array.Copy(t.Real, bestA, nt.Real, 0, bestB - bestA);
+                foreach (bool r in nt.Real) if (r) nt.Detected++;
+                acc.Add(nt);
+            } else acc.Add(t);
+        }
+        acc.Sort((p1, p2) => p1.Times[0].CompareTo(p2.Times[0]));
+        return acc;
+    }
+
+    // Сращивание соседних треков одного направления через паузу ≤ BridgeSec с тем же периодом.
+    static List<Track> Bridge(List<Track> ts, double maxP) {
+        var res = new List<Track>();
+        foreach (Track t in ts) {
+            if (res.Count > 0) {
+                Track p = res[res.Count - 1];
+                int np = p.Times.Length;
+                double g = t.Times[0] - p.Times[np - 1];
+                double ia = p.Times[np - 1] - p.Times[np - 2], ib = t.Times[1] - t.Times[0];
+                if (p.Dir == t.Dir && g > 0 && g <= BridgeSec && Math.Abs(ia / ib - 1) <= 0.15) {
+                    int n = Math.Max(1, (int)Math.Round(g / (0.5 * (ia + ib))));
+                    if (g / n <= 1.25 * maxP) {
+                        var tt = new List<double>(p.Times); var rr = new List<bool>(p.Real);
+                        double sumI = 0; var iv = new double[n];
+                        for (int i = 0; i < n; i++) { iv[i] = ia + (ib - ia) * (i + 0.5) / n; sumI += iv[i]; }
+                        double acc = p.Times[np - 1];
+                        for (int i = 0; i < n - 1; i++) { acc += iv[i] * g / sumI; tt.Add(acc); rr.Add(false); }
+                        tt.AddRange(t.Times); rr.AddRange(t.Real);
+                        var j = new Track(); j.Dir = p.Dir; j.Score = p.Score + t.Score; j.Detected = p.Detected + t.Detected;
+                        j.SnrDb = Math.Max(p.SnrDb, t.SnrDb); j.ResidMs = Math.Max(p.ResidMs, t.ResidMs);
+                        j.Times = tt.ToArray(); j.Real = rr.ToArray();
+                        res[res.Count - 1] = j;
+                        continue;
+                    }
+                }
+            }
+            res.Add(t);
+        }
+        return res;
+    }
+
+    // ================================================================ веса полос
+    // Где полоса реально звучит — без тиков: частота всплесков энергии полосы (выше 5 средних
+    // шума) сверх шумовой. Срезанная микрофоном или кодеком полоса всплесков не даёт и получает
+    // вес 0 — её шум больше не разбавляет остальные.
+    static double[] PresenceWeights(float[][] seg, double[] click, int nch) {
+        var w = new double[Seg]; double mx = 0;
+        // доля отсчётов выше 5 у шума: Γ(nch, 1/nch) — для 1 канала e^-5, для 2 — 11·e^-10
+        double noise = nch >= 2 ? 11 * Math.Exp(-10) : Math.Exp(-5);
+        for (int j = 0; j < Seg; j++) {
+            float[] a = seg[j], c = seg[Seg + j];
+            if (a == null) continue;
+            int hit = 0, tot = 0;
+            for (int i = 0; i < a.Length; i++) {
+                if (click != null && click[i] > ClickThr) continue;
+                tot++;
+                if (Math.Max(a[i], c == null ? 0 : c[i]) > 5) hit++;
+            }
+            double rate = tot > 0 ? (double)hit / tot : 0;
+            w[j] = Math.Max(0, rate - 6 * noise);
+            mx = Math.Max(mx, w[j]);
+        }
+        if (mx <= 0) return null;
+        for (int j = 0; j < Seg; j++) w[j] /= mx;
+        return w;
+    }
+
+    // По уверенным тикам: отношение сигнал/шум каждой полосы (среднее энергии куска около тика
+    // минус 1). Вес полосы ∝ ему — лучшее сложение энергий при слабом сигнале.
+    static double[] LearnWeights(float[][] seg, List<RawTrack> raws) {
+        var sum = new double[Seg]; var cnt = new int[Seg];
+        foreach (RawTrack rt in raws) {
+            int off = rt.Dir > 0 ? 0 : Seg;
+            for (int i = 0; i < rt.N.Length; i++) {
+                if (rt.E[i] < 2) continue;
+                for (int j = 0; j < Seg; j++) {
+                    float[] a = seg[off + j];
+                    if (a == null) continue;
+                    int c = rt.Idx[i], r = 16;
+                    double s = 0; int n = 0;
+                    for (int k = Math.Max(0, c - r); k <= Math.Min(a.Length - 1, c + r); k++) { s += a[k]; n++; }
+                    if (n > 0) { sum[j] += s / n - 1; cnt[j]++; }
+                }
+            }
+        }
+        var w = new double[Seg]; double mx = 0;
+        for (int j = 0; j < Seg; j++) { w[j] = cnt[j] > 0 ? Math.Max(0, sum[j] / cnt[j]) : 0; mx = Math.Max(mx, w[j]); }
+        if (mx <= 0) return null;
+        for (int j = 0; j < Seg; j++) w[j] /= mx;
+        return w;
+    }
+
+    // ================================================================ один прогон с весами
+    static Result Detect(float[][] seg, double[] w, double[] click, Band b, double minP, double maxP, int minTicks, List<RawTrack> rawsOut) {
+        var r = new Result(); r.Weights = w;
+        var all = new List<Track>();
+        float[] zu = Combine(seg, w, 1), zd = Combine(seg, w, -1);
+        if (zu == null || zd == null) return r;
+        for (int dir = 1; dir >= -1; dir -= 2) {
+            double evRef = EvRef;
+            double[] es = dir > 0 ? Statistic(zu, zd, click, b) : Statistic(zd, zu, click, b);
+            List<Cand> cs = Candidates(es, b, evRef);
+            r.Candidates += cs.Count;
+            List<double> sc;
+            List<int[]> paths = TrackAll(cs, es, b, evRef, minP, maxP, minTicks, out sc);
+            for (int i = 0; i < paths.Count; i++) {
+                RawTrack rt = FromPath(paths[i], cs, dir, sc[i]);
+                if (rawsOut != null) rawsOut.Add(rt);
+                all.Add(Smooth(rt));
+                r.Diag += string.Format(" [{0}{1:F2}-{2:F2} n{3} sc{4:F0}]", dir > 0 ? "+" : "-", rt.T[0], rt.T[rt.T.Length - 1], rt.N.Length, sc[i]);
+            }
+        }
+        r.Tracks = Bridge(Resolve(all, minTicks), maxP);
+        foreach (Track t in r.Tracks) r.Detected += t.Detected;
+        return r;
+    }
+
+    static double TotalScore(Result r) { double s = 0; foreach (Track t in r.Tracks) s += t.Score; return s; }
+
+    static bool Better(Result a, Result b) {
+        if (b == null) return true;
+        if (a.Detected != b.Detected) return a.Detected > b.Detected;
+        return TotalScore(a) > TotalScore(b);
+    }
+
+    // ================================================================ вход
+    // x — звук, nch каналов вперемешку (стерео обрабатывается раздельно и складывается по
+    // энергиям: два микрофона телефона в противофазе на 15-20 кГц гасили бы друг друга в моно);
+    // minP/maxP — допустимый интервал между тиками, с; minTicks — минимум интервалов в треке.
+    public static Result Run(float[] x, int nch, int sr, double minP, double maxP, int minTicks) {
+        Band b = MakeBand(sr);
+        if (b == null) { var e = new Result(); e.Diag = "audio band too narrow for the chirp"; return e; }
+        var seg = new float[2 * Seg][];
+        int n = 0;
+        for (int ch = 0; ch < nch; ch++) {
+            float[] zr, zi;
+            Demod(x, nch, ch, b, out zr, out zi);
+            n = zr.Length;
+            Noise nz = MeasureNoise(zr, zi, b);
+            MatchSeg(zr, zi, b, nz, seg);
+        }
+        for (int q = 0; q < 2 * Seg; q++) if (seg[q] != null) { float inv = 1f / nch; float[] a = seg[q]; for (int i = 0; i < a.Length; i++) a[i] *= inv; }
+        double[] click = ClickSpan(x, nch, sr, b, n);
+
+        // Первый проход — две гипотезы весов: все полосы поровну и «где полоса звучит».
+        var eq = new double[Seg];
+        for (int j = 0; j < Seg; j++) eq[j] = seg[j] != null ? 1 : 0;
+        Result best = null; List<RawTrack> bestRaws = null;
+        var hyps = new List<double[]>(); var names = new List<string>();
+        hyps.Add(eq); names.Add("equal");
+        double[] pw = PresenceWeights(seg, click, nch);
+        if (pw != null) { hyps.Add(pw); names.Add("presence"); }
+        for (int h = 0; h < hyps.Count; h++) {
+            var raws = new List<RawTrack>();
+            Result r = Detect(seg, hyps[h], click, b, minP, maxP, minTicks, raws);
+            r.Hyp = names[h];
+            if (Better(r, best)) { best = r; bestRaws = raws; }
+        }
+        // Второй проход — веса из найденных тиков.
+        if (bestRaws != null && bestRaws.Count > 0) {
+            double[] lw = LearnWeights(seg, bestRaws);
+            if (lw != null) {
+                Result r = Detect(seg, lw, click, b, minP, maxP, minTicks, null);
+                r.Hyp = "learned";
+                if (Better(r, best)) best = r;
+            }
+        }
+        if (best.Weights != null) {
+            for (int j = 0; j < Seg; j++) {
+                if (best.Weights[j] < 0.1) continue;
+                double fa, fb; BandOf(j, out fa, out fb);
+                if (best.BandLo == 0) best.BandLo = fa;
+                best.BandHi = fb;
+            }
+        }
+        return best;
     }
 }
 
@@ -975,7 +1348,7 @@ public static class PovRender {
     public static long Run(string ffmpeg, string decArgs, string encArgs, int w, int h,
                            int[] kinds, int[] counts, double[] segT0, double[] segT,
                            int blackLevel, int mode, double fps,
-                           int cell, double spread, int chk) {
+                           int cell, double spread, int chk, int minWin) {
         errDec.Clear(); errEnc.Clear();
         int px = w * h, fs = px * 3;
         long total = 0;
@@ -985,7 +1358,7 @@ public static class PovRender {
         int cap = 4;
         for (int si = 0; si < kinds.Length; si++) {
             int span = counts[si];
-            if (kinds[si] == 2) span = Math.Max(span, (int)Math.Ceiling(segT[si] * (1 + (checker ? spread : 0) * 5 / 6.0)) + 4);
+            if (kinds[si] == 2) span = Math.Max(span, Math.Max((int)Math.Ceiling(segT[si]), minWin) + (int)Math.Ceiling(segT[si] * (checker ? spread : 0) * 5 / 6.0) + 4);
             cap = Math.Max(cap, span + 4);
         }
         byte[] cmap = checker && chk != 2 ? CellMap(w, h, cell, chk == 1) : null;
@@ -1018,7 +1391,7 @@ public static class PovRender {
                 // окно [a, b].
                 long[] wlo = new long[12], whi = new long[12];
                 double[] wwt = new double[12];
-                if (kinds[si] == 2) Windows(segT0[si], segT[si], checker ? spread : 0, wlo, whi, wwt);
+                if (kinds[si] == 2) Windows(segT0[si], segT[si], checker ? spread : 0, minWin, wlo, whi, wwt);
                 else for (int k = 0; k < 12; k++) { wlo[k] = a; whi[k] = b; wwt[k] = (k & 1) == 0 ? 1 : 0; }
                 long need = b;
                 for (int k = 0; k < 12; k++) if (wwt[k] > 0) need = Math.Max(need, whi[k]);
@@ -1166,10 +1539,20 @@ public static class PovRender {
     // окна полные (длиной не меньше прорисовки), картинка не сдвигается и не
     // дорисовывается — меняется только вес двух честных склеек, и стык стоит на месте.
     // На выходе 12 окон: пары (2k, 2k+1) для сдвигов k = 0..5, веса пары в сумме 1.
+    //
+    // Окно не короче minWin кадров, даже если прорисовка короче. Камера пишет кадр не всё
+    // время между кадрами: при 60 к/с и выдержке ~12 мс (3_sweep.mp4) кадр ловит ~70 %
+    // поворота, и прорисовка в 1.8 кадра — это два кадра с провалами между клиньями: круг
+    // не закрывается никогда. Картинка колеса неподвижна в пространстве, поэтому соседние
+    // прорисовки дают те же точки, только под другой фазой выдержки, — окно в несколько
+    // прорисовок закрывает провалы (на 3_sweep.mp4 к четырём кадрам круг почти целый).
+    // Цена — анимация и движение камеры за это время смазываются, поэтому окно растёт только
+    // там, где прорисовка короче minWin кадров: на съёмке 240 к/с оно не меняется.
     const double ShortFrac = 0.15;
-    static void Windows(double t0, double T, double spread, long[] lo, long[] hi, double[] wt) {
+    static void Windows(double t0, double T, double spread, int minWin, long[] lo, long[] hi, double[] wt) {
         int fl = (int)Math.Floor(T + 1e-9);
         int L = (T - fl < ShortFrac) ? fl : fl + 1;
+        if (L < minWin) L = minWin;
         if (L < 1) L = 1;
         for (int k = 0; k < 6; k++) {
             double c = t0 + T / 2 + (k - 2.5) / 6.0 * spread * T;
@@ -1213,7 +1596,7 @@ public static class PovRender {
 '@
 
 function Initialize-PovCode {
-    if (-not ('PovTicks' -as [type])) { Add-Type -TypeDefinition $PovSource -Language CSharp }
+    if (-not ('PovChirp' -as [type])) { Add-Type -TypeDefinition $PovSource -Language CSharp }
 }
 
 # Аргумент командной строки для внешнего процесса: в кавычках, если есть пробел.
@@ -1249,11 +1632,11 @@ function Get-VideoGeometry {
 }
 
 # Фильтр, возвращающий замедленному в Speed раз звуку реальную скорость и высоту: сэмплы
-# объявляются идущими в Speed раз чаще (asetrate) и пересчитываются в 48 кГц. Тон 18 кГц,
-# опущенный замедлением до 18/Speed, снова 18 кГц. Именно 48 кГц, а не частота файла:
-# Samsung хранит замедленный в 4 раза звук как 12 кГц (те же сэмплы, что были на 48 кГц,
-# только помечены медленнее), и пересчёт обратно в 12 кГц срезал бы всё выше 6 кГц —
-# вместе с тоном 18 кГц.
+# объявляются идущими в Speed раз чаще (asetrate) и пересчитываются в 48 кГц. Чирп 15-20 кГц,
+# опущенный замедлением до 15/Speed-20/Speed, снова 15-20 кГц. Именно 48 кГц, а не частота
+# файла: Samsung хранит замедленный в 4 раза звук как 12 кГц (те же сэмплы, что были на
+# 48 кГц, только помечены медленнее), и пересчёт обратно в 12 кГц срезал бы всё выше 6 кГц —
+# вместе с чирпом.
 function Get-SpeedUpFilter {
     param([double]$Speed, [int]$SampleRate)
     if ($Speed -le 1) { return "" }
@@ -1285,26 +1668,35 @@ function Get-SlowMoHint {
     return 0
 }
 
-# Тики по звуку: декодируем дорожку в моно 48 кГц float и отдаём детектору и трекеру.
-# Времена переводятся на шкалу видео: у телефонной записи звук начинается не вровень с
-# видео (test17khz.mp4 — на 13 мс позже), а сырой поток сэмплов об этом не помнит.
-# Замедленная съёмка (Speed > 1): звук сначала разгоняется до реальной скорости, тики
-# ищутся с обычными параметрами (тон 18 кГц, 5 мс), а найденные времена растягиваются
-# обратно в Speed раз — на шкалу файла.
-# Возвращает { Candidates; Tracks = @( @{ Times = double[]; Real = bool[] } ) }.
-function Get-ToneTracks {
-    param([string]$FFmpegPath, [string]$FFprobePath, [string]$File, [string]$TempDir,
-          [double]$Freq, [double]$TickMs, [double]$SnrDb, [double]$TonalDb,
-          [double]$MinPeriod, [double]$MaxPeriod, [int]$MinTicks,
-          [double]$Speed = 1, [int]$SampleRate = 48000)
+function Get-AudioChannels {
+    param([string]$FFprobePath, [string]$File)
+    $r = Invoke-NativeCapture -Path $FFprobePath -ArgList @('-v', 'error', '-select_streams', 'a:0', '-show_entries', 'stream=channels', '-of', 'csv=p=0', '--', $File)
+    $v = 0
+    $line = ($r.Text -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
+    if ($line -and [int]::TryParse($line.Trim().TrimEnd(','), [ref]$v) -and $v -gt 0) { return $v }
+    return 1
+}
 
-    # Декодированный звук — один на каждое замедление: при переборе частот тона он тот же.
+# Тики по звуку: дорожка декодируется в 48 кГц float, стерео — двумя каналами: детектор
+# складывает их по энергиям (два микрофона телефона на 15-20 кГц бывают в противофазе, и
+# сведение в моно гасило бы чирп). Времена переводятся на шкалу видео: у телефонной записи
+# звук начинается не вровень с видео (test17khz.mp4 — на 13 мс позже), а сырой поток
+# сэмплов об этом не помнит. Замедленная съёмка (Speed > 1): звук сначала разгоняется до
+# реальной скорости, чирпы ищутся с обычными параметрами, а найденные времена
+# растягиваются обратно в Speed раз — на шкалу файла.
+# Возвращает { Candidates; Tracks = @( @{ Times; Real; Dir } ); Info = [PovChirp+Result] }.
+function Get-ChirpTracks {
+    param([string]$FFmpegPath, [string]$FFprobePath, [string]$File, [string]$TempDir,
+          [double]$MinPeriod, [double]$MaxPeriod, [int]$MinTicks,
+          [double]$Speed = 1, [int]$SampleRate = 48000, [int]$Channels = 1)
+
+    $nch = [Math]::Max(1, [Math]::Min(2, $Channels))
     $pcm = Join-Path $TempDir ("audio_x{0}.f32" -f (Num $Speed))
     if (-not (Test-Path -LiteralPath $pcm)) {
         $dargs = @('-hide_banner', '-loglevel', 'error', '-y', '-i', $File, '-vn')
         $pre = Get-SpeedUpFilter $Speed $SampleRate
         if ($pre) { $dargs += @('-af', $pre.TrimEnd(',')) }
-        $dargs += @('-ac', '1', '-ar', '48000', '-f', 'f32le', $pcm)
+        $dargs += @('-ac', "$nch", '-ar', '48000', '-f', 'f32le', $pcm)
         $r = Invoke-NativeCapture -Path $FFmpegPath -ArgList $dargs
         if ($r.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $pcm)) { throw "ffmpeg не смог прочитать аудиодорожку (код $($r.ExitCode)). Есть ли звук в файле?" }
     }
@@ -1314,25 +1706,15 @@ function Get-ToneTracks {
     $bytes = $null
 
     $offset = (Get-StreamStart $FFprobePath $File 'a:0') - (Get-StreamStart $FFprobePath $File 'v:0')
-    $cand = [PovTicks]::Detect($x, 48000, $Freq, 700, $TickMs, $SnrDb, $TonalDb, $MinPeriod, $MaxPeriod)
-    # Окно голосования ±0.25 с (не меньше 3.5 периодов), согласие ≥ 0.5, не меньше 5
-    # голосов, участок маски ≥ 0.5 с, трек ≥ MinTicks интервалов.
-    $tr = [PovTicks]::Grid($cand, $MinPeriod, $MaxPeriod, 0.25, 0.5, 5, 0.5, $MinTicks)
+    $res = [PovChirp]::Run($x, $nch, 48000, $MinPeriod, $MaxPeriod, $MinTicks)
 
     $tracks = New-Object System.Collections.Generic.List[object]
-    $ct = New-Object System.Collections.Generic.List[double]
-    $cr = New-Object System.Collections.Generic.List[bool]
-    for ($i = 0; $i -lt $tr.Length; $i += 2) {
-        if ($tr[$i] -eq -2) { break }          # дальше — диагностика согласия, она не нужна
-        if ($tr[$i] -lt 0) {
-            $tracks.Add([PSCustomObject]@{ Times = $ct.ToArray(); Real = $cr.ToArray() })
-            $ct = New-Object System.Collections.Generic.List[double]
-            $cr = New-Object System.Collections.Generic.List[bool]
-        } else {
-            $ct.Add($tr[$i] * $Speed + $offset); $cr.Add($tr[$i + 1] -gt 0)
-        }
+    foreach ($t in $res.Tracks) {
+        $ts = New-Object double[] $t.Times.Length
+        for ($i = 0; $i -lt $ts.Length; $i++) { $ts[$i] = $t.Times[$i] * $Speed + $offset }
+        $tracks.Add([PSCustomObject]@{ Times = $ts; Real = $t.Real; Dir = $t.Dir })
     }
-    return [PSCustomObject]@{ Candidates = [int]($cand.Length / 3); Tracks = $tracks }
+    return [PSCustomObject]@{ Candidates = $res.Candidates; Tracks = $tracks; Info = $res }
 }
 
 if (-not (Test-Path -LiteralPath $InputFile)) {
@@ -1393,6 +1775,7 @@ if ($AudioSync) {
     New-Item -ItemType Directory -Path $tempDir | Out-Null
     try {
         $tracks = New-Object System.Collections.Generic.List[object]
+        $chirpInfo = $null
         if ($LegacyClickDetect) {
             # Старый детектор: порог по громкости в полосе (silencedetect). Годится для
             # щелчка датчика Холла на старых записях — там нет тона, и детектору тиков не за
@@ -1444,34 +1827,29 @@ if ($AudioSync) {
             }
         } else {
             Initialize-PovCode
-            # Частота тона: заданная -BeepFreq или, по умолчанию, 18 кГц (нынешняя прошивка),
-            # а если тиков на ней нет — 17 кГц (записи с прежней прошивкой).
-            $freqTry = if ($PSBoundParameters.ContainsKey('BeepFreq')) { @($BeepFreq) } else { @($BeepFreq, 17000) }
-            Write-Host "Ищу тики синхро-датчика: тон $(($freqTry | ForEach-Object { Num $_ }) -join ' или ') Гц по $(Num $BeepMs) мс, $BeepsPerRev на оборот, прорисовка от $(Num ([Math]::Round($minPeriod * 1000, 1))) до $(Num ([Math]::Round($maxPeriod * 1000, 1))) мс..."
+            [PovChirp]::FLo = $ChirpLoHz; [PovChirp]::FHi = $ChirpHiHz; [PovChirp]::Dur = $ChirpMs / 1000.0
+            $audioCh = Get-AudioChannels -FFprobePath $ffprobe -File $InputFile
+            Write-Host "Ищу чирпы синхро-датчика: $(Num ($ChirpLoHz / 1000))-$(Num ($ChirpHiHz / 1000)) кГц, $(Num $ChirpMs) мс, $BeepsPerRev на оборот, прорисовка от $(Num ([Math]::Round($minPeriod * 1000, 1))) до $(Num ([Math]::Round($maxPeriod * 1000, 1))) мс..."
             if ($slowFixed -eq 0 -and $slowHint -ge 2) { Write-Host "  метаданные: частота съёмки выше частоты кадров файла — похоже на замедленную съёмку ×$slowHint" }
-            # Перебор замедлений (или одно заданное) и частот тона: звук разгоняется до
-            # реальной скорости, тики ищутся с обычными параметрами. Берётся первое сочетание,
-            # при котором нашлось хотя бы 4 оборота отрисовки; если такого нет — лучшее.
-            $det = $null; $best = -1; $foundFreq = $freqTry[0]
+            # Перебор замедлений (или одно заданное): звук разгоняется до реальной скорости,
+            # чирпы ищутся с обычными параметрами. Берётся первое замедление, при котором
+            # нашлось хотя бы 4 оборота отрисовки; если такого нет — лучшее.
+            $det = $null; $best = -1
             $tried = New-Object System.Collections.Generic.List[string]
             foreach ($k in $slowTry) {
-                foreach ($fq in $freqTry) {
-                    $d = Get-ToneTracks -FFmpegPath $ffmpeg -FFprobePath $ffprobe -File $InputFile -TempDir $tempDir `
-                        -Freq $fq -TickMs $BeepMs -SnrDb $BeepSnrDb -TonalDb $BeepTonalDb `
-                        -MinPeriod $minPeriod -MaxPeriod $maxPeriod -MinTicks (2 * $BeepsPerRev) `
-                        -Speed $k -SampleRate $audioRate
-                    $iv = 0
-                    foreach ($tr in $d.Tracks) { $iv += $tr.Times.Count - 1 }
-                    $tried.Add(("  тон {0} Гц, замедление ×{1} (в файле {2:0} Гц, тик {3:0.#} мс): интервалов между тиками {4}" -f (Num $fq), $k, ($fq / $k), ($BeepMs * $k), $iv))
-                    if ($iv -gt $best) { $best = $iv; $det = $d; $slow = $k; $foundFreq = $fq }
-                    if ($iv -ge 4 * $BeepsPerRev) { break }
-                }
-                if ($best -ge 4 * $BeepsPerRev) { break }
+                $d = Get-ChirpTracks -FFmpegPath $ffmpeg -FFprobePath $ffprobe -File $InputFile -TempDir $tempDir `
+                    -MinPeriod $minPeriod -MaxPeriod $maxPeriod -MinTicks (2 * $BeepsPerRev) `
+                    -Speed $k -SampleRate $audioRate -Channels $audioCh
+                $iv = 0
+                foreach ($tr in $d.Tracks) { $iv += $tr.Times.Count - 1 }
+                $tried.Add(("  замедление ×{0} (в файле {1:0.##}-{2:0.##} кГц, чирп {3:0.#} мс): интервалов между тиками {4}" -f $k, ($ChirpLoHz / $k / 1000), ($ChirpHiHz / $k / 1000), ($ChirpMs * $k), $iv))
+                if ($iv -gt $best) { $best = $iv; $det = $d; $slow = $k }
+                if ($iv -ge 4 * $BeepsPerRev) { break }
             }
             # Перебор показываем, только если первой попытки не хватило.
             if ($tried.Count -gt 1) { foreach ($l in $tried) { Write-Host $l } }
-            if ($best -gt 0 -and $foundFreq -ne $freqTry[0]) { Write-Host "Тики найдены на $(Num $foundFreq) Гц — запись с прежней прошивкой." }
             $candCount = $det.Candidates
+            $chirpInfo = $det.Info
             foreach ($tr in $det.Tracks) { $tracks.Add($tr) }
         }
         if ($slow -gt 1) {
@@ -1486,7 +1864,7 @@ if ($AudioSync) {
             for ($i = 0; $i -lt $tr.Times.Count; $i++) {
                 if ($tr.Times[$i] -ge $coverStart -and $tr.Times[$i] -le $coverEnd) { $tt.Add($tr.Times[$i]); $rr.Add($tr.Real[$i]) }
             }
-            if ($tt.Count -ge 2) { $clipped.Add([PSCustomObject]@{ Times = $tt.ToArray(); Real = $rr.ToArray() }) }
+            if ($tt.Count -ge 2) { $clipped.Add([PSCustomObject]@{ Times = $tt.ToArray(); Real = $rr.ToArray(); Dir = $tr.Dir }) }
         }
         $tracks = $clipped
 
@@ -1514,13 +1892,18 @@ if ($AudioSync) {
 
         Write-Host ""
         Write-Host "Кандидатов в тики: $candCount; участков отрисовки: $($tracks.Count)"
+        if ($chirpInfo -and $chirpInfo.BandLo -gt 0) {
+            $hypName = switch ($chirpInfo.Hyp) { 'equal' { 'все полосы поровну' } 'presence' { 'по тому, где полоса звучит' } 'learned' { 'по найденным тикам' } default { $chirpInfo.Hyp } }
+            Write-Host ("  чирп слышен в {0:0.#}-{1:0.#} кГц; веса полос {2} ({3})" -f ($chirpInfo.BandLo / 1000), ($chirpInfo.BandHi / 1000), (($chirpInfo.Weights | ForEach-Object { "{0:0.00}" -f $_ }) -join ' '), $hypName)
+        }
         $ti = 0
         foreach ($tr in $tracks) {
             $ti++
             $ts = $tr.Times
             $rp = for ($k = 0; $k -lt $ts.Count - 1; $k++) { 60.0 / (($ts[$k + 1] - $ts[$k]) / $slow * $BeepsPerRev) }
             $nf = @($tr.Real | Where-Object { -not $_ }).Count
-            Write-Host ("  отрисовка {0}: {1:0.000}-{2:0.000} с, интервалов между тиками {3} (из них по достроенным тикам: {4}), {5:0}..{6:0} об/мин" -f $ti, $ts[0], $ts[$ts.Count - 1], ($ts.Count - 1), $nf, ($rp | Measure-Object -Minimum).Minimum, ($rp | Measure-Object -Maximum).Maximum)
+            $dirTxt = if ($null -eq $tr.Dir) { "" } elseif ($tr.Dir -lt 0) { ", свип вниз (заднее колесо или вращение назад)" } else { ", свип вверх" }
+            Write-Host ("  отрисовка {0}: {1:0.000}-{2:0.000} с, интервалов между тиками {3} (из них по достроенным тикам: {4}), {5:0}..{6:0} об/мин{7}" -f $ti, $ts[0], $ts[$ts.Count - 1], ($ts.Count - 1), $nf, ($rp | Measure-Object -Minimum).Minimum, ($rp | Measure-Object -Maximum).Maximum, $dirTxt)
         }
         $natives = @($segs | Where-Object { $_.Kind -eq 'native' -and ($_.T1 - $_.T0) -gt 0 })
         if ($natives.Count -gt 0) {
@@ -1528,6 +1911,15 @@ if ($AudioSync) {
         }
         Write-Host ("Склеенных кадров (прорисовок): {0}" -f $sweeps) -NoNewline
         if ($fpsSplit -gt 0) { Write-Host (" — из них {0} интервалов длиннее 1/{1} с разбиты, чтобы частота не падала ниже {1} к/с" -f $fpsSplit, (Num $MinFps)) } else { Write-Host "" }
+        # Медленная съёмка: прорисовка короче -MinWindowFrames кадров — окно склейки шире её.
+        $allIv = New-Object System.Collections.Generic.List[double]
+        foreach ($tr in $tracks) { for ($k = 1; $k -lt $tr.Times.Count; $k++) { $allIv.Add($tr.Times[$k] - $tr.Times[$k - 1]) } }
+        if ($allIv.Count -gt 0 -and $inputFps -gt 0) {
+            $framesPerSweep = (Get-Median $allIv.ToArray()) * $inputFps
+            if ($framesPerSweep -lt $MinWindowFrames) {
+                Write-Host ("  прорисовка — около {0:0.#} кадра: окно склейки расширено до {1} кадров (~{2:0.#} прорисовки), иначе выдержка камеры оставляет провалы между клиньями. Для чёткой склейки снимайте 120-240 к/с." -f $framesPerSweep, $MinWindowFrames, ($MinWindowFrames / $framesPerSweep))
+            }
+        }
 
         $printGapList = {
             $ti = 0
@@ -1546,8 +1938,8 @@ if ($AudioSync) {
 
         if ($tracks.Count -eq 0) {
             Write-Host ""
-            Write-Host "Отрисовки не найдено — тиков синхро-датчика на звуке нет (пьезо тикает только пока лента светится)."
-            if (-not $DetectOnly) { Write-Host "Склеивать нечего: видео не меняется. Если тики на записи есть, попробуйте снизить -BeepSnrDb (сейчас $(Num $BeepSnrDb) дБ)." }
+            Write-Host "Отрисовки не найдено — чирпов синхро-датчика на звуке нет (пьезо звучит, только пока запитаны все шесть лучей)."
+            if (-not $DetectOnly) { Write-Host "Склеивать нечего: видео не меняется. Если чирпы на записи есть, проверьте, что -ChirpLoHz/-ChirpHiHz/-ChirpMs совпадают с PIEZO_CHIRP_* прошивки." }
             return
         }
 
@@ -1563,7 +1955,7 @@ if ($AudioSync) {
             Write-Host ""
             $answer = Read-Host "Список выглядит правдоподобно? Продолжить обработку (Y/n)"
             if ($answer -and $answer.Trim().ToLower() -notin @('y', 'yes', 'д', 'да', '')) {
-                Write-Host "Отменено. Проверьте тики через -DetectOnly (-BeepSnrDb, -BeepFreq), либо запустите с -Force, чтобы пропустить этот вопрос."
+                Write-Host "Отменено. Проверьте тики через -DetectOnly, либо запустите с -Force, чтобы пропустить этот вопрос."
                 return
             }
         }
@@ -1657,7 +2049,7 @@ if ($AudioSync) {
                                     $segT0.ToArray(), $segT.ToArray(),
                                     $BlackLevel, $modeId, $outFps, [Math]::Max(0, $CheckerCell),
                                     [Math]::Max(0.0, [Math]::Min(1.0, $CheckerSpread)),
-                                    $chkModeId)
+                                    $chkModeId, [Math]::Max(1, $MinWindowFrames))
         $decErr = [PovRender]::DecoderErrors.Trim()
         if ($decErr) { Write-Warning "Декодер: $decErr" }
         if ($written -lt 0) {

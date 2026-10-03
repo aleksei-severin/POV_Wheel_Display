@@ -461,11 +461,12 @@ void IRAM_ATTR hallInterruptHandler(void* arg) {
     last_hall_time  = now;
     hall_seq++;
 
-    // Тон пьезо на проход луча мимо магнита — пока запитаны все шесть лучей.
+    // Чирп пьезо на проход луча мимо магнита — пока запитаны все шесть лучей.
     // Само событие уже значит «колесо крутится»; светится ли лента (загрузка
     // файла, выдержки перед розжигом) — не важно. В PWR_SPINUP работает один
-    // датчик из шести, и там тона нет.
-    if (power_state == PWR_FULL) beeperTrigger();
+    // датчик из шести, и там тона нет. Направление свипа — по rotation_dir
+    // (только что обновлённому выше): вверх на переднем колесе, вниз на заднем.
+    if (power_state == PWR_FULL) beeperTrigger(rotation_dir >= 0);
 
     if (hallSemaphore) {
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
@@ -3009,7 +3010,7 @@ void setup() {
     esp_task_wdt_delete(xTaskGetCurrentTaskHandle());
 
     // Пьезо — до прерываний Холла: ISR зовёт beeperTrigger(), и к первому
-    // событию таймер отключения тона уже должен существовать.
+    // событию RMT и таблицы чирпа уже должны быть готовы.
     beeperInit();
 
     // Прерывания: шесть датчиков Холла + вибродатчик
