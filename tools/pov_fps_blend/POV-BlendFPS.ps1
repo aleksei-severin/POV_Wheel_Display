@@ -475,16 +475,30 @@ function Get-Median {
 #     (колесо не меняет скорость скачком), явными пропусками и штрафом за энергию на 1/2,
 #     1/3 и 2/3 интервала — иначе ряд «каждый третий тик» без единого пропуска выигрывал у
 #     полного.
+#   * Трекер не должен протягивать серию через шум. На 4_sweep.mp4 (заднее колесо на ходу)
+#     чирпы тонут в сплошном широкополосном шуме цепи и покрышки ~25 с из 35: слабые
+#     кандидаты там находятся на любом интервале, и DP вёл ряд, начатый на чистом участке,
+#     дальше, а период уползал с 40 до 130 мс. Тот же ряд вытеснял из луча правильный ряд
+#     следующего чистого участка — склейка «работала в начале и переставала». Поэтому
+#     (а) луч держит не 12 лучших состояний, а 12 лучших с разными периодами (BeamDiv:
+#     ближе 3 % — дубль); (б) каждый трек проверяется на периодичность: автокорреляция
+#     превышения статистики над порогом на лаге, равном локальному интервалу самого трека
+#     (лаг идёт за скоростью — постоянный резал 1_sweep на разгоне), окно ±0.75 с.
+#     Участок, где она ниже 0.2 дольше 1 с внутри трека (0.5 с на краю), вырезается, края
+#     дочищаются до плотности настоящих тиков 3 из 6. Где чирпа не слышно, кадры идут без
+#     склейки: это честнее, чем склейка по выдуманному периоду.
 #   * Итоговые тики — локальная квадратичная регрессия по ±6 тикам: окно склейки должно
 #     покрывать ровно 1/6 оборота, а это гладкая функция времени; разброс отдельных тиков
 #     (эхо, неровная расстановка датчиков) — шум.
-# Проверено на 1_sweep.mp4 / 2_sweep.mp4 (тики по всей длине отрисовки, 184-299 и 191-343
-# об/мин) и на них же с подмешанным белым шумом: +10 дБ к фону полосы — 44-83 % тиков на
-# месте; +20 дБ — трека нет, но и ложного нет. Срез полосы выше 17 кГц — трек находится по
-# остатку 15-17 кГц, хотя и не целиком.
+# Проверено на 1_sweep.mp4 / 2_sweep.mp4 / 3_sweep.mp4 (тики по всей длине отрисовки) и на
+# 1/2_sweep с подмешанным белым шумом: +10 дБ к фону полосы — 44-69 % тиков на месте;
+# +20 дБ — трека нет, но и ложного нет. Срез полосы выше 17 кГц — трек находится по
+# остатку 15-17 кГц, хотя и не целиком. 4_sweep.mp4 (замедленная ×4) — три трека по чистым
+# участкам (1.3-5.4, 18.4-21.1, 27.0-29.1 с реального времени), остальное без склейки.
 #
 # Рендер — тоже свой (PovRender): ffmpeg декодирует ролик ОДИН раз в поток кадров
-# постоянной частоты, C# склеивает окна и пропускает кадры вне отрисовки как есть,
+# постоянной частоты, C# склеивает окна и пропускает кадры вне отрисовки как есть (потоком,
+# по одному кадру — копить в памяти весь отрезок без тиков на 4K не хватит никакой ОЗУ),
 # второй ffmpeg кодирует и добавляет звук. Прежняя схема — два процесса ffmpeg на каждую
 # склейку — при прорисовке на каждый тик давала сотни запусков с декодированием HEVC от
 # ключевого кадра на каждый.
@@ -514,7 +528,8 @@ public static class PovChirp {
     public static double TransBonus = 0.4;      // за переход (уравнивает полную частоту с кратной)
     public static double IgnoreTolSec = 0.0015, IgnoreK = 1.0;
     public static int MaxSkip = 8;              // пропусков подряд внутри трека
-    public static int Beam = 12;                // состояний трекера на кандидата
+    public static int Beam = 12;                // состояний трекера на кандидата (по одному на период)
+    public static double BeamDiv = 0.03;        // интервалы ближе 3 % — один период
     public static double JitterSec = 0.0005;    // разброс времени тика
     public static double AccTyp = 6.0;          // типичное угловое ускорение колеса, рад/с²
     public static double HallSpread = 0.012;    // разброс интервалов от расстановки датчиков
@@ -985,10 +1000,21 @@ public static class PovChirp {
                 }
                 // порядок однозначный и при равном счёте — тот же, что у порта на Kotlin
                 cand.Sort((p1, p2) => p2.S != p1.S ? p2.S.CompareTo(p1.S) : p1.Prev != p2.Prev ? p1.Prev.CompareTo(p2.Prev) : p1.Skip.CompareTo(p2.Skip));
-                for (int q = 0; q < Math.Min(Beam, cand.Count); q++) {
-                    states.Add(cand[q]);
+                // Луч — лучшее состояние на каждый период (интервалы ближе BeamDiv считаются одним),
+                // а не просто Beam лучших. Иначе продолжения уже набравшего очки ряда — пусть
+                // мусорного, с чужим периодом — занимали все места, и новый ряд с настоящим периодом
+                // выбрасывался на старте: на 4_sweep.mp4 чистый участок 18–21 с (48 мс) шёл трекером
+                // через ~80 мс, продолжая шум с 15.7 с, хотя сам по себе давал вдвое больший счёт.
+                int taken = 0;
+                for (int q = 0; q < cand.Count && taken < Beam; q++) {
+                    St s = cand[q];
+                    bool dup = false;
+                    if (s.I > 0) foreach (int si in beam[j]) { double qi = states[si].I; if (qi > 0 && Math.Abs(Math.Log(s.I / qi)) < BeamDiv) { dup = true; break; } }
+                    if (dup) continue;
+                    states.Add(s);
                     beam[j].Add(states.Count - 1);
-                    if (cand[q].S > bestS) { bestS = cand[q].S; best = states.Count - 1; }
+                    taken++;
+                    if (s.S > bestS) { bestS = s.S; best = states.Count - 1; }
                 }
             }
             if (best < 0 || bestS < MinScore) break;
@@ -1091,6 +1117,98 @@ public static class PovChirp {
         tr.ResidMs = det > 0 ? Math.Sqrt(rs / det) * 1000 : 0;
         return tr;
     }
+
+    // ================================================================ проверка периодичностью
+    // Трекер находит ряд и в чистом шуме: кандидатов там десятки в секунду, и цепочку,
+    // подходящую под плавный период, из них собрать можно, а слабые шумовые пики дают свой
+    // небольшой плюс к счёту. На 4_sweep.mp4 (заднее колесо: цепь и шина заглушили чирпы на
+    // ~25 с из 35) он так тянул трек через 10 с шума, период по дороге уплывал от 40 до
+    // 130 мс, и склейка шла с чужими окнами. Ни сила отдельных тиков, ни их плотность настоящий
+    // слабый ряд от такого не отличают: на быстром вращении (1–3_sweep.mp4, 30–35 мс) тики так
+    // же слабы, а найдено их так же 40–55 %. Отличает периодичность самого сигнала:
+    // автокорреляция статистики (окно ±PerWinSec) на собственном интервале трека — у
+    // настоящего ряда 0.3–0.7, у шума −0.3…0.16. Участок, где она ниже PerMin дольше
+    // PerCutSec, вырезается; такие же края длиннее PerEdgeSec обрезаются.
+    public static double PerMin = 0.2, PerWinSec = 0.75, PerStepSec = 0.25, PerCutSec = 1.0, PerEdgeSec = 0.5;
+
+    static double[] Excess(double[] es, Band b) {
+        int step = Math.Max(1, (int)Math.Round(b.Fsb / 1000));
+        int m = es.Length / step;
+        var v = new double[m];
+        for (int i = 0; i < m; i++) { double mx = 0; for (int k = 0; k < step; k++) mx = Math.Max(mx, es[i * step + k]); v[i] = Math.Max(0, mx - 1); }
+        return v;
+    }
+
+    static List<Track> Validate(Track t, double[] v, Band b, int minTicks) {
+        var res = new List<Track>();
+        int nt = t.Times.Length, m = v.Length, w = (int)Math.Round(PerWinSec * 1000);
+        double ta = t.Times[0], tb = t.Times[nt - 1];
+        // Шаг корреляции — местный интервал трека в каждой точке, а не один на всё окно: колесо
+        // разгоняется и тормозит (1_sweep.mp4, 7.5–8.7 с: 54 → 41 мс), и фиксированный шаг
+        // смазывал корреляцию настоящего ряда до уровня шума.
+        var lag = new int[m];
+        int kk = 0;
+        for (int i = 0; i < m; i++) {
+            double ti = i / 1000.0 + b.T0;
+            while (kk + 2 < nt && t.Times[kk + 1] <= ti) kk++;
+            lag[i] = (int)Math.Round((t.Times[kk + 1] - t.Times[kk]) * 1000);
+        }
+        int ng = (int)Math.Floor((tb - ta) / PerStepSec) + 1;
+        var good = new bool[ng];
+        for (int g = 0; g < ng; g++) {
+            double tc = ta + g * PerStepSec;
+            int c = (int)Math.Round((tc - b.T0) * 1000);
+            int a0 = Math.Max(0, c - w), a1 = Math.Min(m, c + w);
+            while (a1 > a0 && a1 - 1 + lag[a1 - 1] + 2 >= m) a1--;
+            if (a1 - a0 < 4 * lag[Math.Max(0, Math.Min(m - 1, c))]) { good[g] = true; continue; }
+            double mean = 0; for (int i = a0; i < a1; i++) mean += v[i]; mean /= (a1 - a0);
+            double den = 0; for (int i = a0; i < a1; i++) den += (v[i] - mean) * (v[i] - mean);
+            double best = -1;
+            for (int dl = -1; dl <= 1; dl++) {
+                double s = 0; for (int i = a0; i < a1; i++) s += (v[i] - mean) * (v[i + lag[i] + dl] - mean);
+                best = Math.Max(best, s / Math.Max(1e-12, den));
+            }
+            good[g] = best >= PerMin;
+        }
+        // плохие отрезки: внутри — от PerCutSec, по краям — от PerEdgeSec
+        var keep = new bool[ng];
+        for (int g = 0; g < ng; g++) keep[g] = true;
+        for (int g = 0; g < ng; ) {
+            if (good[g]) { g++; continue; }
+            int a = g; while (g < ng && !good[g]) g++;
+            double len = (g - a) * PerStepSec;
+            bool edge = a == 0 || g == ng;
+            if (len >= (edge ? PerEdgeSec : PerCutSec)) for (int q = a; q < g; q++) keep[q] = false;
+        }
+        // куски трека по сохранённым узлам
+        int p = 0;
+        while (p < nt) {
+            int gp = Math.Min(ng - 1, (int)Math.Round((t.Times[p] - ta) / PerStepSec));
+            if (!keep[gp]) { p++; continue; }
+            int q = p, pn = p;
+            while (q + 1 < nt && keep[Math.Min(ng - 1, (int)Math.Round((t.Times[q + 1] - ta) / PerStepSec))]) q++;
+            pn = q + 1;
+            // Края — до первых (последних) EdgeWin позиций, где найдено хотя бы EdgeMin тиков:
+            // короткий хвост в шуме окно корреляции не замечает, оно захватывает соседний сигнал.
+            while (p + EdgeWin - 1 <= q && CountReal(t.Real, p, p + EdgeWin - 1) < EdgeMin) p++;
+            while (p <= q && !t.Real[p]) p++;
+            while (q - EdgeWin + 1 >= p && CountReal(t.Real, q - EdgeWin + 1, q) < EdgeMin) q--;
+            while (q >= p && !t.Real[q]) q--;
+            if (q - p >= minTicks) {
+                var nt2 = new Track(); nt2.Dir = t.Dir; nt2.SnrDb = t.SnrDb; nt2.ResidMs = t.ResidMs;
+                nt2.Times = new double[q - p + 1]; nt2.Real = new bool[q - p + 1];
+                Array.Copy(t.Times, p, nt2.Times, 0, q - p + 1); Array.Copy(t.Real, p, nt2.Real, 0, q - p + 1);
+                foreach (bool r in nt2.Real) if (r) nt2.Detected++;
+                nt2.Score = t.Score * (q - p + 1) / nt;
+                res.Add(nt2);
+            }
+            p = pn;
+        }
+        return res;
+    }
+
+    public static int EdgeWin = 6, EdgeMin = 3;
+    static int CountReal(bool[] r, int a, int b) { int c = 0; for (int i = a; i <= b; i++) if (r[i]) c++; return c; }
 
     // ================================================================ сборка треков
     // Сильные треки первыми, пересечения с уже принятыми отрезаются. Основное направление — по
@@ -1220,11 +1338,12 @@ public static class PovChirp {
             r.Candidates += cs.Count;
             List<double> sc;
             List<int[]> paths = TrackAll(cs, es, b, evRef, minP, maxP, minTicks, out sc);
+            double[] v = Excess(es, b);
             for (int i = 0; i < paths.Count; i++) {
                 RawTrack rt = FromPath(paths[i], cs, dir, sc[i]);
-                if (rawsOut != null) rawsOut.Add(rt);
-                all.Add(Smooth(rt));
-                r.Diag += string.Format(" [{0}{1:F2}-{2:F2} n{3} sc{4:F0}]", dir > 0 ? "+" : "-", rt.T[0], rt.T[rt.T.Length - 1], rt.N.Length, sc[i]);
+                List<Track> ok = Validate(Smooth(rt), v, b, minTicks);
+                if (ok.Count > 0 && rawsOut != null) rawsOut.Add(rt);
+                all.AddRange(ok);
             }
         }
         r.Tracks = Bridge(Resolve(all, minTicks), maxP);
@@ -1355,9 +1474,12 @@ public static class PovRender {
         foreach (int c in counts) total += c;
         bool checker = cell > 0 && spread > 0;
         // Нужный запас кадров вокруг окна — под самые дальние сдвиги.
+        // Кадры как есть (вид 0) идут потоком, по одному — им запас не нужен: на 4K
+        // минута без тиков — это ~1500 кадров по 25 МБ, и кольцо под весь отрезок
+        // съедало всю память, а декодер умирал на полпути.
         int cap = 4;
         for (int si = 0; si < kinds.Length; si++) {
-            int span = counts[si];
+            int span = kinds[si] == 0 ? 1 : counts[si];
             if (kinds[si] == 2) span = Math.Max(span, Math.Max((int)Math.Ceiling(segT[si]), minWin) + (int)Math.Ceiling(segT[si] * (checker ? spread : 0) * 5 / 6.0) + 4);
             cap = Math.Max(cap, span + 4);
         }
@@ -1393,8 +1515,9 @@ public static class PovRender {
                 double[] wwt = new double[12];
                 if (kinds[si] == 2) Windows(segT0[si], segT[si], checker ? spread : 0, minWin, wlo, whi, wwt);
                 else for (int k = 0; k < 12; k++) { wlo[k] = a; whi[k] = b; wwt[k] = (k & 1) == 0 ? 1 : 0; }
-                long need = b;
-                for (int k = 0; k < 12; k++) if (wwt[k] > 0) need = Math.Max(need, whi[k]);
+                // Вид 0 — только первый кадр, остальные дочитываются по одному ниже.
+                long need = kinds[si] == 0 ? a : b;
+                if (kinds[si] != 0) for (int k = 0; k < 12; k++) if (wwt[k] > 0) need = Math.Max(need, whi[k]);
                 // Дочитать кадры до нужного (с запасом вперёд для сдвинутых окон).
                 while (loaded <= need && !eof) {
                     int slot = (int)(loaded % cap);
@@ -1403,11 +1526,28 @@ public static class PovRender {
                     loaded++;
                 }
                 if (a >= loaded) break;
-                if (b >= loaded) b = loaded - 1;
-                int got = (int)(b - a + 1);
+                int got;
                 if (kinds[si] == 0) {
-                    for (long i = a; i <= b; i++) { eout.Write(ring[(int)(i % cap)], 0, fs); written++; }
+                    // Потоком: кадр прочитан — тут же записан; часть могла прийти раньше,
+                    // как запас вперёд для окон прошлой прорисовки.
+                    long i = a;
+                    for (; i <= b; i++) {
+                        if (i >= loaded) {
+                            int slot = (int)(loaded % cap);
+                            if (ring[slot] == null) ring[slot] = new byte[fs];
+                            if (!ReadFrame(din, ring[slot], fs)) { eof = true; break; }
+                            loaded++;
+                        }
+                        eout.Write(ring[(int)(i % cap)], 0, fs); written++;
+                        if (written >= nextReport) {
+                            Console.WriteLine(string.Format("  кадров {0}/{1} ({2:0}%)", written, total, 100.0 * written / Math.Max(1, total)));
+                            nextReport = written + reportStep;
+                        }
+                    }
+                    got = (int)(i - a);
                 } else {
+                    if (b >= loaded) b = loaded - 1;
+                    got = (int)(b - a + 1);
                     // Окна, обрезанные по доступным кадрам.
                     long first = Math.Max(0, loaded - cap);
                     long[] lo = new long[12], hi = new long[12];

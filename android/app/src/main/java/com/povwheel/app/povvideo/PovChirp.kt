@@ -50,7 +50,15 @@ internal class PovChirp(
         const val IGNORE_TOL_SEC = 0.0015
         const val IGNORE_K = 1.0
         const val MAX_SKIP = 8               // пропусков подряд внутри трека
-        const val BEAM = 12                  // состояний трекера на кандидата
+        const val BEAM = 12                  // состояний трекера на кандидата (по одному на период)
+        const val BEAM_DIV = 0.03            // интервалы ближе 3 % — один период
+        const val PER_MIN = 0.2              // проверка периодичностью (см. validate)
+        const val PER_WIN_SEC = 0.75
+        const val PER_STEP_SEC = 0.25
+        const val PER_CUT_SEC = 1.0
+        const val PER_EDGE_SEC = 0.5
+        const val EDGE_WIN = 6               // края трека: в EDGE_WIN позициях не меньше EDGE_MIN найденных
+        const val EDGE_MIN = 3
         const val JITTER_SEC = 0.0005        // разброс времени тика
         const val ACC_TYP = 6.0              // типичное угловое ускорение колеса, рад/с²
         const val HALL_SPREAD = 0.012        // разброс интервалов от расстановки датчиков
@@ -531,14 +539,21 @@ internal class PovChirp(
                     }
                 }
                 cand.sortWith(stOrder)
-                val nb = min(BEAM, cand.size)
-                val ids = IntArray(nb)
-                for (q in 0 until nb) {
-                    states.add(cand[q])
-                    ids[q] = states.size - 1
-                    if (cand[q].s > bestS) { bestS = cand[q].s; best = states.size - 1 }
+                // Луч — лучшее состояние на каждый период (интервалы ближе BEAM_DIV — один), а не
+                // просто BEAM лучших: иначе продолжения уже набравшего очки (пусть мусорного) ряда
+                // занимали все места, и новый ряд с настоящим периодом выбрасывался на старте.
+                val ids = ArrayList<Int>()
+                for (q in cand.indices) {
+                    if (ids.size >= BEAM) break
+                    val s = cand[q]
+                    var dup = false
+                    if (s.i > 0) for (si in ids) { val qi = states[si].i; if (qi > 0 && abs(ln(s.i / qi)) < BEAM_DIV) { dup = true; break } }
+                    if (dup) continue
+                    states.add(s)
+                    ids.add(states.size - 1)
+                    if (s.s > bestS) { bestS = s.s; best = states.size - 1 }
                 }
-                beam[j] = ids
+                beam[j] = ids.toIntArray()
             }
             if (best < 0 || bestS < MIN_SCORE) break
             val path = ArrayList<Int>()
@@ -638,6 +653,88 @@ internal class PovChirp(
         tr.snrDb = if (det > 0) 10 * log10(esum / det) else 0.0
         tr.residMs = if (det > 0) sqrt(rs / det) * 1000 else 0.0
         return tr
+    }
+
+    // ================================================================ проверка периодичностью
+    // Трекер находит ряд и в чистом шуме (кандидатов там десятки в секунду, слабые шумовые пики
+    // дают свой небольшой плюс к счёту): на 4_sweep.mp4 — заднее колесо, цепь и шина заглушили
+    // чирпы на ~25 с из 35 — он тянул трек через 10 с шума, и период уплывал от 40 до 130 мс.
+    // Ни сила тиков, ни их плотность настоящий слабый ряд (быстрое вращение) от такого не
+    // отличают; отличает периодичность самого сигнала — автокорреляция статистики (окно
+    // ±PER_WIN_SEC) на местном интервале трека: у настоящего ряда 0.3–0.7, у шума −0.3…0.16.
+    // Участок ниже PER_MIN дольше PER_CUT_SEC вырезается, такие края длиннее PER_EDGE_SEC
+    // обрезаются; края подрезаются ещё и по плотности найденных тиков.
+    private fun excess(es: DoubleArray, b: Band): DoubleArray {
+        val step = max(1, Math.rint(b.fsb / 1000).toInt())
+        val m = es.size / step
+        val v = DoubleArray(m)
+        for (i in 0 until m) { var mx = 0.0; for (k in 0 until step) mx = max(mx, es[i * step + k]); v[i] = max(0.0, mx - 1) }
+        return v
+    }
+
+    private fun countReal(r: BooleanArray, a: Int, b: Int): Int { var c = 0; for (i in a..b) if (r[i]) c++; return c }
+
+    private fun validate(t: Track, v: DoubleArray, b: Band, minTicks: Int): List<Track> {
+        val res = ArrayList<Track>()
+        val nt = t.times.size; val m = v.size; val w = Math.rint(PER_WIN_SEC * 1000).toInt()
+        val ta = t.times[0]; val tb = t.times[nt - 1]
+        // шаг корреляции — местный интервал трека в каждой точке (колесо разгоняется и тормозит)
+        val lag = IntArray(m)
+        var kk = 0
+        for (i in 0 until m) {
+            val ti = i / 1000.0 + b.t0
+            while (kk + 2 < nt && t.times[kk + 1] <= ti) kk++
+            lag[i] = Math.rint((t.times[kk + 1] - t.times[kk]) * 1000).toInt()
+        }
+        val ng = floor((tb - ta) / PER_STEP_SEC).toInt() + 1
+        val good = BooleanArray(ng)
+        for (g in 0 until ng) {
+            val tc = ta + g * PER_STEP_SEC
+            val c = Math.rint((tc - b.t0) * 1000).toInt()
+            val a0 = max(0, c - w); var a1 = min(m, c + w)
+            while (a1 > a0 && a1 - 1 + lag[a1 - 1] + 2 >= m) a1--
+            if (a1 - a0 < 4 * lag[max(0, min(m - 1, c))]) { good[g] = true; continue }
+            var mean = 0.0; for (i in a0 until a1) mean += v[i]; mean /= (a1 - a0)
+            var den = 0.0; for (i in a0 until a1) den += (v[i] - mean) * (v[i] - mean)
+            var best = -1.0
+            for (dl in -1..1) {
+                var s = 0.0; for (i in a0 until a1) s += (v[i] - mean) * (v[i + lag[i] + dl] - mean)
+                best = max(best, s / max(1e-12, den))
+            }
+            good[g] = best >= PER_MIN
+        }
+        // плохие отрезки: внутри — от PER_CUT_SEC, по краям — от PER_EDGE_SEC
+        val keep = BooleanArray(ng) { true }
+        var g = 0
+        while (g < ng) {
+            if (good[g]) { g++; continue }
+            val a = g; while (g < ng && !good[g]) g++
+            val len = (g - a) * PER_STEP_SEC
+            val edge = a == 0 || g == ng
+            if (len >= (if (edge) PER_EDGE_SEC else PER_CUT_SEC)) for (q in a until g) keep[q] = false
+        }
+        fun node(k: Int) = min(ng - 1, Math.rint((t.times[k] - ta) / PER_STEP_SEC).toInt())
+        var p = 0
+        while (p < nt) {
+            if (!keep[node(p)]) { p++; continue }
+            var q = p
+            while (q + 1 < nt && keep[node(q + 1)]) q++
+            val pn = q + 1
+            // края — до первых (последних) EDGE_WIN позиций, где найдено хотя бы EDGE_MIN тиков
+            while (p + EDGE_WIN - 1 <= q && countReal(t.real, p, p + EDGE_WIN - 1) < EDGE_MIN) p++
+            while (p <= q && !t.real[p]) p++
+            while (q - EDGE_WIN + 1 >= p && countReal(t.real, q - EDGE_WIN + 1, q) < EDGE_MIN) q--
+            while (q >= p && !t.real[q]) q--
+            if (q - p >= minTicks) {
+                val nt2 = Track(); nt2.dir = t.dir; nt2.snrDb = t.snrDb; nt2.residMs = t.residMs
+                nt2.times = t.times.copyOfRange(p, q + 1); nt2.real = t.real.copyOfRange(p, q + 1)
+                nt2.detected = nt2.real.count { it }
+                nt2.score = t.score * (q - p + 1) / nt
+                res.add(nt2)
+            }
+            p = pn
+        }
+        return res
     }
 
     // ================================================================ сборка треков
@@ -769,10 +866,12 @@ internal class PovChirp(
             r.candidates += cs.size
             val sc = ArrayList<Double>()
             val paths = trackAll(cs, es, b, evRef, minP, maxP, minTicks, sc)
+            val v = excess(es, b)
             for (i in paths.indices) {
                 val rt = fromPath(paths[i], cs, dir, sc[i])
-                rawsOut?.add(rt)
-                all.add(smooth(rt))
+                val ok = validate(smooth(rt), v, b, minTicks)
+                if (ok.isNotEmpty()) rawsOut?.add(rt)
+                all.addAll(ok)
             }
             dir -= 2
         }
