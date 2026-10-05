@@ -728,7 +728,10 @@ class BleClient(
         flowSent = 0
         xferActive = true
         try {
-            val ready = UpReady.parse(requestUnlocked(opBegin, header, 12_000))
+            // Прошивка дольше: колесо перед ней дописывает лог Холла во флеш и
+            // стирает слот под образ — на вращавшемся колесе это секунды.
+            val ready = UpReady.parse(requestUnlocked(opBegin, header,
+                if (opBegin == Proto.OP_OTA_BEGIN) 30_000 else 12_000))
             // Потолок 512 — предел длины значения атрибута по спецификации.
             // При MTU 517 в посылку влезает 514, и устройство столько и
             // называло, но стек на той стороне отвергает всё, что длиннее 512,

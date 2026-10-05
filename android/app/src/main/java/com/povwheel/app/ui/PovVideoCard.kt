@@ -148,6 +148,10 @@ fun PovVideoCard(ctrl: PovVideoController) {
             }
 
             is State.Done -> {
+                // Сводка остаётся и после рендера: по ней видно, какой лог и какие
+                // отрезки ролика пошли в склейку, — результат под ней.
+                Report(s.a)
+                Spacer(Modifier.height(2.dp))
                 Text("Saved to the gallery:", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
                 Text(s.path, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
                 // Размеры — как видит зритель (с поворотом из метаданных); меньше исходника

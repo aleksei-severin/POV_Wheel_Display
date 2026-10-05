@@ -80,6 +80,9 @@ volatile bool pending_wifi_on = false;
 // калибровку во флеш и уходит в сон, из которого будит только удержание кнопки.
 volatile bool pending_transport_off = false;
 
+// Заявка на перезагрузку (OP_REBOOT, выключение Wi-Fi). Исполняет loop().
+volatile bool pending_reboot = false;
+
 // ---------------------------------------------------------------------
 //  CRC32 (полином 0xEDB88320, отражённый) — тот же, что java.util.zip.CRC32.
 //  Своя реализация, а не esp_rom_crc32_le: у ромовой неочевидная трактовка
@@ -907,6 +910,7 @@ static void handleCmd(const uint8_t* d, size_t n) {
             force_stop_display = false;
             currentDisplayFile = "";
         }
+        pending_effect_play = (id != EFF_NONE);   // до pending_effect: см. effects.h
         pending_effect = (int8_t)id;
         xSemaphoreGive(fileLoaderSemaphore);
         settings_dirty = true;
@@ -1011,7 +1015,9 @@ static void handleCmd(const uint8_t* d, size_t n) {
         size_t total = LittleFS.totalBytes(), used = LittleFS.usedBytes();
         i.total        = total;
         i.used         = used;
-        i.free         = total - used;
+        // «Свободно» — для анимаций: место под историю лога Холла в него не
+        // входит (см. HLOG_FS_RESERVE), приложение по этому числу меряет заливку.
+        i.free         = fsFreeForAnimations();
         i.frame_stride = FRAME_STRIDE_PAL;
         // PSRAM-потолок считаем НЕ от «свободно сейчас», а от полного объёма
         // минус постоянный резерв (BLE-буферы ~112 КБ, словарь распаковки 32 КБ,
@@ -1055,8 +1061,8 @@ static void handleCmd(const uint8_t* d, size_t n) {
         String fname((const char*)(pl + sizeof(b)), pn - sizeof(b));
         if (!nameOk(fname) || b.raw_size == 0) { sendRsp(op, seq, ST_BAD_ARG); break; }
 
-        size_t total = LittleFS.totalBytes(), used = LittleFS.usedBytes();
-        size_t freeb = total - used;
+        // Резерв под историю лога Холла анимациям не отдаём (HLOG_FS_RESERVE).
+        size_t freeb = fsFreeForAnimations();
         // Перезапись: место, занятое старым файлом, освободится — учитываем его.
         if (LittleFS.exists("/" + fname)) {
             File old = LittleFS.open("/" + fname, "r");
@@ -1195,8 +1201,7 @@ static void handleCmd(const uint8_t* d, size_t n) {
             pending_wifi_on = true;
         } else if (!want && wifi_enabled) {
             webLog("[BLE] Wi-Fi off, rebooting");
-            vTaskDelay(pdMS_TO_TICKS(300));
-            ESP.restart();
+            pending_reboot = true;           // перезагрузит loop(), сбросив лог Холла
         }
         break;
     }
@@ -1264,8 +1269,10 @@ static void handleCmd(const uint8_t* d, size_t n) {
 
     case OP_REBOOT:
         sendRsp(op, seq, ST_OK);
-        vTaskDelay(pdMS_TO_TICKS(300));
-        ESP.restart();
+        // Сама перезагрузка — в loop(): перед ней лог Холла дописывается во флеш
+        // (иначе пропало бы всё накопленное с последней остановки колеса), а
+        // писать флеш из задачи хоста NimBLE нельзя — см. pending_transport_off.
+        pending_reboot = true;
         break;
 
     case OP_POWEROFF:

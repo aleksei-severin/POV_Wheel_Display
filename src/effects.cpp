@@ -7,6 +7,7 @@
 
 volatile uint8_t  effect_id        = EFF_NONE;
 volatile int8_t   pending_effect   = -1;
+volatile bool     pending_effect_play = false;
 volatile uint16_t effect_speed_red = 45;     // км/ч, при которых шрифт красный (регулятора в UI нет)
 
 // Пара буферов кадра. Выделяются при запуске эффекта и освобождаются при
@@ -605,7 +606,13 @@ bool effectsStart(uint8_t id) {
     lastFrameSwitchTime = millis();
     newFrameReady      = true;
     force_stop_display = false;
-    request_play_flag  = true;           // поднять питание, если лента погашена
+    // request_play_flag здесь НЕ ставим: эффект запускают и автоматические
+    // смены — слайдшоу и тик синхронной группы (OP_SYNC_TICK), который
+    // прилетает каждый интервал сам по себе. Флаг значит «человек нажал Play»:
+    // loop() считает его подтверждённой активностью (last_motion_ms,
+    // last_play_ms) и поднимает DCDC №1. Ставился бы здесь — неподвижное колесо
+    // в показе с эффектами не доходило бы ни до PWR_OFF, ни до сна. Запуск
+    // человеком поднимает его сам: см. pending_effect_play в fileLoaderTask().
     frame_loading      = was_loading;
     // Взводим здесь, а не в обработчике HTTP: тот ставит лишь заявку, и запись
     // настроек могла бы успеть сохранить ещё прежний номер эффекта.

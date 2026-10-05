@@ -34,6 +34,33 @@ static portMUX_TYPE hl_mux = portMUX_INITIALIZER_UNLOCKED;
 // Что уже во флеше: номер первой несброшенной записи и время до неё.
 static uint32_t  hl_flushed   = 0;
 static int64_t   hl_flushed_t = 0;
+// Сколько сейчас занимают /hall.log и /hall.old — для резерва LittleFS.
+static volatile uint32_t hl_fs_bytes = 0;
+
+static uint32_t hlFileSize(const char* path) {
+    if (!LittleFS.exists(path)) return 0;
+    File f = LittleFS.open(path, "r");
+    if (!f) return 0;
+    uint32_t n = f.size();
+    f.close();
+    return n;
+}
+
+static void hlUpdateFsBytes() {
+    hl_fs_bytes = hlFileSize(HLOG_FILE) + hlFileSize(HLOG_FILE_OLD);
+}
+
+uint32_t hallLogFsReserveLeft() {
+    uint32_t used = hl_fs_bytes;
+    return used >= HLOG_FS_RESERVE ? 0 : HLOG_FS_RESERVE - used;
+}
+
+size_t fsFreeForAnimations() {
+    size_t total = LittleFS.totalBytes(), used = LittleFS.usedBytes();
+    size_t freeb = total > used ? total - used : 0;
+    size_t res   = hallLogFsReserveLeft();
+    return freeb > res ? freeb - res : 0;
+}
 
 int64_t hallWallUs() {
     struct timeval tv;
@@ -70,6 +97,7 @@ uint32_t hallLogHead()      { return hl_head; }
 
 void hallLogInit() {
     if (hl_ring) return;
+    hlUpdateFsBytes();                      // LittleFS к этому моменту смонтирована
     hl_ring = (uint32_t*)ps_malloc(HLOG_CAP * sizeof(uint32_t));
     hl_cp   = (int64_t*)ps_malloc(HLOG_NCP * sizeof(int64_t));
     if (!hl_ring || !hl_cp) {
@@ -245,6 +273,7 @@ void hallLogFlush() {
         vTaskDelay(1);
     }
     f.close();
+    hlUpdateFsBytes();
     if (!ok) { webLog("[HLOG] Flush write failed (flash full?)"); return; }
     hl_flushed   = h;
     hl_flushed_t = th;

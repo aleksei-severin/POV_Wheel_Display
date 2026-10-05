@@ -246,7 +246,13 @@ void safeOTAShutdown() {
     digitalWrite(PIN_EN_DCDC_REST, LOW);
     digitalWrite(PIN_EN_DCDC_ARM1, LOW);
 
-    // 4. Размонтируем LittleFS — ElegantOTA для ESP32 не делает это автоматически,
+    // 4. Лог Холла — во флеш, пока ФС ещё смонтирована: после прошивки колесо
+    //    перезагрузится, и всё, что накопилось в PSRAM с последней остановки,
+    //    пропало бы. Обычно это пусто (колесо стоит, и при остановке лог уже
+    //    сброшен); лента к этому моменту погашена — замораживать нечего.
+    hallLogFlush();
+
+    // 5. Размонтируем LittleFS — ElegantOTA для ESP32 не делает это автоматически,
     //    запись поверх смонтированной FS приводит к её повреждению и краш/статус 0.
     LittleFS.end();
 
@@ -1031,7 +1037,8 @@ void setupNetwork() {
         char buf[128];
         snprintf(buf, sizeof(buf),
                  "{\"total\":%u,\"used\":%u,\"free\":%u,\"psram_free\":%u,\"frame_size\":%u}",
-                 (unsigned)total, (unsigned)used, (unsigned)(total - used),
+                 // free — для анимаций, без резерва под историю лога Холла.
+                 (unsigned)total, (unsigned)used, (unsigned)fsFreeForAnimations(),
                  (unsigned)ps_free, (unsigned)FRAME_STRIDE_PAL);
         request->send(200, "application/json", buf);
     });
@@ -1097,6 +1104,7 @@ void setupNetwork() {
             }
             // Саму смену делает fileLoaderTask: она ждёт, пока рендер отпустит
             // буфер кадра, и задаче AsyncTCP на этом стоять нельзя.
+            pending_effect_play = (id != EFF_NONE);   // до pending_effect: см. effects.h
             pending_effect = (int8_t)id;
             xSemaphoreGive(fileLoaderSemaphore);
             settings_dirty = true;
@@ -1249,6 +1257,20 @@ void setupNetwork() {
                 uploadFile.close();
                 LittleFS.remove(badPath);
                 webLogf("[ERR] Stale upload removed: %s", badPath.c_str());
+            }
+            // Место: резерв под историю лога Холла анимациям не отдаём
+            // (HLOG_FS_RESERVE), запас 128 кБ — как у заливки по BLE.
+            // Перезаписываемый файл освободит своё место — учитываем его.
+            size_t freeb = fsFreeForAnimations();
+            if (LittleFS.exists(filepath)) {
+                File old = LittleFS.open(filepath, "r");
+                if (old) { freeb += old.size(); old.close(); }
+            }
+            if ((size_t)total + 128 * 1024 > freeb) {
+                webLogf("[ERR] Upload rejected, not enough space: %s", filepath.c_str());
+                uploadFailed     = true;     // onRequest ответит 507
+                uploadTotalBytes = 0;
+                return;
             }
             // Явно удаляем файл перед созданием: гарантирует что LittleFS
             // освободит старые блоки до выделения новых, а не после.

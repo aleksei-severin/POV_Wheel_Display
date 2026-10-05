@@ -2665,8 +2665,12 @@ void fileLoaderTask(void* pvParameters) {
         // рендер отпустит буфер кадра, и в обработчике HTTP этому не место.
         if (pending_effect >= 0) {
             uint8_t want = (uint8_t)pending_effect;
-            pending_effect = -1;
-            effectsStart(want);
+            bool    play = pending_effect_play;
+            pending_effect      = -1;
+            pending_effect_play = false;
+            // Питание и таймер активности — только если эффект выбрал человек
+            // (см. pending_effect_play в effects.h).
+            if (effectsStart(want) && play && !force_stop_display) request_play_flag = true;
         }
         if (pendingFilePath.length() > 0) {
             loadFrameFromFile(pendingFilePath);
@@ -3088,6 +3092,23 @@ void loop() {
     static uint32_t last_play_ms = 0; // Время последнего запроса /play
 
     uint32_t now_ms = millis();
+
+    // --- Перезагрузка по команде (OP_REBOOT, выключение Wi-Fi) ---
+    // Здесь, а не в задаче хоста NimBLE: перед ней всё отложенное уходит во флеш —
+    // лог Холла (иначе пропало бы накопленное с последней остановки колеса),
+    // настройки, последний файл. Сначала гасим ленту: запись флеша поверх идущей
+    // отрисовки оставила бы на ободе мусор. Пауза — чтобы ответ успел уйти.
+    if (pending_reboot) {
+        pending_reboot = false;
+        applyPowerState(PWR_OFF);   // при переходе сам сбрасывает всё отложенное
+        flushLastFile();
+        flushSettings();
+        flushSlideList();
+        hallLogFlush();
+        webLog("[SYS] Rebooting");
+        delay(300);
+        ESP.restart();
+    }
 
     // --- Отложенная запись настроек ---
     // Ждать выключения питания необязательно: пока колесо не раскручено до

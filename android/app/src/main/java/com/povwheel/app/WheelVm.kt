@@ -1140,6 +1140,10 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         prefs.edit().remove(magnetLockKey(addr)).apply()
         found.value = found.value.filter { it.address != addr }
         rebuildWheels()
+        // Архив лога Холла (HallArchive, files/hall/<адрес>) здесь НЕ трогаем
+        // намеренно: «забыть» — это про список колёс, а лог — история поездок,
+        // по которой склеиваются уже снятые ролики. При повторном подключении
+        // колесо с тем же адресом продолжает ту же папку архива.
     }
 
     /** Колёса, виденные раньше: список не пуст ещё до того, как поиск что-то найдёт. */
