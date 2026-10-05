@@ -102,12 +102,7 @@ fun PovVideoCard(ctrl: PovVideoController) {
         ) { Text("Render POV Video") }
 
         when (val s = st) {
-            is State.Idle -> Hint(
-                "Pick a video of the spinning wheel, filmed with any camera. The app looks up the wheel's Hall sensor log " +
-                    "for the time the video was recorded (collected automatically while a wheel is connected to this phone) " +
-                    "and matches it to the frames. Every 1/6 turn becomes one clean frame; the result is saved to the gallery " +
-                    "next to the original."
-            )
+            is State.Idle -> {}
 
             is State.Analyzing -> {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -200,11 +195,6 @@ fun PovVideoCard(ctrl: PovVideoController) {
             }
         }
     }
-}
-
-@Composable
-private fun Hint(text: String) {
-    Text(text, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
 }
 
 /** Сводка о файле — те же строки, что скрипт выводит в консоль. */

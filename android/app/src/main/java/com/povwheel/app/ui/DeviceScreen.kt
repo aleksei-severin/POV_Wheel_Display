@@ -33,6 +33,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.CornerRadius
@@ -98,9 +99,9 @@ fun DeviceScreen(vm: WheelVm) {
     }
 
     // Свайп влево/вправо по контенту — следующее/предыдущее колесо по кругу,
-    // только среди реально подключённых (см. WheelVm.cycleWheel) — свайп на
-    // офлайн-соседа вёл бы на пустой IdleContent.
-    val canSwipe = wheels.count { it.link == Link.Ready } >= 2
+    // по всем колёсам строки (см. WheelVm.cycleWheel): у колеса без связи
+    // показывается его последний снимок экрана, так что пустым свайп не бывает.
+    val canSwipe = wheels.size >= 2
     val scope = rememberCoroutineScope()
     val dragX = remember { Animatable(0f) }
 
@@ -148,8 +149,16 @@ fun DeviceScreen(vm: WheelVm) {
                 })
                 .offset { IntOffset(dragX.value.roundToInt(), 0) }
         ) {
-            if (client != null && curEntry?.link == Link.Ready) {
-                key(current) { ConnectedContent(vm, client) }
+            // Открытое колесо показывается всегда, со связью или без: без связи —
+            // последний снимок экрана (библиотека, настройки) серым и без
+            // управления, кроме Render POV Video. Заглушка — только пока не
+            // открыто ни одно колесо.
+            val cur = current
+            if (cur != null) {
+                key(cur) {
+                    if (client != null) ConnectedContent(vm, client)
+                    else MainContent(vm, Tele(), online = false)
+                }
             } else {
                 IdleContent(wheels, curEntry)
             }
@@ -161,7 +170,10 @@ fun DeviceScreen(vm: WheelVm) {
 private fun ConnectedContent(vm: WheelVm, client: BleClient) {
     val link by client.link.collectAsState()
     val tele by client.tele.collectAsState()
-    MainContent(vm, tele, link == Link.Ready)
+    val online = link == Link.Ready
+    // Без связи — пустая телеметрия, а не последняя: устаревшие обороты, заряд
+    // и «что играет» выглядели бы как живые.
+    MainContent(vm, if (online) tele else Tele(), online)
 }
 
 /**
@@ -182,16 +194,16 @@ private fun MainContent(vm: WheelVm, tele: Tele, online: Boolean) {
     ) { uri -> if (uri != null) vm.updateFirmware(uri) { vm.say(it) } }
 
     LibraryTab(
-        vm, tele,
+        vm, tele, online,
         leadingItems = {
             item(key = "hero", span = { GridItemSpan(maxLineSpan) }) { Hero(vm, tele, online) }
         }
     ) {
         item(key = "brightness", span = { GridItemSpan(maxLineSpan) }) {
-            SettingCard { AutoBrightnessRange(vm, s, tele) }
+            SettingCard(dim = !online) { AutoBrightnessRange(vm, s, tele, online) }
         }
         item(key = "magnet", span = { GridItemSpan(maxLineSpan) }) {
-            SettingCard {
+            SettingCard(dim = !online) {
                 // Заголовок и компактный спиннер в одну строку — блок по высоте
                 // совпадает со свёрнутым «Colour». Спиннер, а не ползунок: на 360
                 // положениях один пиксель дорожки стоит больше градуса, а
@@ -209,6 +221,7 @@ private fun MainContent(vm: WheelVm, tele: Tele, online: Boolean) {
                     // держать 1 с (кольцо вокруг замка показывает прогресс).
                     MagnetLock(
                         locked = magLocked,
+                        enabled = online,
                         onLock = { vm.setMagnetLocked(true) },
                         onUnlock = { vm.setMagnetLocked(false) },
                         onHint = { vm.say("Hold the lock 1 s to unlock") }
@@ -220,7 +233,7 @@ private fun MainContent(vm: WheelVm, tele: Tele, online: Boolean) {
                         modifier = Modifier.width(120.dp),
                         dense = true,
                         wrap = true,              // прокрутка бесконечная, без упора в 0/359
-                        enabled = !magLocked,
+                        enabled = !magLocked && online,
                         // Применяем на дисплей ПРЯМО во время перетаскивания
                         // (throttled, только на открытое колесо, без записи в
                         // NVS) — калибровать вслепую до отпускания пальца неудобно.
@@ -232,11 +245,11 @@ private fun MainContent(vm: WheelVm, tele: Tele, online: Boolean) {
         }
         item(key = "colour", span = { GridItemSpan(maxLineSpan) }) {
             // Полдюжины ползунков незачем держать перед глазами — прячем под тап.
-            SettingCard {
+            SettingCard(dim = !online) {
                 Row(
                     Modifier.fillMaxWidth()
                         .clip(RoundedCornerShape(6.dp))
-                        .tapClickable { colourOpen = !colourOpen }
+                        .tapClickable(enabled = online) { colourOpen = !colourOpen }
                         .padding(vertical = 4.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -249,10 +262,11 @@ private fun MainContent(vm: WheelVm, tele: Tele, online: Boolean) {
                         color = MaterialTheme.colorScheme.onSurface,
                         modifier = Modifier
                             .padding(end = 6.dp)
-                            .rotate(if (colourOpen) 0f else -90f)
+                            .rotate(if (colourOpen && online) 0f else -90f)
                     )
                 }
-                if (colourOpen) {
+                // Без связи ползунки не показываем: двигать их всё равно некуда.
+                if (colourOpen && online) {
                     Spacer(Modifier.height(4.dp))
                     ColourControls(vm)
                 }
@@ -263,7 +277,7 @@ private fun MainContent(vm: WheelVm, tele: Tele, online: Boolean) {
             SettingCard { PovVideoCard(vm.povVideo) }
         }
         item(key = "maint", span = { GridItemSpan(maxLineSpan) }) {
-            SettingCard {
+            SettingCard(dim = !online) {
                 // Только кнопки, без заголовка — карточка по высоте как «Magnet
                 // Position». «OFF» — уход в транспортный режим: колесо гаснет и
                 // до удержания кнопки не проснётся ни по тряске, ни по BLE.
@@ -274,15 +288,16 @@ private fun MainContent(vm: WheelVm, tele: Tele, online: Boolean) {
                         Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(5.dp)
                     ) {
-                        MaintBtn("OFF", fw == null, danger = true) { confirmOff = true }
-                        MaintBtn("Reboot", fw == null) { vm.reboot() }
-                        MaintBtn("Wi-Fi", fw == null) {
+                        val can = fw == null && online
+                        MaintBtn("OFF", can, danger = true) { confirmOff = true }
+                        MaintBtn("Reboot", can) { vm.reboot() }
+                        MaintBtn("Wi-Fi", can) {
                             vm.wifi(true); vm.say("Wi-Fi is coming up for OTA")
                         }
-                        MaintBtn("Update", fw == null) {
+                        MaintBtn("Update", can) {
                             fwPicker.launch(arrayOf("application/octet-stream", "*/*"))
                         }
-                        MaintBtn("Log", fw == null) { showLog = true }
+                        MaintBtn("Log", can) { showLog = true }
                     }
                 }
                 if (fw != null) {
@@ -397,8 +412,10 @@ private fun WheelName(vm: WheelVm, w: WheelEntry, selected: Boolean) {
             when (w.link) {
                 Link.Connecting ->
                     CircularProgressIndicator(Modifier.size(WHEEL_DOT_SLOT), strokeWidth = 1.5.dp, color = Warn)
+                // Зелёная у любого колеса на связи, в том числе у выбранного:
+                // выбор уже виден по подсветке и цвету имени, а цвет точки — статус.
                 Link.Ready ->
-                    Box(Modifier.size(7.dp).clip(CircleShape).background(if (selected) cs.primary else Ok))
+                    Box(Modifier.size(7.dp).clip(CircleShape).background(Ok))
                 else ->
                     Box(Modifier.size(7.dp).clip(CircleShape).background(Danger))
             }
@@ -406,7 +423,7 @@ private fun WheelName(vm: WheelVm, w: WheelEntry, selected: Boolean) {
         Text(
             w.name,
             style = MaterialTheme.typography.bodyMedium,
-            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
             color = nameColor,
             maxLines = 1,
             softWrap = false
@@ -525,16 +542,16 @@ private fun Hero(vm: WheelVm, tele: Tele, online: Boolean) {
     // Нет связи или телеметрия ещё не пришла — прочерки, как у скорости/оборотов,
     // а не нули напряжения и процентов.
     val battKnown = online && tele.vbatMv > 0
-    // Короткий статус рядом с процентом — теперь только «Offline»/«Empty»:
+    // Короткий статус под процентом — только «Empty» (сработала защита батареи).
+    // «Offline»/«Connecting…» убраны: отдельной строкой они вытягивали карточку
+    // вниз, а связь и так видна по прочеркам и точке у имени колеса. По той же
+    // причине раньше ушли и другие бейджи:
     // «Low», «Charging» и «Charged» были текстовыми бейджами и раздували
     // карточку по высоте отдельной строкой. «Charging» заменён значком молнии
     // прямо на иконке батареи (см. BatteryIcon); «Low» и «Charged» и так видны
     // по цвету/значению самого процента — отдельная надпись под них не нужна.
-    val battBadge: Pair<String, Color?>? = when {
-        !battKnown -> "Offline" to null
-        tele.cutoff -> "Empty" to Danger
-        else -> null
-    }
+    val battBadge: Pair<String, Color?>? =
+        if (battKnown && tele.cutoff) "Empty" to Danger else null
     val charging = battKnown && tele.chg == 1
     val battColor = when {
         !battKnown -> MaterialTheme.colorScheme.onSurfaceVariant
@@ -558,7 +575,7 @@ private fun Hero(vm: WheelVm, tele: Tele, online: Boolean) {
                     if (tele.kmh > 0f) String.format("%.1f", tele.kmh) else "--",
                     style = MaterialTheme.typography.headlineSmall,
                     fontWeight = FontWeight.Bold,
-                    modifier = Modifier.alignByBaseline().tapClickable { showCirc = true }
+                    modifier = Modifier.alignByBaseline().tapClickable(enabled = online) { showCirc = true }
                 )
                 Text(" km/h", style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -567,7 +584,7 @@ private fun Hero(vm: WheelVm, tele: Tele, online: Boolean) {
                     if (tele.rpm > 0f) tele.rpm.roundToInt().toString() else "--",
                     style = MaterialTheme.typography.titleMedium,
                     modifier = Modifier.alignByBaseline().padding(start = 10.dp)
-                        .tapClickable { showRpm = true }
+                        .tapClickable(enabled = online) { showRpm = true }
                 )
                 Text(" rpm", style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -645,11 +662,16 @@ private fun Hero(vm: WheelVm, tele: Tele, online: Boolean) {
 /** Блок настроек в своей карточке. Отступы между карточками задаёт сетка
  *  (`verticalArrangement`), поэтому своего нижнего поля у карточки нет. */
 @Composable
-private fun SettingCard(content: @Composable ColumnScope.() -> Unit) {
-    Card(Modifier.fillMaxWidth()) {
+private fun SettingCard(dim: Boolean = false, content: @Composable ColumnScope.() -> Unit) {
+    // dim — колесо без связи: блок виден (последние значения), но серый, а
+    // управление в нём выключено самими элементами (enabled).
+    Card(Modifier.fillMaxWidth().then(if (dim) Modifier.alpha(DIM_ALPHA) else Modifier)) {
         Column(Modifier.padding(12.dp), content = content)
     }
 }
+
+/** Насколько гасить то, что без связи с колесом недоступно. */
+internal const val DIM_ALPHA = 0.4f
 
 /**
  * Диапазон авто-яркости одним слайдером с двумя бегунками вместо двух
@@ -673,7 +695,7 @@ private fun userToBri(u: Int): Int =
         .coerceIn(BRI_LO, BRI_HI)
 
 @Composable
-private fun AutoBrightnessRange(vm: WheelVm, s: Settings, tele: Tele) {
+private fun AutoBrightnessRange(vm: WheelVm, s: Settings, tele: Tele, enabled: Boolean) {
     val lo = briToUser(minOf(s.bmin, s.bmax))
     val hi = briToUser(maxOf(s.bmin, s.bmax))
     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -688,6 +710,7 @@ private fun AutoBrightnessRange(vm: WheelVm, s: Settings, tele: Tele) {
         val inset = 10.dp
         StepRangeSlider(
             lo = lo, hi = hi, valueRange = 1..BRI_U_MAX,
+            enabled = enabled,
             onChange = { a, b ->
                 vm.settings.value = s.copy(
                     bmin = userToBri(minOf(a, b)),
@@ -730,7 +753,8 @@ private fun StepRangeSlider(
     valueRange: IntRange,
     onChange: (Int, Int) -> Unit,
     onChangeFinished: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true
 ) {
     val cs = MaterialTheme.colorScheme
     val density = LocalDensity.current
@@ -755,9 +779,11 @@ private fun StepRangeSlider(
             .roundToInt().coerceIn(valueRange.first, valueRange.last)
 
         Box(
-            Modifier.matchParentSize().pointerInput(usable) {
+            Modifier.matchParentSize().pointerInput(usable, enabled) {
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)
+                    // Выключен — жест не трогаем вовсе: пусть скроллится лента.
+                    if (!enabled) return@awaitEachGesture
                     val x = down.position.x
                     val dLo = abs(x - xOf(loS.value))
                     val dHi = abs(x - xOf(hiS.value))
@@ -1188,6 +1214,7 @@ private fun NumberSpinner(
 @Composable
 private fun MagnetLock(
     locked: Boolean,
+    enabled: Boolean,
     onLock: () -> Unit,
     onUnlock: () -> Unit,
     onHint: () -> Unit
@@ -1204,9 +1231,10 @@ private fun MagnetLock(
     Box(
         Modifier
             .size(30.dp)
-            .pointerInput(locked) {
+            .pointerInput(locked, enabled) {
                 awaitEachGesture {
                     awaitFirstDown()
+                    if (!enabled) return@awaitEachGesture
                     if (!locked) {
                         if (waitForUpOrCancellation() != null) { view.tapFeedback(); onLock() }
                         return@awaitEachGesture

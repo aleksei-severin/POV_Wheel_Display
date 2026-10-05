@@ -21,7 +21,8 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicInteger
 
-class BleException(message: String) : Exception(message)
+/** [status] — код PovStatus из ответа колеса, −1 — ошибка транспорта (таймаут, обрыв). */
+class BleException(message: String, val status: Int = -1) : Exception(message)
 
 /**
  * Состояние связи с одним колесом.
@@ -398,7 +399,7 @@ class BleClient(
             synchronized(pending) { pending.remove(seq) }
             throw BleException("timed out waiting for the wheel")
         }
-        if (res.first != Proto.ST_OK) throw BleException(Proto.statusText(res.first))
+        if (res.first != Proto.ST_OK) throw BleException(Proto.statusText(res.first), res.first)
         return res.second
     }
 
@@ -754,7 +755,7 @@ class BleClient(
                     val w = CompletableDeferred<Unit>()
                     flowWaiter = w
                     if (linkDown) throw BleException("connection lost")
-                    if (flowStatus != Proto.ST_OK) throw BleException(Proto.statusText(flowStatus))
+                    if (flowStatus != Proto.ST_OK) throw BleException(Proto.statusText(flowStatus), flowStatus)
                     if (off - flowConsumed < window) break
                     withTimeoutOrNull(15_000) { w.await() }
                         ?: throw BleException("the wheel stopped acknowledging data")

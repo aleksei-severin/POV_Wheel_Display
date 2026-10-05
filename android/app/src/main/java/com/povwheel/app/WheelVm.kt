@@ -16,10 +16,12 @@ import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.ParcelUuid
+import android.util.Base64
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.povwheel.app.ble.BleClient
+import com.povwheel.app.ble.BleException
 import com.povwheel.app.ble.DevFile
 import com.povwheel.app.ble.FsInfo
 import com.povwheel.app.ble.Link
@@ -48,6 +50,8 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+import org.json.JSONArray
+import org.json.JSONObject
 import java.util.TimeZone
 
 /** Одно колесо глазами интерфейса — подключённое или просто замеченное. */
@@ -146,6 +150,66 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     private val fsInfoByAddr   = HashMap<String, FsInfo>()
     private val settingsByAddr = HashMap<String, Settings>()
     private val prefetched     = HashSet<String>()
+
+    /**
+     * Тот же кэш — на диске (`files/wheelcache/<адрес>.json`): библиотека, место
+     * и настройки последнего, что колесо показало, пока было на связи. Нужен,
+     * чтобы экран колеса без связи (даже после перезапуска приложения) остался
+     * тем, с чем человек работал, — серым и без управления, но не пустым
+     * «Connecting to…». Пишется фоном, только когда снимок изменился.
+     */
+    private val cacheDir by lazy { File(ctx.filesDir, "wheelcache").also { it.mkdirs() } }
+    private val cacheWritten = HashMap<String, String>()
+
+    private fun cacheFile(addr: String) = File(cacheDir, addr.replace(":", "") + ".json")
+
+    private fun cacheJson(fl: List<DevFile>, fs: FsInfo, s: Settings?): String {
+        val o = JSONObject()
+        o.put("files", JSONArray().apply { fl.forEach { put(JSONArray().put(it.name).put(it.size)) } })
+        o.put("fs", JSONArray().put(fs.total).put(fs.used).put(fs.free).put(fs.psramFree)
+            .put(fs.frameStride).put(fs.maxFrames))
+        if (s != null) o.put("set", Base64.encodeToString(s.pack(), Base64.NO_WRAP))
+        return o.toString()
+    }
+
+    /** Поднять с диска то, чего нет в памяти (после перезапуска приложения). */
+    private fun loadCache(addr: String) {
+        if (filesByAddr.containsKey(addr) && fsInfoByAddr.containsKey(addr) && settingsByAddr.containsKey(addr)) return
+        val f = cacheFile(addr)
+        if (!f.exists()) return
+        runCatching {
+            val text = f.readText()
+            val o = JSONObject(text)
+            if (!filesByAddr.containsKey(addr)) o.optJSONArray("files")?.let { a ->
+                filesByAddr[addr] = (0 until a.length()).map { val r = a.getJSONArray(it); DevFile(r.getString(0), r.getLong(1)) }
+            }
+            if (!fsInfoByAddr.containsKey(addr)) o.optJSONArray("fs")?.let { a ->
+                fsInfoByAddr[addr] = FsInfo(a.getLong(0), a.getLong(1), a.getLong(2), a.getLong(3), a.getInt(4), a.getInt(5))
+            }
+            if (!settingsByAddr.containsKey(addr)) o.optString("set").takeIf { it.isNotEmpty() }?.let {
+                settingsByAddr[addr] = Settings.parse(Base64.decode(it, Base64.NO_WRAP))
+            }
+            cacheWritten[addr] = text
+        }
+    }
+
+    /** Сбросить на диск изменившиеся снимки. Открытое колесо — из живых потоков экрана. */
+    private suspend fun saveCaches() {
+        val cur = current.value
+        val addrs = LinkedHashSet<String>().apply { addAll(filesByAddr.keys); cur?.let { add(it) } }
+        for (addr in addrs) {
+            val isCur = addr == cur
+            val fl = if (isCur) files.value else filesByAddr[addr] ?: continue
+            val fs = if (isCur) fsInfo.value else fsInfoByAddr[addr] ?: FsInfo()
+            val s = if (isCur && settingsLoaded.value) settings.value else settingsByAddr[addr]
+            // Колесо, о котором ещё ничего не узнали, пустым снимком не затираем.
+            if (fl.isEmpty() && fs.total == 0L && s == null) continue
+            val js = cacheJson(fl, fs, s)
+            if (cacheWritten[addr] == js) continue
+            cacheWritten[addr] = js
+            withContext(Dispatchers.IO) { runCatching { cacheFile(addr).writeText(js) } }
+        }
+    }
 
     // ------------------------------------------------------- синхронизация слайдшоу
     //
@@ -725,6 +789,10 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             while (true) { delay(1000); rebuildWheels() }
         }
+        // Кэш последнего экрана на диск — раз в несколько секунд, только изменения.
+        viewModelScope.launch {
+            while (true) { delay(3000); runCatching { saveCaches() } }
+        }
         found.value = knownDevices()
         rebuildWheels()
         registerBtStateReceiver()
@@ -939,10 +1007,6 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     private fun readyClient(): BleClient? =
         currentClient()?.takeIf { it.link.value == Link.Ready }
 
-    /** Открытое сейчас колесо и правда на связи — экран у него есть смысл не отбирать. */
-    private fun currentIsActive(): Boolean =
-        current.value?.let { clients[it]?.link?.value == Link.Ready } == true
-
     /**
      * Открыть колесо по тапу в строке: если оно уже на связи — просто показать,
      * иначе показать «подключаемся» и запустить соединение.
@@ -965,11 +1029,10 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         setIgnored(addr, false)
         val c = clients[addr]
         if (c != null && c.link.value == Link.Ready) { selectWheel(addr); return }
+        // Колесо без связи тоже открываем: экран показывает его последний снимок
+        // (серым, без управления — см. DeviceScreen), а подключение идёт само.
+        selectWheel(addr)
         connect(addr, name)
-        if (current.value == null || clients[current.value]?.link?.value != Link.Ready) {
-            current.value = addr
-            prefs.edit().putString("last_wheel", addr).apply()
-        }
     }
 
     /**
@@ -984,15 +1047,9 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      */
     fun openLastWheel() {
         val addr = prefs.getString("last_wheel", null) ?: return
+        // Остаёмся на нём, даже если рядом на связи другое: человек работал с
+        // этим, и его экран (последний снимок) показывается и без связи.
         openWheel(addr, prefs.getString("name_" + addr, "POV wheel")!!)
-        viewModelScope.launch {
-            delay(3000)
-            while (current.value == addr && clients[addr]?.link?.value != Link.Ready) {
-                val alt = wheels.value.firstOrNull { it.reachable && it.address != addr }
-                if (alt != null) { openWheel(alt.address, alt.name); return@launch }
-                delay(1000)
-            }
-        }
     }
 
     /**
@@ -1006,7 +1063,9 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      * уже реально можно показать. Меньше двух — свайп ничего не делает.
      */
     fun cycleWheel(dir: Int) {
-        val list = wheels.value.filter { it.link == Link.Ready }
+        // Все колёса строки шапки — и без связи тоже: у них показывается
+        // последний снимок экрана (см. openWheel).
+        val list = wheels.value
         if (list.size < 2) return
         val i = list.indexOfFirst { it.address == current.value }.coerceAtLeast(0)
         val next = list[(i + dir).mod(list.size)]
@@ -1140,6 +1199,8 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         prefs.edit().remove(magnetLockKey(addr)).apply()
         found.value = found.value.filter { it.address != addr }
         rebuildWheels()
+        cacheWritten.remove(addr)
+        runCatching { cacheFile(addr).delete() }
         // Архив лога Холла (HallArchive, files/hall/<адрес>) здесь НЕ трогаем
         // намеренно: «забыть» — это про список колёс, а лог — история поездок,
         // по которой склеиваются уже снятые ролики. При повторном подключении
@@ -1231,7 +1292,12 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             // смотрит. Показываем это подключение, только если экран свободен
             // (ничего не выбрано, либо выбранное само не на связи) либо это
             // как раз то колесо, что уже открыто (переподключение того же).
-            if (addr == current.value || !currentIsActive()) {
+            // Экран занимаем, только если он пуст. Открытое колесо — то, с
+            // которым человек работает, даже если оно сейчас без связи: его
+            // последний снимок показывается серым, и вырывать экран из-под него
+            // ради только что проснувшегося соседа не надо (переключиться на
+            // соседа — тап по имени или свайп).
+            if (addr == current.value || current.value == null) {
                 selectWheel(addr)
                 refreshAll()
                 startPolling()
@@ -1272,6 +1338,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
 
         current.value = addr
         prefs.edit().putString("last_wheel", addr).apply()   // открыть его при следующем старте
+        loadCache(addr)                                      // после перезапуска — с диска
 
         // Кэш — ТОЛЬКО для мгновенного показа; settingsLoaded держим false, пока
         // не придёт настоящее чтение с устройства (adoptSettings). Иначе первое
@@ -1303,16 +1370,11 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         // Колесо могло за время обрыва перезагрузиться и потерять RTC-настройки —
         // после реконнекта перечитываем их заново, а не доверяем старой копии.
         if (addr == current.value) {
+            // Экран остаётся на этом колесе: его последний снимок показывается
+            // серым, пока связь не вернётся (см. DeviceScreen). Раньше экран
+            // перескакивал на любое другое доступное колесо — теперь переход
+            // только по воле человека (тап, свайп).
             settingsLoaded.value = false
-            // Именно текущее колесо и отвалилось — это тот случай, когда экран
-            // ДОЛЖЕН уйти с него: правило «не отбирать экран у активного
-            // колеса» (см. connect()) относится только к ещё живому текущему.
-            // Переходим на любое другое доступное и остаёмся там — назад сюда
-            // не утащит, пока это, отвалившееся, само не переподключится, пока
-            // оно ещё текущее (см. проверку в connect()).
-            val alt = wheels.value.firstOrNull { it.address != addr && it.link == Link.Ready }
-                ?: wheels.value.firstOrNull { it.address != addr && it.reachable }
-            if (alt != null) openWheel(alt.address, alt.name)
         }
         if (!wantConnected.contains(addr)) return
         reconnectJobs[addr]?.cancel()
@@ -1548,7 +1610,12 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         val lenTouched: Boolean = false,   // правил ли пользователь длину вручную
         val anim: Boolean = false,         // источник анимированный (GIF / WebP / видео)
         val poster: Bitmap? = null,        // круглое превью, null пока считается
-        val ready: Boolean = false         // тип определён и постер отрисован
+        val ready: Boolean = false,        // тип определён и постер отрисован
+        /** Задержки кадров GIF/WebP — для оценки размера на колесе ([upEstimatedBytes]). */
+        val srcDelays: IntArray? = null,
+        /** Префикс имени на колесе (img_/gif_/anm_/vid_) — по нему видно, что файл
+         *  там уже есть и заливка его пропустит. Пусто, пока тип не определён. */
+        val prefix: String = ""
     )
 
     /** Заливка одного колеса: своя очередь, свой статус, свой прогресс. См.
@@ -1561,11 +1628,12 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         val progress = MutableStateFlow(-1f)
         val busy     = MutableStateFlow(false)
         val currentUri = MutableStateFlow<Uri?>(null)
-        val selClip  = MutableStateFlow<PreviewClip?>(null)
+        /** Анимированные превью ждущих заливки файлов, по Uri — у КАЖДОЙ жёлтой
+         *  ячейки, а не только у выбранной. */
+        val clips    = MutableStateFlow<Map<Uri, PreviewClip>>(emptyMap())
         /** Другие колёса, на которые уйдёт та же пачка (см. [startUpload]) —
          *  живёт до нажатия Upload, редактируется только на странице-источнике. */
         val syncTargets = MutableStateFlow<Set<String>>(emptySet())
-        var selClipJob: kotlinx.coroutines.Job? = null
         var prepJob: kotlinx.coroutines.Job? = null
     }
 
@@ -1599,9 +1667,69 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     /** Uri файла, который льётся прямо сейчас на ЭТО колесо — его ячейка в
      *  сетке рисует сматывающийся ободок по [upProgress]. null — ничего не льётся. */
     val upCurrentUri: StateFlow<Uri?> get() = session(current.value).currentUri
-    /** Анимированное превью ВЫБРАННОЙ ячейки сетки. Остальные остаются статичными
-     *  постерами — держать в памяти клипы всех тридцати файлов ни к чему. */
-    val upSelClip: StateFlow<PreviewClip?> get() = session(current.value).selClip
+    /** Анимированные превью ждущих заливки ячеек сетки, по Uri. Размер — как у
+     *  миниатюр библиотеки (PreviewClips.CACHE_*): клипы держатся у всех ячеек
+     *  разом, и на тридцати файлах больший размер стоил бы под сотню мегабайт. */
+    val upClips: StateFlow<Map<Uri, PreviewClip>> get() = session(current.value).clips
+
+    /**
+     * Сколько займёт файл на колесе после заливки: заголовок ANI6 и кадры по
+     * 16608 байт — ровно столько кадров, сколько выйдет из конвертации при
+     * потолке открытого колеса. null — тип ещё не определён.
+     */
+    fun upEstimatedBytes(item: UpItem, maxFrames: Int = fsInfo.value.maxFrames): Long? {
+        if (!item.ready) return null
+        val cap = maxOf(1, maxFrames)
+        val n = when {
+            item.isVideo -> {
+                val dur = if (item.srcDur > 0) item.srcDur else item.lengthSec
+                val len = item.lengthSec.coerceIn(0.1, maxOf(0.1, dur))
+                maxOf(1, minOf(Math.round(len * item.fps).toInt(), cap))
+            }
+            item.srcDelays != null && item.srcDelays.isNotEmpty() -> converter.animOutFrames(item.srcDelays, cap)
+            else -> 1
+        }
+        return 8L + n.toLong() * 16608L
+    }
+
+    /** Имя файла на колесе, если оно предсказуемо (латиница без пробелов — иначе
+     *  конвертер добавляет случайный хвост), — чтобы узнать уже залитый дубль. */
+    private fun expectedName(item: UpItem): String? {
+        if (item.prefix.isEmpty()) return null
+        val base = item.name.substringBeforeLast('.', item.name)
+        val nr = Ani6.buildFileName(item.prefix, base, 0)
+        return if (nr.warning == null) nr.name else null
+    }
+
+    /** Порядок заливки: по возрастанию места на колесе — сначала картинки, потом
+     *  анимации от лёгких к тяжёлым. Тогда в забитую память влезает как можно
+     *  больше файлов, а не влезает предсказуемо только тяжёлый хвост. */
+    private fun uploadOrder(items: List<UpItem>, maxFrames: Int = fsInfo.value.maxFrames): List<UpItem> =
+        items.sortedBy { upEstimatedBytes(it, maxFrames) ?: Long.MAX_VALUE }
+
+    /**
+     * Ждущие файлы, которым места на открытом колесе не хватит: очередь проходится
+     * в порядке заливки ([uploadOrder]) с тем же запасом, что требует прошивка
+     * ([UPLOAD_MARGIN]), с округлением занятого до блоков ФС и с учётом дублей —
+     * точная копия уже залитого пропускается и места не берёт, другая версия того
+     * же имени освобождает место старой.
+     */
+    fun upWontFit(items: List<UpItem>): Set<Uri> {
+        val fs = fsInfo.value
+        if (fs.total <= 0L) return emptySet()          // о месте на колесе ещё ничего не знаем
+        val existing = files.value
+        var avail = fs.free
+        val out = HashSet<Uri>()
+        for (it in uploadOrder(items)) {
+            val b = upEstimatedBytes(it) ?: continue
+            val dup = expectedName(it)?.let { n -> existing.firstOrNull { f -> f.name == n } }
+            if (dup != null && dup.size == b) continue
+            val freed = dup?.size ?: 0L
+            if (b + UPLOAD_MARGIN > avail + freed) { out.add(it.uri); continue }
+            avail += freed - ((b + 4095) / 4096) * 4096
+        }
+        return out
+    }
     /** Отмеченные партнёры синхронной заливки для очереди, стоящей на этой
      *  странице прямо сейчас (см. [SyncTargetsRow]-подобный ряд в UploadStrip). */
     val upSyncTargets: StateFlow<Set<String>> get() = session(current.value).syncTargets
@@ -1616,6 +1744,15 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     // мелко (34…104 dp), так что больше не нужно.
     private val POSTER_PX = 200
 
+    /** Запас свободного места, который прошивка требует сверх размера файла
+     *  (OP_UP_BEGIN: raw_size + 128 кБ) — служебные блоки LittleFS. */
+    private val UPLOAD_MARGIN = 128L * 1024
+    /** Повторов заливки одного файла после неудачи. */
+    private val UPLOAD_RETRIES = 2
+    private val ST_BAD_ARG = 2
+    private val ST_BUSY = 3
+    private val ST_NO_SPACE = 5
+
     /** Выбрали файлы — строим пачку и запускаем фоновую подготовку превью.
      *  Пачка ложится в сессию ТОГО колеса, чья страница открыта сейчас: именно
      *  оно и есть источник — тут же настраиваются кадрирование/fps/длина и
@@ -1625,8 +1762,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         val addr = current.value ?: return
         val s = session(addr)
         s.prepJob?.cancel()
-        s.selClipJob?.cancel()
-        s.selClip.value = null
+        s.clips.value = emptyMap()
         s.items.value = emptyList()
         s.sel.value = 0
         s.progress.value = -1f
@@ -1674,49 +1810,56 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                     }
                     val isVid = kind == Converter.Kind.VIDEO
                     val dur = if (isVid) withContext(Dispatchers.IO) { converter.videoDurationSec(u) } else 0.0
+                    val delays = if (kind == Converter.Kind.GIF || kind == Converter.Kind.WEBP_ANIM)
+                        withContext(Dispatchers.IO) { converter.animDelays(u) } else null
+                    val prefix = when (kind) {
+                        Converter.Kind.VIDEO -> "vid_"
+                        Converter.Kind.GIF -> "gif_"
+                        Converter.Kind.WEBP_ANIM -> "anm_"
+                        Converter.Kind.IMAGE -> "img_"
+                    }
                     updateByUri(addr, u) {
                         it.copy(isVideo = isVid, anim = kind != Converter.Kind.IMAGE, srcDur = dur,
+                            srcDelays = delays, prefix = prefix,
                             lengthSec = if (isVid && !it.lenTouched) defaultLengthSec(addr, it.fps, dur)
                                         else it.lengthSec)
                     }
                 }
+                // Кадрирование могло смениться — прежний клип уже не тот.
+                s.clips.value = s.clips.value - u
                 val fit = s.items.value.firstOrNull { it.uri == u }?.fit ?: Fit.CROP
                 val poster = withContext(Dispatchers.Default) { converter.posterOf(u, fit, POSTER_PX) }
                 updateByUri(addr, u) { it.copy(poster = poster, ready = true) }
-                // Готова выбранная ячейка — заводим её анимированное превью.
-                if (s.items.value.getOrNull(s.sel.value)?.uri == u) refreshSelClip(addr)
+            }
+            // Сначала постеры у всех (видно, что выбрано), потом анимированные
+            // превью — по одному, чтобы не грузить процессор и память всей пачкой.
+            for (i in indices) {
+                if (!isActive) break
+                val u = s.items.value.getOrNull(i)?.uri ?: continue
+                buildClip(addr, u)
             }
         }
     }
 
     /**
-     * Пересобирает анимированное превью выбранной ячейки. Клип строится только
-     * для неё: держать в памяти по клипу на каждый из тридцати возможных файлов
-     * незачем, а именно эту ячейку пользователь сейчас и разглядывает.
+     * Анимированное превью одной ждущей ячейки (GIF, WebP, видео; у картинки
+     * хватает постера). Строится в размере миниатюр библиотеки и кладётся в
+     * карту сессии по Uri; если кадрирование за это время сменили — выброшено.
      */
-    private fun refreshSelClip(addr: String) {
+    private suspend fun buildClip(addr: String, uri: Uri) {
         val s = session(addr)
-        s.selClipJob?.cancel()
-        val cur = s.items.value.getOrNull(s.sel.value)
-        // Прежний клип не утилизируем — его ещё может рисовать ячейка; освободит
-        // сборщик. Один клип за раз, счёт идёт на мегабайты, не на десятки.
-        s.selClip.value = null
-        if (cur == null || !cur.ready || !cur.anim) return
-        val uri = cur.uri
-        val fit = cur.fit
-        s.selClipJob = viewModelScope.launch {
-            val clip = withContext(Dispatchers.Default) {
-                runCatching {
-                    converter.previewClip(uri, fit, PreviewClips.UPLOAD_PX, PreviewClips.UPLOAD_FRAMES)
-                }.getOrNull()
-            }
-            val now = s.items.value.getOrNull(s.sel.value)
-            if (isActive && now != null && now.uri == uri && now.fit == fit) {
-                s.selClip.value = clip
-            } else {
-                clip?.recycle()   // не показан — освобождаем сразу
-            }
-        }
+        val item = s.items.value.firstOrNull { it.uri == uri } ?: return
+        if (!item.ready || !item.anim || s.clips.value.containsKey(uri)) return
+        val fit = item.fit
+        val clip = withContext(Dispatchers.Default) {
+            runCatching {
+                converter.previewClip(uri, fit, PreviewClips.CACHE_PX, PreviewClips.CACHE_FRAMES)
+            }.getOrNull()
+        } ?: return
+        val now = s.items.value.firstOrNull { it.uri == uri }
+        // Прежний клип не утилизируем — его ещё может рисовать ячейка; освободит сборщик.
+        if (now != null && now.fit == fit) s.clips.value = s.clips.value + (uri to clip)
+        else clip.recycle()
     }
 
     private fun updateByUri(addr: String, uri: Uri, f: (UpItem) -> UpItem) {
@@ -1738,7 +1881,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     fun selectUpItem(i: Int) {
         val addr = current.value ?: return
         val s = session(addr)
-        if (i in s.items.value.indices) { s.sel.value = i; refreshSelClip(addr) }
+        if (i in s.items.value.indices) s.sel.value = i
     }
 
     /** Убрать один файл из пачки. */
@@ -1747,29 +1890,32 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         val s = session(addr)
         val cur = s.items.value
         if (i !in cur.indices) return
+        val gone = cur[i].uri
         val next = cur.toMutableList().also { it.removeAt(i) }
         s.items.value = next
+        s.clips.value = s.clips.value - gone
         s.sel.value = s.sel.value.coerceIn(0, maxOf(0, next.size - 1))
         if (next.isEmpty()) {
             s.status.value = "Waiting for a file…"
             s.kind.value = 0
         }
         recomputeUploadBusyAddrs()
-        refreshSelClip(addr)
     }
 
     /** Смена кадрирования выбранного файла — перерисовываем его превью. */
     fun setFit(f: Int) {
         val addr = current.value ?: return
         updateSel(addr) { it.copy(fit = f) }
-        val u = session(addr).items.value.getOrNull(session(addr).sel.value)?.uri ?: return
+        val s = session(addr)
+        val u = s.items.value.getOrNull(s.sel.value)?.uri ?: return
+        s.clips.value = s.clips.value - u            // старый клип — от прежнего кадрирования
         viewModelScope.launch {
             val poster = withContext(Dispatchers.Default) { converter.posterOf(u, f, POSTER_PX) }
             // Если кадрирование за это время снова сменили — отдаём ход более
             // свежей отрисовке, а не подсовываем устаревшую.
             updateByUri(addr, u) { if (it.fit == f) it.copy(poster = poster) else it }
+            buildClip(addr, u)
         }
-        refreshSelClip(addr)
     }
 
     fun setBackMirror(v: Boolean) {
@@ -1850,7 +1996,8 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         val origin = current.value ?: return
         val originSession = session(origin)
         if (originSession.busy.value) return
-        val jobs = originSession.items.value
+        // Лёгкие вперёд (см. uploadOrder): плитка покажет очередь в этом порядке.
+        val jobs = uploadOrder(originSession.items.value)
         if (jobs.isEmpty()) { originSession.status.value = "Select a file first."; originSession.kind.value = 2; return }
         if (client(origin)?.link?.value != Link.Ready) {
             originSession.status.value = "Not connected."; originSession.kind.value = 2; return
@@ -1898,22 +2045,9 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 val s = session(addr)
                 s.items.value = jobs
                 s.sel.value = 0
-                // Аниматированный клип, оставшийся от РЕДАКТИРОВАНИЯ до нажатия
-                // Upload (см. refreshSelClip — она заводит его только для того,
-                // что было выбрано тапом на панели настроек, независимо от
-                // индекса), обязательно сбросить здесь. Иначе он переживает
-                // reset sel в 0 выше: sel.value=0 меняет, КАКАЯ ячейка теперь
-                // "выбранная" (и, значит, получает pendingClip), но сам клип
-                // в selClip остаётся старым — от совсем другого файла, который
-                // пользователь разглядывал перед заливкой. Раз ничто во время
-                // самой заливки не вызывает refreshSelClip повторно (это делают
-                // только onFilesPicked/selectUpItem/removeUpItem/setFit — все
-                // редактирование, а не сам процесс отправки), этот старый клип
-                // виден на ячейке с бегущим ободком до конца всей пачки — то
-                // есть один и тот же превью-ролик независимо от того, какой
-                // файл льётся на самом деле именно сейчас.
-                s.selClipJob?.cancel()
-                s.selClip.value = null
+                // Анимированные превью — по Uri, так что у партнёров синхронной
+                // заливки те же клипы, что на странице-источнике.
+                if (s !== originSession) s.clips.value = originSession.clips.value
                 s.currentUri.value = null
                 s.progress.value = -1f
                 s.status.value = "Starting…"
@@ -2051,9 +2185,27 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             }
             s.currentUri.value = item.uri
             s.progress.value = -1f
-            s.status.value = item.name + " — converting…"
 
             val cap = (fsInfoByAddr[addr] ?: FsInfo()).maxFrames
+            // Заведомо не влезет — пропускаем ДО конвертации: размер файла на колесе
+            // известен заранее точно (те же кадры, что даст конвертер), и тратить
+            // минуту на тяжёлое видео ради отказа незачем.
+            val est = upEstimatedBytes(item, cap)
+            val fs0 = fsInfoByAddr[addr]
+            if (est != null && fs0 != null && fs0.total > 0L) {
+                val dup0 = expectedName(item)?.let { n -> (filesByAddr[addr] ?: emptyList()).firstOrNull { it.name == n } }
+                val free0 = fs0.free + (dup0?.size ?: 0L)
+                // Точная копия уже залитого места не берёт — её пропустят ниже.
+                if (!(dup0 != null && dup0.size == est) && est + UPLOAD_MARGIN > free0) {
+                    fail++
+                    s.status.value = item.name + " — not enough free memory (" + fmtKb(est) +
+                        " > " + fmtKb(maxOf(0L, free0 - UPLOAD_MARGIN)) + " free)"
+                    s.kind.value = 2
+                    remaining.remove(item); s.items.value = remaining.toList()
+                    continue
+                }
+            }
+            s.status.value = item.name + " — converting…"
             val res = try {
                 getConverted(item, cap)
             } catch (e: kotlinx.coroutines.CancellationException) {
@@ -2087,10 +2239,12 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             // может влезть на одно и не влезть на другое.
             val fs = fsInfoByAddr[addr] ?: FsInfo()
             val freeAfter = fs.free + (dup?.size ?: 0L)   // старый файл того же имени будет перезаписан
-            if (res.data.size > freeAfter) {
+            // Тот же запас, что требует прошивка (OP_UP_BEGIN): иначе файл, прошедший
+            // эту проверку впритык, колесо всё равно отвергло бы.
+            if (res.data.size + UPLOAD_MARGIN > freeAfter) {
                 fail++
-                s.status.value = item.name + " — doesn't fit (" + fmtKb(res.data.size.toLong()) +
-                    " > " + fmtKb(freeAfter) + " free)"
+                s.status.value = item.name + " — not enough free memory (" + fmtKb(res.data.size.toLong()) +
+                    " > " + fmtKb(maxOf(0L, freeAfter - UPLOAD_MARGIN)) + " free)"
                 s.kind.value = 2
                 remaining.remove(item); s.items.value = remaining.toList()
                 continue
@@ -2108,9 +2262,19 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 // статус честно говорит об этом, а не показывает 0%/тишину,
                 // которую легко принять за зависание.
                 if (radioMutex.isLocked) s.status.value = label + " — waiting for radio…"
+                // До UPLOAD_RETRIES повторов: связь по BLE рвётся и по бытовым
+                // поводам (колесо отъехало, помеха), а колесо при ошибке само
+                // закрывает недолитый файл (OP_UP_ABORT, обрыв — см. streamBody),
+                // так что заливать заново безопасно. Не повторяем то, что повтор не
+                // исправит: нет места, неверное имя/размер.
+                var attempt = 0
+                while (true) {
+                    val cc = waitReady(addr)
+                        ?: throw BleException("lost connection")
+                    try {
                 radioMutex.withLock {
                     val started = System.currentTimeMillis()
-                    c.upload(res.fileName, wire.bytes, res.data.size, crc, wire.compressed) { p ->
+                    cc.upload(res.fileName, wire.bytes, res.data.size, crc, wire.compressed) { p ->
                         s.progress.value = p.sent.toFloat() / maxOf(p.totalWire, 1L)
                         val kb = p.sent / 1024
                         val tot = p.totalWire / 1024
@@ -2123,12 +2287,32 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                             (if (rate > 0) String.format("  ·  %.0f kB/s", rate) else "")
                     }
                 }
+                        break
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e
+                    } catch (e: Throwable) {
+                        val st = (e as? BleException)?.status ?: -1
+                        if (attempt >= UPLOAD_RETRIES || st == ST_NO_SPACE || st == ST_BAD_ARG) throw e
+                        attempt++
+                        s.progress.value = -1f
+                        s.status.value = label + " — retry " + attempt + "/" + UPLOAD_RETRIES +
+                            " (" + (e.message ?: "upload failed") + ")"
+                        // «Занято» — на колесе ещё висит прошлая передача; её
+                        // сторож снимает за 10 с (XFER_STALL_MS в прошивке).
+                        delay(if (st == ST_BUSY) 11_000L else 2_000L * attempt)
+                    }
+                }
                 ok++
                 val fl = existing.toMutableList()
                 if (dup != null) fl.remove(dup)
                 fl.add(DevFile(res.fileName, res.data.size.toLong()))
                 filesByAddr[addr] = fl
                 fsInfoByAddr[addr] = fs.copy(free = fs.free - res.data.size + (dup?.size ?: 0L))
+                // Точное свободное место — у самого колеса (блоки ФС, служебное):
+                // по нему пересчитывается, кому из оставшихся в очереди не хватит места.
+                client(addr)?.takeIf { it.link.value == Link.Ready }?.let { cl ->
+                    runCatching { cl.fsInfo() }.getOrNull()?.let { fsInfoByAddr[addr] = it }
+                }
                 if (current.value == addr) { files.value = fl; fsInfo.value = fsInfoByAddr[addr]!! }
                 // Рендерим и кладём в кэш компактное превью, пока доступ к
                 // исходнику ещё жив — один раз на файл, не на каждую цель.
@@ -2163,6 +2347,17 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         if (fail == 0) say((client(addr)?.hello?.name ?: addr) + ": " + msg)
         } finally {
             keepAliveJob.cancel()
+        }
+    }
+
+    /** Связь с колесом [addr] — дождаться, если она переподключается (до 20 с). */
+    private suspend fun waitReady(addr: String): BleClient? {
+        val deadline = System.currentTimeMillis() + 20_000
+        while (true) {
+            val c = client(addr)
+            if (c != null && c.link.value == Link.Ready) return c
+            if (System.currentTimeMillis() > deadline) return null
+            delay(250)
         }
     }
 

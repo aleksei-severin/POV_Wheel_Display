@@ -96,6 +96,9 @@ private fun cellKey(c: Cell): Any = when (c) {
 internal fun LibraryTab(
     vm: WheelVm,
     tele: Tele,
+    /** Колесо на связи. Без неё плитка показывает последний снимок библиотеки
+     *  серым, и ни играть, ни удалять, ни заливать, ни запускать показ нельзя. */
+    online: Boolean,
     leadingItems: (LazyGridScope.() -> Unit)? = null,
     extraItems: (LazyGridScope.() -> Unit)? = null
 ) {
@@ -103,7 +106,7 @@ internal fun LibraryTab(
     val fs by vm.fsInfo.collectAsState()
     val items by vm.upItems.collectAsState()
     val upSel by vm.upSel.collectAsState()
-    val upSelClip by vm.upSelClip.collectAsState()
+    val upClips by vm.upClips.collectAsState()
     val upBusy by vm.upBusy.collectAsState()
     val upCurUri by vm.upCurrentUri.collectAsState()
     val upProgress by vm.upProgress.collectAsState()
@@ -163,6 +166,9 @@ internal fun LibraryTab(
     // сразу выходил бы из активности.
     BackHandler(enabled = mode != LibMode.NORMAL) { cancelSelection() }
 
+    // Связь пропала посреди выбора — выходим из режима: ни удалить, ни запустить
+    // показ всё равно нельзя.
+    LaunchedEffect(online) { if (!online) cancelSelection() }
     // Сменили колесо или библиотека уехала из-под режима — выходим из него.
     LaunchedEffect(curWheel) {
         mode = LibMode.NORMAL; checks = emptySet(); slideCycle = 0
@@ -203,6 +209,9 @@ internal fun LibraryTab(
     // переключения. Эффекты общие всегда (это не файл с колеса), поэтому их
     // теперь можно включать в синхронный показ наравне с анимациями.
     val syncPicking = mode == LibMode.SLIDESHOW && pickedPartners.isNotEmpty()
+    // Ждущие файлы, которым места на колесе не хватит (заливка идёт от лёгких к
+    // тяжёлым, см. WheelVm.upWontFit) — красный ободок и красный размер.
+    val wontFit = remember(items, fs, files) { vm.upWontFit(items) }
     val cells = remember(items, files) {
         buildList {
             add(Cell.Add)
@@ -230,7 +239,8 @@ internal fun LibraryTab(
                     syncedOn = activePartners.isNotEmpty(),
                     selecting = mode == LibMode.SLIDESHOW,
                     // hasSel → можно сделать слайдшоу из одних эффектов, файлы не нужны.
-                    enabled = tele.slideshow || activePartners.isNotEmpty() || files.isNotEmpty() || hasSel,
+                    enabled = online &&
+                        (tele.slideshow || activePartners.isNotEmpty() || files.isNotEmpty() || hasSel),
                     playing = tele.play && !tele.slideshow,
                     onStop = { vm.stopDisplay() },
                     onTap = {
@@ -256,7 +266,7 @@ internal fun LibraryTab(
             }
 
             if (items.isNotEmpty()) item(key = "upload", span = { GridItemSpan(maxLineSpan) }) {
-                UploadStrip(vm, otherUploadTargets)
+                UploadStrip(vm, otherUploadTargets, online)
             }
 
             items(cells.size, key = { cellKey(cells[it]) }) { i ->
@@ -282,10 +292,14 @@ internal fun LibraryTab(
                 val lockedForSync = syncPicking && cell is Cell.Stored && cell.file.name !in commonNames
                 LibraryCell(
                     vm = vm, cell = cell, mode = mode, upBusy = upBusy,
+                    online = online,
                     checked = checked,
                     lockedForSync = lockedForSync,
                     selectedPending = isSelPending,
-                    pendingClip = if (isSelPending) upSelClip else null,
+                    pendingClip = (cell as? Cell.Pending)?.let { upClips[it.item.uri] },
+                    // Сколько займёт на колесе — пересчитывается на лету при смене fps/длины.
+                    pendingBytes = (cell as? Cell.Pending)?.let { vm.upEstimatedBytes(it.item) },
+                    noRoom = (cell as? Cell.Pending)?.item?.uri in wontFit,
                     uploading = upCurUri != null && (cell as? Cell.Pending)?.item?.uri == upCurUri,
                     progress = upProgress,
                     playing = playing,
@@ -534,6 +548,8 @@ private fun LibraryCell(
     cell: Cell,
     mode: LibMode,
     upBusy: Boolean,
+    // Колесо без связи: ячейка видна (последний снимок), но серая и не нажимается.
+    online: Boolean,
     checked: Boolean,
     // Файла нет у кого-то из партнёров, отмеченных для синхронного показа —
     // ячейка остаётся в плитке (чтобы не путать «нет на колесе» с «нельзя
@@ -541,6 +557,9 @@ private fun LibraryCell(
     lockedForSync: Boolean,
     selectedPending: Boolean,
     pendingClip: PreviewClip?,
+    pendingBytes: Long?,
+    // Места на колесе на этот файл не хватит — красный ободок и размер.
+    noRoom: Boolean,
     uploading: Boolean,
     progress: Float,
     playing: Boolean,
@@ -552,7 +571,7 @@ private fun LibraryCell(
     var confirmRemove by remember { mutableStateOf(false) }
 
     val ring: Color? = when {
-        cell is Cell.Pending -> Warn
+        cell is Cell.Pending -> if (noRoom) Danger else Warn
         playing -> Ok
         else -> null
     }
@@ -563,7 +582,8 @@ private fun LibraryCell(
     // боксе, чекбокс — поверх, в углу.
     Box(
         Modifier.fillMaxWidth().aspectRatio(1f)
-            .then(if (lockedForSync) Modifier.alpha(0.35f) else Modifier),
+            .then(if (lockedForSync) Modifier.alpha(0.35f)
+                  else if (!online) Modifier.alpha(DIM_ALPHA) else Modifier),
         contentAlignment = Alignment.Center
     ) {
         Box(
@@ -577,6 +597,7 @@ private fun LibraryCell(
                     else Modifier
                 )
                 .tapCombinedClickable(
+                    enabled = online,
                     onClick = {
                         when (cell) {
                             Cell.Add -> if (!upBusy) onAdd()
@@ -654,13 +675,19 @@ private fun LibraryCell(
         }
         if (showCheck) CheckDot(checked, Modifier.align(Alignment.BottomEnd))
 
-        // В режиме выбора у файла — его размер в левом нижнем углу.
-        if (cell is Cell.Stored && mode != LibMode.NORMAL) {
+        // Размер в левом нижнем углу: у файла с колеса — в режиме выбора, у
+        // ждущего заливки — всегда (сколько он займёт на колесе после неё).
+        val sizeLabel = when {
+            cell is Cell.Stored && mode != LibMode.NORMAL -> cell.file.size
+            cell is Cell.Pending -> pendingBytes
+            else -> null
+        }
+        if (sizeLabel != null) {
             Text(
-                fmtBytes(cell.file.size),
+                fmtBytes(sizeLabel),
                 fontSize = 9.sp,
                 fontWeight = FontWeight.Medium,
-                color = Color.White,
+                color = if (noRoom) Danger else Color.White,
                 maxLines = 1,
                 modifier = Modifier
                     .align(Alignment.BottomStart)
@@ -744,7 +771,7 @@ private fun StoredDisc(vm: WheelVm, f: DevFile) {
  * проверяется заранее.
  */
 @Composable
-private fun UploadStrip(vm: WheelVm, others: List<WheelEntry>) {
+private fun UploadStrip(vm: WheelVm, others: List<WheelEntry>, online: Boolean) {
     val fs by vm.fsInfo.collectAsState()
     val items by vm.upItems.collectAsState()
     val sel by vm.upSel.collectAsState()
@@ -778,7 +805,7 @@ private fun UploadStrip(vm: WheelVm, others: List<WheelEntry>) {
         }
 
         Button(
-            onClick = hapticClick { vm.startUpload() }, enabled = !busy,
+            onClick = hapticClick { vm.startUpload() }, enabled = !busy && online,
             modifier = Modifier.fillMaxWidth()
         ) {
             Text(
@@ -851,14 +878,23 @@ private fun UploadStrip(vm: WheelVm, others: List<WheelEntry>) {
             }
         }
 
+        // Выбранному файлу не хватит места на колесе — коротко и красным.
+        if (cur.uri in vm.upWontFit(items)) {
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "Not enough free memory on the wheel",
+                style = MaterialTheme.typography.bodySmall,
+                color = Danger
+            )
+        }
+
         if (cur.isVideo) {
             Spacer(Modifier.height(8.dp))
             val nfr = (cur.lengthSec * cur.fps).roundToInt().coerceAtLeast(1)
-            val kb = (8 + nfr.toLong() * 16608) / 1024
             val trimmed = nfr > fs.maxFrames
             Text(
                 (if (cur.srcDur > 0) String.format("source %.1f s · ", cur.srcDur) else "") +
-                    String.format("%.1f s @ %d fps = %d frames · %d kB", cur.lengthSec, cur.fps, nfr, kb) +
+                    String.format("%.1f s @ %d fps = %d frames", cur.lengthSec, cur.fps, nfr) +
                     (if (trimmed) "  — trimmed, device fits " + fs.maxFrames + " frames" else ""),
                 style = MaterialTheme.typography.bodySmall,
                 fontFamily = FontFamily.Monospace, fontSize = 11.sp,

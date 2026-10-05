@@ -45,6 +45,52 @@ class GifDecoder(private val bytes: ByteArray) {
         return out
     }
 
+    companion object {
+        /**
+         * Задержки кадров, мс, — тем же обходом блоков, что [parse], но без
+         * распаковки LZW: для оценки, сколько кадров займёт файл на колесе, пиксели
+         * не нужны, а на большом GIF распаковка — это секунды.
+         */
+        fun delaysOf(bytes: ByteArray): IntArray = GifDecoder(bytes).scanDelays()
+    }
+
+    private fun scanDelays(): IntArray {
+        val sig = String(readBytes(6), Charsets.US_ASCII)
+        if (sig != "GIF87a" && sig != "GIF89a") return IntArray(0)
+        readWord(); readWord()
+        val packed = readByte()
+        readByte(); readByte()
+        if (packed and 0x80 != 0) pos += (2 shl (packed and 7)) * 3
+        var delay = 100
+        val out = ArrayList<Int>()
+        while (pos < bytes.size) {
+            val bt = readByte()
+            if (bt == 0x3B) break
+            if (bt == 0x21) {
+                val et = readByte()
+                if (et == 0xF9) {
+                    readByte(); readByte()
+                    val d = readWord() * 10
+                    delay = if (d < 20) 100 else d       // то же правило, что в parse()
+                    readByte(); readByte()
+                } else {
+                    var l = readByte()
+                    while (l != 0) { pos += l; if (pos > bytes.size) break; l = readByte() }
+                }
+            } else if (bt == 0x2C) {
+                readWord(); readWord()
+                val w = readWord(); val h = readWord()
+                val ip = readByte()
+                if (ip and 0x80 != 0) pos += (2 shl (ip and 7)) * 3
+                readByte()
+                var l = readByte()
+                while (l != 0) { pos += l; if (pos > bytes.size) break; l = readByte() }
+                if (w > 0 && h > 0) out.add(delay)        // как parse(): пустой кадр не считается
+            }
+        }
+        return out.toIntArray()
+    }
+
     fun parse() {
         val sig = String(readBytes(6), Charsets.US_ASCII)
         if (sig != "GIF87a" && sig != "GIF89a") throw IllegalArgumentException("Not a GIF")

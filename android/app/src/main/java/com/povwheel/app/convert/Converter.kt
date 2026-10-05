@@ -184,6 +184,28 @@ class Converter(private val context: Context) {
         return Result(nr.name, out, outFrames, warning)
     }
 
+    /**
+     * Задержки кадров анимированного источника (GIF / анимированный WebP), мс;
+     * null — не анимация (картинка, видео). Для оценки размера файла на колесе
+     * ([animOutFrames]) до самой конвертации.
+     */
+    fun animDelays(uri: Uri): IntArray? = try {
+        if (mimeOf(uri).startsWith("video/")) null
+        else {
+            val raw = readBytes(uri)
+            when (kindOf(uri, raw)) {
+                Kind.GIF -> GifDecoder.delaysOf(raw)
+                Kind.WEBP_ANIM -> WebP.parse(raw)?.frames?.map { if (it.dur < 20) 100 else it.dur }?.toIntArray()
+                else -> null
+            }
+        }
+    } catch (e: Exception) { null }
+
+    /** Сколько кадров будет в файле на колесе для анимации с задержками [delays]
+     *  при потолке [maxFrames] — ровно та же раскладка, что при конвертации. */
+    fun animOutFrames(delays: IntArray, maxFrames: Int): Int =
+        planAnimTiming(delays.toList(), maxFrames).reps.sum().coerceAtLeast(1)
+
     /** Результат [planAnimTiming]: базовый шаг и число повторов на каждый кадр. */
     private class AnimTiming(val tick: Int, val reps: IntArray)
 
