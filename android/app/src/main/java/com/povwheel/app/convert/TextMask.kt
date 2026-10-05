@@ -28,21 +28,23 @@ import kotlin.math.roundToInt
  * радугу, которая живёт во времени) накладывает колесо.
  *
  * Размер шрифта подбирается сам: короткая строка — крупно (до [MAX_CAP_FRAC]
- * длины луча), длинная ужимается, пока не уложится в дугу. [MAX_CHARS] выбран
- * так, чтобы даже из широких букв строка оставалась читаемой — около 9 диодов
- * по высоте.
+ * длины луча), длинная ужимается, пока не замкнёт круг: конец строки сходится с
+ * началом через зазор ровно в пробел. [MAX_CHARS] выбран так, чтобы даже из
+ * широких букв строка оставалась читаемой — около 9 диодов по высоте.
  */
 object TextMask {
     const val MAX_CHARS = 40
 
     private const val S = 800                 // сторона рабочего холста, px
     private const val SS = 4                  // подвыборок на ячейку по каждой оси
-    private const val ARC_FILL = 0.92         // доля окружности под строку: зазор между концами
-    private const val MAX_CAP_FRAC = 0.40     // предел высоты букв — доля длины луча
+    private const val MAX_CAP_FRAC = 0.60     // предел высоты букв — доля длины луча
 
     private val canvasBmp: Bitmap by lazy { Bitmap.createBitmap(S, S, Bitmap.Config.ARGB_8888) }
     private val sampler by lazy { PolarSampler() }
-    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    // LINEAR_TEXT + SUBPIXEL — ширина строки строго пропорциональна кеглю: кегль
+    // считается по замеру, и хинтованные (округлённые до пикселя) ширины
+    // разошлись бы с ним — стык конца и начала строки уехал бы на букву.
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.LINEAR_TEXT_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply {
         color = Color.WHITE
         typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
         // Межбуквенный зазор чуть шире обычного: угловое размытие на ободе
@@ -65,27 +67,33 @@ object TextMask {
         // получал бы только половину яркости штриха.
         val top = rOut - step * 0.5
 
-        // Меряем на кегле 100 и масштабируем линейно.
-        paint.textSize = 100f
-        val w100 = paint.measureText(text).toDouble()
-        // Высота над базовой линией: не меньше заглавной «H», чтобы строка не
-        // прыгала, когда в неё добавляется первая заглавная.
+        // Меры на единицу кегля: ширина строки, ширина пробела (зазор на стыке
+        // конца и начала) и высота над базовой линией — не меньше заглавной «H»,
+        // чтобы строка не прыгала, когда в неё добавляется первая заглавная.
         val b = Rect()
-        paint.getTextBounds("H", 0, 1, b)
-        val capH = -b.top.toDouble()
-        paint.getTextBounds(text, 0, text.length, b)
-        val asc100 = maxOf(capH, -b.top.toDouble())
-        if (w100 <= 0 || asc100 <= 0) return mask
+        var size = 100.0
+        var w1 = 0.0
+        var asc1 = 0.0
+        // Второй проход — уточнение на найденном кегле: высота букв по
+        // getTextBounds целочисленная и на кегле 100 меряется грубо.
+        repeat(2) {
+            paint.textSize = size.toFloat()
+            w1 = paint.measureText(text) / size
+            val sp1 = paint.measureText(" ") / size
+            paint.getTextBounds("H", 0, 1, b)
+            val capH = -b.top.toDouble()
+            paint.getTextBounds(text, 0, text.length, b)
+            asc1 = maxOf(capH, -b.top.toDouble()) / size
+            if (w1 <= 0 || asc1 <= 0) return mask
+            // Строка плюс пробел — не длиннее окружности по базовой линии:
+            // s·(w1 + sp1) ≤ 2π·(top − s·asc1), где top − s·asc1 — её радиус.
+            val sW = 2 * PI * top / (w1 + sp1 + 2 * PI * asc1)
+            val sH = MAX_CAP_FRAC * (rOut - rIn) / asc1
+            size = minOf(sW, sH)
+        }
+        paint.textSize = size.toFloat()
 
-        // Ширина строки по базовой линии не больше дуги ARC_FILL·2π·rb, где
-        // rb = top − k·asc100: k·w100 ≤ A·(top − k·asc100).
-        val a = ARC_FILL * 2 * PI
-        val kW = a * top / (w100 + a * asc100)
-        val kH = MAX_CAP_FRAC * (rOut - rIn) / asc100
-        val k = minOf(kW, kH)
-        paint.textSize = (100 * k).toFloat()
-
-        val rb = top - k * asc100
+        val rb = top - size * asc1
         val width = paint.measureText(text).toDouble()
         val spanDeg = width / rb * 180 / PI
         // Дуга по часовой стрелке (экранные оси, y вниз) с серединой строки
