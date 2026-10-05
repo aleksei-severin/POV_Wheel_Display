@@ -41,6 +41,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.StateFlow
@@ -1701,35 +1702,77 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         return if (nr.warning == null) nr.name else null
     }
 
-    /** Порядок заливки: по возрастанию места на колесе — сначала картинки, потом
-     *  анимации от лёгких к тяжёлым. Тогда в забитую память влезает как можно
-     *  больше файлов, а не влезает предсказуемо только тяжёлый хвост. */
-    private fun uploadOrder(items: List<UpItem>, maxFrames: Int = fsInfo.value.maxFrames): List<UpItem> =
-        items.sortedBy { upEstimatedBytes(it, maxFrames) ?: Long.MAX_VALUE }
+    /**
+     * Раскладка очереди: [order] — порядок заливки (он же порядок жёлтых ячеек в
+     * плитке), [wontFit] — кому места не хватит, [freeAfter] — сколько останется
+     * свободным после заливки всех, кто влезает (null — оценивать нечего).
+     */
+    class QueuePlan(val order: List<UpItem>, val wontFit: Set<Uri>, val freeAfter: Long?)
 
     /**
-     * Ждущие файлы, которым места на открытом колесе не хватит: очередь проходится
-     * в порядке заливки ([uploadOrder]) с тем же запасом, что требует прошивка
-     * ([UPLOAD_MARGIN]), с округлением занятого до блоков ФС и с учётом дублей —
-     * точная копия уже залитого пропускается и места не берёт, другая версия того
-     * же имени освобождает место старой.
+     * Порядок — по возрастанию места на колесе: сначала картинки, потом анимации
+     * от лёгких к тяжёлым. Тогда в забитую память влезает как можно больше
+     * файлов, а не влезает предсказуемо только тяжёлый хвост. Проход идёт с тем
+     * же запасом, что требует прошивка ([UPLOAD_MARGIN]), с округлением занятого
+     * до блоков ФС и с учётом дублей — точная копия уже залитого пропускается и
+     * места не берёт, другая версия того же имени освобождает место старой.
+     *
+     * Кому не хватило — в хвост, за ещё не разобранными (тип не определён, размер
+     * неизвестен): заливка их всё равно пропустит, а место они не занимают, так
+     * что и на остальных это не влияет.
      */
-    fun upWontFit(items: List<UpItem>): Set<Uri> {
-        val fs = fsInfo.value
-        if (fs.total <= 0L) return emptySet()          // о месте на колесе ещё ничего не знаем
-        val existing = files.value
+    private fun planQueue(items: List<UpItem>, fs: FsInfo, existing: List<DevFile>): QueuePlan {
+        // sortedBy устойчив: файлы одного размера остаются в порядке выбора.
+        val sized = items.mapNotNull { it -> upEstimatedBytes(it, fs.maxFrames)?.let { b -> it to b } }
+            .sortedBy { it.second }
+        val unknown = items.filter { upEstimatedBytes(it, fs.maxFrames) == null }
+        // О месте на колесе ещё ничего не знаем — просто по размеру.
+        if (fs.total <= 0L) return QueuePlan(sized.map { it.first } + unknown, emptySet(), null)
         var avail = fs.free
-        val out = HashSet<Uri>()
-        for (it in uploadOrder(items)) {
-            val b = upEstimatedBytes(it) ?: continue
+        val fit = ArrayList<UpItem>()
+        val red = ArrayList<UpItem>()
+        for ((it, b) in sized) {
             val dup = expectedName(it)?.let { n -> existing.firstOrNull { f -> f.name == n } }
-            if (dup != null && dup.size == b) continue
+            if (dup != null && dup.size == b) { fit.add(it); continue }
             val freed = dup?.size ?: 0L
-            if (b + UPLOAD_MARGIN > avail + freed) { out.add(it.uri); continue }
-            avail += freed - ((b + 4095) / 4096) * 4096
+            if (b + UPLOAD_MARGIN > avail + freed) { red.add(it); continue }
+            avail += roundUp4K(freed) - roundUp4K(b)
+            fit.add(it)
         }
-        return out
+        return QueuePlan(fit + unknown + red, red.mapTo(HashSet()) { it.uri },
+            if (sized.isEmpty()) null else maxOf(0L, avail))
     }
+
+    private fun roundUp4K(b: Long) = (b + 4095) / 4096 * 4096
+
+    /** Место и библиотека колеса [addr]. У открытого — те же значения, что видит экран. */
+    private fun fsOf(addr: String) = if (addr == current.value) fsInfo.value else fsInfoByAddr[addr] ?: FsInfo()
+    private fun filesOf(addr: String) = if (addr == current.value) files.value else filesByAddr[addr] ?: emptyList()
+
+    /** План очереди открытого колеса — для плитки и строки свободного места. */
+    fun upPlan(items: List<UpItem>): QueuePlan = planQueue(items, fsInfo.value, files.value)
+
+    /**
+     * Держит очередь [addr] в порядке [planQueue] — плитка показывает её ровно так,
+     * как она пойдёт, ещё до нажатия Upload. Выбранный файл остаётся выбранным,
+     * куда бы он ни переехал. Во время заливки порядок заморожен: там очередь —
+     * уже проход по файлам ([runUploadTarget]).
+     */
+    private fun resortQueue(addr: String) {
+        val s = session(addr)
+        if (s.busy.value) return
+        val cur = s.items.value
+        if (cur.size < 2) return
+        val next = planQueue(cur, fsOf(addr), filesOf(addr)).order
+        if (next.indices.all { next[it] === cur[it] }) return
+        val selUri = cur.getOrNull(s.sel.value)?.uri
+        s.items.value = next
+        s.sel.value = next.indexOfFirst { it.uri == selUri }.coerceAtLeast(0)
+    }
+
+    /** Пересортировать очередь открытого колеса — после правки длины ролика
+     *  (во время набора её не двигаем, см. [setLength]). */
+    fun resortUpQueue() { current.value?.let { resortQueue(it) } }
     /** Отмеченные партнёры синхронной заливки для очереди, стоящей на этой
      *  странице прямо сейчас (см. [SyncTargetsRow]-подобный ряд в UploadStrip). */
     val upSyncTargets: StateFlow<Set<String>> get() = session(current.value).syncTargets
@@ -1753,6 +1796,18 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     private val ST_BUSY = 3
     private val ST_NO_SPACE = 5
 
+    // Отдельный init — после объявления сессий заливки и констант выше:
+    // viewModelScope стартует корутину сразу, и первый же collect дошёл бы до
+    // ещё не созданных полей.
+    init {
+        // Сменилось место или библиотека открытого колеса (в том числе при
+        // переключении на другое колесо) — кто влезает, а кто нет, тоже мог
+        // смениться, а с ним и порядок очереди.
+        viewModelScope.launch {
+            combine(fsInfo, files) { _, _ -> }.collect { resortUpQueue() }
+        }
+    }
+
     /** Выбрали файлы — строим пачку и запускаем фоновую подготовку превью.
      *  Пачка ложится в сессию ТОГО колеса, чья страница открыта сейчас: именно
      *  оно и есть источник — тут же настраиваются кадрирование/fps/длина и
@@ -1769,15 +1824,17 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         s.status.value = "Reading " + picked.size + " file(s)…"
         s.kind.value = 0
         viewModelScope.launch {
+            // Uri в очереди уникальны: по нему ячейка плитки держит свой ключ, а
+            // подготовка и выбор находят файл после пересортировки.
             val list = withContext(Dispatchers.IO) {
-                picked.map { UpItem(it, converter.displayName(it)) }
+                picked.distinct().map { UpItem(it, converter.displayName(it)) }
             }
             s.items.value = list
             recomputeUploadBusyAddrs()
             s.status.value = if (list.size > 1) list.size.toString() + " files selected. Press Upload."
                              else list[0].name + " ready. Press Upload."
             s.kind.value = 1
-            startPrep(addr, list.indices.toList())
+            startPrep(addr, list.map { it.uri })
         }
     }
 
@@ -1792,14 +1849,15 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      * на другое колесо — превью обязаны дописаться в ТУ сессию, откуда пачка
      * пришла, а не в ту, что случайно окажется открыта к моменту готовности.
      */
-    private fun startPrep(addr: String, indices: List<Int>) {
+    private fun startPrep(addr: String, uris: List<Uri>) {
         val s = session(addr)
         s.prepJob?.cancel()
         s.prepJob = viewModelScope.launch {
-            for (i in indices) {
+            // По Uri, не по индексам: очередь пересортировывается по мере того, как
+            // у файлов становится известен размер.
+            for (u in uris) {
                 if (!isActive) break
-                val item0 = s.items.value.getOrNull(i) ?: continue
-                val u = item0.uri
+                val item0 = s.items.value.firstOrNull { it.uri == u } ?: continue
                 if (!item0.ready) {
                     val kind = withContext(Dispatchers.IO) {
                         val sniff = try {
@@ -1830,12 +1888,13 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 val fit = s.items.value.firstOrNull { it.uri == u }?.fit ?: Fit.CROP
                 val poster = withContext(Dispatchers.Default) { converter.posterOf(u, fit, POSTER_PX) }
                 updateByUri(addr, u) { it.copy(poster = poster, ready = true) }
+                // Размер на колесе стал известен — файл встаёт на своё место в очереди.
+                resortQueue(addr)
             }
             // Сначала постеры у всех (видно, что выбрано), потом анимированные
             // превью — по одному, чтобы не грузить процессор и память всей пачкой.
-            for (i in indices) {
+            for (u in uris) {
                 if (!isActive) break
-                val u = s.items.value.getOrNull(i)?.uri ?: continue
                 buildClip(addr, u)
             }
         }
@@ -1882,6 +1941,9 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         val addr = current.value ?: return
         val s = session(addr)
         if (i in s.items.value.indices) s.sel.value = i
+        // Длину прежнего выбранного могли править, не закончив ввод (Done) — её
+        // поле уже ушло с экрана, и встать на место в очереди файл должен сейчас.
+        resortQueue(addr)
     }
 
     /** Убрать один файл из пачки. */
@@ -1891,15 +1953,20 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         val cur = s.items.value
         if (i !in cur.indices) return
         val gone = cur[i].uri
+        val selUri = cur.getOrNull(s.sel.value)?.uri
         val next = cur.toMutableList().also { it.removeAt(i) }
         s.items.value = next
         s.clips.value = s.clips.value - gone
-        s.sel.value = s.sel.value.coerceIn(0, maxOf(0, next.size - 1))
+        // Выбор остаётся на том же файле; убрали сам выбранный — на соседе.
+        val keep = next.indexOfFirst { it.uri == selUri }
+        s.sel.value = (if (keep >= 0) keep else i).coerceIn(0, maxOf(0, next.size - 1))
         if (next.isEmpty()) {
             s.status.value = "Waiting for a file…"
             s.kind.value = 0
         }
         recomputeUploadBusyAddrs()
+        // Освободилось место — кто-то из красных мог начать влезать.
+        resortQueue(addr)
     }
 
     /** Смена кадрирования выбранного файла — перерисовываем его превью. */
@@ -1942,9 +2009,16 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             val len = if (!it.lenTouched || it.lengthSec > cap) defaultLengthSec(addr, n, it.srcDur) else it.lengthSec
             it.copy(fps = n, lengthSec = len)
         }
+        resortQueue(addr)
     }
 
-    fun setLength(v: Double) {
+    /**
+     * Длина выбранного ролика. Поле ввода шлёт её на каждое изменение текста с
+     * [resort] = false — размер, красный ободок и «after upload» пересчитываются
+     * сразу, но ячейка не прыгает по очереди на промежуточных значениях
+     * («1» по пути к «15»); на место она встаёт по Done ([resortUpQueue]).
+     */
+    fun setLength(v: Double, resort: Boolean = true) {
         val addr = current.value ?: return
         updateSel(addr) {
             // coerceIn(min,max) бросает при min > max, а потолок на забитом флеше
@@ -1952,6 +2026,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             val cap = (fsInfoByAddr[addr] ?: FsInfo()).maxFrames.toDouble() / it.fps
             it.copy(lengthSec = if (cap <= 0.5) 0.5 else v.coerceIn(0.5, cap), lenTouched = true)
         }
+        if (resort) resortQueue(addr)
     }
 
     /** Скопировать настройки выбранного файла на все остальные в пачке. */
@@ -1959,9 +2034,9 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         val addr = current.value ?: return
         val s = session(addr)
         val sel = s.items.value.getOrNull(s.sel.value) ?: return
-        val changedFit = ArrayList<Int>()
-        s.items.value = s.items.value.mapIndexed { i, item ->
-            if (item.fit != sel.fit) changedFit.add(i)
+        val changedFit = ArrayList<Uri>()
+        s.items.value = s.items.value.map { item ->
+            if (item.fit != sel.fit) changedFit.add(item.uri)
             val len = if (item.isVideo) {
                 val cap = (fsInfoByAddr[addr] ?: FsInfo()).maxFrames.toDouble() / sel.fps
                 if (sel.lengthSec > cap || cap <= 0.5) defaultLengthSec(addr, sel.fps, item.srcDur) else sel.lengthSec
@@ -1973,9 +2048,10 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 lenTouched = if (item.isVideo) sel.lenTouched else item.lenTouched
             )
         }
+        resortQueue(addr)                            // fps/длина у видео могли смениться
         if (changedFit.isNotEmpty()) {
-            val pending = s.items.value.indices.filter { !s.items.value[it].ready }
-            startPrep(addr, (changedFit + pending).distinct().sorted())
+            val pending = s.items.value.filter { !it.ready }.map { it.uri }
+            startPrep(addr, (changedFit + pending).distinct())
         }
     }
 
@@ -1996,8 +2072,9 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         val origin = current.value ?: return
         val originSession = session(origin)
         if (originSession.busy.value) return
-        // Лёгкие вперёд (см. uploadOrder): плитка покажет очередь в этом порядке.
-        val jobs = uploadOrder(originSession.items.value)
+        // Тот же порядок, что уже стоит в плитке (см. planQueue): лёгкие вперёд,
+        // не влезающие — в хвосте.
+        val jobs = planQueue(originSession.items.value, fsOf(origin), filesOf(origin)).order
         if (jobs.isEmpty()) { originSession.status.value = "Select a file first."; originSession.kind.value = 2; return }
         if (client(origin)?.link?.value != Link.Ready) {
             originSession.status.value = "Not connected."; originSession.kind.value = 2; return

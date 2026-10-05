@@ -20,6 +20,7 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -27,14 +28,22 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -47,6 +56,7 @@ import com.povwheel.app.ble.Link
 import com.povwheel.app.ble.Tele
 import com.povwheel.app.convert.Fit
 import com.povwheel.app.convert.PreviewClip
+import java.util.Locale
 import kotlin.math.roundToInt
 
 // Потолок выбора за раз (фотопикер). Больше нескольких десятков анимаций всё
@@ -65,7 +75,9 @@ private sealed interface Cell {
 
 private fun cellKey(c: Cell): Any = when (c) {
     Cell.Add -> "add"
-    is Cell.Pending -> "p:" + c.index          // индекс уникален даже при дублях Uri
+    // По Uri, не по индексу: очередь пересортировывается по размеру, и ячейка
+    // должна переезжать вместе со своим файлом (Uri в очереди уникальны).
+    is Cell.Pending -> "p:" + c.item.uri
     is Cell.Stored -> "s:" + c.file.name
     is Cell.Effect -> "e:" + c.id
 }
@@ -209,9 +221,10 @@ internal fun LibraryTab(
     // переключения. Эффекты общие всегда (это не файл с колеса), поэтому их
     // теперь можно включать в синхронный показ наравне с анимациями.
     val syncPicking = mode == LibMode.SLIDESHOW && pickedPartners.isNotEmpty()
-    // Ждущие файлы, которым места на колесе не хватит (заливка идёт от лёгких к
-    // тяжёлым, см. WheelVm.upWontFit) — красный ободок и красный размер.
-    val wontFit = remember(items, fs, files) { vm.upWontFit(items) }
+    // Очередь уже стоит в порядке заливки (WheelVm.planQueue): лёгкие вперёд,
+    // не влезающие — в хвосте, с красным ободком и красным размером.
+    val plan = remember(items, fs, files) { vm.upPlan(items) }
+    val wontFit = plan.wontFit
     val cells = remember(items, files) {
         buildList {
             add(Cell.Add)
@@ -235,6 +248,10 @@ internal fun LibraryTab(
                 LibraryHeader(
                     freeText = if (fs.total > 0)
                         String.format("%.1f MB free", fs.free / 1048576.0) else "",
+                    // Сколько останется после заливки очереди — без красных: их
+                    // заливка пропустит, пока им не урежут длину или fps.
+                    afterText = plan.freeAfter?.takeIf { fs.total > 0 && items.isNotEmpty() }
+                        ?.let { String.format("(%.1f MB after upload)", it / 1048576.0) } ?: "",
                     slideshowOn = tele.slideshow || activePartners.isNotEmpty(),
                     syncedOn = activePartners.isNotEmpty(),
                     selecting = mode == LibMode.SLIDESHOW,
@@ -391,6 +408,7 @@ internal fun LibraryTab(
 @Composable
 private fun LibraryHeader(
     freeText: String,          // свободное место на флеше — справа от «Library»
+    afterText: String,         // «(… MB after upload)» оранжевым, пока есть очередь
     slideshowOn: Boolean,
     syncedOn: Boolean,         // идущий показ — синхронный (другая надпись на Stop)
     selecting: Boolean,
@@ -415,7 +433,10 @@ private fun LibraryHeader(
         // Занимает весь свободный зазор и первым ужимается (…), чтобы кнопки
         // Stop + Slideshow всегда влезли в одну строку.
         Text(
-            freeText,
+            buildAnnotatedString {
+                append(freeText)
+                if (afterText.isNotEmpty()) withStyle(SpanStyle(color = Orange)) { append(" " + afterText) }
+            },
             style = MaterialTheme.typography.bodySmall,
             color = cs.onSurfaceVariant,
             maxLines = 1,
@@ -590,7 +611,7 @@ private fun LibraryCell(
             Modifier
                 .fillMaxSize()
                 .clip(CircleShape)
-                .background(if (cell is Cell.Effect) Color.Black else cs.surfaceVariant)
+                .background(cs.surfaceVariant)
                 .then(
                     // Пока ободок сматывается прогрессом — статичное кольцо не рисуем.
                     if (ring != null && !uploading) Modifier.border(ringW, ring, CircleShape)
@@ -647,8 +668,15 @@ private fun LibraryCell(
                         CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp,
                             color = cs.onSurfaceVariant)
                 is Cell.Stored -> StoredDisc(vm, cell.file)
-                is Cell.Effect -> EffectPreview(cell.id, Modifier.fillMaxSize())
+                // Чёрный диск с тем же серым полем по краю, что у файлов: ободок
+                // «играет» (зелёный) ложится на это поле, как у остальных ячеек.
+                is Cell.Effect -> EffectPreview(cell.id,
+                    Modifier.fillMaxSize().padding(3.dp).clip(CircleShape).background(Color.Black))
             }
+            // Отверстие под ступицу — одно на все диски. У превью из кэша (RGB_565)
+            // оно было чёрным, у свежих — прозрачным, у эффектов его не было вовсе.
+            if (cell is Cell.Stored || cell is Cell.Effect || (cell is Cell.Pending && cell.item.poster != null))
+                HubHole(cs.surfaceVariant, Modifier.fillMaxSize().padding(3.dp))
 
             if (uploading) {
                 Canvas(Modifier.fillMaxSize().padding(1.dp)) {
@@ -773,6 +801,7 @@ private fun StoredDisc(vm: WheelVm, f: DevFile) {
 @Composable
 private fun UploadStrip(vm: WheelVm, others: List<WheelEntry>, online: Boolean) {
     val fs by vm.fsInfo.collectAsState()
+    val files by vm.files.collectAsState()
     val items by vm.upItems.collectAsState()
     val sel by vm.upSel.collectAsState()
     val status by vm.upStatus.collectAsState()
@@ -783,6 +812,7 @@ private fun UploadStrip(vm: WheelVm, others: List<WheelEntry>, online: Boolean) 
     if (items.isEmpty()) return
     val selIdx = sel.coerceIn(0, items.size - 1)
     val cur = items[selIdx]
+    val plan = remember(items, fs, files) { vm.upPlan(items) }
 
     Column(
         Modifier.fillMaxWidth()
@@ -868,18 +898,21 @@ private fun UploadStrip(vm: WheelVm, others: List<WheelEntry>, online: Boolean) 
                     width = 54.dp, enabled = !busy,
                     onClick = { vm.setFps(when (cur.fps) { 10 -> 15; 15 -> 5; else -> 10 }) }
                 )
-                PillField(
-                    value = String.format("%.1f", cur.lengthSec),
-                    width = 56.dp, enabled = !busy,
-                    onValueChange = {
-                        it.replace(',', '.').toDoubleOrNull()?.let { v -> vm.setLength(v) }
-                    }
-                )
+                // Своё поле у каждого файла: смена выбора не переносит набранный
+                // текст на соседний ролик.
+                key(cur.uri) {
+                    LengthField(
+                        value = cur.lengthSec,
+                        width = 56.dp, enabled = !busy,
+                        onEdit = { v -> vm.setLength(v, resort = false) },
+                        onDone = { vm.resortUpQueue() }
+                    )
+                }
             }
         }
 
         // Выбранному файлу не хватит места на колесе — коротко и красным.
-        if (cur.uri in vm.upWontFit(items)) {
+        if (cur.uri in plan.wontFit) {
             Spacer(Modifier.height(6.dp))
             Text(
                 "Not enough free memory on the wheel",
@@ -938,15 +971,39 @@ private fun Pill(
     }
 }
 
+/**
+ * Длина ролика, секунды, в пилюле. Пока в поле фокус, в нём ровно то, что набрал
+ * пользователь, — без переформатирования. Раньше текст пересобирался из модели
+ * («%.1f») на каждое нажатие: стереть значение целиком было нельзя (пустая строка
+ * не разбирается — возвращалось старое), а дробная часть возвращалась сама
+ * («0.5», стёрли «0», набрали «1» — вышло «10.5»). Теперь:
+ * - при входе в поле значение выделяется целиком, новое просто набирается поверх;
+ * - каждое разборчивое значение сразу уходит в [onEdit] — размер, красный ободок
+ *   и «after upload» видны по ходу набора; пустое и «0» — нет;
+ * - по Done или уходу фокуса — [onDone], и в поле встаёт то, что модель реально
+ *   приняла (зажато в 0.5 с … потолок кадров).
+ */
 @Composable
-private fun PillField(
-    value: String,
+private fun LengthField(
+    value: Double,
     width: Dp,
     enabled: Boolean,
-    onValueChange: (String) -> Unit
+    onEdit: (Double) -> Unit,
+    onDone: () -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
     val fg = if (enabled) cs.onSurface else cs.onSurface.copy(alpha = 0.38f)
+    val shown = String.format(Locale.US, "%.1f", value)
+    val focusManager = LocalFocusManager.current
+    var tf by remember { mutableStateOf(TextFieldValue(shown)) }
+    var focused by remember { mutableStateOf(false) }
+    // Касание, которым поле получает фокус, следом ставит курсор — его заменяем
+    // выделением всего текста (см. onValueChange).
+    var selectAllPending by remember { mutableStateOf(false) }
+    // Вне фокуса — принятое моделью значение (его меняет и смена fps).
+    LaunchedEffect(shown, focused) {
+        if (!focused && tf.text != shown) tf = TextFieldValue(shown)
+    }
     Surface(
         shape = PILL_SHAPE,
         color = Color.Transparent,
@@ -955,22 +1012,49 @@ private fun PillField(
     ) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             BasicTextField(
-                value = value,
-                onValueChange = onValueChange,
+                value = tf,
+                onValueChange = { nv ->
+                    val text = nv.text.replace(',', '.')
+                    // Только цифры и одна точка, не длиннее «999.9».
+                    if (text.length > 5 || text.count { it == '.' } > 1 ||
+                        text.any { !it.isDigit() && it != '.' }) return@BasicTextField
+                    if (selectAllPending) {
+                        selectAllPending = false
+                        if (text == tf.text && nv.selection.collapsed) {
+                            tf = nv.copy(selection = TextRange(0, text.length))
+                            return@BasicTextField
+                        }
+                    }
+                    val changed = text != tf.text
+                    tf = nv.copy(text = text)
+                    if (changed) text.toDoubleOrNull()?.takeIf { it > 0.0 }?.let(onEdit)
+                },
                 enabled = enabled,
                 singleLine = true,
                 textStyle = MaterialTheme.typography.labelMedium.copy(
                     color = fg, textAlign = TextAlign.Center
                 ),
                 cursorBrush = SolidColor(cs.primary),
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.Decimal, imeAction = ImeAction.Done
+                ),
+                keyboardActions = KeyboardActions(onDone = { focusManager.clearFocus() }),
                 decorationBox = { inner ->
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Box(Modifier.weight(1f), contentAlignment = Alignment.Center) { inner() }
                         Text("s", style = MaterialTheme.typography.labelMedium, color = fg)
                     }
                 },
-                modifier = Modifier.padding(horizontal = 7.dp)
+                modifier = Modifier.padding(horizontal = 7.dp).onFocusChanged { st ->
+                    if (st.isFocused && !focused) {
+                        tf = tf.copy(selection = TextRange(0, tf.text.length))
+                        selectAllPending = true
+                    } else if (!st.isFocused && focused) {
+                        selectAllPending = false
+                        onDone()
+                    }
+                    focused = st.isFocused
+                }
             )
         }
     }

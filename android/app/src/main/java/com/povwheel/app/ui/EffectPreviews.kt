@@ -153,7 +153,8 @@ private fun TestingPreview() {
         Color(0xFFFF3B30), Color(0xFFFFCC00), Color(0xFF34C759),
         Color(0xFF32ADE6), Color(0xFF5856D6), Color(0xFFAF52DE)
     )
-    Canvas(Modifier.fillMaxSize().padding(6.dp)) {
+    // Ячейка уже отступила 3 dp под серое поле — вместе это прежние 6 dp.
+    Canvas(Modifier.fillMaxSize().padding(3.dp)) {
         val c = Offset(size.width / 2f, size.height / 2f)
         val r = size.minDimension / 2f
         val w = 2.6f.dp.toPx()
@@ -173,11 +174,22 @@ private fun TestingPreview() {
 private fun SpeedPreview() {
     val v = (6f + pingPong(phase(3200)) * 42f).roundToInt()
     val col = lerp(Color(0xFF22C55E), Color(0xFFEF4444), ((v - 6f) / 42f).coerceIn(0f, 1f))
-    Column(
-        Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center,
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        Text(v.toString(), color = col, fontWeight = FontWeight.Bold, fontSize = 20.sp, maxLines = 1)
-        Text("km/h", color = col.copy(alpha = 0.8f), fontSize = 7.sp, maxLines = 1)
+    // Как на колесе: число над центром, «km/h» под ним, оба в стороне от
+    // отверстия под ступицу (его рисует ячейка поверх превью).
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        val gap = maxWidth * HUB_HOLE_FRAC + 1.dp
+        Box(
+            Modifier.fillMaxWidth().fillMaxHeight(0.5f).align(Alignment.TopCenter).padding(bottom = gap),
+            contentAlignment = Alignment.BottomCenter
+        ) {
+            Text(v.toString(), color = col, fontWeight = FontWeight.Bold, fontSize = 18.sp,
+                lineHeight = 18.sp, maxLines = 1)
+        }
+        Box(
+            Modifier.fillMaxWidth().fillMaxHeight(0.5f).align(Alignment.BottomCenter).padding(top = gap),
+            contentAlignment = Alignment.TopCenter
+        ) {
+            Text("km/h", color = col.copy(alpha = 0.8f), fontSize = 7.sp, lineHeight = 7.sp, maxLines = 1)
+        }
     }
 }

@@ -13,6 +13,8 @@ val Accent = Color(0xFF3B82F6)
 val Ok = Color(0xFF22C55E)
 val Warn = Color(0xFFF59E0B)
 val Danger = Color(0xFFEF4444)
+// Оранжевый — заметно отличается от янтарного Warn (ободок ждущих заливки).
+val Orange = Color(0xFFF97316)
 
 private val Dark = darkColorScheme(
     primary = Accent,
