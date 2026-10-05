@@ -195,7 +195,7 @@ RTC_DATA_ATTR int slideCurrentIndex = -1;   // индекс в savedFiles (-1 = 
 // Отбор для слайдшоу (см. applySlideList).
 std::vector<String> slideList;
 bool slideListInclude = false;
-uint8_t slideEffectMask = 0;                      // биты 0..5 — эффекты 1..6 в показе
+uint8_t slideEffectMask = 0;                      // бит N-1 — эффект N в показе (EFF_SLIDE_MASK)
 static volatile bool slide_list_dirty = false;   // нужно сбросить в NVS, когда рендер стоит
 
 RTC_DATA_ATTR volatile float global_gamma         = 2.5f;
@@ -352,6 +352,9 @@ static void loadSettingsFromNVS() {
 
 // Сброс отложенных настроек. Вызывать только когда отрисовка остановлена.
 static void flushSettings() {
+    // Текст и цвет эффекта «Текст» — тем же отложенным путём и с тем же
+    // правилом: только пока лента не светится (их правки взводят settings_dirty).
+    effectsTextFlush();
     if (!settings_dirty) return;
     SettingsBlob now, stored;
     fillSettingsBlob(now);
@@ -1904,7 +1907,7 @@ static String slideListJoin() {
 void applySlideList(bool include, const std::vector<String>& names, uint8_t effectMask) {
     slideList = names;
     slideListInclude = include;
-    slideEffectMask  = effectMask & 0x3F;
+    slideEffectMask  = effectMask & EFF_SLIDE_MASK;
     slide_list_dirty = true;
     settings_dirty   = true;   // разбудить отложенный сброс в NVS в loop()
 }
@@ -1921,7 +1924,7 @@ bool slideInSlideshow(const String& name) {
 static void loadSlideList() {
     String joined = prefs.getString("slidelist", "");
     slideListInclude = prefs.getUChar("slidelistmode", 0) != 0;
-    slideEffectMask  = prefs.getUChar("slideeffmask", 0) & 0x3F;
+    slideEffectMask  = prefs.getUChar("slideeffmask", 0) & EFF_SLIDE_MASK;
     slideList.clear();
     int start = 0;
     while (start < (int)joined.length()) {
@@ -2475,7 +2478,7 @@ static bool advanceSlideshow() {
         webLogf("[DISP] Slideshow: %s (%d/%d)", nextFile.c_str(), pos + 1, total);
     } else {
         int ord = pos - fileCount, eid = 0, c = 0;
-        for (int e = 1; e <= 6; e++) {
+        for (int e = 1; e < EFF_COUNT; e++) {
             if (!(slideEffectMask & (1 << (e - 1)))) continue;
             if (c == ord) { eid = e; break; }
             c++;
@@ -2519,9 +2522,9 @@ static int slideSequencePositionOf(const String& name, int effId) {
         }
     }
     if (name.length()) return filePos;
-    if (effId < 1 || effId > 6 || !(slideEffectMask & (1 << (effId - 1)))) return -1;
+    if (effId < 1 || effId >= EFF_COUNT || !(slideEffectMask & (1 << (effId - 1)))) return -1;
     int c = 0;
-    for (int e = 1; e <= 6; e++) {
+    for (int e = 1; e < EFF_COUNT; e++) {
         if (!(slideEffectMask & (1 << (e - 1)))) continue;
         if (e == effId) return fileCount + c;
         c++;
@@ -2570,7 +2573,7 @@ static int slideSequencePositionOf(const String& name, int effId) {
 bool syncTick(const String& name, int effId) {
     if (name.length()) {
         if (!LittleFS.exists("/" + name)) return false;
-    } else if (effId < 1 || effId > 6) {
+    } else if (effId < 1 || effId >= EFF_COUNT) {
         return false;
     }
     int pos = slideSequencePositionOf(name, effId);

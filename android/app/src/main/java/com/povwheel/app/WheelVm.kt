@@ -28,11 +28,13 @@ import com.povwheel.app.ble.Link
 import com.povwheel.app.ble.PreviewFrame
 import com.povwheel.app.ble.Proto
 import com.povwheel.app.ble.Settings
+import com.povwheel.app.ble.TextStyle
 import com.povwheel.app.convert.Ani6
 import com.povwheel.app.convert.Converter
 import com.povwheel.app.convert.Fit
 import com.povwheel.app.convert.PreviewClip
 import com.povwheel.app.convert.PreviewClips
+import com.povwheel.app.convert.TextMask
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -103,6 +105,9 @@ data class WheelEntry(
     companion object { const val STALE_AFTER_MS = 20_000L }
 }
 
+/** Номер эффекта «Текст» — EFF_TEXT в include/effects.h. */
+const val TEXT_EFFECT_ID = 7
+
 class WheelVm(app: Application) : AndroidViewModel(app) {
 
     private val ctx: Context get() = getApplication()
@@ -164,12 +169,17 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
 
     private fun cacheFile(addr: String) = File(cacheDir, addr.replace(":", "") + ".json")
 
-    private fun cacheJson(fl: List<DevFile>, fs: FsInfo, s: Settings?): String {
+    private fun cacheJson(fl: List<DevFile>, fs: FsInfo, s: Settings?, t: TextFx?): String {
         val o = JSONObject()
         o.put("files", JSONArray().apply { fl.forEach { put(JSONArray().put(it.name).put(it.size)) } })
         o.put("fs", JSONArray().put(fs.total).put(fs.used).put(fs.free).put(fs.psramFree)
             .put(fs.frameStride).put(fs.maxFrames))
         if (s != null) o.put("set", Base64.encodeToString(s.pack(), Base64.NO_WRAP))
+        // Текст — как лежит на колесе: цвет и сжатый блоб (строка + маска).
+        val tb = t?.blob
+        if (t != null && tb != null) o.put("txt", JSONArray()
+            .put(Base64.encodeToString(t.style.pack(), Base64.NO_WRAP))
+            .put(Base64.encodeToString(tb, Base64.NO_WRAP)))
         return o.toString()
     }
 
@@ -190,6 +200,11 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             if (!settingsByAddr.containsKey(addr)) o.optString("set").takeIf { it.isNotEmpty() }?.let {
                 settingsByAddr[addr] = Settings.parse(Base64.decode(it, Base64.NO_WRAP))
             }
+            if (!textFxByAddr.containsKey(addr)) o.optJSONArray("txt")?.let { a ->
+                val st = TextStyle.parse(Base64.decode(a.getString(0), Base64.NO_WRAP))
+                val blob = Base64.decode(a.getString(1), Base64.NO_WRAP)
+                TextMask.unpack(blob)?.let { (txt, mask) -> textFxByAddr[addr] = TextFx(txt, st, mask, blob) }
+            }
             cacheWritten[addr] = text
         }
     }
@@ -203,9 +218,10 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             val fl = if (isCur) files.value else filesByAddr[addr] ?: continue
             val fs = if (isCur) fsInfo.value else fsInfoByAddr[addr] ?: FsInfo()
             val s = if (isCur && settingsLoaded.value) settings.value else settingsByAddr[addr]
+            val t = if (isCur) textFx.value else textFxByAddr[addr]
             // Колесо, о котором ещё ничего не узнали, пустым снимком не затираем.
             if (fl.isEmpty() && fs.total == 0L && s == null) continue
-            val js = cacheJson(fl, fs, s)
+            val js = cacheJson(fl, fs, s, t)
             if (cacheWritten[addr] == js) continue
             cacheWritten[addr] = js
             withContext(Dispatchers.IO) { runCatching { cacheFile(addr).writeText(js) } }
@@ -735,6 +751,11 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     val settingsLoaded = MutableStateFlow(false)
     val files = MutableStateFlow<List<DevFile>>(emptyList())
     val fsInfo = MutableStateFlow(FsInfo())
+    /** Эффект «Текст» открытого колеса — миниатюра в плитке и редактор (см.
+     *  TextFx ниже). Объявлены ДО init: открытие последнего колеса при старте
+     *  (loadCache) уже читает карту. */
+    val textFx = MutableStateFlow(TextFx())
+    private val textFxByAddr = HashMap<String, TextFx>()
     val logLines = MutableStateFlow<List<String>>(emptyList())
     val toast = MutableStateFlow<String?>(null)
 
@@ -1350,6 +1371,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         settingsLoaded.value = false
         files.value  = filesByAddr[addr] ?: emptyList()
         fsInfo.value = fsInfoByAddr[addr] ?: FsInfo()
+        textFx.value = textFxByAddr[addr] ?: TextFx()
         magnetLocked.value = prefs.getBoolean(magnetLockKey(addr), false)
         logLines.value = emptyList()
         logTotal = 0
@@ -1523,6 +1545,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 if (current.value == addr) fsInfo.value = it
             }
             runCatching { c.telemetry() }
+            fetchTextFx(addr, c)
         }
     }
 
@@ -1541,6 +1564,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             }
             runCatching { c.list() }.getOrNull()?.let { filesByAddr[addr] = it }
             runCatching { c.fsInfo() }.getOrNull()?.let { fsInfoByAddr[addr] = it }
+            fetchTextFx(addr, c)
         }
     }
 
@@ -2617,6 +2641,113 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     }
     fun stopDisplay() { endSync(current.value); onTargets { it.stop() }; say("Display stopped") }
     fun effect(id: Int) { endSync(current.value); onTargets { it.effect(id) } }
+
+    // ------------------------------------------------------------ эффект «Текст»
+    //
+    // Маску строки рисует телефон (convert/TextMask), колесо только красит её.
+    // Правки из редактора уходят на колесо сразу, пока человек печатает: каждая
+    // новая строка — свежая маска, каждое касание палитры — новый цвет.
+
+    /** Текст на колесе: строка, цвет, маска 360 × 44 и сжатый блоб — ровно то,
+     *  что лежит на колесе (для кэша экрана без связи). mask == null — не задан. */
+    data class TextFx(
+        val text: String = "",
+        val style: TextStyle = TextStyle(),
+        val mask: ByteArray? = null,
+        val blob: ByteArray? = null
+    )
+
+    private fun adoptTextFx(addr: String, t: TextFx) {
+        textFxByAddr[addr] = t
+        if (current.value == addr) textFx.value = t
+    }
+
+    /** Прочитать текст с колеса, если прошивка его знает. Пока открыт
+     *  редактор, не затираем набранное пришедшим с колеса старым. */
+    private suspend fun fetchTextFx(addr: String, c: BleClient) {
+        if (c.hello?.hasText != true) return
+        val (st, blob) = runCatching { c.textGet() }.getOrNull() ?: return
+        val un = withContext(Dispatchers.Default) { TextMask.unpack(blob) }
+        if (textEditing && addr == current.value) return
+        adoptTextFx(addr, TextFx(un?.first ?: "", st, un?.second, blob.takeIf { un != null }))
+    }
+
+    // Правки — последним значением: StateFlow сам пропускает промежуточные,
+    // пока уходит предыдущее, и отправка не отстаёт от набора. Счётчик — чтобы
+    // одинаковая строка, набранная снова, всё равно ушла.
+    private data class TextEdit(val addr: String, val text: String, val n: Long)
+    private data class StyleEdit(val addr: String, val style: TextStyle, val n: Long)
+    private val textEdits = MutableStateFlow<TextEdit?>(null)
+    private val styleEdits = MutableStateFlow<StyleEdit?>(null)
+    private var editSeq = 0L
+    @Volatile private var textEditing = false
+    // На каком колесе в этом сеансе редактора эффект уже запущен — второй раз
+    // OP_EFFECT не шлём: колесо гасит ленту на время перезапуска эффекта.
+    private var textStartedFor: String? = null
+
+    init {
+        viewModelScope.launch {
+            textEdits.collect { e ->
+                if (e == null) return@collect
+                val mask = withContext(Dispatchers.Default) { TextMask.render(e.text) }
+                val blob = withContext(Dispatchers.Default) { TextMask.pack(e.text, mask) }
+                adoptTextFx(e.addr, (textFxByAddr[e.addr] ?: TextFx()).copy(text = e.text, mask = mask, blob = blob))
+                val c = client(e.addr)?.takeIf { it.link.value == Link.Ready && it.hello?.hasText == true }
+                    ?: return@collect
+                try {
+                    c.textSet(blob)
+                    ensureTextPlaying(e.addr, c)
+                } catch (ex: Exception) {
+                    say((c.hello?.name ?: e.addr) + ": " + (ex.message ?: "text not sent"))
+                }
+            }
+        }
+        viewModelScope.launch {
+            styleEdits.collect { e ->
+                if (e == null) return@collect
+                val c = client(e.addr)?.takeIf { it.link.value == Link.Ready && it.hello?.hasText == true }
+                    ?: return@collect
+                try {
+                    c.textStyle(e.style)
+                    ensureTextPlaying(e.addr, c)
+                } catch (ex: Exception) {
+                    say((c.hello?.name ?: e.addr) + ": " + (ex.message ?: "colour not sent"))
+                }
+            }
+        }
+    }
+
+    /** Первая правка в редакторе включает эффект на колесе — набранное сразу
+     *  видно на ободе. */
+    private suspend fun ensureTextPlaying(addr: String, c: BleClient) {
+        if (textStartedFor == addr) return
+        textStartedFor = addr
+        if (c.tele.value.effect != TEXT_EFFECT_ID) {
+            endSync(addr)
+            c.effect(TEXT_EFFECT_ID)
+        }
+    }
+
+    fun beginTextEdit() { textEditing = true; textStartedFor = null }
+    fun endTextEdit() { textEditing = false }
+
+    fun editText(text: String) {
+        val addr = current.value ?: return
+        val t = text.take(TextMask.MAX_CHARS)
+        // Строка в состоянии — сразу (подпись), маска догонит после отрисовки.
+        adoptTextFx(addr, (textFxByAddr[addr] ?: TextFx()).copy(text = t))
+        textEdits.value = TextEdit(addr, t, ++editSeq)
+    }
+
+    fun editTextStyle(st: TextStyle) {
+        val addr = current.value ?: return
+        adoptTextFx(addr, (textFxByAddr[addr] ?: TextFx()).copy(style = st))
+        styleEdits.value = StyleEdit(addr, st, ++editSeq)
+    }
+
+    /** Колесо открытого экрана умеет эффект «Текст» (или он уже знаком из кэша). */
+    fun hasTextEffect(): Boolean =
+        currentClient()?.hello?.hasText == true || textFx.value.mask != null
     fun album(start: Boolean, ms: Int) {
         if (start) endSync(current.value)
         onTargets { it.album(start, ms) }
@@ -2626,8 +2757,8 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
 
     private fun slideSelKey(addr: String) = "slidesel_" + addr
 
-    /** Токены эффектов в наборе выбранного для слайдшоу: `@e1`..`@e6`. */
-    val slideEffectTokens: List<String> = (1..6).map { "@e" + it }
+    /** Токены эффектов в наборе выбранного для слайдшоу: `@e1`..`@e7`. */
+    val slideEffectTokens: List<String> = (1..TEXT_EFFECT_ID).map { "@e" + it }
     fun isSlideEffect(token: String) = token in slideEffectTokens
 
     /** Отмеченное для слайдшоу из прошлого раза: имена файлов (пересечённые с

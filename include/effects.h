@@ -29,8 +29,12 @@ enum EffectId : uint8_t {
     EFF_TESTING,
     EFF_RIPPLE,     // концентрические волны
     EFF_CLOCK,      // часы со стрелками
+    EFF_TEXT,       // строка вдоль обода; маску рисует телефон (см. OP_TEXT_* в povble.h)
     EFF_COUNT
 };
+
+// Маска эффектов в слайдшоу: бит N-1 — эффект N.
+#define EFF_SLIDE_MASK ((uint8_t)((1u << (EFF_COUNT - 1)) - 1))
 
 // Текущий эффект. EFF_NONE — эффекты выключены, кадр берётся из файла.
 extern volatile uint8_t effect_id;
@@ -67,3 +71,20 @@ const char* effectName(uint8_t id);
 
 // Текущая скорость колеса, км/ч. Считается из оборотов и длины окружности.
 float currentSpeedKmh();
+
+// ---- Эффект «Текст» ----
+// Строку по окружности рисует телефон (его шрифты, кириллица, сглаживание) и
+// присылает маску яркости 360 × 44; колесо только красит её — одним цветом или
+// радугой, которая течёт по углу. Маска и цвет живут в /text.fx и переживают сон.
+
+// Сжатый (raw deflate) блоб [u8 len][строка UTF-8][маска 360 × 44] — распаковать
+// и применить. false — не распаковался или не того размера.
+bool effectsTextSetBlob(const uint8_t* comp, size_t len);
+// Цвет: mode 0 — r/g/b, 1 — радуга со скоростью speed (0…100).
+void effectsTextSetStyle(uint8_t mode, uint8_t r, uint8_t g, uint8_t b, uint8_t speed);
+void effectsTextGetStyle(uint8_t& mode, uint8_t& r, uint8_t& g, uint8_t& b, uint8_t& speed);
+// Копирует сжатый блоб в dst (не больше cap), возвращает его длину (0 — не задан).
+size_t effectsTextBlob(uint8_t* dst, size_t cap);
+// Записывает изменённые текст и цвет в /text.fx. Вызывать только когда отрисовка
+// остановлена — запись флеша морозит renderingTask (см. flushSettings()).
+void effectsTextFlush();

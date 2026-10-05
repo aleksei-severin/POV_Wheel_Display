@@ -61,6 +61,10 @@ object Proto {
     const val OP_TIME_SET  = 0x1D   // [i64 wall_us][i64 at_esp_us][i32 tz]  ← TimeInfo
     const val OP_HALL_LOG  = 0x1E   // [u32 from_seq][u16 max]  ← staged: HallPage + n × u32
     const val OP_HALL_HIST = 0x1F   // [u8 file 0=.old 1=.log][u32 off][u16 max]  ← staged: HallHist + байты
+    // Эффект «Текст» (FEAT_TEXT): маску рисует телефон (convert/TextMask), колесо её красит
+    const val OP_TEXT_STYLE = 0x20  // TextStyle
+    const val OP_TEXT_SET   = 0x21  // [u16 total][u16 off][кусок сжатого блоба]
+    const val OP_TEXT_GET   = 0x22  // ← staged: TextStyle + [u16 len][сжатый блоб]
 
     /**
      * Предел имени — столько же, сколько держит PovHello.name вместе с
@@ -102,6 +106,7 @@ object Proto {
     const val FEAT_WIFI      = 0x0008
     const val FEAT_ALBUM_SEL = 0x0010   // OP_ALBUM понимает отбор файлов для слайдшоу
     const val FEAT_HALL_LOG  = 0x0020   // OP_TIME / OP_TIME_SET / OP_HALL_LOG / OP_HALL_HIST
+    const val FEAT_TEXT      = 0x0040   // эффект «Текст»: OP_TEXT_STYLE / OP_TEXT_SET / OP_TEXT_GET
 
     const val ST_BUSY = 3
 
@@ -129,6 +134,7 @@ data class Hello(
     val hasPreview  get() = features and Proto.FEAT_PREVIEW != 0
     val hasAlbumSel get() = features and Proto.FEAT_ALBUM_SEL != 0
     val hasHallLog  get() = features and Proto.FEAT_HALL_LOG != 0
+    val hasText     get() = features and Proto.FEAT_TEXT != 0
 
     companion object {
         const val SIZE = 48
@@ -410,6 +416,31 @@ class HallHist(
             val n = p.int
             val cnt = minOf(n, a.size - SIZE).coerceAtLeast(0)
             return HallHist(size, kb, ks, off, a.copyOfRange(SIZE, SIZE + cnt))
+        }
+    }
+}
+
+/**
+ * Цвет эффекта «Текст» (PovTextStyle, 8 байт). [rainbow] — радуга течёт по углу
+ * со скоростью [speed] (0…100, 100 — два оборота цветового круга в секунду),
+ * иначе текст цвета [rgb] (0xRRGGBB).
+ */
+data class TextStyle(val rainbow: Boolean = false, val rgb: Int = 0xFFFFFF, val speed: Int = 30) {
+    fun pack(): ByteArray {
+        val b = Proto.buf(SIZE)
+        b.put((if (rainbow) 1 else 0).toByte())
+        b.put((rgb shr 16).toByte()); b.put((rgb shr 8).toByte()); b.put(rgb.toByte())
+        b.put(speed.coerceIn(0, 100).toByte())
+        return b.array()
+    }
+    companion object {
+        const val SIZE = 8
+        fun parse(a: ByteArray): TextStyle {
+            if (a.size < SIZE) return TextStyle()
+            val r = a[1].toInt() and 0xFF
+            val g = a[2].toInt() and 0xFF
+            val bl = a[3].toInt() and 0xFF
+            return TextStyle(a[0].toInt() != 0, (r shl 16) or (g shl 8) or bl, a[4].toInt() and 0xFF)
         }
     }
 }

@@ -49,6 +49,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.povwheel.app.TEXT_EFFECT_ID
 import com.povwheel.app.WheelEntry
 import com.povwheel.app.WheelVm
 import com.povwheel.app.ble.DevFile
@@ -128,6 +129,7 @@ internal fun LibraryTab(
     val slideIntervalMap by vm.slideIntervalMs.collectAsState()
     val pendingSyncDelete by vm.pendingSyncDelete.collectAsState()
     val uploadBusyAddrs by vm.uploadBusyAddrs.collectAsState()
+    val textFx by vm.textFx.collectAsState()
 
     val hasSel = vm.currentClient()?.hello?.hasAlbumSel == true
     val allNames = files.map { it.name }
@@ -147,6 +149,7 @@ internal fun LibraryTab(
     var slideCycle by remember { mutableStateOf(0) }
     var confirmDelete by remember { mutableStateOf(false) }
     var intervalDialog by remember { mutableStateOf(false) }
+    var textDialog by remember { mutableStateOf(false) }
 
     // Партнёры (два и больше), отмеченные (пока не запущено) в режиме выбора
     // слайдшоу, и общий с ними список файлов (имя+размер совпадают у всех).
@@ -225,12 +228,14 @@ internal fun LibraryTab(
     // не влезающие — в хвосте, с красным ободком и красным размером.
     val plan = remember(items, fs, files) { vm.upPlan(items) }
     val wontFit = plan.wontFit
-    val cells = remember(items, files) {
+    // «Текст» — только если прошивка колеса его знает (или он уже знаком по кэшу).
+    val hasText = vm.hasTextEffect()
+    val cells = remember(items, files, hasText) {
         buildList {
             add(Cell.Add)
             items.forEachIndexed { i, it -> add(Cell.Pending(it, i)) }
             files.forEach { f -> add(Cell.Stored(f)) }
-            EFFECT_IDS.forEach { add(Cell.Effect(it)) }   // эффекты в хвосте плитки
+            EFFECT_IDS.forEach { if (it != TEXT_EFFECT_ID || hasText) add(Cell.Effect(it)) }   // эффекты в хвосте плитки
         }
     }
 
@@ -321,6 +326,8 @@ internal fun LibraryTab(
                     uploading = upCurUri != null && (cell as? Cell.Pending)?.item?.uri == upCurUri,
                     progress = upProgress,
                     playing = playing,
+                    textFx = textFx,
+                    onEditText = { textDialog = true },
                     onAdd = onAdd,
                     onToggleCheck = { n -> checks = if (n in checks) checks - n else checks + n },
                     onEnterDelete = { n -> mode = LibMode.DELETE; checks = setOf(n) }
@@ -377,6 +384,8 @@ internal fun LibraryTab(
         },
         dismissButton = { TextButton(onClick = hapticClick { confirmDelete = false }) { Text("Cancel") } }
     )
+
+    if (textDialog) TextEffectDialog(vm) { textDialog = false }
 
     if (intervalDialog) NumberDialog(
         title = "Slideshow interval",
@@ -588,6 +597,9 @@ private fun LibraryCell(
     uploading: Boolean,
     progress: Float,
     playing: Boolean,
+    // Текст колеса — для миниатюры эффекта «Текст»; onEditText открывает редактор.
+    textFx: WheelVm.TextFx,
+    onEditText: () -> Unit,
     onAdd: () -> Unit,
     onToggleCheck: (String) -> Unit,
     onEnterDelete: (String) -> Unit
@@ -634,6 +646,8 @@ private fun LibraryCell(
                                 // тап по идущему эффекту гасит показ, по другому — запускает
                                 LibMode.NORMAL ->
                                     if (playing) { vm.effect(0); vm.say("Display stopped") }
+                                    // Текст ещё не задан — показывать нечего, сразу в редактор.
+                                    else if (cell.id == TEXT_EFFECT_ID && textFx.text.isBlank()) onEditText()
                                     else { vm.effect(cell.id); vm.say(effectName(cell.id)) }
                                 LibMode.SLIDESHOW -> onToggleCheck("@e" + cell.id)
                                 LibMode.DELETE -> {}   // эффект удалить нельзя
@@ -644,6 +658,8 @@ private fun LibraryCell(
                         when (cell) {
                             is Cell.Stored -> if (mode == LibMode.NORMAL) onEnterDelete(cell.file.name)
                             is Cell.Pending -> if (mode == LibMode.NORMAL && !uploading) confirmRemove = true
+                            // Длинный тап по «Тексту» — редактор строки и цвета.
+                            is Cell.Effect -> if (mode == LibMode.NORMAL && cell.id == TEXT_EFFECT_ID) onEditText()
                             else -> {}
                         }
                     }
@@ -676,7 +692,7 @@ private fun LibraryCell(
                 // Чёрный диск с тем же серым полем по краю, что у файлов: ободок
                 // «играет» (зелёный) ложится на это поле, как у остальных ячеек.
                 is Cell.Effect -> EffectPreview(cell.id,
-                    Modifier.fillMaxSize().padding(3.dp).clip(CircleShape).background(Color.Black))
+                    Modifier.fillMaxSize().padding(3.dp).clip(CircleShape).background(Color.Black), textFx)
             }
             // Отверстие под ступицу — одно на все диски. У превью из кэша (RGB_565)
             // оно было чёрным, у свежих — прозрачным, у эффектов его не было вовсе.

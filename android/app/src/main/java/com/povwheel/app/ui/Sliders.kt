@@ -21,6 +21,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
@@ -34,33 +35,32 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /*
- * Ползунки «под металл»: дорожка — вдавленный в карточку жёлоб (тень сверху
- * внутрь, светлый кант снизу — свет падает сверху), в нём тонкая линия значения;
- * бегунок — выпуклый: градиент сверху вниз, мягкая тень под ним. У одиночного
- * ползунка бегунок круглый с цветной точкой в гнезде, у диапазона — две
- * «черточки» поперёк жёлоба с цветной полоской.
+ * Ползунки: тонкий утопленный жёлоб (лёгкая тень по верхней кромке внутрь),
+ * цветная заливка в нём, и белый выпуклый бегунок с мягкой тенью — у одиночного
+ * круглый с цветной точкой, у диапазона две узкие черточки с цветной риской.
+ * Рельеф намечен, а не нарисован: тени и обводки — в несколько процентов
+ * прозрачности.
  *
- * Поведение общее и прежнее: бегунок трогается, только если палец опустился
- * прямо на него и повёл; касание мимо бегунка жест не перехватывает, и лента под
- * ним свободно скроллится. Тап по жёлобу (без протяжки) переставляет бегунок
- * туда. Хаптик-щелчок — на каждое пройденное деление.
+ * Поведение: бегунок трогается, только если палец опустился прямо на него и
+ * повёл; касание мимо бегунка жест не перехватывает, и лента под ним свободно
+ * скроллится. Тап по жёлобу (без протяжки) переставляет бегунок туда.
+ * Хаптик-щелчок — на каждое пройденное деление.
  */
 
-private val SLIDER_H = 36.dp
-private val RANGE_H = 40.dp
-private val GROOVE_H = 16.dp
-private val LINE_W = 3.dp
-private val THUMB_R = 11.dp
-private val BAR_W = 10.dp
-private val BAR_H = 26.dp
+private val SLIDER_H = 32.dp
+private val RANGE_H = 34.dp
+private val TRACK_H = 6.dp
+private val THUMB_R = 10.dp
+private val DOT_R = 3.5.dp
+private val BAR_W = 6.dp
+private val BAR_H = 20.dp
 private val GRAB = 24.dp       // насколько близко к бегунку нужно попасть пальцем
 
-/** Цвета рельефа: на светлой теме жёлоб светлее карточки, на тёмной — темнее. */
+/** Цвета рельефа: жёлоб — полупрозрачный поверх карточки, бегунок светлый всегда. */
 private class Relief(
-    val grooveBase: Color,
-    val grooveShadow: Color,
-    val grooveHighlight: Color,
-    val lineOff: Color,
+    val track: Color,
+    val trackShadow: Color,
+    val trackLight: Color,
     val thumbTop: Color,
     val thumbBottom: Color,
     val thumbRim: Color,
@@ -71,119 +71,91 @@ private class Relief(
 private fun relief(): Relief {
     val dark = MaterialTheme.colorScheme.surface.luminance() < 0.5f
     return if (dark) Relief(
-        grooveBase = Color.Black.copy(alpha = 0.30f),
-        grooveShadow = Color.Black.copy(alpha = 0.50f),
-        grooveHighlight = Color.White.copy(alpha = 0.10f),
-        lineOff = Color.White.copy(alpha = 0.13f),
-        thumbTop = Color(0xFF767C85),
-        thumbBottom = Color(0xFF454A51),
-        thumbRim = Color.Black.copy(alpha = 0.45f),
-        shadow = Color.Black.copy(alpha = 0.55f)
+        track = Color.White.copy(alpha = 0.10f),
+        trackShadow = Color.Black.copy(alpha = 0.35f),
+        trackLight = Color.Transparent,
+        thumbTop = Color(0xFFF0F0F0),
+        thumbBottom = Color(0xFFD8D8D8),
+        thumbRim = Color.Black.copy(alpha = 0.30f),
+        shadow = Color.Black.copy(alpha = 0.45f)
     ) else Relief(
-        grooveBase = Color.White.copy(alpha = 0.60f),
-        grooveShadow = Color.Black.copy(alpha = 0.16f),
-        grooveHighlight = Color.White,
-        lineOff = Color.Black.copy(alpha = 0.10f),
+        track = Color.Black.copy(alpha = 0.07f),
+        trackShadow = Color.Black.copy(alpha = 0.10f),
+        trackLight = Color.White.copy(alpha = 0.8f),
         thumbTop = Color.White,
-        thumbBottom = Color(0xFFDADADA),
-        thumbRim = Color.Black.copy(alpha = 0.14f),
-        shadow = Color.Black.copy(alpha = 0.22f)
+        thumbBottom = Color(0xFFF1F1F1),
+        thumbRim = Color.Black.copy(alpha = 0.09f),
+        shadow = Color.Black.copy(alpha = 0.16f)
     )
 }
 
-/** Вдавленный жёлоб на всю ширину, высотой [h], верхний край на [top]. */
-private fun DrawScope.drawGroove(r: Relief, top: Float, h: Float) {
+/** Жёлоб от [x0] до [x1] по центру [cy]: основа, тень от верхней кромки и
+ *  светлый волосок под нижней — свет падает сверху. */
+private fun DrawScope.drawTrack(r: Relief, x0: Float, x1: Float, cy: Float) {
+    val h = TRACK_H.toPx()
     val cr = CornerRadius(h / 2f, h / 2f)
-    val tl = Offset(0f, top)
-    val sz = Size(size.width, h)
-    drawRoundRect(r.grooveBase, tl, sz, cr)
-    // Тень от верхней кромки внутрь.
+    val tl = Offset(x0, cy - h / 2f)
+    val sz = Size(x1 - x0, h)
+    drawRoundRect(r.track, tl, sz, cr)
     drawRoundRect(
-        Brush.verticalGradient(0f to r.grooveShadow, 0.5f to Color.Transparent, startY = top, endY = top + h),
+        Brush.verticalGradient(0f to r.trackShadow, 0.6f to Color.Transparent, startY = tl.y, endY = tl.y + h),
         tl, sz, cr
     )
-    // Кромка: тёмная сверху, светлая снизу.
-    val sw = 1.dp.toPx()
+    val hair = 0.8.dp.toPx()
+    drawLine(r.trackLight, Offset(x0 + h / 2f, tl.y + h + hair / 2f), Offset(x1 - h / 2f, tl.y + h + hair / 2f), hair)
+}
+
+/** Цветная заливка жёлоба от [x0] до [x1]: чуть светлее сверху. */
+private fun DrawScope.drawFill(color: Color, x0: Float, x1: Float, cy: Float) {
+    val h = TRACK_H.toPx()
+    if (x1 - x0 < h) { drawCircle(color, h / 2f, Offset(x0, cy)); return }
     drawRoundRect(
-        Brush.verticalGradient(
-            0f to r.grooveShadow, 0.5f to Color.Transparent, 1f to r.grooveHighlight,
-            startY = top, endY = top + h
-        ),
-        Offset(sw / 2f, top + sw / 2f), Size(size.width - sw, h - sw),
-        CornerRadius(h / 2f - sw / 2f, h / 2f - sw / 2f), style = Stroke(sw)
+        Brush.verticalGradient(listOf(lerp(color, Color.White, 0.22f), color), startY = cy - h / 2f, endY = cy + h / 2f),
+        Offset(x0, cy - h / 2f), Size(x1 - x0, h), CornerRadius(h / 2f, h / 2f)
     )
 }
 
 /** Мягкая тень под выпуклой деталью: радиальное пятно чуть ниже центра. */
 private fun DrawScope.drawSoftShadow(r: Relief, c: Offset, radius: Float) {
-    val dy = 1.5.dp.toPx()
-    val rr = radius + 3.dp.toPx()
+    val dy = 1.dp.toPx()
+    val rr = radius + 2.5.dp.toPx()
     drawCircle(
         Brush.radialGradient(
-            0f to r.shadow, (radius / rr) to r.shadow.copy(alpha = r.shadow.alpha * 0.6f), 1f to Color.Transparent,
+            0f to r.shadow, (radius / rr) to r.shadow.copy(alpha = r.shadow.alpha * 0.5f), 1f to Color.Transparent,
             center = c + Offset(0f, dy), radius = rr
         ),
         rr, c + Offset(0f, dy)
     )
 }
 
-/** Круглый выпуклый бегунок с цветной точкой в неглубоком гнезде. */
+/** Круглый бегунок с цветной точкой. */
 private fun DrawScope.drawRoundThumb(r: Relief, c: Offset, dot: Color) {
     val rad = THUMB_R.toPx()
     drawSoftShadow(r, c, rad)
     drawCircle(Brush.verticalGradient(listOf(r.thumbTop, r.thumbBottom), startY = c.y - rad, endY = c.y + rad), rad, c)
-    drawCircle(r.thumbRim, rad - 0.5.dp.toPx(), c, style = Stroke(1.dp.toPx()))
-    // Гнездо: вдавлено — тёмное сверху, светлое снизу.
-    val d = rad * 0.42f
-    val ring = d + 1.5.dp.toPx()
-    drawCircle(
-        Brush.verticalGradient(listOf(r.grooveShadow, r.grooveHighlight), startY = c.y - ring, endY = c.y + ring),
-        ring, c
-    )
-    drawCircle(dot, d, c)
-    drawCircle(Color.Black.copy(alpha = 0.18f), d - 0.4.dp.toPx(), c, style = Stroke(0.8.dp.toPx()))
-    // Блик на точке.
-    drawCircle(Color.White.copy(alpha = 0.55f), d * 0.32f, c + Offset(-d * 0.35f, -d * 0.35f))
+    drawCircle(r.thumbRim, rad - 0.4.dp.toPx(), c, style = Stroke(0.8.dp.toPx()))
+    drawCircle(dot, DOT_R.toPx(), c)
 }
 
-/** Бегунок-черточка поперёк жёлоба: выпуклый «цилиндр» с цветной полоской. */
+/** Бегунок-черточка поперёк жёлоба с цветной риской. */
 private fun DrawScope.drawBarThumb(r: Relief, cx: Float, cy: Float, accent: Color) {
     val w = BAR_W.toPx()
     val h = BAR_H.toPx()
     val tl = Offset(cx - w / 2f, cy - h / 2f)
-    val cr = CornerRadius(w * 0.38f, w * 0.38f)
-    // Тень.
-    val sh = 1.5.dp.toPx()
-    drawRoundRect(r.shadow.copy(alpha = r.shadow.alpha * 0.45f), tl + Offset(-1f, sh + 1f), Size(w + 2f, h + 1f), cr)
-    drawRoundRect(r.shadow.copy(alpha = r.shadow.alpha * 0.6f), tl + Offset(0f, sh), Size(w, h), cr)
-    // Тело: светлое посередине, темнее к краям — читается как выпуклость.
-    drawRoundRect(
-        Brush.horizontalGradient(
-            0f to r.thumbBottom, 0.45f to r.thumbTop, 1f to r.thumbBottom,
-            startX = tl.x, endX = tl.x + w
-        ),
-        tl, Size(w, h), cr
-    )
-    // Свет сверху: верх светлее, низ темнее.
-    drawRoundRect(
-        Brush.verticalGradient(
-            0f to Color.White.copy(alpha = 0.35f), 0.5f to Color.Transparent, 1f to Color.Black.copy(alpha = 0.06f),
-            startY = tl.y, endY = tl.y + h
-        ),
-        tl, Size(w, h), cr
-    )
-    drawRoundRect(r.thumbRim, tl + Offset(0.5f, 0.5f), Size(w - 1f, h - 1f), cr, style = Stroke(1.dp.toPx()))
-    // Цветная полоска с бликом.
-    val sw = 2.4.dp.toPx()
-    val sh2 = h * 0.52f
-    drawLine(accent, Offset(cx, cy - sh2 / 2f), Offset(cx, cy + sh2 / 2f), sw, StrokeCap.Round)
-    drawLine(Color.White.copy(alpha = 0.5f), Offset(cx - sw * 0.15f, cy - sh2 / 2f + sw * 0.3f),
-        Offset(cx - sw * 0.15f, cy - sh2 * 0.1f), sw * 0.35f, StrokeCap.Round)
+    val cr = CornerRadius(w / 2f, w / 2f)
+    // Тень: два слоя, второй шире и прозрачнее — мягкий край без размытия.
+    val dy = 1.dp.toPx()
+    drawRoundRect(r.shadow.copy(alpha = r.shadow.alpha * 0.45f), tl + Offset(-1.2f, dy), Size(w + 2.4f, h + 1.5f), cr)
+    drawRoundRect(r.shadow.copy(alpha = r.shadow.alpha * 0.6f), tl + Offset(0f, dy), Size(w, h), cr)
+    drawRoundRect(Brush.verticalGradient(listOf(r.thumbTop, r.thumbBottom), startY = tl.y, endY = tl.y + h), tl, Size(w, h), cr)
+    drawRoundRect(r.thumbRim, tl + Offset(0.4f, 0.4f), Size(w - 0.8f, h - 0.8f), cr, style = Stroke(0.8.dp.toPx()))
+    val sh = h * 0.5f
+    drawLine(accent, Offset(cx, cy - sh / 2f), Offset(cx, cy + sh / 2f), 1.8.dp.toPx(), StrokeCap.Round)
 }
 
 /**
  * Одиночный ползунок. [divisions] — число делений (0 — плавно). [fill] — своя
- * заливка линии целиком (баланс белого — градиент), без «активной» части;
+ * заливка жёлоба целиком (баланс белого — градиент), без «активной» части;
  * [dotColor] — цвет точки на бегунке (по умолчанию [color]).
  */
 @Composable
@@ -268,19 +240,17 @@ internal fun EmbossedSlider(
                 }
             }
         ) {
-            val gh = GROOVE_H.toPx()
             val cy = size.height / 2f
-            drawGroove(rel, cy - gh / 2f, gh)
-            val lx0 = gh / 2f
-            val lx1 = size.width - gh / 2f
-            val lw = LINE_W.toPx()
+            val x0 = inset - TRACK_H.toPx() / 2f
+            val x1 = size.width - inset + TRACK_H.toPx() / 2f
             val tx = xOf(value)
             val on = if (enabled) color else color.copy(alpha = 0.38f)
+            drawTrack(rel, x0, x1, cy)
             if (fill != null) {
-                drawLine(fill, Offset(lx0, cy), Offset(lx1, cy), lw, StrokeCap.Round)
+                val h = TRACK_H.toPx()
+                drawRoundRect(fill, Offset(x0, cy - h / 2f), Size(x1 - x0, h), CornerRadius(h / 2f, h / 2f))
             } else {
-                drawLine(rel.lineOff, Offset(lx0, cy), Offset(lx1, cy), lw, StrokeCap.Round)
-                drawLine(on, Offset(lx0, cy), Offset(tx.coerceAtLeast(lx0), cy), lw, StrokeCap.Round)
+                drawFill(on, x0, tx, cy)
             }
             drawRoundThumb(rel, Offset(tx, cy), dotColor ?: on)
         }
@@ -318,8 +288,8 @@ internal fun EmbossedRangeSlider(
 
     BoxWithConstraints(modifier.fillMaxWidth().height(RANGE_H)) {
         val wPx = with(density) { maxWidth.toPx() }
-        // Центры черточек ходят между центрами скруглений жёлоба.
-        val inset = with(density) { (GROOVE_H / 2).toPx() }
+        // Черточки ходят между центрами скруглений жёлоба.
+        val inset = with(density) { (BAR_W / 2 + 1.dp).toPx() }
         val usable = (wPx - inset * 2f).coerceAtLeast(1f)
         val grab = with(density) { GRAB.toPx() }
         fun xOf(v: Float) = inset + usable * (v - first) / spanV
@@ -356,29 +326,18 @@ internal fun EmbossedRangeSlider(
                 }
             }
         ) {
-            val gh = GROOVE_H.toPx()
             val cy = size.height / 2f
-            drawGroove(rel, cy - gh / 2f, gh)
-            val lw = LINE_W.toPx()
             val loX = xOf(lo.toFloat())
             val hiX = xOf(hi.toFloat())
             val on = if (enabled) color else color.copy(alpha = 0.38f)
-            drawLine(rel.lineOff, Offset(inset, cy), Offset(size.width - inset, cy), lw, StrokeCap.Round)
-            drawLine(on, Offset(loX, cy), Offset(hiX, cy), lw, StrokeCap.Round)
-            // Деления — точки на линии, по одной на каждое положение шкалы.
-            val tickR = 0.9.dp.toPx()
-            for (v in first..range.last) {
-                val tx = xOf(v.toFloat())
-                drawCircle(
-                    if (tx in loX..hiX) Color.White.copy(alpha = 0.6f) else rel.lineOff.copy(alpha = rel.lineOff.alpha * 2.5f),
-                    tickR, Offset(tx, cy)
-                )
-            }
-            // Текущее значение — тонкая метка во всю высоту жёлоба.
+            drawTrack(rel, 0f, size.width, cy)
+            drawFill(on, loX, hiX, cy)
+            // Текущее значение — тонкая метка поперёк жёлоба.
             if (marker != null) {
                 val mx = xOf(marker.coerceIn(first.toFloat(), range.last.toFloat()))
-                drawLine(markerColor, Offset(mx, cy - gh / 2f + 2.dp.toPx()), Offset(mx, cy + gh / 2f - 2.dp.toPx()),
-                    3.dp.toPx(), StrokeCap.Round)
+                val h = TRACK_H.toPx()
+                drawLine(markerColor, Offset(mx, cy - h / 2f - 1.5.dp.toPx()), Offset(mx, cy + h / 2f + 1.5.dp.toPx()),
+                    2.dp.toPx(), StrokeCap.Round)
             }
             drawBarThumb(rel, loX, cy, on)
             drawBarThumb(rel, hiX, cy, on)

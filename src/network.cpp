@@ -1146,7 +1146,7 @@ void setupNetwork() {
                         while (s < (int)ec.length()) {
                             int c = ec.indexOf(',', s); if (c < 0) c = ec.length();
                             int e = ec.substring(s, c).toInt();
-                            if (e >= 1 && e <= 6) effMask |= (1 << (e - 1));
+                            if (e >= 1 && e < EFF_COUNT) effMask |= (1 << (e - 1));
                             s = c + 1;
                         }
                     }

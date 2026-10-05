@@ -485,6 +485,38 @@ class BleClient(
         request(Proto.OP_EFFECT, b.array())
     }
 
+    /** Цвет эффекта «Текст» — применяется сразу, во флеш колесо пишет его само позже. */
+    suspend fun textStyle(st: TextStyle) { request(Proto.OP_TEXT_STYLE, st.pack()) }
+
+    /**
+     * Сжатый блоб эффекта «Текст» (см. convert/TextMask) — кусками подряд под
+     * одним замком: чужая команда посреди передачи не страшна устройству, но
+     * лишняя задержка между кусками ни к чему.
+     */
+    suspend fun textSet(blob: ByteArray) = opLock.withLock {
+        val chunk = (minOf(payloadSize, 512) - 2 - 4).coerceAtLeast(16)
+        var off = 0
+        while (off < blob.size) {
+            val n = minOf(chunk, blob.size - off)
+            val b = Proto.buf(4 + n)
+            b.putShort(blob.size.toShort())
+            b.putShort(off.toShort())
+            b.put(blob, off, n)
+            requestUnlocked(Proto.OP_TEXT_SET, b.array(), 8000)
+            off += n
+        }
+    }
+
+    /** Текст, который сейчас на колесе: цвет и сжатый блоб (пустой — не задан). */
+    suspend fun textGet(): Pair<TextStyle, ByteArray> {
+        val a = requestStaged(Proto.OP_TEXT_GET)
+        val st = TextStyle.parse(a)
+        if (a.size < TextStyle.SIZE + 2) return st to ByteArray(0)
+        val n = Proto.wrap(a).getShort(TextStyle.SIZE).toInt() and 0xFFFF
+        val from = TextStyle.SIZE + 2
+        return st to a.copyOfRange(from, minOf(a.size, from + n))
+    }
+
     /**
      * Правка позиции внутри уже идущего на колесе слайдшоу — жёсткая
      * коррекция от телефона, пока он на связи, для синхронного показа

@@ -58,6 +58,15 @@ static_assert(sizeof(PovFlow)     ==  9, "PovFlow != Flow.parse в Proto.kt");
 static_assert(sizeof(PovTime)     == 40, "PovTime != TimeInfo.SIZE в Proto.kt");
 static_assert(sizeof(PovHallPage) == 44, "PovHallPage != HallPage.SIZE в Proto.kt");
 static_assert(sizeof(PovHallHist) == 20, "PovHallHist != HallHist.SIZE в Proto.kt");
+static_assert(sizeof(PovTextStyle) == 8, "PovTextStyle != TextStyle.SIZE в Proto.kt");
+
+// Приём сжатой маски эффекта «Текст» (OP_TEXT_SET): куски складываются здесь,
+// пока не придёт последний. 16 кБ PSRAM — с запасом: маска 360 × 44 со строкой
+// сжимается в единицы килобайт.
+#define TEXT_RX_CAP  (16 * 1024)
+static uint8_t*  text_rx       = nullptr;
+static uint16_t  text_rx_total = 0;
+static uint16_t  text_rx_len   = 0;
 
 // ---------------------------------------------------------------------
 //  Общие счётчики версий. Раньше жили static в network.cpp; теперь их
@@ -778,7 +787,7 @@ static void handleCmd(const uint8_t* d, size_t n) {
         h.frame_stride  = FRAME_STRIDE_PAL;
         h.mtu           = peer_mtu;
         h.features      = POV_FEAT_DEFLATE | POV_FEAT_OTA | POV_FEAT_PREVIEW | POV_FEAT_WIFI |
-                          POV_FEAT_ALBUM_SEL | POV_FEAT_HALL_LOG;
+                          POV_FEAT_ALBUM_SEL | POV_FEAT_HALL_LOG | POV_FEAT_TEXT;
         h.uptime_s      = millis() / 1000;
         // Именно видимое имя: приложение подписывает им строку списка, и
         // расходиться с тем, что пришло в рекламе, оно не должно.
@@ -916,6 +925,51 @@ static void handleCmd(const uint8_t* d, size_t n) {
         settings_dirty = true;
         pov_state_version++;
         sendRsp(op, seq, ST_OK);
+        break;
+    }
+
+    case OP_TEXT_STYLE: {
+        if (pn < sizeof(PovTextStyle)) { sendRsp(op, seq, ST_BAD_ARG); break; }
+        PovTextStyle st; memcpy(&st, pl, sizeof(st));
+        effectsTextSetStyle(st.mode, st.r, st.g, st.b, st.speed);
+        // Во флеш — отложенно, вместе с настройками (flushSettings()), и только
+        // пока лента не светится: цвет крутят ползунком, записей было бы десятки.
+        settings_dirty = true;
+        sendRsp(op, seq, ST_OK);
+        break;
+    }
+
+    case OP_TEXT_SET: {
+        if (pn < 4) { sendRsp(op, seq, ST_BAD_ARG); break; }
+        uint16_t total, off;
+        memcpy(&total, pl, 2); memcpy(&off, pl + 2, 2);
+        size_t dl = pn - 4;
+        if (total == 0 || total > TEXT_RX_CAP || off + dl > total) { sendRsp(op, seq, ST_BAD_ARG); break; }
+        if (!text_rx) text_rx = (uint8_t*)ps_malloc(TEXT_RX_CAP);
+        if (!text_rx) { sendRsp(op, seq, ST_OOM); break; }
+        if (off == 0) { text_rx_total = total; text_rx_len = 0; }
+        // Куски строго подряд: потерянный или повторный сбил бы маску молча.
+        else if (total != text_rx_total || off != text_rx_len) { sendRsp(op, seq, ST_STATE); break; }
+        memcpy(text_rx + off, pl + 4, dl);
+        text_rx_len = (uint16_t)(off + dl);
+        if (text_rx_len < text_rx_total) { sendRsp(op, seq, ST_OK); break; }
+        bool ok = effectsTextSetBlob(text_rx, text_rx_total);
+        text_rx_len = 0;
+        if (ok) settings_dirty = true;
+        sendRsp(op, seq, ok ? ST_OK : ST_CRC);
+        break;
+    }
+
+    case OP_TEXT_GET: {
+        stage_len = 0;
+        if (!stage) { sendRsp(op, seq, ST_OOM); break; }
+        PovTextStyle st; memset(&st, 0, sizeof(st));
+        effectsTextGetStyle(st.mode, st.r, st.g, st.b, st.speed);
+        memcpy(stage, &st, sizeof(st));
+        uint16_t n = (uint16_t)effectsTextBlob(stage + sizeof(st) + 2, STAGE_CAP - sizeof(st) - 2);
+        memcpy(stage + sizeof(st), &n, 2);
+        stage_len = sizeof(st) + 2 + n;
+        stageRsp(op, seq);
         break;
     }
 
