@@ -15,7 +15,6 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.waitForUpOrCancellation
-import androidx.compose.foundation.gestures.horizontalDrag
 import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -38,9 +37,12 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathOperation
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
@@ -70,8 +72,11 @@ import com.povwheel.app.ble.Settings
 import com.povwheel.app.ble.Tele
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.cos
 import kotlin.math.roundToInt
+import kotlin.math.sin
 
 // Вкладок больше нет — один экран: сверху библиотека, за ней настройки дисплея
 // той же лентой. Меню Tuning свёрнуто в секцию «Colour». Лог — окно из
@@ -704,141 +709,64 @@ private fun AutoBrightnessRange(vm: WheelVm, s: Settings, tele: Tele, enabled: B
         Text(lo.toString() + "–" + hi + " / " + BRI_U_MAX,
             style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.SemiBold)
     }
-    BoxWithConstraints(Modifier.fillMaxWidth()) {
-        // Дорожка слайдера отбита от краёв на радиус бегунка — метку считаем
-        // в тех же границах, иначе она разъедется с делениями.
-        val inset = 10.dp
-        StepRangeSlider(
-            lo = lo, hi = hi, valueRange = 1..BRI_U_MAX,
+    // Полумесяц и солнце стоят по краям шкалы — «темно» слева, «светло» справа;
+    // сами пределы — две черточки в жёлобе.
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        MoonIcon(Modifier.size(20.dp))
+        Spacer(Modifier.width(8.dp))
+        EmbossedRangeSlider(
+            lo = lo, hi = hi, range = 1..BRI_U_MAX,
             enabled = enabled,
             onChange = { a, b ->
-                vm.settings.value = s.copy(
-                    bmin = userToBri(minOf(a, b)),
-                    bmax = userToBri(maxOf(a, b))
-                )
+                val n = s.copy(bmin = userToBri(minOf(a, b)), bmax = userToBri(maxOf(a, b)))
+                // Сразу на дисплей, без записи в NVS — та по отпусканию пальца.
+                vm.settings.value = n
+                vm.pushSettingsLive(n)
             },
-            onChangeFinished = { vm.pushSettings(vm.settings.value); vm.saveSettings() },
-            modifier = Modifier.fillMaxWidth()
+            onFinished = { vm.pushSettings(vm.settings.value); vm.saveSettings() },
+            // Оранжевая метка — текущая эффективная яркость на пользовательской
+            // шкале; ниже пола (лента выключена или очень тускло) не показываем —
+            // у левого края она читалась бы как «яркость 1».
+            marker = if (tele.effBri in BRI_LO..BRI_HI)
+                1f + (tele.effBri - BRI_LO) * (BRI_U_MAX - 1).toFloat() / (BRI_HI - BRI_LO) else null,
+            modifier = Modifier.weight(1f)
         )
-        // Оранжевая метка — текущая эффективная яркость на пользовательской шкале;
-        // прячем ниже пола (лента выключена или очень тускло) — метка у левого
-        // края читалась бы как «яркость 1».
-        if (tele.effBri in BRI_LO..BRI_HI) {
-            val frac = ((tele.effBri - BRI_LO).toFloat() / (BRI_HI - BRI_LO)).coerceIn(0f, 1f)
-            Box(
-                Modifier
-                    .align(Alignment.CenterStart)
-                    .padding(start = inset)
-                    .offset(x = (maxWidth - inset * 2) * frac - 1.5.dp)
-                    .width(3.dp)
-                    .height(22.dp)
-                    .background(Warn, RoundedCornerShape(2.dp))
-            )
-        }
+        Spacer(Modifier.width(8.dp))
+        SunIcon(Modifier.size(22.dp))
     }
 }
 
-/**
- * Ползунок-диапазон с двумя бегунками. В отличие от штатного `RangeSlider` не
- * прыгает к точке касания: бегунок трогается, только если палец опустился
- * прямо на него и повёл. Если касание не по бегунку — жест не перехватывается,
- * и лента под ним свободно скроллится, даже когда палец пошёл по самой дорожке.
- * Так же ведут себя ползунки в «Colour» (штатный `Slider` двигается лишь по
- * настоящему тапу, а не по касанию-протяжке).
- */
+private val MoonColor = Color(0xFF8EA2E8)
+private val SunColor = Color(0xFFFFB000)
+
+/** Полумесяц рожками вправо-вверх. */
 @Composable
-private fun StepRangeSlider(
-    lo: Int,
-    hi: Int,
-    valueRange: IntRange,
-    onChange: (Int, Int) -> Unit,
-    onChangeFinished: () -> Unit,
-    modifier: Modifier = Modifier,
-    enabled: Boolean = true
-) {
-    val cs = MaterialTheme.colorScheme
-    val density = LocalDensity.current
-    val view = LocalView.current
-    val thumbR = 10.dp
-    val trackH = 4.dp
-    val grab = 22.dp                    // насколько близко к центру бегунка нужно попасть
+private fun MoonIcon(modifier: Modifier) {
+    Canvas(modifier) {
+        val r = size.minDimension / 2f
+        val c = center
+        val disc = Path().apply { addOval(Rect(c, r * 0.85f)) }
+        val bite = Path().apply { addOval(Rect(Offset(c.x + r * 0.4f, c.y - r * 0.3f), r * 0.7f)) }
+        drawPath(Path.combine(PathOperation.Difference, disc, bite), MoonColor)
+    }
+}
 
-    val first = valueRange.first
-    val spanV = (valueRange.last - first).coerceAtLeast(1)
-    val loS = rememberUpdatedState(lo)
-    val hiS = rememberUpdatedState(hi)
-
-    BoxWithConstraints(modifier.fillMaxWidth().height(thumbR * 2 + 12.dp)) {
-        val wPx = with(density) { maxWidth.toPx() }
-        val insetPx = with(density) { thumbR.toPx() }
-        val usable = (wPx - insetPx * 2f).coerceAtLeast(1f)
-        val grabPx = with(density) { grab.toPx() }
-
-        fun xOf(v: Int) = insetPx + usable * (v - first) / spanV
-        fun vOf(x: Float) = (first + (x - insetPx) / usable * spanV)
-            .roundToInt().coerceIn(valueRange.first, valueRange.last)
-
-        Box(
-            Modifier.matchParentSize().pointerInput(usable, enabled) {
-                awaitEachGesture {
-                    val down = awaitFirstDown(requireUnconsumed = false)
-                    // Выключен — жест не трогаем вовсе: пусть скроллится лента.
-                    if (!enabled) return@awaitEachGesture
-                    val x = down.position.x
-                    val dLo = abs(x - xOf(loS.value))
-                    val dHi = abs(x - xOf(hiS.value))
-                    // Не по бегунку — выходим не трогая событие: пусть скроллится список.
-                    if (dLo > grabPx && dHi > grabPx) return@awaitEachGesture
-                    // Бегунки на одном делении: какой тянуть — решаем по НАПРАВЛЕНИЮ
-                    // первого движения (влево — нижний, вправо — верхний), иначе
-                    // при равном расстоянии всегда выигрывал бы нижний и верхний
-                    // было не сдвинуть вправо вообще.
-                    var movingLo: Boolean? =
-                        if (loS.value == hiS.value) null else dLo <= dHi
-                    down.consume()
-                    var moved = false
-                    var lastV = if (movingLo == false) hiS.value else loS.value
-                    horizontalDrag(down.id) { ch ->
-                        ch.consume()
-                        if (movingLo == null) {
-                            val dx = ch.position.x - x
-                            if (abs(dx) < 4f) return@horizontalDrag   // мало — ждём
-                            movingLo = dx < 0f
-                        }
-                        moved = true
-                        val v = vOf(ch.position.x)
-                        // Хаптик-щелчок на каждое пройденное деление шкалы.
-                        if (v != lastV) { view.tickFeedback(); lastV = v }
-                        if (movingLo == true) onChange(v.coerceAtMost(hiS.value), hiS.value)
-                        else onChange(loS.value, v.coerceAtLeast(loS.value))
-                    }
-                    if (moved) onChangeFinished()
-                }
-            }
-        ) {
-            Canvas(Modifier.matchParentSize()) {
-                val cy = size.height / 2f
-                val loX = insetPx + usable * (loS.value - first) / spanV
-                val hiX = insetPx + usable * (hiS.value - first) / spanV
-                val th = trackH.toPx()
-                drawLine(cs.surfaceVariant, Offset(insetPx, cy),
-                    Offset(size.width - insetPx, cy), th, StrokeCap.Round)
-                drawLine(cs.primary, Offset(loX, cy), Offset(hiX, cy), th, StrokeCap.Round)
-                // Деления-точки на фоне, как у ползунков в «Colour» (штатный
-                // Slider со `steps`): по одной на каждое положение шкалы.
-                val tickR = 1.dp.toPx()
-                for (v in first..valueRange.last) {
-                    val x = insetPx + usable * (v - first) / spanV
-                    val active = x in loX..hiX
-                    drawCircle(
-                        color = (if (active) cs.onPrimary else cs.onSurfaceVariant).copy(alpha = 0.38f),
-                        radius = tickR,
-                        center = Offset(x, cy)
-                    )
-                }
-                drawCircle(cs.primary, thumbR.toPx(), Offset(loX, cy))
-                drawCircle(cs.primary, thumbR.toPx(), Offset(hiX, cy))
-            }
+/** Солнце: диск и восемь лучей. */
+@Composable
+private fun SunIcon(modifier: Modifier) {
+    Canvas(modifier) {
+        val r = size.minDimension / 2f
+        val c = center
+        drawCircle(SunColor, r * 0.48f, c)
+        val r0 = r * 0.7f
+        val w = r * 0.17f
+        val r1 = r - w / 2f
+        for (k in 0 until 8) {
+            val a = k * PI / 4
+            val dx = cos(a).toFloat()
+            val dy = sin(a).toFloat()
+            drawLine(SunColor, Offset(c.x + dx * r0, c.y + dy * r0),
+                Offset(c.x + dx * r1, c.y + dy * r1), w, StrokeCap.Round)
         }
     }
 }
@@ -866,50 +794,100 @@ private fun RowScope.MaintBtn(
 @Composable
 private fun ColourControls(vm: WheelVm) {
     val s by vm.settings.collectAsState()
+    // Во время перетаскивания значение сразу уходит на дисплей (без записи в
+    // NVS, с прореживанием в WheelVm) — двигаешь ползунок, и картинка меняется
+    // вместе с ним; в NVS — по отпусканию пальца.
+    fun live(n: Settings) { vm.settings.value = n; vm.pushSettingsLive(n) }
+    val commit = { vm.pushSettings(vm.settings.value); vm.saveSettings() }
     Column {
         SliderRow("Gamma", String.format("%.1f", s.gammaX100 / 100f),
             s.gammaX100 / 10f, 10f, 50f, 40,
-            onChange = { vm.settings.value = s.copy(gammaX100 = it.roundToInt() * 10) },
-            onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() })
+            onChange = { live(s.copy(gammaX100 = it.roundToInt() * 10)) },
+            onCommit = commit)
 
         SliderRow("Saturation", String.format("%.1f", s.satX100 / 100f),
             s.satX100 / 10f, 10f, 30f, 20,
-            onChange = { vm.settings.value = s.copy(satX100 = it.roundToInt() * 10) },
-            onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() })
+            onChange = { live(s.copy(satX100 = it.roundToInt() * 10)) },
+            onCommit = commit)
 
         SliderRow("Contrast", (s.contrastX10 / 10).toString() + "%",
             (s.contrastX10 / 10).toFloat(), 0f, 100f, 100,
-            onChange = { vm.settings.value = s.copy(contrastX10 = it.roundToInt() * 10) },
-            onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() })
+            onChange = { live(s.copy(contrastX10 = it.roundToInt() * 10)) },
+            onCommit = commit)
 
-        SliderRow("Red", (s.rgX10 / 10).toString() + "%",
-            (s.rgX10 / 10).toFloat(), 0f, 100f, 20,
-            onChange = { vm.settings.value = s.copy(rgX10 = it.roundToInt() * 10) },
-            onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() },
-            color = Danger)
-        SliderRow("Green", (s.ggX10 / 10).toString() + "%",
-            (s.ggX10 / 10).toFloat(), 0f, 100f, 20,
-            onChange = { vm.settings.value = s.copy(ggX10 = it.roundToInt() * 10) },
-            onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() },
-            color = Ok)
-        SliderRow("Blue", (s.bgX10 / 10).toString() + "%",
-            (s.bgX10 / 10).toFloat(), 0f, 100f, 20,
-            onChange = { vm.settings.value = s.copy(bgX10 = it.roundToInt() * 10) },
-            onCommit = { vm.pushSettings(vm.settings.value); vm.saveSettings() },
-            color = Accent)
+        // Один ползунок цветовой температуры вместо трёх R/G/B — см. WhiteBalance.
+        WhiteBalanceRow(
+            s,
+            onChange = { r, g, b -> live(s.copy(rgX10 = r, ggX10 = g, bgX10 = b)) },
+            onCommit = commit
+        )
 
         Spacer(Modifier.height(12.dp))
         OutlinedButton(
             onClick = hapticClick {
                 val d = vm.settings.value.copy(
                     gammaX100 = 250, satX100 = 150, contrastX10 = 50,
-                    rgX10 = 1000, ggX10 = 800, bgX10 = 1000
+                    rgX10 = WhiteBalance.BASE[0], ggX10 = WhiteBalance.BASE[1], bgX10 = WhiteBalance.BASE[2]
                 )
                 vm.pushSettings(d); vm.saveSettings()
                 vm.say("Color correction reset")
             },
             modifier = Modifier.fillMaxWidth()
-        ) { Text("↺ Restore defaults") }
+        ) {
+            Text("↺", fontSize = 22.sp, lineHeight = 22.sp)
+            Spacer(Modifier.width(6.dp))
+            Text("Restore defaults")
+        }
+    }
+}
+
+/**
+ * Баланс белого одним ползунком — цветовая температура, 3000…10000 K. Тёплый
+ * край — жёлто-оранжевый белый, холодный — голубоватый; посередине, на 6500 K,
+ * ровно заводской белый. Сами усиления R/G/B считает [WhiteBalance]; если они
+ * выставлены вручную (веб-интерфейс по-прежнему даёт три ползунка) и на кривую не
+ * ложатся, подпись говорит «Custom», а первое движение ставит их на кривую.
+ */
+@Composable
+private fun WhiteBalanceRow(s: Settings, onChange: (Int, Int, Int) -> Unit, onCommit: () -> Unit) {
+    val fit = remember(s.rgX10, s.ggX10, s.bgX10) { WhiteBalance.kelvinOf(s.rgX10, s.ggX10, s.bgX10) }
+    var dragK by remember { mutableStateOf<Int?>(null) }
+    val k = dragK ?: fit.kelvin
+    Column(Modifier.padding(vertical = 4.dp)) {
+        Row {
+            Text("White balance", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+            Text(
+                when {
+                    dragK == null && !fit.exact -> "Custom"
+                    k == WhiteBalance.K_NEUTRAL -> "$k K · neutral"
+                    else -> "$k K"
+                },
+                style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold
+            )
+        }
+        // Линия в жёлобе — градиент от тёплого белого к холодному, точка на
+        // бегунке — оттенок выбранной температуры.
+        EmbossedSlider(
+            value = k.toFloat(),
+            range = WhiteBalance.K_MIN.toFloat()..WhiteBalance.K_MAX.toFloat(),
+            divisions = (WhiteBalance.K_MAX - WhiteBalance.K_MIN) / WhiteBalance.K_STEP,
+            onChange = {
+                val nk = WhiteBalance.snap(it)
+                dragK = nk
+                val g = WhiteBalance.gains(nk)
+                onChange(g[0], g[1], g[2])
+            },
+            onFinished = { dragK = null; onCommit() },
+            fill = Brush.horizontalGradient(
+                listOf(WhiteBalance.WARM_COLOR, WhiteBalance.NEUTRAL_COLOR, WhiteBalance.COOL_COLOR)
+            ),
+            dotColor = WhiteBalance.tint(k)
+        )
+        Row {
+            Text("Warm", style = MaterialTheme.typography.labelSmall, color = WhiteBalance.WARM_COLOR,
+                modifier = Modifier.weight(1f))
+            Text("Cool", style = MaterialTheme.typography.labelSmall, color = WhiteBalance.COOL_COLOR)
+        }
     }
 }
 
@@ -1379,12 +1357,8 @@ private fun SliderRow(
     label: String, valueText: String,
     value: Float, min: Float, max: Float, steps: Int,
     onChange: (Float) -> Unit, onCommit: () -> Unit,
-    color: Color? = null   // R/G/B — красим дорожку и подпись в свой цвет
+    color: Color? = null   // своя окраска линии, точки и подписи
 ) {
-    val view = LocalView.current
-    val divs = steps.coerceAtLeast(1)
-    // Индекс деления, на котором был бегунок в прошлый раз (−1 — жест ещё не шёл).
-    var lastIdx by remember { mutableStateOf(-1) }
     Column(Modifier.padding(vertical = 4.dp)) {
         Row {
             Text(label, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f),
@@ -1392,26 +1366,11 @@ private fun SliderRow(
             Text(valueText, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold,
                 color = color ?: Color.Unspecified)
         }
-        Slider(
-            value = value.coerceIn(min, max),
-            onValueChange = {
-                // Хаптик-щелчок на каждое пройденное деление, а не на каждый
-                // промежуточный кадр перетаскивания.
-                val idx = ((it - min) / (max - min) * divs).roundToInt()
-                if (idx != lastIdx) {
-                    if (lastIdx >= 0) view.tickFeedback()
-                    lastIdx = idx
-                }
-                onChange(it)
-            },
-            onValueChangeFinished = { lastIdx = -1; onCommit() },
-            valueRange = min..max,
-            steps = (steps - 1).coerceAtLeast(0),
-            colors = if (color != null) SliderDefaults.colors(
-                thumbColor = color,
-                activeTrackColor = color,
-                activeTickColor = color.copy(alpha = 0.4f)
-            ) else SliderDefaults.colors()
+        // [steps] — число делений шкалы; хаптик-щелчок на каждое — внутри ползунка.
+        EmbossedSlider(
+            value = value, range = min..max, divisions = steps,
+            onChange = onChange, onFinished = onCommit,
+            color = color ?: MaterialTheme.colorScheme.primary
         )
     }
 }

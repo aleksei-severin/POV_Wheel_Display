@@ -16,9 +16,11 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
@@ -34,6 +36,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -99,7 +102,11 @@ fun PovVideoCard(ctrl: PovVideoController) {
             onClick = hapticClick { openGallery() },
             enabled = !busy,
             modifier = Modifier.fillMaxWidth()
-        ) { Text("Render POV Video") }
+        ) {
+            VideoCamIcon()
+            Spacer(Modifier.width(8.dp))
+            Text("Render POV Video")
+        }
 
         when (val s = st) {
             is State.Idle -> {}
@@ -237,6 +244,31 @@ private fun SyncBar(a: PovAnalysis) {
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant
     )
+}
+
+/**
+ * Значок видеокамеры цветом содержимого кнопки. Рисуется сам: библиотеки значков
+ * в приложении нет нарочно (см. build.gradle.kts), а символа камеры, который
+ * одинаково выглядел бы во всех шрифтах, тоже нет.
+ */
+@Composable
+private fun VideoCamIcon() {
+    val c = LocalContentColor.current
+    Canvas(Modifier.size(width = 20.dp, height = 14.dp)) {
+        val u = size.height / 14f
+        // Корпус.
+        drawRoundRect(c, topLeft = Offset(0f, 1.5f * u), size = Size(13f * u, 11f * u),
+            cornerRadius = CornerRadius(2.5f * u, 2.5f * u))
+        // Объектив — трапеция справа.
+        val lens = Path().apply {
+            moveTo(14f * u, 5.5f * u)
+            lineTo(20f * u, 2f * u)
+            lineTo(20f * u, 12f * u)
+            lineTo(14f * u, 8.5f * u)
+            close()
+        }
+        drawPath(lens, c)
+    }
 }
 
 private fun mmss(sec: Int): String {

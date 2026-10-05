@@ -1693,21 +1693,30 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         return 8L + n.toLong() * 16608L
     }
 
-    /** Имя файла на колесе, если оно предсказуемо (латиница без пробелов — иначе
-     *  конвертер добавляет случайный хвост), — чтобы узнать уже залитый дубль. */
+    /** Имя файла на колесе — чтобы узнать уже залитый дубль. Оно функция имени
+     *  исходника при любом имени (см. Ani6.buildFileName); null — тип ещё не определён. */
     private fun expectedName(item: UpItem): String? {
         if (item.prefix.isEmpty()) return null
         val base = item.name.substringBeforeLast('.', item.name)
-        val nr = Ani6.buildFileName(item.prefix, base, 0)
-        return if (nr.warning == null) nr.name else null
+        return Ani6.buildFileName(item.prefix, base).name
     }
 
     /**
      * Раскладка очереди: [order] — порядок заливки (он же порядок жёлтых ячеек в
-     * плитке), [wontFit] — кому места не хватит, [freeAfter] — сколько останется
-     * свободным после заливки всех, кто влезает (null — оценивать нечего).
+     * плитке), [wontFit] — кому места не хватит, [onWheel] — точные копии уже
+     * залитого (то же имя на колесе и тот же размер — заливка их пропустит, не
+     * конвертируя), [freeAfter] — сколько останется свободным после заливки всех,
+     * кто влезает (null — оценивать нечего).
      */
-    class QueuePlan(val order: List<UpItem>, val wontFit: Set<Uri>, val freeAfter: Long?)
+    class QueuePlan(
+        val order: List<UpItem>,
+        val wontFit: Set<Uri>,
+        val onWheel: Set<Uri>,
+        val freeAfter: Long?
+    ) {
+        /** Сколько файлов реально уйдёт на колесо. */
+        val toUpload: Int get() = order.size - wontFit.size - onWheel.size
+    }
 
     /**
      * Порядок — по возрастанию места на колесе: сначала картинки, потом анимации
@@ -1717,8 +1726,9 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      * до блоков ФС и с учётом дублей — точная копия уже залитого пропускается и
      * места не берёт, другая версия того же имени освобождает место старой.
      *
-     * Кому не хватило — в хвост, за ещё не разобранными (тип не определён, размер
-     * неизвестен): заливка их всё равно пропустит, а место они не занимают, так
+     * Порядок плитки: то, что зальётся, → ещё не разобранные (тип не определён,
+     * размер неизвестен) → уже лежащие на колесе → кому не хватило места, в самом
+     * хвосте. Последние две группы заливка пропустит, а место они не занимают, так
      * что и на остальных это не влияет.
      */
     private fun planQueue(items: List<UpItem>, fs: FsInfo, existing: List<DevFile>): QueuePlan {
@@ -1726,21 +1736,36 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         val sized = items.mapNotNull { it -> upEstimatedBytes(it, fs.maxFrames)?.let { b -> it to b } }
             .sortedBy { it.second }
         val unknown = items.filter { upEstimatedBytes(it, fs.maxFrames) == null }
+        // Уже на колесе — сравнение с библиотекой, о свободном месте знать не нужно.
+        val same = sized.filter { (it, b) -> sameOnWheel(it, b, existing) }.map { it.first }
+        val onWheel = same.mapTo(HashSet()) { it.uri }
+        val rest = sized.filter { it.first.uri !in onWheel }
         // О месте на колесе ещё ничего не знаем — просто по размеру.
-        if (fs.total <= 0L) return QueuePlan(sized.map { it.first } + unknown, emptySet(), null)
+        if (fs.total <= 0L) return QueuePlan(rest.map { it.first } + unknown + same, emptySet(), onWheel, null)
         var avail = fs.free
         val fit = ArrayList<UpItem>()
         val red = ArrayList<UpItem>()
-        for ((it, b) in sized) {
-            val dup = expectedName(it)?.let { n -> existing.firstOrNull { f -> f.name == n } }
-            if (dup != null && dup.size == b) { fit.add(it); continue }
-            val freed = dup?.size ?: 0L
+        for ((it, b) in rest) {
+            // Другая версия того же имени: старый файл будет перезаписан.
+            val freed = expectedName(it)?.let { n -> existing.firstOrNull { f -> f.name == n } }?.size ?: 0L
             if (b + UPLOAD_MARGIN > avail + freed) { red.add(it); continue }
             avail += roundUp4K(freed) - roundUp4K(b)
             fit.add(it)
         }
-        return QueuePlan(fit + unknown + red, red.mapTo(HashSet()) { it.uri },
+        return QueuePlan(fit + unknown + same + red, red.mapTo(HashSet()) { it.uri }, onWheel,
             if (sized.isEmpty()) null else maxOf(0L, avail))
+    }
+
+    /**
+     * Файл уже лежит на колесе: то же имя (оно у ANI6 детерминировано от исходника,
+     * см. Ani6.buildFileName) и тот же размер. Размер на колесе оценка знает точно —
+     * те же кадры, что даст конвертер. Кадрирование и зеркало размер не меняют,
+     * поэтому та же картинка с другим Crop/Fit тоже считается копией — как и
+     * раньше при заливке; перезалить её можно, удалив старую с колеса.
+     */
+    private fun sameOnWheel(item: UpItem, bytes: Long, existing: List<DevFile>): Boolean {
+        val n = expectedName(item) ?: return false
+        return existing.any { it.name == n && it.size == bytes }
     }
 
     private fun roundUp4K(b: Long) = (b + 4095) / 4096 * 4096
@@ -1967,6 +1992,21 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         recomputeUploadBusyAddrs()
         // Освободилось место — кто-то из красных мог начать влезать.
         resortQueue(addr)
+    }
+
+    /** Убрать из очереди всё разом — когда заливать в ней нечего (только уже
+     *  залитое и не влезающее). */
+    fun clearUpQueue() {
+        val addr = current.value ?: return
+        val s = session(addr)
+        if (s.busy.value) return
+        s.prepJob?.cancel()
+        s.items.value = emptyList()
+        s.clips.value = emptyMap()
+        s.sel.value = 0
+        s.status.value = "Waiting for a file…"
+        s.kind.value = 0
+        recomputeUploadBusyAddrs()
     }
 
     /** Смена кадрирования выбранного файла — перерисовываем его превью. */
@@ -2268,6 +2308,14 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             // известен заранее точно (те же кадры, что даст конвертер), и тратить
             // минуту на тяжёлое видео ради отказа незачем.
             val est = upEstimatedBytes(item, cap)
+            // Уже на колесе (плитка показывает такой файл серым с «✓ on wheel») —
+            // пропускаем тоже до конвертации, а не после неё, как раньше.
+            if (est != null && sameOnWheel(item, est, filesByAddr[addr] ?: emptyList())) {
+                ok++; skip++
+                s.status.value = item.name + " — already there, skipped"; s.kind.value = 1
+                remaining.remove(item); s.items.value = remaining.toList()
+                continue
+            }
             val fs0 = fsInfoByAddr[addr]
             if (est != null && fs0 != null && fs0.total > 0L) {
                 val dup0 = expectedName(item)?.let { n -> (filesByAddr[addr] ?: emptyList()).firstOrNull { it.name == n } }

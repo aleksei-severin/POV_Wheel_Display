@@ -317,6 +317,7 @@ internal fun LibraryTab(
                     // Сколько займёт на колесе — пересчитывается на лету при смене fps/длины.
                     pendingBytes = (cell as? Cell.Pending)?.let { vm.upEstimatedBytes(it.item) },
                     noRoom = (cell as? Cell.Pending)?.item?.uri in wontFit,
+                    onWheel = (cell as? Cell.Pending)?.item?.uri in plan.onWheel,
                     uploading = upCurUri != null && (cell as? Cell.Pending)?.item?.uri == upCurUri,
                     progress = upProgress,
                     playing = playing,
@@ -581,6 +582,9 @@ private fun LibraryCell(
     pendingBytes: Long?,
     // Места на колесе на этот файл не хватит — красный ободок и размер.
     noRoom: Boolean,
+    // Точно такой файл уже на колесе — серый ободок, приглушённый диск и
+    // «✓ on wheel» вместо размера: заливка его пропустит.
+    onWheel: Boolean,
     uploading: Boolean,
     progress: Float,
     playing: Boolean,
@@ -592,7 +596,7 @@ private fun LibraryCell(
     var confirmRemove by remember { mutableStateOf(false) }
 
     val ring: Color? = when {
-        cell is Cell.Pending -> if (noRoom) Danger else Warn
+        cell is Cell.Pending -> when { noRoom -> Danger; onWheel -> cs.outline; else -> Warn }
         playing -> Ok
         else -> null
     }
@@ -663,7 +667,8 @@ private fun LibraryCell(
                 is Cell.Pending ->
                     if (cell.item.poster != null)
                         AnimatedDisc(pendingClip, cell.item.poster,
-                            Modifier.fillMaxSize().padding(3.dp).clip(CircleShape))
+                            Modifier.fillMaxSize().padding(3.dp).clip(CircleShape)
+                                .then(if (onWheel) Modifier.alpha(0.4f) else Modifier))
                     else
                         CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp,
                             color = cs.onSurfaceVariant)
@@ -704,18 +709,20 @@ private fun LibraryCell(
         if (showCheck) CheckDot(checked, Modifier.align(Alignment.BottomEnd))
 
         // Размер в левом нижнем углу: у файла с колеса — в режиме выбора, у
-        // ждущего заливки — всегда (сколько он займёт на колесе после неё).
+        // ждущего заливки — всегда (сколько он займёт на колесе после неё). У
+        // уже залитого места он не займёт — вместо размера отметка.
         val sizeLabel = when {
-            cell is Cell.Stored && mode != LibMode.NORMAL -> cell.file.size
-            cell is Cell.Pending -> pendingBytes
+            cell is Cell.Stored && mode != LibMode.NORMAL -> fmtBytes(cell.file.size)
+            cell is Cell.Pending && onWheel -> "✓ on wheel"
+            cell is Cell.Pending -> pendingBytes?.let { fmtBytes(it) }
             else -> null
         }
         if (sizeLabel != null) {
             Text(
-                fmtBytes(sizeLabel),
+                sizeLabel,
                 fontSize = 9.sp,
                 fontWeight = FontWeight.Medium,
-                color = if (noRoom) Danger else Color.White,
+                color = when { noRoom -> Danger; onWheel -> Ok; else -> Color.White },
                 maxLines = 1,
                 modifier = Modifier
                     .align(Alignment.BottomStart)
@@ -834,14 +841,25 @@ private fun UploadStrip(vm: WheelVm, others: List<WheelEntry>, online: Boolean) 
             Spacer(Modifier.height(6.dp))
         }
 
+        // В счётчике — только то, что реально уйдёт на колесо: уже залитые и не
+        // влезающие заливка пропустит. Если не уйдёт ничего — кнопка просто
+        // очищает очередь, а не гоняет пустой проход. С отмеченными партнёрами
+        // так нельзя: у них своя библиотека и своё место, каждый решает сам —
+        // там счётчик, как и раньше, по всей очереди.
+        val synced = syncTargets.isNotEmpty()
+        val nothing = !busy && !synced && plan.toUpload == 0
         Button(
-            onClick = hapticClick { vm.startUpload() }, enabled = !busy && online,
+            onClick = hapticClick { if (nothing) vm.clearUpQueue() else vm.startUpload() },
+            enabled = !busy && (online || nothing),
             modifier = Modifier.fillMaxWidth()
         ) {
             Text(
-                if (busy) "Working…"
-                else "↑ Convert & upload (" + items.size + ")" +
-                    (if (syncTargets.isNotEmpty()) " ×" + (1 + syncTargets.size) else "")
+                when {
+                    busy -> "Working…"
+                    nothing -> "✕ Nothing to upload — clear"
+                    synced -> "↑ Convert & upload (" + items.size + ") ×" + (1 + syncTargets.size)
+                    else -> "↑ Convert & upload (" + plan.toUpload + ")"
+                }
             )
         }
 
@@ -911,13 +929,21 @@ private fun UploadStrip(vm: WheelVm, others: List<WheelEntry>, online: Boolean) 
             }
         }
 
-        // Выбранному файлу не хватит места на колесе — коротко и красным.
+        // Выбранному файлу не хватит места на колесе — коротко и красным; уже
+        // лежит на колесе — зелёным, что его пропустят.
         if (cur.uri in plan.wontFit) {
             Spacer(Modifier.height(6.dp))
             Text(
                 "Not enough free memory on the wheel",
                 style = MaterialTheme.typography.bodySmall,
                 color = Danger
+            )
+        } else if (cur.uri in plan.onWheel) {
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "Already on the wheel — will be skipped",
+                style = MaterialTheme.typography.bodySmall,
+                color = Ok
             )
         }
 

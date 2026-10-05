@@ -83,18 +83,65 @@ object Ani6 {
      * и дефис — так один символ всегда равен одному байту.
      */
     private const val NAME_MAX = 31
+    // Префикс (4) + основа + «-» + хэш (6) + «.bin» (4) — в 31 байт.
+    private const val SLUG_MAX = NAME_MAX - 4 - 1 - 6 - 4
 
-    fun buildFileName(prefix: String, rawBase: String, uniq: Int): NameResult {
+    private fun isSafe(c: Char) = c in 'a'..'z' || c in 'A'..'Z' || c in '0'..'9' || c == '_' || c == '-'
+
+    /**
+     * Имя файла на колесе. Не подходящее под правила имя (кириллица, пробелы,
+     * слишком длинное) раньше заменялось на `invalid-NNNN` со случайным номером —
+     * и повторная заливка того же файла давала второе имя, то есть вторую копию,
+     * а приложение не могло узнать в ней дубль. Теперь имя — функция исходного:
+     * читаемая основа (кириллица транслитом, прочее — «_», до [SLUG_MAX] символов)
+     * плюс 6 hex-знаков FNV-1a от исходного имени в UTF-8, чтобы разные имена с
+     * одинаковой основой не совпали. Тот же алгоритм — в data/index.html.
+     */
+    fun buildFileName(prefix: String, rawBase: String): NameResult {
         val candidate = prefix + rawBase + ".bin"
-        val safe = rawBase.isNotEmpty() && rawBase.all {
-            it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' || it == '_' || it == '-'
-        }
+        val safe = rawBase.isNotEmpty() && rawBase.all(::isSafe)
         if (safe && candidate.length <= NAME_MAX) return NameResult(candidate, null)
         val reason = if (!safe) "contains non-latin or special characters"
                      else "too long (" + candidate.length + " > " + NAME_MAX + " chars)"
-        val num = (1000 + (uniq % 9000)).toString()
-        val fallback = prefix + "invalid-" + num + ".bin"
-        return NameResult(fallback, "\"" + rawBase + "\" — " + reason + ". Saving as: " + fallback)
+        val slug = slugOf(rawBase)
+        val hash = fnv1aHex(rawBase)
+        val name = prefix + (if (slug.isEmpty()) hash else slug + "-" + hash.substring(0, 6)) + ".bin"
+        return NameResult(name, "\"" + rawBase + "\" — " + reason + ". Saving as: " + name)
+    }
+
+    private val TRANSLIT = mapOf(
+        'а' to "a", 'б' to "b", 'в' to "v", 'г' to "g", 'д' to "d", 'е' to "e", 'ё' to "e",
+        'ж' to "zh", 'з' to "z", 'и' to "i", 'й' to "y", 'к' to "k", 'л' to "l", 'м' to "m",
+        'н' to "n", 'о' to "o", 'п' to "p", 'р' to "r", 'с' to "s", 'т' to "t", 'у' to "u",
+        'ф' to "f", 'х' to "kh", 'ц' to "ts", 'ч' to "ch", 'ш' to "sh", 'щ' to "shch",
+        'ъ' to "", 'ы' to "y", 'ь' to "", 'э' to "e", 'ю' to "yu", 'я' to "ya",
+        'і' to "i", 'ї' to "yi", 'є' to "ye", 'ґ' to "g"
+    )
+
+    /** Читаемая основа: латиница/цифры/«_»/«-» как есть, кириллица транслитом,
+     *  остальное — «_» (подряд не повторяется), края без «_» и «-». */
+    private fun slugOf(raw: String): String {
+        val sb = StringBuilder()
+        for (c in raw) {
+            val low = c.lowercaseChar()
+            val t = TRANSLIT[low]
+            when {
+                isSafe(c) -> sb.append(c)
+                t != null -> sb.append(if (c != low && t.isNotEmpty()) t[0].uppercaseChar() + t.substring(1) else t)
+                sb.isNotEmpty() && sb.last() != '_' -> sb.append('_')
+            }
+        }
+        return sb.toString().trim('_', '-').take(SLUG_MAX).trimEnd('_', '-')
+    }
+
+    /** FNV-1a 32 бит от UTF-8 байтов, 8 hex-знаков. */
+    private fun fnv1aHex(s: String): String {
+        var h = 0x811c9dc5.toInt()
+        for (b in s.toByteArray(Charsets.UTF_8)) {
+            h = h xor (b.toInt() and 0xFF)
+            h *= 0x01000193
+        }
+        return String.format("%08x", h)
     }
 
     data class NameResult(val name: String, val warning: String?)

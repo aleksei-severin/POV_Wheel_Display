@@ -2359,10 +2359,46 @@ function buildFileName(prefix, rawBase) {
     } else {
         reason = `too long (${candidate.length} > ${LFS_NAME_MAX} chars)`;
     }
-    // Уникальный 4-значный номер на основе времени
-    const num = (1000 + (Date.now() % 9000)).toString().slice(-4).padStart(4, '0');
-    const safe = prefix + 'invalid-' + num + '.bin';
+    // Имя — функция исходного (тот же алгоритм, что Ani6.buildFileName в
+    // приложении): читаемая основа + 6 hex FNV-1a от исходного имени. Раньше здесь
+    // был случайный номер, и повторная заливка того же файла давала вторую копию.
+    const slug = _nameSlug(rawBase);
+    const hash = _fnv1aHex(rawBase);
+    const safe = prefix + (slug ? slug + '-' + hash.slice(0, 6) : hash) + '.bin';
     return { name: safe, warning: `"${rawBase}" — ${reason}. Saving as: ${safe}` };
+}
+
+const _NAME_SLUG_MAX = LFS_NAME_MAX - 4 - 1 - 6 - 4;   // префикс, «-», хэш, «.bin»
+const _TRANSLIT = {
+    'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'e','ж':'zh','з':'z','и':'i','й':'y',
+    'к':'k','л':'l','м':'m','н':'n','о':'o','п':'p','р':'r','с':'s','т':'t','у':'u','ф':'f',
+    'х':'kh','ц':'ts','ч':'ch','ш':'sh','щ':'shch','ъ':'','ы':'y','ь':'','э':'e','ю':'yu','я':'ya',
+    'і':'i','ї':'yi','є':'ye','ґ':'g'
+};
+
+// Латиница/цифры/«_»/«-» как есть, кириллица транслитом, прочее — «_» (подряд не
+// повторяется), края без «_» и «-».
+function _nameSlug(raw) {
+    let s = '';
+    for (const c of raw) {
+        const low = c.toLowerCase();
+        const t = _TRANSLIT[low];
+        if (/^[a-zA-Z0-9_-]$/.test(c)) s += c;
+        else if (t !== undefined) s += (c !== low && t) ? t[0].toUpperCase() + t.slice(1) : t;
+        else if (s && !s.endsWith('_')) s += '_';
+    }
+    s = s.replace(/^[_-]+|[_-]+$/g, '').slice(0, _NAME_SLUG_MAX);
+    return s.replace(/[_-]+$/, '');
+}
+
+// FNV-1a 32 бит от UTF-8 байтов, 8 hex-знаков.
+function _fnv1aHex(str) {
+    let h = 0x811c9dc5;
+    for (const b of new TextEncoder().encode(str)) {
+        h ^= b;
+        h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h.toString(16).padStart(8, '0');
 }
 
 // Раскладка тайминга анимации на формат ANI6 (одна задержка на весь файл).

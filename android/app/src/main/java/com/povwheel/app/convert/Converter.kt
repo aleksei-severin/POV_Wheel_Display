@@ -96,7 +96,7 @@ class Converter(private val context: Context) {
             Kind.WEBP_ANIM -> "anm_"
             Kind.IMAGE -> "img_"
         }
-        val nr = Ani6.buildFileName(prefix, rawBase, (System.currentTimeMillis() % 100000).toInt())
+        val nr = Ani6.buildFileName(prefix, rawBase)
 
         return when (kind) {
             Kind.IMAGE -> convertStill(bytes ?: readBytes(uri), fitMode, mirrorBack, nr, prog)
