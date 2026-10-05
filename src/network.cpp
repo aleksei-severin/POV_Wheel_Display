@@ -1,6 +1,7 @@
 #include "network.h"
 #include "effects.h"
 #include "povble.h"
+#include "hall_log.h"
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
@@ -607,23 +608,64 @@ static void wifiScanRun() {
 //  не должно. Поэтому BLE не лезет к ним напрямую, а зовёт эти две функции.
 // =====================================================================
 
-// Синхронизация часов с телефона — то же, что делал POST /settime.
-void povSetTime(uint32_t epoch, int32_t tz) {
-    if (epoch >= TIME_VALID_FROM) {
-        // Системные часы newlib: дальше их держит счётчик RTC, и время
-        // переживёт и глубокий сон, и перезагрузку по OTA.
-        struct timeval tv = { .tv_sec = (time_t)epoch, .tv_usec = 0 };
-        settimeofday(&tv, nullptr);
-        _time_epoch_base  = epoch;
-        _time_millis_base = millis();
+// Грубая установка часов по секундам — браузер (/settime) и OP_SETTIME.
+// Часы, выставленные точно (OP_TIME_SET), она не сбивает: расхождение меньше
+// двух секунд — это округление до секунды на той стороне, а не ошибка часов,
+// и переставлять их значило бы испортить привязку лога Холла к времени
+// (см. hall_log.h) ради точности, которой у этого источника нет.
+static void _setClockSeconds(uint32_t epoch) {
+    if (epoch < TIME_VALID_FROM) return;
+    int64_t now = hallWallUs();
+    if (hallClockPrecise() && now != 0) {
+        int64_t d = (int64_t)epoch * 1000000LL - now;
+        if (d > -2000000LL && d < 2000000LL) return;
     }
+    // Системные часы newlib: дальше их держит счётчик RTC, и время
+    // переживёт и глубокий сон, и перезагрузку по OTA.
+    struct timeval tv = { .tv_sec = (time_t)epoch, .tv_usec = 0 };
+    settimeofday(&tv, nullptr);
+    // Эта пара нужна только ретроспективной простановке меток лога —
+    // она считает от millis() текущей сессии.
+    _time_epoch_base  = epoch;
+    _time_millis_base = millis();
+    hallClockSet(false);
+}
+
+static void _setTimezone(int32_t tz) {
     // Пояс правится независимо от часов: приложение шлёт его и тогда, когда
     // время уже верное, а пользователь пересёк границу поясов.
     if (tz >= -50400 && tz <= 50400 && tz != _time_tz_offset) {
         _time_tz_offset = tz;
+        // Пишем в лог: перепутанный пояс иначе никак не отличить от
+        // неверно идущих часов — на экране и то и другое выглядит
+        // одинаково, просто время «не то».
         webLogf("[SYS] Timezone set to UTC%+.1f h", (double)tz / 3600.0);
     }
+}
+
+// Синхронизация часов с телефона — то же, что делал POST /settime.
+void povSetTime(uint32_t epoch, int32_t tz) {
+    _setClockSeconds(epoch);
+    _setTimezone(tz);
     // Строки, записанные до синхронизации, получают наконец настоящие метки.
+    portENTER_CRITICAL(&_log_mux);
+    _retroFillTimestamps();
+    portEXIT_CRITICAL(&_log_mux);
+}
+
+// Точная установка (OP_TIME_SET): телефон сам вычислил время UTC с
+// точностью до миллисекунд по пингам OP_TIME.
+void povSetTimeUs(int64_t wall_us, int32_t tz) {
+    if (wall_us >= (int64_t)TIME_VALID_FROM * 1000000LL) {
+        struct timeval tv;
+        tv.tv_sec  = (time_t)(wall_us / 1000000LL);
+        tv.tv_usec = (suseconds_t)(wall_us % 1000000LL);
+        settimeofday(&tv, nullptr);
+        _time_epoch_base  = (uint32_t)tv.tv_sec;
+        _time_millis_base = millis();
+        hallClockSet(true);
+    }
+    _setTimezone(tz);
     portENTER_CRITICAL(&_log_mux);
     _retroFillTimestamps();
     portEXIT_CRITICAL(&_log_mux);
@@ -1427,25 +1469,10 @@ void setupNetwork() {
     // tz — смещение часового пояса в секундах (UTC+2 → +7200, передаётся браузером)
     server.on("/settime", HTTP_POST, [](AsyncWebServerRequest *request){
         if (request->hasParam("t")) {
-            uint32_t t = (uint32_t)request->getParam("t")->value().toInt();
-            // Ставим системные часы: дальше их держит счётчик RTC, и время
-            // переживёт и глубокий сон, и перезагрузку по OTA.
-            struct timeval tv = { .tv_sec = (time_t)t, .tv_usec = 0 };
-            settimeofday(&tv, nullptr);
-            // Эта пара нужна только ретроспективной простановке меток лога —
-            // она считает от millis() текущей сессии.
-            _time_epoch_base  = t;
-            _time_millis_base = millis();
+            _setClockSeconds((uint32_t)request->getParam("t")->value().toInt());
         }
         if (request->hasParam("tz")) {
-            int32_t tz = (int32_t)request->getParam("tz")->value().toInt();
-            if (tz != _time_tz_offset) {
-                _time_tz_offset = tz;
-                // Пишем в лог: перепутанный пояс иначе никак не отличить от
-                // неверно идущих часов — на экране и то и другое выглядит
-                // одинаково, просто время «не то».
-                webLogf("[SYS] Timezone set to UTC%+.1f h", (double)tz / 3600.0);
-            }
+            _setTimezone((int32_t)request->getParam("tz")->value().toInt());
         }
         // Ретроспективно проставляем метки строкам записанным до синхронизации (??)
         portENTER_CRITICAL(&_log_mux);

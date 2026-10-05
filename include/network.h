@@ -19,5 +19,6 @@ extern String currentDisplayFile;   // Имя файла, загруженног
 // --- Мостики для BLE (реализованы в network.cpp) ---
 // Кольцо лога и база времени лежат в RTC-памяти и должны иметь ровно одну
 // точку записи, поэтому povble.cpp работает с ними только через эти две.
-void     povSetTime(uint32_t epoch, int32_t tz);
+void     povSetTime(uint32_t epoch, int32_t tz);       // по секундам; точные часы не сбивает
+void     povSetTimeUs(int64_t wall_us, int32_t tz);    // точно (OP_TIME_SET)
 uint32_t povBuildLogs(uint8_t* out, size_t cap, uint32_t since);

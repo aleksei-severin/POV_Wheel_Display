@@ -2,7 +2,7 @@
 #include "network.h"
 #include "effects.h"
 #include "povble.h"
-#include "beeper.h"
+#include "hall_log.h"
 #include <WiFi.h>
 
 #include <Arduino.h>
@@ -16,6 +16,7 @@
 #include "esp_system.h"
 #include "esp_sleep.h"
 #include "esp_task_wdt.h"
+#include "esp_timer.h"
 #include <sys/time.h>
 
 // Экспортируем сервер из network.cpp для добавления нового эндпоинта
@@ -132,6 +133,18 @@ RTC_DATA_ATTR static uint32_t rtc_cal_magic = 0;
 RTC_DATA_ATTR static float    rtc_hall_cal[HALL_COUNT];
 RTC_DATA_ATTR static uint8_t  rtc_hall_cal_n[HALL_COUNT];
 static bool hall_cal_ready = false;
+
+// Калибровка для лога Холла (hall_log.h): телефон приводит события разных
+// датчиков к точным 60° той же поправкой, что и якорь фазы здесь.
+void hallGetCal(int16_t out_x100[6], uint8_t* arm_reverse) {
+    for (int i = 0; i < HALL_COUNT && i < 6; i++) {
+        float v = rtc_hall_cal[i] * 100.0f;
+        if (v >  32767.0f) v =  32767.0f;
+        if (v < -32767.0f) v = -32767.0f;
+        out_x100[i] = (int16_t)lroundf(v);
+    }
+    *arm_reverse = global_arm_reverse ? 1 : 0;
+}
 
 // Оценка вращения (обновляется renderingTask, читается loop()/web)
 static volatile float rotor_omega = 0.0f;  // град/мкс, знаковая
@@ -401,7 +414,10 @@ void IRAM_ATTR hallInterruptHandler(void* arg) {
     // Датчик обесточен (или не должен учитываться) — игнорируем.
     if (!(hall_active_mask & (1u << k))) return;
 
-    uint32_t now = micros();
+    // То же время, что micros() (это его младшие 32 бита), но полное — для
+    // лога Холла, которому нужна шкала без переполнения раз в 71 минуту.
+    int64_t  now64 = esp_timer_get_time();
+    uint32_t now   = (uint32_t)now64;
 
     // Глобальный антидребезг между любыми двумя событиями
     if (last_hall_time != 0 && (uint32_t)(now - last_hall_time) < HALL_MIN_GAP_US) return;
@@ -461,12 +477,10 @@ void IRAM_ATTR hallInterruptHandler(void* arg) {
     last_hall_time  = now;
     hall_seq++;
 
-    // Чирп пьезо на проход луча мимо магнита — пока запитаны все шесть лучей.
-    // Само событие уже значит «колесо крутится»; светится ли лента (загрузка
-    // файла, выдержки перед розжигом) — не важно. В PWR_SPINUP работает один
-    // датчик из шести, и там тона нет. Направление свипа — по rotation_dir
-    // (только что обновлённому выше): вверх на переднем колесе, вниз на заднем.
-    if (power_state == PWR_FULL) beeperTrigger(rotation_dir >= 0);
+    // В лог для синхронизации видео (см. hall_log.h) — каждое принятое
+    // событие, включая сомнительные по периоду: само событие подлинное, под
+    // подозрением был только замер оборота.
+    hallLogIsr(now64, (uint8_t)k);
 
     if (hallSemaphore) {
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
@@ -1372,6 +1386,7 @@ void renderingTask(void* pvParameters) {
             ota_in_progress || frame_loading) {
             if (rendering_active) {
                 rendering_active = false;
+                hallLogMark(HLOG_DARK, 0);
                 // render_pause_ms здесь НЕ трогаем: это не дребезг у порога, а
                 // намеренная пауза (загрузка файла, Stop, OTA). Задерживать
                 // розжиг после неё значило бы добавлять чёрную паузу к каждой
@@ -1417,6 +1432,7 @@ void renderingTask(void* pvParameters) {
         if (!anchor_ok || rev == 0 || rpm_now < rpm_thr || age_us > age_limit) {
             if (rendering_active) {
                 rendering_active = false;
+                hallLogMark(HLOG_DARK, 0);
                 render_pause_ms  = millis();
                 webLog("[PWR] Rotation lost, rendering paused");
                 // См. комментарий у предыдущего blankAllLEDs_DMA(): слив мог быть
@@ -1450,6 +1466,8 @@ void renderingTask(void* pvParameters) {
             // Пауза короче времени раскрутки, так что старту не мешает.
             if ((uint32_t)(millis() - render_pause_ms) < RENDER_RESUME_HOLD_MS) continue;
             rendering_active = true;
+            // Метка для склейки видео: с этого момента на ободе есть картинка.
+            hallLogMark(HLOG_LIT, rotation_dir >= 0 ? 1 : 0);
             // Обороты уже выше порога — rotation_dir опирается на свежие голоса
             // ISR по порядку срабатывания датчиков, а не на значение,
             // оставшееся с прошлой остановки.
@@ -2002,6 +2020,9 @@ static void applyPowerState(PowerState target) {
             flushLastFile();
             flushSettings();
             flushSlideList();
+            // Лог Холла — во флеш: колесо встало, и если телефона рядом не
+            // было, через минуту сон сотрёт PSRAM вместе с ним.
+            hallLogFlush();
             webLog("[PWR] Power off");
             break;
 
@@ -2104,6 +2125,7 @@ static bool waitPinReleased(uint8_t pin, uint32_t stable_ms, uint32_t timeout_ms
 //   дешевле прежнего периодического опроса и не растёт с тем, сколько
 //   времени колесо проводит в этой позе.
 static void armWakeSourcesAndSleep(bool arm_vib) {
+    hallLogNoteSleep();   // время сна копится для поправки часов (см. hall_log.h)
     gpio_hold_en((gpio_num_t)PIN_EN_DCDC_ARM1);
     gpio_hold_en((gpio_num_t)PIN_EN_DCDC_REST);
     gpio_deep_sleep_hold_en();
@@ -2124,6 +2146,7 @@ static void enterDeepSleep() {
     flushLastFile();
     flushSettings();
     flushSlideList();
+    hallLogFlush();
     // Снимаем питание и глушим прерывания
     digitalWrite(PIN_EN_DCDC_REST, LOW);
     digitalWrite(PIN_EN_DCDC_ARM1, LOW);
@@ -2173,6 +2196,9 @@ static void enterDeepSleep() {
 // напряжение, вибрация — чтобы у человека был способ добудиться до
 // веб-интерфейса, пока батарея восстанавливается.
 static void enterTrickleSleep(uint32_t seconds) {
+    // Пишет флеш, только если с прошлого раза пришли новые события, то есть
+    // не на каждом минутном цикле предзаряда, а лишь когда колесо крутили.
+    hallLogFlush();
     digitalWrite(PIN_EN_DCDC_REST, LOW);
     digitalWrite(PIN_EN_DCDC_ARM1, LOW);
     gpio_hold_en((gpio_num_t)PIN_EN_DCDC_ARM1);
@@ -2188,6 +2214,7 @@ static void enterTrickleSleep(uint32_t seconds) {
     if (waitPinReleased(PIN_VIBRATION, 50, 2000)) wake_mask |= (1ULL << PIN_VIBRATION);
     esp_sleep_enable_ext1_wakeup(wake_mask, ESP_EXT1_WAKEUP_ANY_LOW);
     esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
+    hallLogNoteSleep();
     esp_deep_sleep_start();
 }
 
@@ -2315,6 +2342,7 @@ static void transportSleepArm() {
     // Единственный источник пробуждения — кнопка, замкнутая на землю.
     // Вибродатчик здесь НЕ подключается: в этом вся суть режима.
     esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_BUTTON, 0);
+    hallLogNoteSleep();
     esp_deep_sleep_start();
 }
 
@@ -2341,6 +2369,7 @@ static void enterTransportSleep() {
     flushSettings();
     flushSlideList();
     saveHallCalibration();
+    hallLogFlush();
 
     transportSleepArm();
 }
@@ -2698,6 +2727,10 @@ void povRequestSleep() {
 // =====================================================================
 
 void setup() {
+    // Досчитать время сна для поправки часов лога Холла — до любого раннего
+    // возврата в сон ниже (фильтр толчков, залипший вибродатчик, предзаряд).
+    hallLogNoteWake();
+
     // millis() сбрасывается при каждом запуске — старая millis-база из RTC недействительна.
     resetTimeSync();
 
@@ -2910,6 +2943,9 @@ void setup() {
     // поднимается в конце setup() — там уже есть семафоры и задачи, которым
     // отдавать команды.
     bleReserve();
+    // Кольцо лога Холла — по той же причине рано: полмегабайта одним куском.
+    // Потолок анимации в OP_FSINFO учитывает его в резерве PSRAM.
+    hallLogInit();
     loadSettingsFromNVS();              // до построения таблиц: они зависят от гаммы и балансов
     loadHallCalibration();
     loadSlideList();                    // отбор файлов для слайдшоу переживает сон и питание
@@ -3008,10 +3044,6 @@ void setup() {
     // loopTask (Arduino loop) работает на Core 1 с приоритетом 1 и вытесняется
     // renderingTask во время вращения — отписываем его от Task WDT.
     esp_task_wdt_delete(xTaskGetCurrentTaskHandle());
-
-    // Пьезо — до прерываний Холла: ISR зовёт beeperTrigger(), и к первому
-    // событию RMT и таблицы чирпа уже должны быть готовы.
-    beeperInit();
 
     // Прерывания: шесть датчиков Холла + вибродатчик
     for (uint32_t i = 0; i < HALL_COUNT; i++) {

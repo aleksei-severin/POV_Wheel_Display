@@ -54,6 +54,11 @@ class PovVideoController(private val app: Application, private val scope: Corout
     val busy: StateFlow<Boolean> = _busy
 
     @Volatile private var cancelFlag = false
+    /** Рендер стартует сам, как только анализ нашёл лог (хотя бы на часть ролика). */
+    @Volatile private var autoRender = false
+
+    /** true — однократно: экран запускает рендер сам (через свой запрос разрешений). */
+    fun consumeAutoRender(): Boolean { val v = autoRender; autoRender = false; return v }
     private var job: Job? = null
     private val renderDispatcher = Executors.newSingleThreadExecutor { r ->
         Thread(r, "pov-render").apply { isDaemon = true }
@@ -62,6 +67,7 @@ class PovVideoController(private val app: Application, private val scope: Corout
     fun pick(uri: Uri) {
         if (_busy.value) return
         cancelFlag = false
+        autoRender = true
         _busy.value = true
         _state.value = State.Analyzing("video", "Reading video…")
         job = scope.launch(renderDispatcher) {
@@ -74,8 +80,8 @@ class PovVideoController(private val app: Application, private val scope: Corout
                 _state.value = State.Idle
             } catch (e: SecurityException) {
                 _state.value = State.Failed("The gallery did not share this video with the app. Allow access to videos and try again.", null, uri)
-            } catch (e: PovAnalyzer.NoAudio) {
-                _state.value = State.Failed("This video has no sound track — the sync chirps are what tell the sweeps apart.", null)
+            } catch (e: PovAnalyzer.NoLog) {
+                _state.value = State.Failed(e.message ?: "There is no Hall log for this video.", null)
             } catch (e: Throwable) {
                 _state.value = State.Failed("Could not read this video: " + (e.message ?: e.javaClass.simpleName), null)
             } finally {

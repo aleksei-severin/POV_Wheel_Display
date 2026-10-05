@@ -9,6 +9,8 @@ import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.os.Build
+import android.os.SystemClock
+import com.povwheel.app.hall.HallSync
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -120,6 +122,15 @@ class BleClient(
 
     var onLog: ((String) -> Unit)? = null
 
+    // Пинг часов (OP_TIME): номер запроса и момент прихода ответа. Метка ставится в
+    // колбэке binder, до пересадки на корутину — иначе в круг запрос-ответ легла бы
+    // ещё и задержка планировщика, а от его половины зависит точность часов.
+    @Volatile private var timedSeq = -1
+    @Volatile private var timedRxNs = 0L
+
+    /** Фоновая синхронизация лога Холла — пока колесо на связи и умеет его отдавать. */
+    @Volatile private var hallSync: HallSync? = null
+
     // -------------------------------------------------------------- соединение
 
     suspend fun connect(): Boolean = withContext(Dispatchers.IO) {
@@ -151,6 +162,13 @@ class BleClient(
         }
         lastError = null
         _link.value = Link.Ready
+        // Лог Холла собирается ВСЕГДА, пока колесо на связи, — кто бы ни держал
+        // соединение (экран, фоновая служба, синхронный показ): архив для склейки
+        // видео должен быть полным, а не только пока открыт нужный экран.
+        if (hello?.hasHallLog == true) {
+            hallSync?.stop()
+            hallSync = HallSync(context.applicationContext, this@BleClient).also { it.start() }
+        }
         true
     }
 
@@ -162,6 +180,8 @@ class BleClient(
     }
 
     fun close() {
+        hallSync?.stop()
+        hallSync = null
         linkDown = true
         try { gatt?.disconnect() } catch (_: Exception) {}
         try { gatt?.close() } catch (_: Exception) {}
@@ -288,8 +308,10 @@ class BleClient(
     private fun dispatchNotify(c: BluetoothGattCharacteristic, v: ByteArray) {
         when (c.uuid) {
             Proto.RSP -> {
+                val rxNs = SystemClock.elapsedRealtimeNanos()
                 if (v.size < 4) return
                 val seq = v[1].toInt() and 0xFF
+                if (seq == timedSeq) timedRxNs = rxNs
                 val status = v[2].toInt() and 0xFF
                 val body = v.copyOfRange(4, v.size)
                 val d = synchronized(pending) { pending.remove(seq) }
@@ -512,6 +534,69 @@ class BleClient(
     }
 
     suspend fun fsInfo(): FsInfo = FsInfo.parse(request(Proto.OP_FSINFO))
+
+    // ------------------------------------------------------- лог Холла и часы
+
+    /** Один пинг часов. [wallMidUs] — часы телефона в середине круга запрос-ответ. */
+    class TimeSample(val info: TimeInfo, val sendNs: Long, val recvNs: Long, private val wallMinusElapsedUs: Long) {
+        val rttUs: Long get() = (recvNs - sendNs) / 1000
+        val wallMidUs: Long get() = (sendNs + recvNs) / 2 / 1000 + wallMinusElapsedUs
+    }
+
+    /**
+     * Пинг OP_TIME. Колесо снимает esp_timer прямо перед ответом; телефон относит
+     * его к середине круга. Ошибка — не больше половины круга, а лучшие из серии
+     * пингов (уведомление ушло в ближайшее событие соединения) дают единицы мс.
+     */
+    suspend fun timePing(): TimeSample = opLock.withLock {
+        val g = gatt ?: throw BleException("not connected")
+        val c = chCmd ?: throw BleException("not connected")
+        val seq = seqGen.incrementAndGet() and 0xFF
+        val d = CompletableDeferred<Pair<Int, ByteArray>>()
+        synchronized(pending) { pending[seq] = d }
+        timedRxNs = 0L
+        timedSeq = seq
+        val wallOff = System.currentTimeMillis() * 1000 - SystemClock.elapsedRealtimeNanos() / 1000
+        val t0 = SystemClock.elapsedRealtimeNanos()
+        val res = try {
+            writeChar(g, c, byteArrayOf(Proto.OP_TIME.toByte(), seq.toByte()),
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+            withTimeoutOrNull(3000) { d.await() }
+        } catch (e: Exception) {
+            synchronized(pending) { pending.remove(seq) }
+            timedSeq = -1
+            throw e
+        }
+        val t1 = timedRxNs.takeIf { it != 0L } ?: SystemClock.elapsedRealtimeNanos()
+        timedSeq = -1
+        if (res == null) {
+            synchronized(pending) { pending.remove(seq) }
+            throw BleException("timed out waiting for the wheel")
+        }
+        if (res.first != Proto.ST_OK) throw BleException(Proto.statusText(res.first))
+        TimeSample(TimeInfo.parse(res.second), t0, t1, wallOff)
+    }
+
+    /** Точная установка часов колеса: [wallUs] — UTC в момент [atEspUs] по его esp_timer. */
+    suspend fun timeSet(wallUs: Long, atEspUs: Long, tzSeconds: Int): TimeInfo {
+        val b = Proto.buf(20)
+        b.putLong(wallUs); b.putLong(atEspUs); b.putInt(tzSeconds)
+        return TimeInfo.parse(request(Proto.OP_TIME_SET, b.array()))
+    }
+
+    /** Страница кольца лога Холла начиная с номера [fromSeq]. */
+    suspend fun hallLog(fromSeq: Long, max: Int): HallPage {
+        val b = Proto.buf(6)
+        b.putInt(fromSeq.toInt()); b.putShort(max.toShort())
+        return HallPage.parse(requestStaged(Proto.OP_HALL_LOG, b.array()))
+    }
+
+    /** Кусок файла истории лога Холла: [which] 0 — /hall.old, 1 — /hall.log. */
+    suspend fun hallHist(which: Int, off: Long, max: Int): HallHist {
+        val b = Proto.buf(7)
+        b.put(which.toByte()); b.putInt(off.toInt()); b.putShort(max.toShort())
+        return HallHist.parse(requestStaged(Proto.OP_HALL_HIST, b.array()))
+    }
 
     suspend fun telemetry(): Tele = Tele.parse(request(Proto.OP_TELE)).also { _tele.value = it }
 

@@ -1235,7 +1235,10 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             // Часы переживают глубокий сон, но после полного обесточивания
             // взяться им неоткуда — любое соединение это повод их выставить,
             // даже фоновому колесу, которое сейчас не на экране.
-            try {
+            // Колесо с логом Холла часы выставляет HallSync — точно и только
+            // ПОСЛЕ того, как измерит, насколько они ушли во сне: грубая
+            // установка по секундам до этого стёрла бы само измерение.
+            if (c.hello?.hasHallLog != true) try {
                 val tz = TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 1000
                 c.setTime(System.currentTimeMillis() / 1000, tz)
             } catch (_: Exception) {}

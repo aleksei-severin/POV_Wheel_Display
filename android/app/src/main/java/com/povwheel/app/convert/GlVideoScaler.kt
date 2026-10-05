@@ -126,6 +126,28 @@ internal class GlVideoScaler(outW: Int, outH: Int) {
      * «кодированного» из-за кропа или разворота декодером).
      */
     fun renderInto(dst: Bitmap, decW: Int, decH: Int) {
+        renderToPixBuf(decW, decH)
+        dst.copyPixelsFromBuffer(pixBuf)
+    }
+
+    /**
+     * То же уменьшение, но на выходе яркость (8 бит на точку, [outW]×[outH], строки
+     * сверху вниз) — для анализа видео, где цвет не нужен, а Bitmap — лишняя копия.
+     * Ориентация — как у декодера (кодированная, без поворота из метаданных): строки
+     * кадра здесь совпадают со строками сенсора.
+     */
+    fun renderLuma(dst: ByteArray, decW: Int, decH: Int) {
+        renderToPixBuf(decW, decH)
+        val n = outW * outH
+        for (i in 0 until n) {
+            val r = pixBuf.get(i * 4).toInt() and 0xFF
+            val g = pixBuf.get(i * 4 + 1).toInt() and 0xFF
+            val b = pixBuf.get(i * 4 + 2).toInt() and 0xFF
+            dst[i] = ((r * 77 + g * 150 + b * 29) shr 8).toByte()
+        }
+    }
+
+    private fun renderToPixBuf(decW: Int, decH: Int) {
         // --- пасс 1: OES → tex[0] в масштабе кадра (с кэпом), матрица SurfaceTexture ---
         // stMatrix несёт вертикальный флип видеокадра, поэтому дальше по
         // конвейеру переворотов Y нет: glReadPixels + copyPixelsFromBuffer дают
@@ -175,7 +197,6 @@ internal class GlVideoScaler(outW: Int, outH: Int) {
         GLES20.glReadPixels(0, 0, outW, outH, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, pixBuf)
         checkGl("readPixels")
         pixBuf.rewind()
-        dst.copyPixelsFromBuffer(pixBuf)
     }
 
     fun release() {

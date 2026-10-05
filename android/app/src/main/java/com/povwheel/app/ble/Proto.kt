@@ -56,6 +56,11 @@ object Proto {
     // автономный ход слайдшоу остаётся вооружён, и колесо не застывает на
     // последнем кадре, если телефон потом пропадёт без предупреждения.
     const val OP_SYNC_TICK = 0x1B
+    // Лог Холла для склейки POV-видео (FEAT_HALL_LOG, см. include/hall_log.h)
+    const val OP_TIME      = 0x1C   // пинг часов  ← TimeInfo
+    const val OP_TIME_SET  = 0x1D   // [i64 wall_us][i64 at_esp_us][i32 tz]  ← TimeInfo
+    const val OP_HALL_LOG  = 0x1E   // [u32 from_seq][u16 max]  ← staged: HallPage + n × u32
+    const val OP_HALL_HIST = 0x1F   // [u8 file 0=.old 1=.log][u32 off][u16 max]  ← staged: HallHist + байты
 
     /**
      * Предел имени — столько же, сколько держит PovHello.name вместе с
@@ -96,6 +101,9 @@ object Proto {
     const val FEAT_PREVIEW   = 0x0004
     const val FEAT_WIFI      = 0x0008
     const val FEAT_ALBUM_SEL = 0x0010   // OP_ALBUM понимает отбор файлов для слайдшоу
+    const val FEAT_HALL_LOG  = 0x0020   // OP_TIME / OP_TIME_SET / OP_HALL_LOG / OP_HALL_HIST
+
+    const val ST_BUSY = 3
 
     fun buf(n: Int): ByteBuffer = ByteBuffer.allocate(n).order(ByteOrder.LITTLE_ENDIAN)
     fun wrap(b: ByteArray): ByteBuffer = ByteBuffer.wrap(b).order(ByteOrder.LITTLE_ENDIAN)
@@ -120,6 +128,7 @@ data class Hello(
     val hasOta      get() = features and Proto.FEAT_OTA != 0
     val hasPreview  get() = features and Proto.FEAT_PREVIEW != 0
     val hasAlbumSel get() = features and Proto.FEAT_ALBUM_SEL != 0
+    val hasHallLog  get() = features and Proto.FEAT_HALL_LOG != 0
 
     companion object {
         const val SIZE = 48
@@ -315,6 +324,92 @@ data class Flow(val consumed: Long, val written: Long, val status: Int) {
             val w = p.int.toLong() and 0xFFFFFFFFL
             val s = if (p.hasRemaining()) p.get().toInt() and 0xFF else 0
             return Flow(c, w, s)
+        }
+    }
+}
+
+/** Ответ на OP_TIME / OP_TIME_SET, 40 байт (PovTime). */
+data class TimeInfo(
+    /** esp_timer колеса в момент ответа, мкс от загрузки. */
+    val espUs: Long,
+    /** Системные часы колеса, мкс UTC; 0 — не заведены. */
+    val wallUs: Long,
+    /** Проспано с последней установки часов, мкс — по нему раскладывается дрейф RC. */
+    val sleepUs: Long,
+    val bootId: Long,
+    val clockGen: Long,
+    val headSeq: Long,
+    val pwr: Int,
+    /** Последняя установка часов была точной (OP_TIME_SET). */
+    val precise: Boolean
+) {
+    companion object {
+        const val SIZE = 40
+        fun parse(a: ByteArray): TimeInfo {
+            val p = Proto.wrap(a)
+            val esp = p.long
+            val wall = p.long
+            val sl = p.long
+            val boot = p.int.toLong() and 0xFFFFFFFFL
+            val gen = p.int.toLong() and 0xFFFFFFFFL
+            val head = p.int.toLong() and 0xFFFFFFFFL
+            val pwr = p.get().toInt() and 0xFF
+            val fl = p.get().toInt() and 0xFF
+            return TimeInfo(esp, wall, sl, boot, gen, head, pwr, fl and 1 != 0)
+        }
+    }
+}
+
+/** Страница кольца лога Холла (PovHallPage, 44 байта) и сами записи. */
+class HallPage(
+    val bootId: Long,
+    /** Номер первой записи [entries]. */
+    val seq0: Long,
+    val head: Long,
+    val oldest: Long,
+    /** Время esp_timer, мкс, ДО первой записи. */
+    val t0: Long,
+    val calX100: IntArray,
+    val armReverse: Boolean,
+    val dir: Int,
+    val entries: IntArray
+) {
+    companion object {
+        const val SIZE = 44
+        fun parse(a: ByteArray): HallPage {
+            val p = Proto.wrap(a)
+            val boot = p.int.toLong() and 0xFFFFFFFFL
+            val seq0 = p.int.toLong() and 0xFFFFFFFFL
+            val n = p.int
+            val head = p.int.toLong() and 0xFFFFFFFFL
+            val oldest = p.int.toLong() and 0xFFFFFFFFL
+            val t0 = p.long
+            val cal = IntArray(6) { p.short.toInt() }
+            val rev = (p.get().toInt() and 0xFF) != 0
+            val dir = p.get().toInt()
+            p.short
+            val cnt = minOf(n, (a.size - SIZE) / 4).coerceAtLeast(0)
+            val e = IntArray(cnt) { p.int }
+            return HallPage(boot, seq0, head, oldest, t0, cal, rev, dir, e)
+        }
+    }
+}
+
+/** Кусок файла истории лога Холла (PovHallHist, 20 байт) и сами байты. */
+class HallHist(
+    val size: Long, val keyBoot: Long, val keySeq: Long, val off: Long, val bytes: ByteArray
+) {
+    companion object {
+        const val SIZE = 20
+        fun parse(a: ByteArray): HallHist {
+            val p = Proto.wrap(a)
+            val size = p.int.toLong() and 0xFFFFFFFFL
+            val kb = p.int.toLong() and 0xFFFFFFFFL
+            val ks = p.int.toLong() and 0xFFFFFFFFL
+            val off = p.int.toLong() and 0xFFFFFFFFL
+            val n = p.int
+            val cnt = minOf(n, a.size - SIZE).coerceAtLeast(0)
+            return HallHist(size, kb, ks, off, a.copyOfRange(SIZE, SIZE + cnt))
         }
     }
 }

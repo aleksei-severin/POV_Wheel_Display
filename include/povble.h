@@ -70,6 +70,18 @@ enum PovOp : uint8_t {
                            //    правка позиции ВНУТРИ уже идущего слайдшоу — в отличие от
                            //    OP_PLAY/OP_EFFECT, не сбрасывает slideshowActive (см. syncTick()
                            //    в main.cpp): нужен FEAT_ALBUM_SEL, слайдшоу должно уже идти
+
+    // Лог Холла для склейки POV-видео (POV_FEAT_HALL_LOG, см. hall_log.h).
+    // Все три — фоновый обмен приложения: таймер простоя они не сбрасывают.
+    OP_TIME        = 0x1C,  // →  ничего            ←  PovTime (пинг часов: телефон
+                           //    сопоставляет esp_timer со своими часами по min-RTT)
+    OP_TIME_SET    = 0x1D,  // →  [i64 wall_us][i64 at_esp_us][i32 tz]  ←  PovTime
+                           //    точная установка часов: wall_us — время UTC в момент
+                           //    at_esp_us по esp_timer колеса
+    OP_HALL_LOG    = 0x1E,  // →  [u32 from_seq][u16 max]  ←  staged: PovHallPage + n × u32
+    OP_HALL_HIST   = 0x1F,  // →  [u8 file 0=.old 1=.log][u32 off][u16 max]
+                           //    ←  staged: PovHallHist + байты файла истории; ST_BUSY,
+                           //    пока лента светится (чтение флеша морозит отрисовку)
 };
 
 // Предел имени. 19 значащих символов — ровно столько, сколько влезает в
@@ -118,6 +130,7 @@ struct PovHello {
 #define POV_FEAT_PREVIEW   0x0004
 #define POV_FEAT_WIFI      0x0008   // Wi-Fi можно поднять по требованию
 #define POV_FEAT_ALBUM_SEL 0x0010   // OP_ALBUM понимает отбор файлов для слайдшоу
+#define POV_FEAT_HALL_LOG  0x0020   // OP_TIME / OP_TIME_SET / OP_HALL_LOG / OP_HALL_HIST
 
 // Настройки, симметричные на чтение и запись. Всё, что имеет побочные эффекты
 // (эффект, слайдшоу, воспроизведение), сюда НЕ входит — у этого свои команды,
@@ -200,6 +213,44 @@ struct PovUpBegin {
     uint32_t raw_size;    // размер РАСПАКОВАННОГО файла
     uint32_t comp_size;   // сколько байт придёт по DATA
     uint32_t crc32;       // CRC32 распакованных данных (как java.util.zip.CRC32)
+};
+
+// Ответ на OP_TIME / OP_TIME_SET. esp_us снимается непосредственно перед
+// отправкой: телефон относит его к середине своего круга запрос-ответ.
+struct PovTime {
+    int64_t  esp_us;      // esp_timer_get_time()
+    int64_t  wall_us;     // системные часы, мкс UTC; 0 — не заведены
+    uint64_t sleep_us;    // проспано с последней установки часов (дрейф RC)
+    uint32_t boot_id;     // сессия лога Холла
+    uint32_t clock_gen;   // номер установки часов
+    uint32_t head_seq;    // следующая запись лога Холла
+    uint8_t  pwr;         // PowerState: в PWR_FULL история не читается
+    uint8_t  flags;       // бит 0 — последняя установка часов была точной
+    uint16_t _rsvd;
+};
+
+// Заголовок страницы OP_HALL_LOG. За ним n записей кольца (см. hall_log.h).
+// Первая запись начинается ровно на контрольной точке: t0 — время до неё.
+struct PovHallPage {
+    uint32_t boot_id;
+    uint32_t seq0;        // номер первой записи страницы
+    uint32_t n;
+    uint32_t head;        // следующая запись, которая будет сделана
+    uint32_t oldest;      // самая старая доступная
+    int64_t  t0;          // мкс esp_timer до первой записи
+    int16_t  cal_x100[6]; // калибровка датчиков, сотые градуса
+    uint8_t  arm_reverse;
+    int8_t   dir;         // rotation_dir сейчас
+    uint16_t _rsvd;
+};
+
+// Заголовок ответа OP_HALL_HIST. За ним n байт файла с позиции off.
+struct PovHallHist {
+    uint32_t size;        // размер файла, 0 — файла нет
+    uint32_t key_boot;    // первый блок файла: сменился — файл провернулся,
+    uint32_t key_seq;     //   читать с начала
+    uint32_t off;
+    uint32_t n;
 };
 
 // Ответ на OP_UP_BEGIN / OP_OTA_BEGIN

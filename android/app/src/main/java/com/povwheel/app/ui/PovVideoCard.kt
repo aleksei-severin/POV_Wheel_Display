@@ -8,6 +8,7 @@ import android.os.Build
 import android.provider.MediaStore
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -22,6 +23,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -29,6 +31,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -41,8 +46,8 @@ import com.povwheel.app.povvideo.PovVideoController.State
 import java.util.Locale
 
 /**
- * Карточка «Render POV Video»: ролик с колесом из галереи → сводка о тиках → рендер,
- * где каждая 1/6 оборота становится одним чистым кадром (как tools/pov_fps_blend на ПК).
+ * Карточка «Render POV Video»: ролик с колесом из галереи → поиск лога Холла в архиве на
+ * время записи и сводка → рендер, где каждая 1/6 оборота становится одним чистым кадром.
  */
 @Composable
 fun PovVideoCard(ctrl: PovVideoController) {
@@ -82,6 +87,13 @@ fun PovVideoCard(ctrl: PovVideoController) {
         else ctrl.render()
     }
 
+    // Лог нашёлся (хотя бы на часть ролика) — рендер начинается сам; что синхронизировано,
+    // показывает полоса над сводкой. Отменить можно кнопкой Stop.
+    LaunchedEffect(st) {
+        val s = st
+        if (s is State.Ready && s.a.renderable && ctrl.consumeAutoRender()) startRender()
+    }
+
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Button(
             onClick = hapticClick { openGallery() },
@@ -91,8 +103,10 @@ fun PovVideoCard(ctrl: PovVideoController) {
 
         when (val s = st) {
             is State.Idle -> Hint(
-                "Pick a video of the spinning wheel recorded with sound (the wheel chirps at 15–20 kHz on every sweep). " +
-                    "Every 1/6 turn becomes one clean frame; the result is saved to the gallery next to the original."
+                "Pick a video of the spinning wheel, filmed with any camera. The app looks up the wheel's Hall sensor log " +
+                    "for the time the video was recorded (collected automatically while a wheel is connected to this phone) " +
+                    "and matches it to the frames. Every 1/6 turn becomes one clean frame; the result is saved to the gallery " +
+                    "next to the original."
             )
 
             is State.Analyzing -> {
@@ -193,11 +207,40 @@ private fun Hint(text: String) {
 @Composable
 private fun Report(a: PovAnalysis) {
     Text(a.displayName, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+    SyncBar(a)
     Text(
         a.report.joinToString("\n"),
         fontFamily = FontFamily.Monospace,
         fontSize = 11.sp,
         lineHeight = 14.sp,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+}
+
+/**
+ * Шкала ролика: где есть синхронизация по логу Холла (окрашено) и где кадры пойдут как
+ * есть. Лог мог сохраниться не целиком — рендер всё равно идёт, просто склеены будут
+ * только окрашенные отрезки.
+ */
+@Composable
+private fun SyncBar(a: PovAnalysis) {
+    val track = MaterialTheme.colorScheme.surfaceVariant
+    val fill = MaterialTheme.colorScheme.primary
+    val dur = a.durationSec.coerceAtLeast(1e-3)
+    Canvas(Modifier.fillMaxWidth().height(10.dp)) {
+        val r = CornerRadius(size.height / 2, size.height / 2)
+        drawRoundRect(track, cornerRadius = r)
+        for (iv in a.syncRanges) {
+            val x0 = (iv[0] / dur).toFloat().coerceIn(0f, 1f) * size.width
+            val x1 = (iv[1] / dur).toFloat().coerceIn(0f, 1f) * size.width
+            if (x1 > x0) drawRoundRect(fill, topLeft = Offset(x0, 0f), size = Size(x1 - x0, size.height), cornerRadius = r)
+        }
+    }
+    val covered = a.syncRanges.sumOf { it[1] - it[0] }
+    Text(
+        if (a.syncRanges.isEmpty()) "No synced range in this video"
+        else String.format(Locale.US, "Synced by the Hall log: %.1f of %.1f s", covered, a.durationSec),
+        style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant
     )
 }

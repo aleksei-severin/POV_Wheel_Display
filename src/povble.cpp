@@ -26,12 +26,14 @@
 #include "povble.h"
 #include "network.h"
 #include "effects.h"
+#include "hall_log.h"
 #include <NimBLEDevice.h>
 #include <LittleFS.h>
 #include <Update.h>
 #include <esp_heap_caps.h>
 #include <esp_ota_ops.h>
 #include <esp_system.h>
+#include <esp_timer.h>
 #include <sys/time.h>
 #include <time.h>
 
@@ -53,6 +55,9 @@ static_assert(sizeof(PovFsInfo)   == 20, "PovFsInfo != FsInfo.SIZE в Proto.kt")
 static_assert(sizeof(PovUpBegin)  == 14, "PovUpBegin != заголовок заливки в BleClient.kt");
 static_assert(sizeof(PovUpReady)  ==  6, "PovUpReady != UpReady.parse в Proto.kt");
 static_assert(sizeof(PovFlow)     ==  9, "PovFlow != Flow.parse в Proto.kt");
+static_assert(sizeof(PovTime)     == 40, "PovTime != TimeInfo.SIZE в Proto.kt");
+static_assert(sizeof(PovHallPage) == 44, "PovHallPage != HallPage.SIZE в Proto.kt");
+static_assert(sizeof(PovHallHist) == 20, "PovHallHist != HallHist.SIZE в Proto.kt");
 
 // ---------------------------------------------------------------------
 //  Общие счётчики версий. Раньше жили static в network.cpp; теперь их
@@ -710,6 +715,23 @@ static bool nameOk(const String& n) {
     return n.indexOf("..") < 0;
 }
 
+// Ответ OP_TIME / OP_TIME_SET. Метка esp_timer снимается последней, прямо
+// перед отправкой: телефон относит её к середине своего круга запрос-ответ,
+// и всё, что случилось бы между меткой и уходом посылки, легло бы в ошибку.
+static void sendTime(uint8_t op, uint8_t seq) {
+    PovTime t;
+    memset(&t, 0, sizeof(t));
+    t.boot_id   = hallLogBootId();
+    t.clock_gen = hallClockGen();
+    t.sleep_us  = hallSleepUs();
+    t.head_seq  = hallLogHead();
+    t.pwr       = (uint8_t)power_state;
+    t.flags     = hallClockPrecise() ? 1 : 0;
+    t.wall_us   = hallWallUs();      // пара снимается подряд — расходятся на микросекунды
+    t.esp_us    = esp_timer_get_time();
+    sendRsp(op, seq, ST_OK, &t, sizeof(t));
+}
+
 // ---------------------------------------------------------------------
 //  Обработка команд
 // ---------------------------------------------------------------------
@@ -731,7 +753,14 @@ static void handleCmd(const uint8_t* d, size_t n) {
     // Slideshow: «Nothing outside the Hall ISR may write last_hall_time»).
     // Реальное взаимодействие (OP_PLAY, OP_STOP, настройки и т.п.) по-прежнему
     // сбрасывает таймер как обычно.
-    if (op != OP_TELE && op != OP_FRAG && op != OP_SYNC_TICK) last_web_activity_time = millis();
+    //
+    // Обмен лога Холла (OP_TIME/OP_TIME_SET/OP_HALL_LOG/OP_HALL_HIST) — того же
+    // рода: приложение ведёт его само, пока колесо на связи, чтобы архив для
+    // склейки видео был полным. Колесо на полке рядом с телефоном обязано
+    // уснуть, как и без него.
+    if (op != OP_TELE && op != OP_FRAG && op != OP_SYNC_TICK &&
+        op != OP_TIME && op != OP_TIME_SET && op != OP_HALL_LOG && op != OP_HALL_HIST)
+        last_web_activity_time = millis();
 
     switch (op) {
 
@@ -746,7 +775,7 @@ static void handleCmd(const uint8_t* d, size_t n) {
         h.frame_stride  = FRAME_STRIDE_PAL;
         h.mtu           = peer_mtu;
         h.features      = POV_FEAT_DEFLATE | POV_FEAT_OTA | POV_FEAT_PREVIEW | POV_FEAT_WIFI |
-                          POV_FEAT_ALBUM_SEL;
+                          POV_FEAT_ALBUM_SEL | POV_FEAT_HALL_LOG;
         h.uptime_s      = millis() / 1000;
         // Именно видимое имя: приложение подписывает им строку списка, и
         // расходиться с тем, что пришло в рекламе, оно не должно.
@@ -993,7 +1022,8 @@ static void handleCmd(const uint8_t* d, size_t n) {
         // 640 КБ резерва оставляют потолок «пустого» PSRAM примерно там же, где
         // он был у прежнего расчёта от largest_free_block − 256 КБ, но теперь он
         // не проседает, когда что-то играет.
-        const uint32_t PS_RESERVE = 640 * 1024, FS_RESERVE = 128 * 1024, HDR = 8;
+        // + кольцо лога Холла: оно занято с загрузки и под анимацию не отдаётся.
+        const uint32_t PS_RESERVE = 640 * 1024 + HLOG_PSRAM_BYTES, FS_RESERVE = 128 * 1024, HDR = 8;
         size_t ps_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
         uint32_t ps_usable = (ps_total > PS_RESERVE) ? (ps_total - PS_RESERVE) : 0;
         i.psram_free = ps_usable;   // приложение показывает это как «доступно под анимацию»
@@ -1168,6 +1198,67 @@ static void handleCmd(const uint8_t* d, size_t n) {
             vTaskDelay(pdMS_TO_TICKS(300));
             ESP.restart();
         }
+        break;
+    }
+
+    case OP_TIME:
+        sendTime(op, seq);
+        break;
+
+    case OP_TIME_SET: {
+        if (pn < 20) { sendRsp(op, seq, ST_BAD_ARG); break; }
+        int64_t wall, at; int32_t tz;
+        memcpy(&wall, pl, 8); memcpy(&at, pl + 8, 8); memcpy(&tz, pl + 16, 4);
+        // Телефон назвал время UTC для момента at по нашим часам esp_timer —
+        // переносим его на «сейчас» тем же кварцем.
+        int64_t now = esp_timer_get_time();
+        povSetTimeUs(wall + (now - at), tz);
+        webLogf("[SYS] Clock set precisely (gen %lu)", (unsigned long)hallClockGen());
+        sendTime(op, seq);
+        break;
+    }
+
+    case OP_HALL_LOG: {
+        if (pn < 6) { sendRsp(op, seq, ST_BAD_ARG); break; }
+        uint32_t from; uint16_t mx;
+        memcpy(&from, pl, 4); memcpy(&mx, pl + 4, 2);
+        size_t cap = (STAGE_CAP - sizeof(PovHallPage)) / 4;
+        if (mx == 0 || mx > cap) mx = (uint16_t)(cap > 0xFFFF ? 0xFFFF : cap);
+        // Страница начинается с контрольной точки НЕ ПОЗЖЕ from — до 63 записей
+        // назад. Страница короче двух интервалов точек могла бы так и не дойти до
+        // from, и телефон спрашивал бы одно и то же место вечно.
+        if (mx < 2 * HLOG_CP_EVERY) mx = 2 * HLOG_CP_EVERY;
+        PovHallPage pg;
+        memset(&pg, 0, sizeof(pg));
+        uint32_t* ev = (uint32_t*)(stage + sizeof(PovHallPage));
+        pg.n = (uint32_t)hallLogRead(from, ev, mx, &pg.seq0, &pg.t0, &pg.oldest, &pg.head);
+        pg.boot_id = hallLogBootId();
+        hallGetCal(pg.cal_x100, &pg.arm_reverse);
+        pg.dir = rotation_dir;
+        memcpy(stage, &pg, sizeof(pg));
+        stage_len = sizeof(pg) + pg.n * 4;
+        stageRsp(op, seq);
+        break;
+    }
+
+    case OP_HALL_HIST: {
+        if (pn < 7) { sendRsp(op, seq, ST_BAD_ARG); break; }
+        // Чтение флеша гасит кеш команд на обоих ядрах — пока лента светится,
+        // это рваный кадр на ободе. Телефон спросит снова, когда колесо встанет.
+        if (power_state == PWR_FULL) { sendRsp(op, seq, ST_BUSY); break; }
+        uint8_t which = pl[0];
+        uint32_t off; uint16_t mx;
+        memcpy(&off, pl + 1, 4); memcpy(&mx, pl + 5, 2);
+        size_t cap = STAGE_CAP - sizeof(PovHallHist);
+        if (mx == 0 || mx > cap) mx = (uint16_t)(cap > 0xFFFF ? 0xFFFF : cap);
+        PovHallHist hh;
+        memset(&hh, 0, sizeof(hh));
+        hh.off = off;
+        hh.n = (uint32_t)hallLogHistRead(which, off, stage + sizeof(hh), mx,
+                                         &hh.size, &hh.key_boot, &hh.key_seq);
+        memcpy(stage, &hh, sizeof(hh));
+        stage_len = sizeof(hh) + hh.n;
+        stageRsp(op, seq);
         break;
     }
 
