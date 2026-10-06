@@ -546,6 +546,10 @@ extern volatile bool ota_in_progress;
 extern void webLog(const char* msg);
 extern void webLogf(const char* fmt, ...);
 
+// Сбросить во флеш всё отложенное (настройки, last_file, текст и параметры
+// эффектов) немедленно. Только при погашенной ленте — см. safeOTAShutdown().
+extern void flushPendingSettings();
+
 // Местное время. false — синхронизации с браузером ещё не было.
 extern bool localClock(int& h, int& m, int& s);
 // Местная дата (год полностью, месяц 1…12, день 1…31). false — как у localClock().

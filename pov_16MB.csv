@@ -15,6 +15,10 @@
 # 1472KB slots. Handing the remainder to one slot would make them unequal: the
 # build would check the firmware against the larger one and OTA would then fail
 # writing into the smaller.
+# That tail (0xFF0000..0xFFFFFF) is NOT free, though: the firmware keeps the
+# custom text and the effect settings there as raw flash (effects.cpp, FXSTORE_*),
+# precisely because no flashing step touches it - firmware upload, OTA and
+# uploadfs all leave it alone. Do not give it to a partition.
 #
 # WARNING: changing this table is a USB-only operation (OTA does not touch the
 # partition table) and it erases littlefs - the partition moves. Settings in nvs

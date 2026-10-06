@@ -55,7 +55,7 @@ The geometry and every engineering trade-off target one use case: a 29" MTB whee
 | **Brains** | ESP32-S3, 16 MB flash, 8 MB PSRAM |
 | **Sync** | **6 Hall sensors** (one per arm) + one magnet on the fork or frame |
 | **Sensors** | Ambient light (auto-brightness), vibration (wake by shake) |
-| **Power** | 1S Li-Po with USB charging, **up to 6 h** display time, **up to 1 year** standby |
+| **Power** | 1S6P Li-Po pack — six 1000 mAh cells in parallel, **6000 mAh** total — with USB charging, **up to 6 h** display time, **up to 1 year** standby |
 | **Enclosure** | Water-resistant |
 
 **Both sides are readable.** Text, the clock and the speedometer are mirrored on the far face, so
@@ -120,6 +120,11 @@ flowchart LR
 
 All of this runs on the phone's GPU, with no extra hardware and no special camera.
 
+Long-press **Render POV Video** to export the rotation archive as a ZIP — a readable `README.txt`
+listing, per display, every session and when its image was on, plus a CSV of every sensor event — or
+to import one. An import merges into the phone's archive and never replaces what is already there,
+so another phone's archive can be rendered here as well.
+
 ---
 
 ## 🎨 Built-in effects
@@ -127,7 +132,7 @@ All of this runs on the phone's GPU, with no extra hardware and no special camer
 | Effect | What it does |
 |---|---|
 | 🏎️ **Speed** | Live speedometer in big digits that shift from green to red as you speed up (red point set in the app) |
-| 🕐 **Clock** | Digital time `hh.mm.ss` over the date `yyyy.mm.dd`, solid or rainbow |
+| 🕐 **Clock** | Time `hh:mm:ss` with blinking colons around the top of the rim, the date `yyyy.mm.dd` around the bottom, solid or rainbow |
 | ✍️ **Text** | Your text around the rim, solid or rainbow |
 | 🌈 **Rainbow** | A colour spiral flowing across the disc — speed and band sharpness set in the app |
 | 🎯 **Testing** | Alignment cross with a colour per arm, for calibration |

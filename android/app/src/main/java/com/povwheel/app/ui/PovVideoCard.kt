@@ -15,24 +15,33 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -100,16 +109,31 @@ fun PovVideoCard(ctrl: PovVideoController) {
         if (s is State.Ready && s.a.renderable && ctrl.consumeAutoRender()) startRender()
     }
 
+    var archiveOpen by remember { mutableStateOf(false) }
+    val cs = MaterialTheme.colorScheme
+
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Button(
-            onClick = hapticClick { openGallery() },
-            enabled = !busy,
-            modifier = Modifier.fillMaxWidth()
+        // Вид — как у обычной Button, но с длинным тапом: он открывает архив лога
+        // (выгрузить / загрузить). У Material-кнопки долгого нажатия нет.
+        Surface(
+            shape = ButtonDefaults.shape,
+            color = if (!busy) cs.primary else cs.onSurface.copy(alpha = 0.12f),
+            contentColor = if (!busy) cs.onPrimary else cs.onSurface.copy(alpha = 0.38f),
+            modifier = Modifier.fillMaxWidth().heightIn(min = ButtonDefaults.MinHeight)
+                .clip(ButtonDefaults.shape)
+                .tapCombinedClickable(onLongClick = { archiveOpen = true }) { if (!busy) openGallery() }
         ) {
-            VideoCamIcon()
-            Spacer(Modifier.width(8.dp))
-            Text("Render POV Video")
+            Row(
+                Modifier.padding(ButtonDefaults.ContentPadding),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                VideoCamIcon()
+                Spacer(Modifier.width(8.dp))
+                Text("Render POV Video", style = MaterialTheme.typography.labelLarge)
+            }
         }
+        if (archiveOpen) HallArchiveDialog(ctrl) { archiveOpen = false }
 
         when (val s = st) {
             is State.Idle -> {}
@@ -205,6 +229,91 @@ fun PovVideoCard(ctrl: PovVideoController) {
             }
         }
     }
+}
+
+/**
+ * Архив лога Холла (длинный тап по «Render POV Video»): выгрузить ZIP — README.txt
+ * со сводкой по дисплеям (сессии, когда горело изображение) и CSV событий — или
+ * загрузить такой ZIP обратно. Загрузка сливает его с архивом телефона, ничего не
+ * заменяя.
+ */
+@Composable
+private fun HallArchiveDialog(ctrl: PovVideoController, onDismiss: () -> Unit) {
+    val op by ctrl.archive.collectAsState()
+    val working = op is PovVideoController.ArchiveOp.Working
+    // Сводка архива — заново после каждой выгрузки/загрузки.
+    val stats by produceState<com.povwheel.app.hall.HallArchive.Stats?>(null, working) {
+        value = ctrl.archiveStats()
+    }
+    val export = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { u ->
+        u?.let { ctrl.exportArchive(it) }
+    }
+    val import = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { u ->
+        u?.let { ctrl.importArchive(it) }
+    }
+    DisposableEffect(Unit) { onDispose { ctrl.resetArchiveOp() } }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Hall log archive") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                val s = stats
+                Text(
+                    when {
+                        s == null -> "Reading the archive…"
+                        s.sessions == 0 -> "The archive is empty."
+                        else -> s.wheels.toString() + (if (s.wheels == 1) " display · " else " displays · ") +
+                            s.sessions + (if (s.sessions == 1) " session · " else " sessions · ") +
+                            String.format(Locale.US, "%.1f MB", s.bytes / 1048576.0) +
+                            (if (s.firstUs != null && s.lastUs != null) "\n" + dateSpan(s.firstUs, s.lastUs) else "")
+                    },
+                    style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    "Export saves a ZIP: README.txt with a summary per display — every session and the " +
+                        "times its image was on — plus one CSV per session with every sensor event.\n" +
+                        "Import merges such a ZIP into this phone's archive: new events are added, " +
+                        "nothing already here is replaced.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                when (val o = op) {
+                    is PovVideoController.ArchiveOp.Working -> Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                        Text(o.step, style = MaterialTheme.typography.bodySmall)
+                    }
+                    is PovVideoController.ArchiveOp.Done ->
+                        Text(o.message, style = MaterialTheme.typography.bodySmall, color = Ok)
+                    is PovVideoController.ArchiveOp.Failed ->
+                        Text(o.message, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                    PovVideoController.ArchiveOp.Idle -> {}
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = hapticClick { export.launch(ctrl.exportFileName()) },
+                        enabled = !working && (stats?.sessions ?: 0) > 0
+                    ) { Text("Export…") }
+                    OutlinedButton(
+                        onClick = hapticClick { import.launch(arrayOf("application/zip", "application/x-zip-compressed", "application/octet-stream")) },
+                        enabled = !working
+                    ) { Text("Import…") }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = hapticClick(onDismiss)) { Text("Close") } }
+    )
+}
+
+/** «2026-09-20 … 2026-10-06» по времени первой и последней записи архива. */
+private fun dateSpan(firstUs: Double, lastUs: Double): String {
+    val f = java.text.SimpleDateFormat("yyyy-MM-dd", Locale.US)
+    val a = f.format(java.util.Date((firstUs / 1000).toLong()))
+    val b = f.format(java.util.Date((lastUs / 1000).toLong()))
+    return if (a == b) a else "$a … $b"
 }
 
 /** Сводка о файле — те же строки, что скрипт выводит в консоль. */

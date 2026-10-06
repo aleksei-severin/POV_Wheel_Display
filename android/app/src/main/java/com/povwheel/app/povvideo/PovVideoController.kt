@@ -9,7 +9,10 @@ import android.os.Build
 import android.os.Environment
 import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
+import com.povwheel.app.hall.HallArchive
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -19,6 +22,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
+import java.util.Locale
 import java.util.concurrent.Executors
 
 /**
@@ -166,6 +170,93 @@ class PovVideoController(private val app: Application, private val scope: Corout
             }
         }
     }
+
+    // ------------------------------------------------ архив лога: выгрузка и загрузка
+
+    sealed interface ArchiveOp {
+        data object Idle : ArchiveOp
+        data class Working(val step: String) : ArchiveOp
+        data class Done(val message: String) : ArchiveOp
+        data class Failed(val message: String) : ArchiveOp
+    }
+
+    private val _archive = MutableStateFlow<ArchiveOp>(ArchiveOp.Idle)
+    /** Ход выгрузки/загрузки архива лога Холла (окно по длинному тапу на кнопке). */
+    val archive: StateFlow<ArchiveOp> = _archive
+    private var archiveJob: Job? = null
+
+    fun resetArchiveOp() { if (_archive.value !is ArchiveOp.Working) _archive.value = ArchiveOp.Idle }
+
+    /** Что сейчас в архиве — для окна. */
+    suspend fun archiveStats(): HallArchive.Stats =
+        withContext(Dispatchers.IO) {
+            HallArchive.init(app)
+            HallArchive.stats()
+        }
+
+    /** Имя файла выгрузки по умолчанию: pov-hall-log-2026-10-06_1540.zip. */
+    fun exportFileName(): String =
+        "pov-hall-log-" + java.text.SimpleDateFormat("yyyy-MM-dd_HHmm", Locale.US)
+            .format(java.util.Date()) + ".zip"
+
+    /** Весь архив — в ZIP по [uri]. Сначала свежий хвост лога с колёс на связи. */
+    fun exportArchive(uri: Uri) {
+        if (archiveJob?.isActive == true) return
+        archiveJob = scope.launch {
+            try {
+                logRefresher?.let { r ->
+                    _archive.value = ArchiveOp.Working("Fetching the latest Hall log…")
+                    runCatching { withTimeoutOrNull(15_000) { r() } }
+                }
+                _archive.value = ArchiveOp.Working("Exporting…")
+                val res = withContext(Dispatchers.IO) {
+                    HallArchive.init(app)
+                    val out = app.contentResolver.openOutputStream(uri, "wt")
+                        ?: throw java.io.IOException("cannot write the chosen file")
+                    out.use { o ->
+                        HallArchive.export(o) { s -> _archive.value = ArchiveOp.Working("Exporting " + s + "…") }
+                    }
+                }
+                _archive.value = if (res.sessions == 0) ArchiveOp.Done("The archive is empty — nothing to export.")
+                else ArchiveOp.Done("Exported " + plural(res.wheels, "display") + ", " + plural(res.sessions, "session") +
+                    ", " + String.format(Locale.US, "%,d", res.events) + " events. README.txt inside has the summary.")
+            } catch (e: Throwable) {
+                if (e is CancellationException) throw e
+                _archive.value = ArchiveOp.Failed("Export failed: " + (e.message ?: e.javaClass.simpleName))
+            }
+        }
+    }
+
+    /** ZIP по [uri] (формат выгрузки) — слить с архивом телефона, ничего не заменяя. */
+    fun importArchive(uri: Uri) {
+        if (archiveJob?.isActive == true) return
+        archiveJob = scope.launch {
+            try {
+                _archive.value = ArchiveOp.Working("Importing…")
+                val res = withContext(Dispatchers.IO) {
+                    HallArchive.init(app)
+                    val inp = app.contentResolver.openInputStream(uri)
+                        ?: throw java.io.IOException("cannot read the chosen file")
+                    inp.use { i ->
+                        HallArchive.import(i, File(app.cacheDir, "hall_import")) { s ->
+                            _archive.value = ArchiveOp.Working("Importing " + s + "…")
+                        }
+                    }
+                }
+                _archive.value = ArchiveOp.Done(
+                    if (res.events == 0L) "Nothing new — everything in this file is already in the archive (" +
+                        plural(res.sessions, "session") + " checked)."
+                    else "Merged " + plural(res.sessions, "session") + " from " + plural(res.wheels, "display") + ": " +
+                        String.format(Locale.US, "%,d", res.events) + " new events."
+                )
+            } catch (e: Throwable) {
+                if (e is CancellationException) throw e
+                _archive.value = ArchiveOp.Failed("Import failed: " + (e.message ?: e.javaClass.simpleName))
+            }
+        }
+    }
+
+    private fun plural(n: Int, word: String) = n.toString() + " " + word + (if (n == 1) "" else "s")
 
     fun cancel() { cancelFlag = true }
 

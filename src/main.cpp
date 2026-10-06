@@ -356,8 +356,7 @@ static void flushSettings() {
     // Текст и цвет эффекта «Текст», параметры радуги и часов — тем же
     // отложенным путём и с тем же правилом: только пока лента не светится (их
     // правки взводят settings_dirty).
-    effectsTextFlush();
-    effectsFxFlush();
+    effectsFlush();
     if (!settings_dirty) return;
     SettingsBlob now, stored;
     fillSettingsBlob(now);
@@ -1947,6 +1946,15 @@ static void flushSlideList() {
     if (prefs.getUChar("slidelistmode", 0) != mode)  prefs.putUChar("slidelistmode", mode);
     if (prefs.getUChar("slideeffmask", 0) != slideEffectMask) prefs.putUChar("slideeffmask", slideEffectMask);
     slide_list_dirty = false;
+}
+
+// Всё отложенное — во флеш сейчас же: перед прошивкой по воздуху колесо уже не
+// вернётся в loop(), и правка, сделанная за секунды до неё (текст, цвет,
+// настройки, отбор слайдшоу), иначе пропала бы. Лента обязана быть погашена.
+void flushPendingSettings() {
+    flushLastFile();
+    flushSettings();
+    flushSlideList();
 }
 
 // Будит renderingTask вне очереди. Нужно загрузчику файла: иначе флаг

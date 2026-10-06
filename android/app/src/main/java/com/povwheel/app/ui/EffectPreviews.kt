@@ -154,20 +154,27 @@ internal fun SpeedDisc(kmh: Float, red: Int, px: Int, modifier: Modifier = Modif
     StyledMaskDisc(m, TextStyle(rainbow = false, rgb = FxMask.speedColor(v, red)), px, modifier)
 }
 
-/** Clock: время и дата телефона (часы колеса выставляет он же) цветом часов колеса. */
+/**
+ * Clock: время и дата телефона (часы колеса выставляет он же) по окружности, как на
+ * ободе, цветом часов колеса. Двоеточия мигают в той же фазе, что на колесе: горят
+ * первые полсекунды каждой секунды.
+ */
 @Composable
 internal fun ClockDisc(style: TextStyle, px: Int, modifier: Modifier = Modifier) {
     val mask by produceState<ByteArray?>(null) {
         var shown = -1L
         while (true) {
+            val ms = System.currentTimeMillis()
             val now = LocalDateTime.now()
-            val key = now.toLocalDate().toEpochDay() * 86400 + now.toLocalTime().toSecondOfDay()
+            val colon = ms % 1000L < 500L
+            val key = (now.toLocalDate().toEpochDay() * 86400 + now.toLocalTime().toSecondOfDay()) * 2 +
+                (if (colon) 1 else 0)
             if (key != shown) {
                 shown = key
-                value = withContext(Dispatchers.Default) { FxMask.clock(now) }
+                value = withContext(Dispatchers.Default) { FxMask.clock(now, colon) }
             }
-            // До начала следующей секунды — смена цифр не опаздывает.
-            delay((1000L - System.currentTimeMillis() % 1000L).coerceIn(20L, 1000L))
+            // До следующей половины секунды — двоеточия и цифры не опаздывают.
+            delay((500L - System.currentTimeMillis() % 500L).coerceIn(20L, 500L))
         }
     }
     val m = mask ?: return

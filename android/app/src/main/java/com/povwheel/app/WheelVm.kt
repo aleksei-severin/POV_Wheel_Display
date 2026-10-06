@@ -109,6 +109,9 @@ data class WheelEntry(
 /** Номер эффекта «Текст» — EFF_TEXT в include/effects.h. */
 const val TEXT_EFFECT_ID = 7
 
+/** Текст эффекта «Текст», пока пользователь не задал свой (радугой). */
+const val DEFAULT_TEXT = "Hello World!"
+
 class WheelVm(app: Application) : AndroidViewModel(app) {
 
     private val ctx: Context get() = getApplication()
@@ -2347,18 +2350,29 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             }
         }
 
-        val remaining = jobs.toMutableList()
         var ok = 0
         var skip = 0
         var fail = 0
 
+        // Очередь на экране — ЖИВАЯ: пока льётся один файл, остальные можно убрать
+        // длинным тапом (removeUpItem). Поэтому прошедший файл вычёркиваем из
+        // текущего списка сессии, а не пересобираем список из снимка [jobs] —
+        // иначе убранный файл возвращался в очередь и заливался следом.
+        fun dropItem(item: UpItem) {
+            val left = s.items.value.filter { it.uri != item.uri }
+            s.items.value = left
+            s.sel.value = s.sel.value.coerceIn(0, maxOf(0, left.size - 1))
+        }
+
         try {
         for (item in jobs) {
+            // Убран из очереди, пока заливались предыдущие, — пропускаем.
+            if (s.items.value.none { it.uri == item.uri }) continue
             val c = client(addr)
             if (c == null || c.link.value != Link.Ready) {
                 fail++
                 s.status.value = item.name + " — lost connection"; s.kind.value = 2
-                remaining.remove(item); s.items.value = remaining.toList()
+                dropItem(item)
                 continue
             }
             s.currentUri.value = item.uri
@@ -2374,7 +2388,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             if (est != null && sameOnWheel(item, est, filesByAddr[addr] ?: emptyList())) {
                 ok++; skip++
                 s.status.value = item.name + " — already there, skipped"; s.kind.value = 1
-                remaining.remove(item); s.items.value = remaining.toList()
+                dropItem(item)
                 continue
             }
             val fs0 = fsInfoByAddr[addr]
@@ -2387,7 +2401,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                     s.status.value = item.name + " — not enough free memory (" + fmtKb(est) +
                         " > " + fmtKb(maxOf(0L, free0 - UPLOAD_MARGIN)) + " free)"
                     s.kind.value = 2
-                    remaining.remove(item); s.items.value = remaining.toList()
+                    dropItem(item)
                     continue
                 }
             }
@@ -2404,7 +2418,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 fail++
                 val why = e.message?.takeIf { it.isNotBlank() } ?: e::class.java.simpleName
                 s.status.value = item.name + " — failed: " + why; s.kind.value = 2
-                remaining.remove(item); s.items.value = remaining.toList()
+                dropItem(item)
                 continue
             }
             res.warning?.let { say(it) }
@@ -2417,7 +2431,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             if (dup != null && dup.size == res.data.size.toLong()) {
                 ok++; skip++
                 s.status.value = item.name + " — already there, skipped"; s.kind.value = 1
-                remaining.remove(item); s.items.value = remaining.toList()
+                dropItem(item)
                 continue
             }
 
@@ -2432,7 +2446,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 s.status.value = item.name + " — not enough free memory (" + fmtKb(res.data.size.toLong()) +
                     " > " + fmtKb(maxOf(0L, freeAfter - UPLOAD_MARGIN)) + " free)"
                 s.kind.value = 2
-                remaining.remove(item); s.items.value = remaining.toList()
+                dropItem(item)
                 continue
             }
 
@@ -2510,9 +2524,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 say((c.hello?.name ?: addr) + ": " + (e.message ?: "upload failed"))
                 s.status.value = item.name + " — failed: " + (e.message ?: "upload failed"); s.kind.value = 2
             }
-            remaining.remove(item)
-            s.items.value = remaining.toList()
-            s.sel.value = s.sel.value.coerceIn(0, maxOf(0, remaining.size - 1))
+            dropItem(item)
         }
 
         s.progress.value = -1f
@@ -2704,9 +2716,36 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     private suspend fun fetchTextFx(addr: String, c: BleClient) {
         if (c.hello?.hasText != true) return
         val (st, blob) = runCatching { c.textGet() }.getOrNull() ?: return
-        val un = withContext(Dispatchers.Default) { TextMask.unpack(blob) }
         if (textEditing && addr == current.value) return
+        if (blob.isEmpty() && textProvisioned.add(addr)) {
+            provisionDefaultText(addr, c, st)
+            return
+        }
+        val un = withContext(Dispatchers.Default) { TextMask.unpack(blob) }
         adoptTextFx(addr, TextFx(un?.first ?: "", st, un?.second, blob.takeIf { un != null }))
+    }
+
+    /** Колёса, которым в этом запуске уже отправляли текст по умолчанию. */
+    private val textProvisioned = HashSet<String>()
+
+    /**
+     * Текст на колесе ни разу не задавали (блоб пустой) — ставим «Hello World!»
+     * радугой. Само колесо до этого показывает ту же строку своим шрифтом 5×7;
+     * отсюда она уходит нарисованной телефоном и дальше хранится на колесе, как
+     * любой текст. Цвет трогаем, только если он заводской старой прошивки (белый):
+     * новая и так начинает с радуги, а выбранный руками цвет не перезаписываем.
+     */
+    private suspend fun provisionDefaultText(addr: String, c: BleClient, st: TextStyle) {
+        val mask = withContext(Dispatchers.Default) { TextMask.render(DEFAULT_TEXT) }
+        val blob = withContext(Dispatchers.Default) { TextMask.pack(DEFAULT_TEXT, mask) }
+        val style = if (!st.rainbow && st.rgb == 0xFFFFFF && st.speed == 30) st.copy(rainbow = true) else st
+        try {
+            c.textSet(blob)
+            if (style != st) c.textStyle(style)
+            adoptTextFx(addr, TextFx(DEFAULT_TEXT, style, mask, blob))
+        } catch (_: Exception) {
+            adoptTextFx(addr, TextFx("", st, null, null))
+        }
     }
 
     // Правки — последним значением: StateFlow сам пропускает промежуточные,

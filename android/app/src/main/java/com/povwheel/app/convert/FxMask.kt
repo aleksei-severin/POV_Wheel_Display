@@ -8,6 +8,7 @@ import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.roundToInt
 import kotlin.math.sin
+import kotlin.math.sqrt
 
 /**
  * Миниатюры эффектов, которые колесо рисует само (Speed, Clock, Rainbow), — тем
@@ -22,7 +23,8 @@ import kotlin.math.sin
 object FxMask {
     // ---- Шрифт и раскладка: копия effects.cpp ----
 
-    // Единицы, в которых крайний диод на радиусе 47.5, центр в нуле, ось y вниз.
+    // Единицы, в которых крайний диод на радиусе 47.5, центр в нуле, ось y вниз;
+    // угол растёт по часовой стрелке от «3 часов», 270° — верх.
     private const val SS = 4
     private const val R_OUT = 47.5
     private const val LED_R_INNER_MM = 49.0
@@ -34,6 +36,8 @@ object FxMask {
     private const val G_H = 13
     private const val G_DOT = 14
     private const val G_DASH = 15
+    private const val G_COLON = 16
+    private const val G_SPACE1 = 17
 
     private val FONT57 = arrayOf(
         intArrayOf(0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E), // 0
@@ -51,14 +55,15 @@ object FxMask {
         intArrayOf(0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10), // /
         intArrayOf(0x10, 0x10, 0x16, 0x19, 0x11, 0x11, 0x11), // h
         intArrayOf(0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10), // .  (ширина 1)
-        intArrayOf(0x00, 0x00, 0x00, 0x0E, 0x00, 0x00, 0x00)  // -
+        intArrayOf(0x00, 0x00, 0x00, 0x0E, 0x00, 0x00, 0x00), // -
+        intArrayOf(0x00, 0x00, 0x10, 0x00, 0x10, 0x00, 0x00), // :  (ширина 1)
+        intArrayOf(0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)  // погасшее двоеточие
     )
-    private fun glyphW(g: Int) = if (g == G_DOT) 1 else 5
+    private fun glyphW(g: Int) = if (g == G_DOT || g == G_COLON || g == G_SPACE1) 1 else 5
+    private fun glyphBit(g: Int, row: Int, col: Int): Boolean =
+        FONT57[g][row] and (if (glyphW(g) == 1) 0x10 else (0x10 shr col)) != 0
 
-    private const val CLK_SC_TIME = 2.0
-    private const val CLK_SC_DATE = 1.6
-
-    /** Строка, разложенная по столбцам: в каждом — 7 бит горящих строк шрифта. */
+    /** Прямая строка, разложенная по столбцам: в каждом — 7 бит горящих строк шрифта. */
     private class Run(val x0: Double, val y0: Double, val sc: Double, val col: IntArray)
 
     /** По центру по горизонтали; [y0] — верх строки. */
@@ -67,9 +72,8 @@ object FxMask {
         for (k in g.indices) {
             if (k > 0) cols.add(0)                              // столбец-зазор
             for (x in 0 until glyphW(g[k])) {
-                val bit = if (g[k] == G_DOT) 0x10 else (0x10 shr x)
                 var bits = 0
-                for (row in 0 until 7) if (FONT57[g[k]][row] and bit != 0) bits = bits or (1 shl row)
+                for (row in 0 until 7) if (glyphBit(g[k], row, x)) bits = bits or (1 shl row)
                 cols.add(bits)
             }
         }
@@ -78,6 +82,7 @@ object FxMask {
 
     // Точки выборки внутри ячеек — один раз на процесс.
     private val jit = DoubleArray(SS) { (it + 0.5) / SS - 0.5 }
+    private val ph = DoubleArray(Geom.SECTORS * SS)
     private val ca = DoubleArray(Geom.SECTORS * SS)
     private val sa = DoubleArray(Geom.SECTORS * SS)
     private val ledR = DoubleArray(Geom.LEDS_PER_SIDE)
@@ -85,13 +90,75 @@ object FxMask {
     init {
         for (s in 0 until Geom.SECTORS) for (k in 0 until SS) {
             val a = (s + jit[k]) * PI / 180.0
+            ph[s * SS + k] = a
             ca[s * SS + k] = cos(a); sa[s * SS + k] = sin(a)
         }
         val step = (LED_R_OUTER_MM - LED_R_INNER_MM) / (Geom.LEDS_PER_SIDE - 1)
         for (i in 0 until Geom.LEDS_PER_SIDE) ledR[i] = (LED_R_INNER_MM + i * step) / LED_R_OUTER_MM * R_OUT
     }
 
-    private fun render(runs: Array<Run>): ByteArray {
+    // ---- Строка по дуге (как arcRunMake/arcHit в effects.cpp) ----
+
+    /** Каждая строка часов занимает до стольких градусов своей половины круга —
+     *  между концами времени и даты по 30° (CLK_ARC_SPAN_DEG в effects.cpp). */
+    private const val ARC_SPAN_DEG = 150.0
+
+    /**
+     * Буквы жёсткие, повёрнуты к центру и стоят вплотную по внутреннему краю строки;
+     * [upOut] — верх букв наружу (строка сверху, по часовой), иначе к втулке (снизу,
+     * против часовой). Шрифт — наибольший, при котором строка влезает в [ARC_SPAN_DEG].
+     */
+    private class Arc(val g: IntArray, centerDeg: Double, val dir: Int, val upOut: Boolean) {
+        val sc: Double
+        val rIn: Double
+        val rHi: Double
+        val span: Double
+        val start: Double
+        val s0 = DoubleArray(g.size)
+        val w = DoubleArray(g.size)
+        val bound = DoubleArray(g.size)
+        init {
+            val rTop = R_OUT - 0.5 * pitch
+            val spanMax = ARC_SPAN_DEG * PI / 180.0
+            val cols = g.size - 1 + g.sumOf { glyphW(it) }
+            sc = spanMax * rTop / (cols + 7.0 * spanMax)
+            rIn = rTop - 7.0 * sc
+            rHi = sqrt(rTop * rTop + 6.25 * sc * sc)
+            span = cols * sc / rIn
+            start = centerDeg * PI / 180.0 - dir * span * 0.5
+            var s = 0.0
+            for (k in g.indices) {
+                s0[k] = s
+                w[k] = glyphW(g[k]) * sc
+                bound[k] = s + w[k] + sc * 0.5
+                s += w[k] + sc
+            }
+        }
+
+        fun hit(rr: Double, phi: Double): Boolean {
+            if (rr < rIn || rr > rHi) return false
+            var d = phi - start
+            while (d < -PI) d += 2 * PI
+            while (d >= PI) d -= 2 * PI
+            val a = d * dir                                   // по ходу чтения
+            if (a < -0.3 || a > span + 0.3) return false
+            val s = a * rIn
+            var k = 0
+            while (k < g.size - 1 && s >= bound[k]) k++
+            val dl = a - (s0[k] + w[k] * 0.5) / rIn
+            val lx = rr * sin(dl)                             // вдоль строки
+            val lr = rr * cos(dl) - rIn                       // от внутреннего края
+            if (lr < 0 || lr >= 7.0 * sc) return false
+            val cx = (lx + w[k] * 0.5) / sc
+            if (cx < 0) return false
+            val col = cx.toInt()
+            if (col >= glyphW(g[k])) return false
+            val ri = (lr / sc).toInt()
+            return glyphBit(g[k], if (upOut) 6 - ri else ri, col)
+        }
+    }
+
+    private fun render(runs: Array<Run>, arcs: Array<Arc> = emptyArray()): ByteArray {
         val out = ByteArray(Geom.IDX_BYTES)
         val full = SS * SS
         for (s in 0 until Geom.SECTORS) {
@@ -100,16 +167,21 @@ object FxMask {
                 for (ka in 0 until SS) {
                     val c = ca[s * SS + ka]
                     val sn = sa[s * SS + ka]
+                    val phi = ph[s * SS + ka]
                     for (kr in 0 until SS) {
                         val rr = ledR[i] + jit[kr] * pitch
-                        val x = rr * c
-                        val y = rr * sn
-                        for (r in runs) {
-                            val u = (x - r.x0) / r.sc
-                            val v = (y - r.y0) / r.sc
-                            if (u < 0 || v < 0 || v >= 7.0 || u >= r.col.size) continue
-                            if ((r.col[u.toInt()] shr v.toInt()) and 1 != 0) { hits++; break }
+                        var hit = arcs.any { it.hit(rr, phi) }
+                        if (!hit) {
+                            val x = rr * c
+                            val y = rr * sn
+                            for (r in runs) {
+                                val u = (x - r.x0) / r.sc
+                                val v = (y - r.y0) / r.sc
+                                if (u < 0 || v < 0 || v >= 7.0 || u >= r.col.size) continue
+                                if ((r.col[u.toInt()] shr v.toInt()) and 1 != 0) { hit = true; break }
+                            }
                         }
+                        if (hit) hits++
                     }
                 }
                 out[s * Geom.LEDS_PER_SIDE + i] = ((hits * 255 + full / 2) / full).toByte()
@@ -133,24 +205,26 @@ object FxMask {
         ))
     }
 
-    /** Маска часов: «hh.mm.ss» над центром, «yyyy.mm.dd» под ним; null — прочерки. */
-    fun clock(t: LocalDateTime?): ByteArray {
+    /**
+     * Маска часов по окружности: «hh:mm:ss» — верхняя половина, низ цифр к втулке;
+     * «yyyy.mm.dd» — нижняя, верх цифр к втулке. [colon] — двоеточия горят (первая
+     * половина секунды). null — часы не заведены, прочерки.
+     */
+    fun clock(t: LocalDateTime?, colon: Boolean = true): ByteArray {
         val tm: IntArray
         val dt: IntArray
         if (t != null) {
             val y = t.year
-            tm = intArrayOf(t.hour / 10, t.hour % 10, G_DOT, t.minute / 10, t.minute % 10, G_DOT,
+            val c = if (colon) G_COLON else G_SPACE1
+            tm = intArrayOf(t.hour / 10, t.hour % 10, c, t.minute / 10, t.minute % 10, c,
                 t.second / 10, t.second % 10)
             dt = intArrayOf(y / 1000 % 10, y / 100 % 10, y / 10 % 10, y % 10, G_DOT,
                 t.monthValue / 10, t.monthValue % 10, G_DOT, t.dayOfMonth / 10, t.dayOfMonth % 10)
         } else {
-            tm = IntArray(8) { if (it == 2 || it == 5) G_DOT else G_DASH }
+            tm = IntArray(8) { if (it == 2 || it == 5) G_COLON else G_DASH }
             dt = IntArray(10) { if (it == 4 || it == 7) G_DOT else G_DASH }
         }
-        return render(arrayOf(
-            run(tm, -10.0 - 7.0 * CLK_SC_TIME, CLK_SC_TIME),
-            run(dt, 10.0, CLK_SC_DATE)
-        ))
+        return render(emptyArray(), arrayOf(Arc(tm, 270.0, +1, true), Arc(dt, 90.0, -1, false)))
     }
 
     // ---- Цвет ----

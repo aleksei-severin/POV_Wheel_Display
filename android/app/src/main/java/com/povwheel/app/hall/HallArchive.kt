@@ -8,6 +8,7 @@ import java.io.FileOutputStream
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -300,7 +301,15 @@ object HallArchive {
 
     /** Все записи файла событий, по времени, без повторов номеров. */
     private fun readEvents(f: File): Triple<LongArray, ByteArray, ByteArray> {
-        if (!f.exists()) return Triple(LongArray(0), ByteArray(0), ByteArray(0))
+        val e = readEventsFull(f)
+        return Triple(e.esp, e.type, e.arg)
+    }
+
+    /** События сессии вместе с номерами записей кольца. */
+    private class Events(val esp: LongArray, val seq: LongArray, val type: ByteArray, val arg: ByteArray)
+
+    private fun readEventsFull(f: File): Events {
+        if (!f.exists()) return Events(LongArray(0), LongArray(0), ByteArray(0), ByteArray(0))
         val b = ByteBuffer.wrap(f.readBytes()).order(ByteOrder.LITTLE_ENDIAN)
         val n = b.remaining() / 16
         val esp = LongArray(n); val seq = LongArray(n); val ty = ByteArray(n); val ar = ByteArray(n)
@@ -316,8 +325,449 @@ object HallArchive {
         // Номера идут по времени, но после сортировки по номеру ещё раз — по времени
         // (страховка на случай перезапуска счётчика в одной сессии).
         keep.sortBy { esp[it] }
-        return Triple(LongArray(keep.size) { esp[keep[it]] }, ByteArray(keep.size) { ty[keep[it]] },
-            ByteArray(keep.size) { ar[keep[it]] })
+        return Events(LongArray(keep.size) { esp[keep[it]] }, LongArray(keep.size) { seq[keep[it]] },
+            ByteArray(keep.size) { ty[keep[it]] }, ByteArray(keep.size) { ar[keep[it]] })
+    }
+
+    // ------------------------------------------------------------ выгрузка и загрузка
+    //
+    // Архив можно унести с телефона и принести обратно (или на другой телефон):
+    // ZIP, в котором
+    //  - README.txt — сводка для человека: по каждому дисплею его сессии с датами и
+    //    временем, когда он светился (с оборотами), и пояснение к файлам;
+    //  - <дисплей>/wheel.json — имя и измеренные ошибки часов колеса;
+    //  - <дисплей>/<дата>_<время>_s<сессия>.csv — каждое событие строкой: местное
+    //    время, esp_timer, номер записи, событие, аргумент — читается любой таблицей;
+    //  - <дисплей>/<дата>_<время>_s<сессия>.json — пинги часов и прочее, без чего
+    //    сессию не привязать ко времени телефона (нужно для обратной загрузки).
+    // Загрузка СЛИВАЕТ такой архив с текущим: события добавляются по номерам записей
+    // (уже имеющиеся не дублируются), пинги и опорные пары — объединяются; ничего из
+    // того, что уже лежит на телефоне, не заменяется. Повторная загрузка того же
+    // файла ничего не добавляет.
+
+    class Stats(val wheels: Int, val sessions: Int, val bytes: Long, val firstUs: Double?, val lastUs: Double?)
+
+    /** Что лежит в архиве — для окна выгрузки. */
+    @Synchronized
+    fun stats(): Stats {
+        if (!::root.isInitialized) return Stats(0, 0, 0, null, null)
+        var wheels = 0; var sessions = 0; var bytes = 0L
+        var lo: Double? = null; var hi: Double? = null
+        for (wd in root.listFiles() ?: emptyArray()) {
+            if (!wd.isDirectory) continue
+            val w = loadWheelFile(wd)
+            var any = false
+            for (sf in wd.listFiles() ?: emptyArray()) {
+                val nm = sf.name
+                if (!nm.startsWith("s_")) continue
+                if (nm.endsWith(".ev")) { bytes += sf.length(); continue }
+                if (!nm.endsWith(".json")) continue
+                bytes += sf.length()
+                val s = runCatching { JSONObject(sf.readText()) }.getOrNull() ?: continue
+                val elo = s.optLong("espLo", Long.MAX_VALUE)
+                val ehi = s.optLong("espHi", Long.MIN_VALUE)
+                if (elo > ehi) continue
+                any = true; sessions++
+                clockMap(s, w)?.let { m ->
+                    lo = min(lo ?: m.wall(elo), m.wall(elo))
+                    hi = max(hi ?: m.wall(ehi), m.wall(ehi))
+                }
+            }
+            if (any) wheels++
+        }
+        return Stats(wheels, sessions, bytes, lo, hi)
+    }
+
+    /** Снимок одной сессии для выгрузки — под замком, писать ZIP можно уже без него. */
+    private class Snap(val boot: Long, val json: JSONObject, val map: ClockMap?, val ev: Events)
+
+    @Synchronized
+    private fun snap(wd: File, boot: Long): Snap? {
+        val w = loadWheelFile(wd)
+        val s = runCatching { JSONObject(File(wd, "s_" + hex(boot) + ".json").readText()) }.getOrNull() ?: return null
+        val ev = readEventsFull(File(wd, "s_" + hex(boot) + ".ev"))
+        if (ev.esp.isEmpty()) return null
+        return Snap(boot, s, clockMap(s, w), ev)
+    }
+
+    class ExportResult(val wheels: Int, val sessions: Int, val events: Long)
+
+    /** Весь архив — ZIP в [out] (закрывает его вызывающий). */
+    fun export(out: java.io.OutputStream, progress: (String) -> Unit): ExportResult {
+        if (!::root.isInitialized) throw IllegalStateException("archive is not ready")
+        val zone = java.time.ZoneId.systemDefault()
+        val zos = java.util.zip.ZipOutputStream(java.io.BufferedOutputStream(out))
+        val report = StringBuilder()
+        var nWheels = 0; var nSessions = 0; var nEvents = 0L
+        val wheelDirs = synchronized(this) { root.listFiles()?.filter { it.isDirectory } ?: emptyList() }
+        for (wd in wheelDirs.sortedBy { loadWheelFile(it).optString("name", it.name).lowercase() }) {
+            val w = synchronized(this) { loadWheelFile(wd) }
+            val name = w.optString("name", "")
+            val boots = (wd.listFiles() ?: emptyArray()).mapNotNull { f ->
+                val nm = f.name
+                if (nm.startsWith("s_") && nm.endsWith(".json")) nm.substring(2, nm.length - 5).toLongOrNull(16) else null
+            }
+            val snaps = boots.mapNotNull { snap(wd, it) }
+                .sortedBy { it.map?.wall(it.ev.esp.first()) ?: Double.MAX_VALUE }
+            if (snaps.isEmpty()) continue
+            nWheels++
+            val addr = prettyAddr(wd.name)
+            val folder = safeName(if (name.isNotEmpty()) "$name ($addr)" else addr)
+            putText(zos, "$folder/wheel.json", JSONObject()
+                .put("dir", wd.name).put("addr", addr).put("name", name)
+                .put("gens", w.optJSONObject("gens") ?: JSONObject()).toString(2))
+            report.append('\n').append("=".repeat(64)).append('\n')
+            report.append(if (name.isNotEmpty()) "$name   ($addr)" else addr).append('\n')
+            report.append("=".repeat(64)).append('\n')
+            report.append(snaps.size).append(if (snaps.size == 1) " session" else " sessions")
+                .append(", folder \"").append(folder).append("\"\n")
+            for (sn in snaps) {
+                nSessions++
+                nEvents += sn.ev.esp.size
+                val base = "$folder/" + sessionBase(sn, zone)
+                progress((if (name.isNotEmpty()) name else addr) + " — session " + hex(sn.boot))
+                writeCsv(zos, "$base.csv", sn, name.ifEmpty { addr }, zone)
+                putText(zos, "$base.json", JSONObject(sn.json.toString())
+                    .put("boot", hex(sn.boot)).put("dir", wd.name).toString())
+                report.append(sessionReport(sn, base.substringAfterLast('/'), zone))
+            }
+        }
+        val head = StringBuilder()
+        head.append("POV Wheel — Hall sensor log archive\n")
+        head.append("Exported ").append(fmtFull(System.currentTimeMillis() * 1000.0, zone))
+            .append(" (").append(zoneLabel(zone, System.currentTimeMillis() * 1000.0)).append(")\n")
+        head.append(nWheels).append(if (nWheels == 1) " display, " else " displays, ")
+            .append(nSessions).append(if (nSessions == 1) " session, " else " sessions, ")
+            .append(String.format(Locale.US, "%,d", nEvents)).append(" events\n\n")
+        head.append(README_HELP)
+        putText(zos, "README.txt", head.toString() + report.toString())
+        zos.finish()
+        zos.flush()
+        return ExportResult(nWheels, nSessions, nEvents)
+    }
+
+    private val README_HELP = """
+        |What this is
+        |  Each time a magnet passes one of a display's six Hall sensors (six times a
+        |  revolution) the display logs the moment. The app keeps every such log it has
+        |  ever downloaded and uses it to stitch "Render POV Video". Below, for each
+        |  display: its sessions (one session = from power-up to the next deep sleep)
+        |  and the periods when the image was actually on.
+        |
+        |Files
+        |  <display>/<date>_<time>_s<session>.csv — one line per event, opens in any
+        |      spreadsheet. Columns: time (local, phone clock), esp_us (the display's own
+        |      microsecond timer since power-up), seq (record number in the display's
+        |      log), event, arg.
+        |      event: hall = a magnet passed Hall sensor <arg> (0…5);
+        |             lit  = the image switched on (arg 1 = forward, 0 = reverse spin);
+        |             dark = the image switched off.
+        |  <display>/<…>.json — clock sync data for the same session; keep it next to
+        |      the .csv, the app needs it to import the session back.
+        |  <display>/wheel.json — the display's name and measured clock errors.
+        |
+        |Importing
+        |  POV Wheel app → long press "Render POV Video" → Import. The archive is MERGED
+        |  into the phone's own: new events are added, nothing already there is replaced,
+        |  and importing the same file twice adds nothing.
+        |""".trimMargin()
+
+    /** Сводка одной сессии: время, привязка часов, когда светился дисплей. */
+    private fun sessionReport(sn: Snap, base: String, zone: java.time.ZoneId): String {
+        val ev = sn.ev
+        val m = sn.map
+        val t0 = ev.esp.first(); val t1 = ev.esp.last()
+        val sb = StringBuilder("\n")
+        val day0 = m?.let { dayOf(it.wall(t0), zone) }
+        fun at(esp: Long): String =
+            if (m == null) "+" + hms((esp - t0) / 1e6)
+            else {
+                val w = m.wall(esp)
+                if (dayOf(w, zone) == day0) fmtTime(w, zone) else fmtFull(w, zone)
+            }
+        sb.append("Session ").append(hex(sn.boot)).append(" — ")
+        if (m != null) sb.append(fmtFull(m.wall(t0), zone)).append(" … ").append(at(t1))
+        else sb.append("date unknown")
+        sb.append("   (").append(dur((t1 - t0) / 1e6)).append(")\n")
+        sb.append("  Clock: ").append(
+            if (m == null) "no reference — this session never reached a phone, times are counted from its first event"
+            else m.how + String.format(Locale.US, ", ±%s", accuracy(m.sigmaUs))
+        ).append('\n')
+        sb.append("  File:  ").append(base).append(".csv\n")
+        // Периоды «изображение горит»: от lit до dark. Обороты — по событиям Холла
+        // внутри периода (все шесть датчиков на одну революцию).
+        class Iv(val a: Long, var b: Long, var halls: Long, var on: Double, val reverse: Boolean,
+                 val fromStart: Boolean, var toEnd: Boolean = false)
+        val raw = ArrayList<Iv>()
+        var litAt = -1L; var litRev = false; var hallsAtLit = 0L; var halls = 0L
+        for (i in ev.esp.indices) {
+            when (ev.type[i].toInt()) {
+                T_HALL -> halls++
+                T_LIT -> if (litAt < 0) { litAt = ev.esp[i]; litRev = ev.arg[i].toInt() == 0; hallsAtLit = halls }
+                T_DARK -> {
+                    if (litAt >= 0) raw.add(Iv(litAt, ev.esp[i], halls - hallsAtLit, (ev.esp[i] - litAt) / 1e6, litRev, false))
+                    // Лог начинается посреди показа (кольцо на колесе успело переписаться).
+                    else if (raw.isEmpty()) raw.add(Iv(t0, ev.esp[i], halls, (ev.esp[i] - t0) / 1e6, false, true))
+                    litAt = -1
+                }
+            }
+        }
+        if (litAt >= 0) raw.add(Iv(litAt, t1, halls - hallsAtLit, (t1 - litAt) / 1e6, litRev, false, true))
+        // Короткие погасания (смена файла в слайдшоу, перезапуск эффекта — доли
+        // секунды) склеиваем: иначе час езды со слайдшоу дал бы сотни строк.
+        val merged = ArrayList<Iv>()
+        for (iv in raw) {
+            val last = merged.lastOrNull()
+            if (last != null && (iv.a - last.b) < 10_000_000L && iv.reverse == last.reverse) {
+                last.b = iv.b; last.halls += iv.halls; last.on += iv.on; last.toEnd = iv.toEnd
+            } else merged.add(iv)
+        }
+        if (merged.isEmpty()) {
+            sb.append("  Display on: never (spun below the start speed, or only woke up)\n")
+        } else {
+            sb.append("  Display on:\n")
+            for (iv in merged) {
+                val rpm = if (iv.on >= 2) iv.halls / 6.0 / iv.on * 60 else 0.0
+                sb.append(String.format(Locale.US, "    %s – %s   %-12s%s%s%s%s\n",
+                    at(iv.a), at(iv.b), dur((iv.b - iv.a) / 1e6),
+                    if (rpm > 0) String.format(Locale.US, "   ~%.0f rpm", rpm) else "",
+                    if (iv.reverse) "   reverse spin" else "",
+                    if (iv.fromStart) "   (log starts while on)" else "",
+                    if (iv.toEnd) "   (log ends while on)" else ""))
+            }
+            sb.append("  On in total: ").append(dur(merged.sumOf { it.on }))
+                .append(String.format(Locale.US, "   (%,d Hall events in the session)\n", halls))
+        }
+        return sb.toString()
+    }
+
+    private fun writeCsv(zos: java.util.zip.ZipOutputStream, path: String, sn: Snap, wheel: String, zone: java.time.ZoneId) {
+        zos.putNextEntry(java.util.zip.ZipEntry(path))
+        val ev = sn.ev
+        val m = sn.map
+        val sb = StringBuilder(1 shl 17)
+        sb.append("# POV Wheel Hall log — ").append(wheel).append(", session ").append(hex(sn.boot)).append('\n')
+        if (m != null) sb.append("# time: local time, ").append(zoneLabel(zone, m.wall(ev.esp.first())))
+            .append(", from ").append(m.how).append(String.format(Locale.US, " (±%s)\n", accuracy(m.sigmaUs)))
+        else sb.append("# time: unknown — this session never reached a phone (no clock reference)\n")
+        sb.append("# event: hall = magnet passed Hall sensor <arg> (0..5); lit = image on (arg 1 forward, 0 reverse); dark = image off\n")
+        sb.append("time,esp_us,seq,event,arg\n")
+        val fmt = java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
+        for (i in ev.esp.indices) {
+            if (m != null) {
+                val us = m.wall(ev.esp[i])
+                sb.append(java.time.LocalDateTime.ofInstant(
+                    java.time.Instant.ofEpochMilli(Math.floor(us / 1000.0).toLong()), zone).format(fmt))
+            }
+            sb.append(',').append(ev.esp[i]).append(',').append(ev.seq[i]).append(',')
+                .append(evName(ev.type[i].toInt())).append(',').append(ev.arg[i].toInt()).append('\n')
+            if (sb.length > 60_000) { zos.write(sb.toString().toByteArray(Charsets.UTF_8)); sb.setLength(0) }
+        }
+        zos.write(sb.toString().toByteArray(Charsets.UTF_8))
+        zos.closeEntry()
+    }
+
+    private fun putText(zos: java.util.zip.ZipOutputStream, path: String, text: String) {
+        zos.putNextEntry(java.util.zip.ZipEntry(path))
+        zos.write(text.toByteArray(Charsets.UTF_8))
+        zos.closeEntry()
+    }
+
+    private fun evName(t: Int) = when (t) { T_HALL -> "hall"; T_LIT -> "lit"; T_DARK -> "dark"; else -> "t$t" }
+    private fun evType(n: String) = when (n) { "hall" -> T_HALL; "lit" -> T_LIT; "dark" -> T_DARK; else -> -1 }
+
+    /** «2026-10-05_14-02_s1a2b3c4d» — дата и время начала сессии, если известны. */
+    private fun sessionBase(sn: Snap, zone: java.time.ZoneId): String {
+        val m = sn.map ?: return "unknown-date_s" + hex(sn.boot)
+        val t = java.time.LocalDateTime.ofInstant(java.time.Instant.ofEpochMilli((m.wall(sn.ev.esp.first()) / 1000).toLong()), zone)
+        return t.format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm")) + "_s" + hex(sn.boot)
+    }
+
+    private fun dayOf(us: Double, zone: java.time.ZoneId) =
+        java.time.Instant.ofEpochMilli((us / 1000).toLong()).atZone(zone).toLocalDate()
+    private fun fmtFull(us: Double, zone: java.time.ZoneId): String =
+        java.time.Instant.ofEpochMilli((us / 1000).toLong()).atZone(zone)
+            .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
+    private fun fmtTime(us: Double, zone: java.time.ZoneId): String =
+        java.time.Instant.ofEpochMilli((us / 1000).toLong()).atZone(zone)
+            .format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss"))
+    private fun zoneLabel(zone: java.time.ZoneId, us: Double): String {
+        val off = zone.rules.getOffset(java.time.Instant.ofEpochMilli((us / 1000).toLong()))
+        return "UTC" + (if (off.totalSeconds == 0) "" else off.id)
+    }
+    private fun hms(secs: Double): String {
+        val s = secs.toLong().coerceAtLeast(0)
+        return String.format(Locale.US, "%d:%02d:%02d", s / 3600, s / 60 % 60, s % 60)
+    }
+    private fun dur(secs: Double): String {
+        val s = Math.round(secs).coerceAtLeast(0)
+        return when {
+            s >= 3600 -> String.format(Locale.US, "%d h %02d min", s / 3600, s / 60 % 60)
+            s >= 60 -> String.format(Locale.US, "%d min %02d s", s / 60, s % 60)
+            else -> "$s s"
+        }
+    }
+    private fun accuracy(us: Double): String =
+        if (us < 1e6) String.format(Locale.US, "%.0f ms", us / 1000) else String.format(Locale.US, "%.0f s", us / 1e6)
+    private fun prettyAddr(dir: String): String =
+        if (dir.length == 12 && dir.all { it.isLetterOrDigit() }) dir.chunked(2).joinToString(":") else dir
+    private fun safeName(s: String): String =
+        s.map { if (it.isLetterOrDigit() || it in " ()-_.,") it else '_' }.joinToString("").trim()
+
+    class ImportResult(val wheels: Int, val sessions: Int, val events: Long)
+
+    /**
+     * Слить ZIP из [input] (формат [export]) с архивом телефона. [tmp] — пустая
+     * папка под распаковку, удаляется по окончании.
+     */
+    fun import(input: java.io.InputStream, tmp: File, progress: (String) -> Unit): ImportResult {
+        if (!::root.isInitialized) throw IllegalStateException("archive is not ready")
+        tmp.deleteRecursively(); tmp.mkdirs()
+        try {
+            progress("Unpacking…")
+            val base = tmp.canonicalPath + File.separator
+            java.util.zip.ZipInputStream(java.io.BufferedInputStream(input)).use { zis ->
+                var e = zis.nextEntry
+                while (e != null) {
+                    if (!e.isDirectory) {
+                        val f = File(tmp, e.name)
+                        // Имя из архива не должно вывести за пределы папки распаковки.
+                        if (!f.canonicalPath.startsWith(base)) throw java.io.IOException("damaged archive")
+                        f.parentFile?.mkdirs()
+                        f.outputStream().use { zis.copyTo(it) }
+                    }
+                    e = zis.nextEntry
+                }
+            }
+            val wheelFiles = tmp.walkTopDown().filter { it.isFile && it.name == "wheel.json" }.toList()
+            if (wheelFiles.isEmpty()) throw java.io.IOException("this is not a POV Wheel log archive")
+            var nWheels = 0; var nSessions = 0; var nEvents = 0L
+            for (wf in wheelFiles) {
+                val wj = runCatching { JSONObject(wf.readText()) }.getOrNull() ?: continue
+                val dir = wj.optString("dir").ifEmpty {
+                    Regex("([0-9A-Fa-f]{12})").findAll(wf.parentFile?.name ?: "").lastOrNull()?.value ?: ""
+                }
+                if (dir.isEmpty() || dir.any { !it.isLetterOrDigit() }) continue
+                mergeWheel(dir, wj)
+                nWheels++
+                for (sf in wf.parentFile?.listFiles() ?: emptyArray()) {
+                    if (!sf.name.endsWith(".json") || sf.name == "wheel.json") continue
+                    val sj = runCatching { JSONObject(sf.readText()) }.getOrNull() ?: continue
+                    val boot = sj.optString("boot").toLongOrNull(16) ?: continue
+                    progress((wj.optString("name").ifEmpty { prettyAddr(dir) }) + " — session " + hex(boot))
+                    val csv = File(sf.parentFile, sf.name.removeSuffix(".json") + ".csv")
+                    val ev = if (csv.exists()) parseCsv(csv) else Events(LongArray(0), LongArray(0), ByteArray(0), ByteArray(0))
+                    nEvents += mergeSession(dir, boot, sj, ev)
+                    nSessions++
+                }
+            }
+            return ImportResult(nWheels, nSessions, nEvents)
+        } finally {
+            tmp.deleteRecursively()
+        }
+    }
+
+    /** CSV выгрузки → события. Время в первой колонке только для человека — берём esp_us. */
+    private fun parseCsv(f: File): Events {
+        var n = 0
+        var esp = LongArray(4096); var seq = LongArray(4096)
+        var ty = ByteArray(4096); var ar = ByteArray(4096)
+        f.bufferedReader().useLines { lines ->
+            for (line in lines) {
+                if (line.isEmpty() || line[0] == '#' || line.startsWith("time,")) continue
+                val c = line.split(',')
+                if (c.size < 5) continue
+                val t = evType(c[3].trim())
+                val e = c[1].trim().toLongOrNull()
+                val q = c[2].trim().toLongOrNull()
+                val a = c[4].trim().toIntOrNull()
+                if (t < 0 || e == null || q == null || a == null) continue
+                if (n == esp.size) {
+                    esp = esp.copyOf(n * 2); seq = seq.copyOf(n * 2)
+                    ty = ty.copyOf(n * 2); ar = ar.copyOf(n * 2)
+                }
+                esp[n] = e; seq[n] = q; ty[n] = t.toByte(); ar[n] = a.toByte(); n++
+            }
+        }
+        return Events(esp.copyOf(n), seq.copyOf(n), ty.copyOf(n), ar.copyOf(n))
+    }
+
+    /** Имя колеса — если своего нет; ошибки часов — по поколениям, точнее та, где сна больше. */
+    @Synchronized
+    private fun mergeWheel(dir: String, imp: JSONObject) {
+        val w = loadWheel(dir)
+        var changed = false
+        val name = imp.optString("name")
+        if (w.optString("name").isEmpty() && name.isNotEmpty()) { w.put("name", name); changed = true }
+        val ig = imp.optJSONObject("gens")
+        if (ig != null) {
+            val gens = w.optJSONObject("gens") ?: JSONObject().also { w.put("gens", it) }
+            for (k in ig.keys()) {
+                val g = ig.optJSONObject(k) ?: continue
+                val old = gens.optJSONObject(k)
+                if (old == null || g.optLong("sleep") > old.optLong("sleep")) { gens.put(k, g); changed = true }
+            }
+        }
+        if (changed) saveWheel(dir, w)
+    }
+
+    /** Слить сессию: события по номерам, которых ещё нет; пинги и опорные пары — объединением. */
+    @Synchronized
+    private fun mergeSession(dir: String, boot: Long, imp: JSONObject, ev: Events): Long {
+        val s = loadSession(dir, boot)
+        if (!s.has("cal")) imp.optJSONArray("cal")?.let { s.put("cal", it) }
+        if (!s.has("rev") && imp.has("rev")) s.put("rev", imp.optBoolean("rev"))
+
+        imp.optJSONArray("pings")?.let { ip ->
+            val arr = s.optJSONArray("pings") ?: JSONArray().also { s.put("pings", it) }
+            val seen = HashSet<String>()
+            for (i in 0 until arr.length()) arr.optJSONArray(i)?.let { seen.add(it.optLong(0).toString() + ":" + it.optLong(1)) }
+            for (i in 0 until ip.length()) {
+                val p = ip.optJSONArray(i) ?: continue
+                if (seen.add(p.optLong(0).toString() + ":" + p.optLong(1))) arr.put(p)
+            }
+            if (arr.length() > 4000) s.put("pings", thinPings(arr))
+        }
+        imp.optJSONArray("refs")?.let { ir ->
+            val all = ArrayList<JSONArray>()
+            val seen = HashSet<String>()
+            for (src in listOf(s.optJSONArray("refs") ?: JSONArray(), ir))
+                for (i in 0 until src.length()) {
+                    val r = src.optJSONArray(i) ?: continue
+                    if (seen.add(r.optLong(0).toString() + ":" + r.optLong(1))) all.add(r)
+                }
+            // Модель часов берёт последнюю пару — после слияния это самая поздняя по esp.
+            all.sortBy { it.optLong(0) }
+            s.put("refs", JSONArray().apply { all.takeLast(200).forEach { put(it) } })
+        }
+
+        val have = ranges(s)
+        val buf = ByteBuffer.allocate(ev.esp.size * 16).order(ByteOrder.LITTLE_ENDIAN)
+        var added = 0
+        var minEsp = Long.MAX_VALUE; var maxEsp = Long.MIN_VALUE
+        for (i in ev.esp.indices) {
+            if (covered(have, ev.seq[i])) continue
+            buf.putLong(ev.esp[i]).putInt(ev.seq[i].toInt()).put(ev.type[i]).put(ev.arg[i]).putShort(0)
+            added++
+            minEsp = min(minEsp, ev.esp[i]); maxEsp = max(maxEsp, ev.esp[i])
+        }
+        if (added > 0) {
+            FileOutputStream(File(wheelDir(dir), "s_" + hex(boot) + ".ev"), true).use { it.write(buf.array(), 0, added * 16) }
+            s.put("espLo", min(s.optLong("espLo", Long.MAX_VALUE), minEsp))
+            s.put("espHi", max(s.optLong("espHi", Long.MIN_VALUE), maxEsp))
+        }
+        // Покрытые номера: из выгрузки, а нет их — по самим событиям.
+        val ir = imp.optJSONArray("ranges")
+        if (ir != null && ir.length() > 0) {
+            for (i in 0 until ir.length()) ir.optJSONArray(i)?.let { addRange(s, it.optLong(0), it.optLong(1)) }
+        } else if (ev.seq.isNotEmpty()) {
+            val q = ev.seq.sorted()
+            var lo = q[0]; var prev = q[0]
+            for (x in q.drop(1)) { if (x > prev + 1) { addRange(s, lo, prev + 1); lo = x }; prev = x }
+            addRange(s, lo, prev + 1)
+        }
+        saveSession(dir, boot, s)
+        return added.toLong()
     }
 
     /** Модель часов сессии. null — привязать к часам телефона нечем. */

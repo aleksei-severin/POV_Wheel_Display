@@ -459,7 +459,7 @@ data class TextStyle(val rainbow: Boolean = false, val rgb: Int = 0xFFFFFF, val 
 data class FxParams(
     val speedRed: Int = 45,
     val rbSpeed: Int = 10,
-    val rbSharp: Int = 0,
+    val rbSharp: Int = 100,
     val clock: TextStyle = TextStyle()
 ) {
     fun pack(): ByteArray {
