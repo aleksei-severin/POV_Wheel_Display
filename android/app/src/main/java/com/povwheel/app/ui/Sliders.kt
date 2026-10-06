@@ -332,12 +332,16 @@ internal fun EmbossedRangeSlider(
             val on = if (enabled) color else color.copy(alpha = 0.38f)
             drawTrack(rel, 0f, size.width, cy)
             drawFill(on, loX, hiX, cy)
-            // Текущее значение — тонкая метка поперёк жёлоба.
+            // Текущее значение — метка поперёк жёлоба. Толстая и заметно выше
+            // жёлоба, с тёмной каймой: тонкая риска цвета, близкого к заливке,
+            // почти терялась на ней.
             if (marker != null) {
                 val mx = xOf(marker.coerceIn(first.toFloat(), range.last.toFloat()))
-                val h = TRACK_H.toPx()
-                drawLine(markerColor, Offset(mx, cy - h / 2f - 1.5.dp.toPx()), Offset(mx, cy + h / 2f + 1.5.dp.toPx()),
-                    2.dp.toPx(), StrokeCap.Round)
+                val half = TRACK_H.toPx() / 2f + 5.dp.toPx()
+                val w = 4.5.dp.toPx()
+                drawLine(rel.shadow.copy(alpha = 0.55f), Offset(mx, cy - half), Offset(mx, cy + half),
+                    w + 2.dp.toPx(), StrokeCap.Round)
+                drawLine(markerColor, Offset(mx, cy - half), Offset(mx, cy + half), w, StrokeCap.Round)
             }
             drawBarThumb(rel, loX, cy, on)
             drawBarThumb(rel, hiX, cy, on)

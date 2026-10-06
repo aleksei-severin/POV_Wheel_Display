@@ -548,3 +548,5 @@ extern void webLogf(const char* fmt, ...);
 
 // Местное время. false — синхронизации с браузером ещё не было.
 extern bool localClock(int& h, int& m, int& s);
+// Местная дата (год полностью, месяц 1…12, день 1…31). false — как у localClock().
+extern bool localDate(int& y, int& mo, int& d);

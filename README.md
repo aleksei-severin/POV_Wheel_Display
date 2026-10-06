@@ -128,13 +128,14 @@ All of this runs on the phone's GPU, with no extra hardware and no special camer
 
 | Effect | What it does |
 |---|---|
-| 🏎️ **Speed** | Live speedometer in big digits that shift from green to red as you speed up |
-| 🕐 **Clock** | Analog clock face with numerals |
+| 🏎️ **Speed** | Live speedometer in big digits that shift from green to red as you speed up (red point set in the app) |
+| 🕐 **Clock** | Digital time `hh.mm.ss` over the date `yyyy.mm.dd`, solid or rainbow |
 | ✍️ **Text** | Your text around the rim, solid or rainbow |
-| 🔥 **Fire** | Flames rising from the hub |
-| 🌈 **Rainbow** | A colour spiral flowing across the disc |
-| 💧 **Ripples** | Concentric waves rolling out from the hub |
+| 🌈 **Rainbow** | A colour spiral flowing across the disc — speed and band sharpness set in the app |
 | 🎯 **Testing** | Alignment cross with a colour per arm, for calibration |
+
+Long-press an effect in the app to set it up; the library thumbnail shows it exactly as the rim
+will — the real speed, the current time, the chosen colours.
 
 ---
 

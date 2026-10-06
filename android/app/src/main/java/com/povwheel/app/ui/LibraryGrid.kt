@@ -30,20 +30,20 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalFocusManager
-import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextRange
-import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.TextFieldValue
-import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -53,6 +53,7 @@ import com.povwheel.app.TEXT_EFFECT_ID
 import com.povwheel.app.WheelEntry
 import com.povwheel.app.WheelVm
 import com.povwheel.app.ble.DevFile
+import com.povwheel.app.ble.FxParams
 import com.povwheel.app.ble.Link
 import com.povwheel.app.ble.Tele
 import com.povwheel.app.convert.Fit
@@ -130,6 +131,7 @@ internal fun LibraryTab(
     val pendingSyncDelete by vm.pendingSyncDelete.collectAsState()
     val uploadBusyAddrs by vm.uploadBusyAddrs.collectAsState()
     val textFx by vm.textFx.collectAsState()
+    val fxParams by vm.fxParams.collectAsState()
 
     val hasSel = vm.currentClient()?.hello?.hasAlbumSel == true
     val allNames = files.map { it.name }
@@ -149,7 +151,8 @@ internal fun LibraryTab(
     var slideCycle by remember { mutableStateOf(0) }
     var confirmDelete by remember { mutableStateOf(false) }
     var intervalDialog by remember { mutableStateOf(false) }
-    var textDialog by remember { mutableStateOf(false) }
+    // Открытый диалог настроек эффекта (EffectId), 0 — никакого.
+    var fxDialog by remember { mutableStateOf(0) }
 
     // Партнёры (два и больше), отмеченные (пока не запущено) в режиме выбора
     // слайдшоу, и общий с ними список файлов (имя+размер совпадают у всех).
@@ -327,7 +330,16 @@ internal fun LibraryTab(
                     progress = upProgress,
                     playing = playing,
                     textFx = textFx,
-                    onEditText = { textDialog = true },
+                    fx = fxParams,
+                    kmh = tele.kmh,
+                    onEditEffect = { id ->
+                        when {
+                            id == TEXT_EFFECT_ID -> fxDialog = id
+                            id == EFF_SPEED || id == EFF_RAINBOW || id == EFF_CLOCK ->
+                                if (vm.hasFxSettings()) fxDialog = id
+                                else vm.say("Update the wheel firmware to change " + effectName(id) + " settings")
+                        }
+                    },
                     onAdd = onAdd,
                     onToggleCheck = { n -> checks = if (n in checks) checks - n else checks + n },
                     onEnterDelete = { n -> mode = LibMode.DELETE; checks = setOf(n) }
@@ -385,7 +397,12 @@ internal fun LibraryTab(
         dismissButton = { TextButton(onClick = hapticClick { confirmDelete = false }) { Text("Cancel") } }
     )
 
-    if (textDialog) TextEffectDialog(vm) { textDialog = false }
+    when (fxDialog) {
+        TEXT_EFFECT_ID -> TextEffectDialog(vm) { fxDialog = 0 }
+        EFF_SPEED -> SpeedEffectDialog(vm, tele.kmh) { fxDialog = 0 }
+        EFF_RAINBOW -> RainbowEffectDialog(vm) { fxDialog = 0 }
+        EFF_CLOCK -> ClockEffectDialog(vm) { fxDialog = 0 }
+    }
 
     if (intervalDialog) NumberDialog(
         title = "Slideshow interval",
@@ -418,7 +435,7 @@ internal fun LibraryTab(
 @Composable
 private fun LibraryHeader(
     freeText: String,          // свободное место на флеше — справа от «Library»
-    afterText: String,         // «(… MB after upload)» оранжевым, пока есть очередь
+    afterText: String,         // «(… MB after upload)» оранжевым под «Library», пока есть очередь
     slideshowOn: Boolean,
     syncedOn: Boolean,         // идущий показ — синхронный (другая надпись на Stop)
     selecting: Boolean,
@@ -434,25 +451,39 @@ private fun LibraryHeader(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        Text(
-            "Library",
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.SemiBold,
-            modifier = Modifier.alignByBaseline()
-        )
-        // Занимает весь свободный зазор и первым ужимается (…), чтобы кнопки
-        // Stop + Slideshow всегда влезли в одну строку.
-        Text(
-            buildAnnotatedString {
-                append(freeText)
-                if (afterText.isNotEmpty()) withStyle(SpanStyle(color = Orange)) { append(" " + afterText) }
-            },
-            style = MaterialTheme.typography.bodySmall,
-            color = cs.onSurfaceVariant,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f).alignByBaseline()
-        )
+        // Слева — «Library» со свободным местом, под ними, пока есть очередь,
+        // «(… MB after upload)». Строки сжаты по высоте, чтобы обе вместе не
+        // выходили за высоту кнопки Slideshow справа (≈34 dp) и шапка не
+        // прыгала, когда очередь появляется и исчезает. Блок занимает весь
+        // свободный зазор и первым ужимается (…), чтобы кнопки Stop + Slideshow
+        // всегда влезли в одну строку.
+        val two = afterText.isNotEmpty()
+        Column(Modifier.weight(1f)) {
+            Row {
+                Text(
+                    "Library",
+                    style = MaterialTheme.typography.titleMedium.let { if (two) it.copy(lineHeight = 18.sp) else it },
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    modifier = Modifier.alignByBaseline()
+                )
+                Text(
+                    freeText,
+                    style = MaterialTheme.typography.bodySmall.let { if (two) it.copy(lineHeight = 13.sp) else it },
+                    color = cs.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f).alignByBaseline().padding(start = 8.dp)
+                )
+            }
+            if (two) Text(
+                afterText,
+                style = MaterialTheme.typography.bodySmall.copy(lineHeight = 13.sp),
+                color = Orange,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
 
         // Слева от Slideshow: Stop для текущей анимации (бывшая кнопка окна DISPLAY).
         if (playing && !slideshowOn) {
@@ -597,9 +628,12 @@ private fun LibraryCell(
     uploading: Boolean,
     progress: Float,
     playing: Boolean,
-    // Текст колеса — для миниатюры эффекта «Текст»; onEditText открывает редактор.
+    // Текст колеса — для миниатюры эффекта «Текст»; настройки Speed/Rainbow/Clock
+    // и скорость колеса — для их миниатюр. onEditEffect открывает окно настроек.
     textFx: WheelVm.TextFx,
-    onEditText: () -> Unit,
+    fx: FxParams,
+    kmh: Float,
+    onEditEffect: (Int) -> Unit,
     onAdd: () -> Unit,
     onToggleCheck: (String) -> Unit,
     onEnterDelete: (String) -> Unit
@@ -647,7 +681,7 @@ private fun LibraryCell(
                                 LibMode.NORMAL ->
                                     if (playing) { vm.effect(0); vm.say("Display stopped") }
                                     // Текст ещё не задан — показывать нечего, сразу в редактор.
-                                    else if (cell.id == TEXT_EFFECT_ID && textFx.text.isBlank()) onEditText()
+                                    else if (cell.id == TEXT_EFFECT_ID && textFx.text.isBlank()) onEditEffect(cell.id)
                                     else { vm.effect(cell.id); vm.say(effectName(cell.id)) }
                                 LibMode.SLIDESHOW -> onToggleCheck("@e" + cell.id)
                                 LibMode.DELETE -> {}   // эффект удалить нельзя
@@ -658,8 +692,9 @@ private fun LibraryCell(
                         when (cell) {
                             is Cell.Stored -> if (mode == LibMode.NORMAL) onEnterDelete(cell.file.name)
                             is Cell.Pending -> if (mode == LibMode.NORMAL && !uploading) confirmRemove = true
-                            // Длинный тап по «Тексту» — редактор строки и цвета.
-                            is Cell.Effect -> if (mode == LibMode.NORMAL && cell.id == TEXT_EFFECT_ID) onEditText()
+                            // Длинный тап по эффекту — его настройки: строка и цвет
+                            // «Текста», цвет часов, красная точка Speed, радуга.
+                            is Cell.Effect -> if (mode == LibMode.NORMAL) onEditEffect(cell.id)
                             else -> {}
                         }
                     }
@@ -692,7 +727,8 @@ private fun LibraryCell(
                 // Чёрный диск с тем же серым полем по краю, что у файлов: ободок
                 // «играет» (зелёный) ложится на это поле, как у остальных ячеек.
                 is Cell.Effect -> EffectPreview(cell.id,
-                    Modifier.fillMaxSize().padding(3.dp).clip(CircleShape).background(Color.Black), textFx)
+                    Modifier.fillMaxSize().padding(3.dp).clip(CircleShape).background(Color.Black),
+                    textFx, fx, kmh)
             }
             // Отверстие под ступицу — одно на все диски. У превью из кэша (RGB_565)
             // оно было чёрным, у свежих — прозрачным, у эффектов его не было вовсе.
@@ -857,91 +893,113 @@ private fun UploadStrip(vm: WheelVm, others: List<WheelEntry>, online: Boolean) 
             Spacer(Modifier.height(6.dp))
         }
 
-        // В счётчике — только то, что реально уйдёт на колесо: уже залитые и не
-        // влезающие заливка пропустит. Если не уйдёт ничего — кнопка просто
-        // очищает очередь, а не гоняет пустой проход. С отмеченными партнёрами
-        // так нельзя: у них своя библиотека и своё место, каждый решает сам —
-        // там счётчик, как и раньше, по всей очереди.
-        val synced = syncTargets.isNotEmpty()
-        val nothing = !busy && !synced && plan.toUpload == 0
-        Button(
-            onClick = hapticClick { if (nothing) vm.clearUpQueue() else vm.startUpload() },
-            enabled = !busy && (online || nothing),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text(
-                when {
-                    busy -> "Working…"
-                    nothing -> "✕ Nothing to upload — clear"
-                    synced -> "↑ Convert & upload (" + items.size + ") ×" + (1 + syncTargets.size)
-                    else -> "↑ Convert & upload (" + plan.toUpload + ")"
+        // Пока идёт заливка, полоса — только её лог и прогресс: кнопка, пилюли,
+        // «Apply to All» и подсказки всё равно неактивны и лишь занимали место.
+        if (!busy) {
+            // В счётчике — только то, что реально уйдёт на колесо: уже залитые и не
+            // влезающие заливка пропустит. Если не уйдёт ничего — кнопка просто
+            // очищает очередь, а не гоняет пустой проход. С отмеченными партнёрами
+            // так нельзя: у них своя библиотека и своё место, каждый решает сам —
+            // там счётчик, как и раньше, по всей очереди.
+            val synced = syncTargets.isNotEmpty()
+            val nothing = !synced && plan.toUpload == 0
+            Button(
+                onClick = hapticClick { if (nothing) vm.clearUpQueue() else vm.startUpload() },
+                enabled = online || nothing,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                if (!nothing) {
+                    UploadArrowIcon()
+                    Spacer(Modifier.width(8.dp))
                 }
-            )
-        }
-
-        Spacer(Modifier.height(8.dp))
-        Text(
-            status,
-            style = MaterialTheme.typography.bodySmall,
-            fontFamily = FontFamily.Monospace, fontSize = 11.sp,
-            color = when (statusKind) {
-                1 -> Ok; 2 -> Danger; else -> MaterialTheme.colorScheme.onSurfaceVariant
-            }
-        )
-        if (progress >= 0f) {
-            Spacer(Modifier.height(6.dp))
-            LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
-        }
-
-        Spacer(Modifier.height(8.dp))
-        // Имя файла и «Remove» убраны: ненужный файл убирается из очереди
-        // длинным тапом по его жёлтой ячейке. Осталась только строка «какой из
-        // нескольких сейчас настраивается» + «применить ко всем».
-        if (items.size > 1) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    "Editing " + (selIdx + 1) + " / " + items.size,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.weight(1f)
+                    when {
+                        nothing -> "✕ Nothing to upload — clear"
+                        synced -> "Convert & Upload (" + items.size + ") ×" + (1 + syncTargets.size)
+                        else -> "Convert & Upload (" + plan.toUpload + ")"
+                    }
                 )
-                TextButton(onClick = hapticClick { vm.applyUpSettingsToAll() }, enabled = !busy) {
-                    Text("Apply to all", style = MaterialTheme.typography.labelMedium)
-                }
             }
-            Spacer(Modifier.height(6.dp))
         }
 
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            Pill(
-                text = if (cur.fit == Fit.CROP) "Crop" else "Fit",
-                width = 46.dp, enabled = !busy,
-                onClick = { vm.setFit(if (cur.fit == Fit.CROP) Fit.FIT else Fit.CROP) }
-            )
-            Pill(
-                text = "Mirror back",
-                width = 84.dp, selected = cur.mirror, enabled = !busy,
-                onClick = { vm.setBackMirror(!cur.mirror) }
-            )
-            if (cur.isVideo) {
-                Pill(
-                    text = "FPS " + cur.fps,
-                    width = 54.dp, enabled = !busy,
-                    onClick = { vm.setFps(when (cur.fps) { 10 -> 15; 15 -> 5; else -> 10 }) }
-                )
-                // Своё поле у каждого файла: смена выбора не переносит набранный
-                // текст на соседний ролик.
-                key(cur.uri) {
-                    LengthField(
-                        value = cur.lengthSec,
-                        width = 56.dp, enabled = !busy,
-                        onEdit = { v -> vm.setLength(v, resort = false) },
-                        onDone = { vm.resortUpQueue() }
-                    )
+        // Строка статуса — ход заливки и ошибки; пустая (только что выбрали
+        // файлы) — не занимает места.
+        if (status.isNotEmpty()) {
+            if (!busy) Spacer(Modifier.height(8.dp))
+            Text(
+                status,
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace, fontSize = 11.sp,
+                color = when (statusKind) {
+                    1 -> Ok; 2 -> Danger; else -> MaterialTheme.colorScheme.onSurfaceVariant
                 }
+            )
+        }
+        if (busy) {
+            Spacer(Modifier.height(6.dp))
+            // Между файлами (конвертация ещё не дала процента) — бегущая полоса.
+            if (progress >= 0f) LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
+            else LinearProgressIndicator(Modifier.fillMaxWidth())
+            return@Column
+        }
+
+        Spacer(Modifier.height(8.dp))
+        // Настройки выбранного файла и «Apply to All» — одной строкой одинаковых
+        // пилюль. Имя файла и «Remove» убраны: ненужный файл убирается из очереди
+        // длинным тапом по его жёлтой ячейке; какой файл настраивается, видно по
+        // его толстому ободку. Не влезают в ширину — сжимаются все пропорционально
+        // (и шрифт с ними), но в одну строку и той же высоты.
+        BoxWithConstraints(Modifier.fillMaxWidth()) {
+            val gap = 6.dp
+            val multi = items.size > 1
+            val widths = buildList {
+                add(46.dp); add(84.dp)
+                if (cur.isVideo) { add(54.dp); add(56.dp) }
+                if (multi) add(92.dp)
+            }
+            val gaps = gap * (widths.size - 1)
+            val natural = widths.fold(0.dp) { a, w -> a + w }
+            val k = if (natural + gaps > maxWidth) ((maxWidth - gaps) / natural).coerceIn(0.6f, 1f) else 1f
+            val ts = maxOf(k, 0.85f)
+            var wi = 0
+            fun w() = widths[wi++] * k
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(gap)
+            ) {
+                Pill(
+                    text = if (cur.fit == Fit.CROP) "Crop" else "Fit",
+                    width = w(), textScale = ts,
+                    onClick = { vm.setFit(if (cur.fit == Fit.CROP) Fit.FIT else Fit.CROP) }
+                )
+                Pill(
+                    text = "Mirror back",
+                    width = w(), textScale = ts, selected = cur.mirror,
+                    onClick = { vm.setBackMirror(!cur.mirror) }
+                )
+                if (cur.isVideo) {
+                    Pill(
+                        text = "FPS " + cur.fps,
+                        width = w(), textScale = ts,
+                        onClick = { vm.setFps(when (cur.fps) { 10 -> 15; 15 -> 5; else -> 10 }) }
+                    )
+                    // Своё поле у каждого файла: смена выбора не переносит набранный
+                    // текст на соседний ролик.
+                    val lw = w()
+                    key(cur.uri) {
+                        LengthField(
+                            value = cur.lengthSec,
+                            width = lw, textScale = ts, enabled = true,
+                            onEdit = { v -> vm.setLength(v, resort = false) },
+                            onDone = { vm.resortUpQueue() }
+                        )
+                    }
+                }
+                if (multi) Pill(
+                    text = "Apply to All",
+                    width = w(), textScale = ts,
+                    onClick = { vm.applyUpSettingsToAll() }
+                )
             }
         }
 
@@ -979,6 +1037,28 @@ private fun UploadStrip(vm: WheelVm, others: List<WheelEntry>, online: Boolean) 
     }
 }
 
+/**
+ * Стрелка «вверх» перед «Convert & Upload» — рисуется сама, жирной: символ «↑» в
+ * системном шрифте выходит волосяным, а библиотеки значков в приложении нет
+ * нарочно (см. build.gradle.kts).
+ */
+@Composable
+private fun UploadArrowIcon() {
+    val c = LocalContentColor.current
+    Canvas(Modifier.size(width = 14.dp, height = 16.dp)) {
+        val u = size.width / 14f
+        val w = 3.2f * u
+        // Древко и наконечник одной ломаной толстой линией со скруглёнными концами.
+        drawLine(c, Offset(7f * u, 15f * u), Offset(7f * u, 2.5f * u), w, StrokeCap.Round)
+        val head = Path().apply {
+            moveTo(1.5f * u, 7.5f * u)
+            lineTo(7f * u, 2f * u)
+            lineTo(12.5f * u, 7.5f * u)
+        }
+        drawPath(head, c, style = Stroke(width = w, cap = StrokeCap.Round, join = StrokeJoin.Round))
+    }
+}
+
 // ---- Пилюли настроек заливки (раньше жили в UploadPanel.kt) ----
 
 private val PILL_HEIGHT = 34.dp
@@ -990,6 +1070,8 @@ private fun Pill(
     width: Dp,
     selected: Boolean = false,
     enabled: Boolean = true,
+    // Доля обычного кегля — когда ряд пилюль сжат, чтобы влезть в одну строку.
+    textScale: Float = 1f,
     onClick: () -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
@@ -1008,7 +1090,9 @@ private fun Pill(
         modifier = Modifier.width(width).height(PILL_HEIGHT)
     ) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Text(text, style = MaterialTheme.typography.labelMedium, color = fg, maxLines = 1)
+            val st = MaterialTheme.typography.labelMedium
+            Text(text, style = st.copy(fontSize = st.fontSize * textScale), color = fg,
+                maxLines = 1, softWrap = false)
         }
     }
 }
@@ -1031,10 +1115,12 @@ private fun LengthField(
     width: Dp,
     enabled: Boolean,
     onEdit: (Double) -> Unit,
-    onDone: () -> Unit
+    onDone: () -> Unit,
+    textScale: Float = 1f
 ) {
     val cs = MaterialTheme.colorScheme
     val fg = if (enabled) cs.onSurface else cs.onSurface.copy(alpha = 0.38f)
+    val labelStyle = MaterialTheme.typography.labelMedium.let { it.copy(fontSize = it.fontSize * textScale) }
     val shown = String.format(Locale.US, "%.1f", value)
     val focusManager = LocalFocusManager.current
     var tf by remember { mutableStateOf(TextFieldValue(shown)) }
@@ -1073,9 +1159,7 @@ private fun LengthField(
                 },
                 enabled = enabled,
                 singleLine = true,
-                textStyle = MaterialTheme.typography.labelMedium.copy(
-                    color = fg, textAlign = TextAlign.Center
-                ),
+                textStyle = labelStyle.copy(color = fg, textAlign = TextAlign.Center),
                 cursorBrush = SolidColor(cs.primary),
                 keyboardOptions = KeyboardOptions(
                     keyboardType = KeyboardType.Decimal, imeAction = ImeAction.Done
@@ -1084,10 +1168,10 @@ private fun LengthField(
                 decorationBox = { inner ->
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Box(Modifier.weight(1f), contentAlignment = Alignment.Center) { inner() }
-                        Text("s", style = MaterialTheme.typography.labelMedium, color = fg)
+                        Text("s", style = labelStyle, color = fg)
                     }
                 },
-                modifier = Modifier.padding(horizontal = 7.dp).onFocusChanged { st ->
+                modifier = Modifier.padding(horizontal = (7 * textScale).dp).onFocusChanged { st ->
                     if (st.isFocused && !focused) {
                         tf = tf.copy(selection = TextRange(0, tf.text.length))
                         selectAllPending = true

@@ -13,50 +13,68 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
-import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.povwheel.app.TEXT_EFFECT_ID
 import com.povwheel.app.WheelVm
+import com.povwheel.app.ble.FxParams
+import com.povwheel.app.ble.TextStyle
+import com.povwheel.app.convert.FxMask
 import com.povwheel.app.convert.TextMask
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import java.time.LocalDateTime
 import kotlin.math.PI
-import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.roundToInt
 import kotlin.math.sin
 
 /**
- * Круглые превью процедурных эффектов для плитки библиотеки. Рисуются на телефоне
- * (эффект генерится на колесе, файла-источника нет) — декоративные Canvas-анимации,
- * каждая передаёт суть эффекта. `id` — `EffectId` из include/effects.h, 1..7.
- * Исключение — «Текст» (7): его миниатюра — та же маска, что на колесе.
+ * Круглые превью процедурных эффектов для плитки библиотеки. Эффект генерится на
+ * колесе, файла-источника нет — поэтому Speed, Clock, Rainbow и Text рисуются
+ * тем же алгоритмом и с теми же настройками, что на ободе (см. convert/FxMask),
+ * а Testing — схемой. `id` — `EffectId` из include/effects.h.
  */
-internal val EFFECT_IDS = 1..TEXT_EFFECT_ID
+internal const val EFF_SPEED = 1
+internal const val EFF_RAINBOW = 3
+internal const val EFF_TESTING = 4
+internal const val EFF_CLOCK = 6
+
+/** Эффекты в хвосте плитки. Номера 2 (Fire) и 5 (Ripples) удалены из прошивки. */
+internal val EFFECT_IDS = listOf(EFF_SPEED, EFF_RAINBOW, EFF_TESTING, EFF_CLOCK, TEXT_EFFECT_ID)
 
 /** Короткое имя эффекта (для тоста). */
 internal fun effectName(id: Int): String = when (id) {
-    1 -> "Speed"; 2 -> "Fire"; 3 -> "Rainbow"
-    4 -> "Testing"; 5 -> "Ripples"; 6 -> "Clock"; TEXT_EFFECT_ID -> "Text"; else -> "Effect"
+    EFF_SPEED -> "Speed"; EFF_RAINBOW -> "Rainbow"; EFF_TESTING -> "Testing"
+    EFF_CLOCK -> "Clock"; TEXT_EFFECT_ID -> "Text"; else -> "Effect"
 }
 
-/** [text] — текст колеса, нужен только эффекту «Текст». */
+/**
+ * [text] — текст колеса (эффект «Текст»), [fx] — настройки Speed/Rainbow/Clock,
+ * [kmh] — скорость колеса сейчас (Speed показывает настоящую, без вращения — 0).
+ */
 @Composable
-internal fun EffectPreview(id: Int, modifier: Modifier = Modifier, text: WheelVm.TextFx? = null) {
+internal fun EffectPreview(
+    id: Int,
+    modifier: Modifier = Modifier,
+    text: WheelVm.TextFx? = null,
+    fx: FxParams = FxParams(),
+    kmh: Float = 0f
+) {
     Box(modifier, contentAlignment = Alignment.Center) {
         when (id) {
-            1 -> SpeedPreview()
-            2 -> FirePreview()
-            3 -> RainbowPreview()
-            4 -> TestingPreview()
-            5 -> RipplePreview()
-            6 -> ClockPreview()
+            EFF_SPEED -> SpeedDisc(kmh, fx.speedRed, 160, Modifier.fillMaxSize())
+            EFF_RAINBOW -> RainbowDisc(fx, 96, Modifier.fillMaxSize())
+            EFF_TESTING -> TestingPreview()
+            EFF_CLOCK -> ClockDisc(fx.clock, 160, Modifier.fillMaxSize())
             TEXT_EFFECT_ID -> TextDisc(text, 160, Modifier.fillMaxSize())
         }
     }
@@ -69,43 +87,120 @@ internal val RAINBOW_COLORS = listOf(
     Color(0xFF0000FF), Color(0xFFFF00FF), Color(0xFFFF0000)
 )
 
-/**
- * Текст колеса — та же маска, которую красит колесо, и тем же цветом: одним
- * или радугой, которая течёт по углу с той же скоростью (на колесе: тон от
- * сектора плюс сдвиг во времени, speed 100 — два оборота круга в секунду).
- * Текст ещё не задан — подпись-заглушка. [px] — сторона растра маски.
- */
+/** Фаза радуги на экране, градусы: speed 100 — два оборота круга в секунду, как на колесе. */
 @Composable
-internal fun TextDisc(fx: WheelVm.TextFx?, px: Int, modifier: Modifier = Modifier) {
-    val mask = fx?.mask
-    val bmp = remember(mask, px) { mask?.let { TextMask.disc(it, px).asImageBitmap() } }
-    if (fx == null || bmp == null || fx.text.isBlank()) {
-        Box(modifier, contentAlignment = Alignment.Center) {
-            Text("Aa", color = Color(0xFFECECEC), fontWeight = FontWeight.Bold, fontSize = 18.sp, maxLines = 1)
-        }
-        return
-    }
-    val st = fx.style
-    if (!st.rainbow) {
-        Image(bmp, null, modifier, colorFilter = ColorFilter.tint(Color(0xFF000000.toInt() or st.rgb)))
-        return
-    }
-    // Сдвиг радуги: 0.0072° на мс на единицу скорости = 720°/с при speed 100.
+private fun rainbowDeg(speed: Int): Float {
     var deg by remember { mutableStateOf(0f) }
-    LaunchedEffect(st.speed) {
+    LaunchedEffect(speed) {
         var last = 0L
         while (true) {
             withFrameNanos { now ->
-                if (last != 0L) deg = (deg + (now - last) / 1_000_000f * st.speed * 0.0072f) % 360f
+                if (last != 0L) deg = (deg + (now - last) / 1_000_000f * speed * 0.0072f) % 360f
                 last = now
             }
         }
     }
+    return deg
+}
+
+/**
+ * Маска колеса (360 × 44), окрашенная как на ободе: одним цветом или радугой,
+ * которая течёт по углу с той же скоростью (тон от сектора плюс сдвиг во
+ * времени, speed 100 — два оборота круга в секунду). [px] — сторона растра.
+ */
+@Composable
+internal fun StyledMaskDisc(mask: ByteArray, style: TextStyle, px: Int, modifier: Modifier = Modifier) {
+    val bmp = remember(mask, px) { TextMask.disc(mask, px).asImageBitmap() }
+    if (!style.rainbow) {
+        Image(bmp, null, modifier, colorFilter = ColorFilter.tint(Color(0xFF000000.toInt() or style.rgb)))
+        return
+    }
+    val deg = rainbowDeg(style.speed)
     Canvas(modifier.graphicsLayer(compositingStrategy = CompositingStrategy.Offscreen)) {
         drawImage(bmp, dstSize = IntSize(size.width.roundToInt(), size.height.roundToInt()))
         // На колесе тон растёт с номером сектора — по часовой стрелке от «3 часов»,
         // как и у sweepGradient; растущий сдвиг уводит картину против часовой.
         rotate(-deg) { drawRect(Brush.sweepGradient(RAINBOW_COLORS), blendMode = BlendMode.SrcIn) }
+    }
+}
+
+/**
+ * Текст колеса — та же маска, которую красит колесо, и тем же цветом.
+ * Текст ещё не задан — подпись-заглушка. [px] — сторона растра маски.
+ */
+@Composable
+internal fun TextDisc(fx: WheelVm.TextFx?, px: Int, modifier: Modifier = Modifier) {
+    val mask = fx?.mask
+    if (fx == null || mask == null || fx.text.isBlank()) {
+        Box(modifier, contentAlignment = Alignment.Center) {
+            Text("Aa", color = Color(0xFFECECEC), fontWeight = FontWeight.Bold, fontSize = 18.sp, maxLines = 1)
+        }
+        return
+    }
+    StyledMaskDisc(mask, fx.style, px, modifier)
+}
+
+/**
+ * Speed: настоящая скорость колеса (округлённая, как на колесе; не крутится — 0)
+ * тем же шрифтом и раскладкой и тем же цветом от зелёного к красному на [red] км/ч.
+ */
+@Composable
+internal fun SpeedDisc(kmh: Float, red: Int, px: Int, modifier: Modifier = Modifier) {
+    val v = (kmh + 0.5f).toInt().coerceIn(0, 999)
+    val mask by produceState<ByteArray?>(null, v) {
+        value = withContext(Dispatchers.Default) { FxMask.speed(v) }
+    }
+    val m = mask ?: return
+    StyledMaskDisc(m, TextStyle(rainbow = false, rgb = FxMask.speedColor(v, red)), px, modifier)
+}
+
+/** Clock: время и дата телефона (часы колеса выставляет он же) цветом часов колеса. */
+@Composable
+internal fun ClockDisc(style: TextStyle, px: Int, modifier: Modifier = Modifier) {
+    val mask by produceState<ByteArray?>(null) {
+        var shown = -1L
+        while (true) {
+            val now = LocalDateTime.now()
+            val key = now.toLocalDate().toEpochDay() * 86400 + now.toLocalTime().toSecondOfDay()
+            if (key != shown) {
+                shown = key
+                value = withContext(Dispatchers.Default) { FxMask.clock(now) }
+            }
+            // До начала следующей секунды — смена цифр не опаздывает.
+            delay((1000L - System.currentTimeMillis() % 1000L).coerceIn(20L, 1000L))
+        }
+    }
+    val m = mask ?: return
+    StyledMaskDisc(m, style, px, modifier)
+}
+
+/**
+ * Rainbow: спектр со спиралью, скоростью и резкостью полос колеса — та же таблица
+ * цвета и та же раскладка по секторам и диодам, что в effects.cpp.
+ */
+@Composable
+internal fun RainbowDisc(fx: FxParams, px: Int, modifier: Modifier = Modifier) {
+    val disc = remember(px) { FxMask.RainbowDisc(px) }
+    val lut = remember(fx.rbSharp) { FxMask.rainbowLut(fx.rbSharp) }
+    // Фаза в долях круга (1024 на оборот), копится по кадрам — смена скорости
+    // ползунком не дёргает картину, как и на колесе.
+    var phase by remember { mutableStateOf(0.0) }
+    LaunchedEffect(fx.rbSpeed) {
+        var last = 0L
+        while (true) {
+            withFrameNanos { now ->
+                if (last != 0L) {
+                    // speed 100 — два оборота в секунду: 2048 единиц/с.
+                    phase = (phase + (now - last) / 1e9 * fx.rbSpeed * 20.48) % FxMask.RB_LUT
+                }
+                last = now
+            }
+        }
+    }
+    Canvas(modifier) {
+        val img = disc.draw(lut, phase.toInt()).asImageBitmap()
+        drawImage(img, dstSize = IntSize(size.width.roundToInt(), size.height.roundToInt()),
+            filterQuality = FilterQuality.Low)
     }
 }
 
@@ -126,83 +221,6 @@ private fun phase(periodMs: Int): Float {
         }
     }
     return p
-}
-
-/** Треугольная волна 0→1→0 из линейной фазы. */
-private fun pingPong(p: Float) = abs(p * 2f - 1f)
-
-// ---- Сами превью ----
-
-@Composable
-private fun RainbowPreview() {
-    val a = phase(3600) * 360f
-    val colors = listOf(
-        Color(0xFFFF3B30), Color(0xFFFF9500), Color(0xFFFFCC00), Color(0xFF34C759),
-        Color(0xFF32ADE6), Color(0xFF5856D6), Color(0xFFAF52DE), Color(0xFFFF3B30)
-    )
-    Canvas(Modifier.fillMaxSize()) {
-        rotate(a) { drawCircle(Brush.sweepGradient(colors)) }
-    }
-}
-
-@Composable
-private fun FirePreview() {
-    val f = pingPong(phase(950))
-    val g = pingPong(phase(1330))
-    Canvas(Modifier.fillMaxSize()) {
-        val c = Offset(size.width / 2f, size.height * (0.62f - 0.06f * f))
-        drawCircle(
-            Brush.radialGradient(
-                0f to Color.White,
-                0.22f to Color(0xFFFFE082),
-                0.5f to Color(0xFFFF7043),
-                0.8f to Color(0xFF7F1000),
-                1f to Color.Black,
-                center = c,
-                radius = size.minDimension / 2f * (0.72f + 0.28f * g)
-            )
-        )
-    }
-}
-
-@Composable
-private fun RipplePreview() {
-    val p = phase(2600)
-    Canvas(Modifier.fillMaxSize()) {
-        val maxR = size.minDimension / 2f
-        for (k in 0 until 4) {
-            val rp = (p + k * 0.25f) % 1f
-            drawCircle(
-                color = Color(0xFF32ADE6).copy(alpha = (1f - rp) * 0.85f),
-                radius = rp * maxR,
-                style = Stroke(2f.dp.toPx())
-            )
-        }
-    }
-}
-
-@Composable
-private fun ClockPreview() {
-    val sec = phase(4200) * 360f
-    val white = Color(0xFFECECEC)
-    Canvas(Modifier.fillMaxSize()) {
-        val c = Offset(size.width / 2f, size.height / 2f)
-        val r = size.minDimension / 2f * 0.92f
-        for (i in 0 until 12) {
-            val ang = i * PI / 6.0
-            val ca = cos(ang).toFloat(); val sa = sin(ang).toFloat()
-            drawLine(white, Offset(c.x + ca * r * 0.82f, c.y + sa * r * 0.82f),
-                Offset(c.x + ca * r * 0.96f, c.y + sa * r * 0.96f), 1.4f.dp.toPx())
-        }
-        fun hand(deg: Float, len: Float, wDp: Float, col: Color) {
-            val ang = (deg - 90f) * PI.toFloat() / 180f
-            drawLine(col, c, Offset(c.x + cos(ang) * r * len, c.y + sin(ang) * r * len),
-                wDp.dp.toPx(), cap = StrokeCap.Round)
-        }
-        hand(300f, 0.42f, 2.6f, white)
-        hand(70f, 0.62f, 2.2f, white)
-        hand(sec, 0.78f, 1.3f, Color(0xFFFF3B30))
-    }
 }
 
 @Composable
@@ -226,30 +244,6 @@ private fun TestingPreview() {
                 val ang = k * PI.toFloat() / 3f
                 drawLine(armCols[k], c, Offset(c.x + cos(ang) * r, c.y + sin(ang) * r), w, cap = StrokeCap.Round)
             }
-        }
-    }
-}
-
-@Composable
-private fun SpeedPreview() {
-    val v = (6f + pingPong(phase(3200)) * 42f).roundToInt()
-    val col = lerp(Color(0xFF22C55E), Color(0xFFEF4444), ((v - 6f) / 42f).coerceIn(0f, 1f))
-    // Как на колесе: число над центром, «km/h» под ним, оба в стороне от
-    // отверстия под ступицу (его рисует ячейка поверх превью).
-    BoxWithConstraints(Modifier.fillMaxSize()) {
-        val gap = maxWidth * HUB_HOLE_FRAC + 1.dp
-        Box(
-            Modifier.fillMaxWidth().fillMaxHeight(0.5f).align(Alignment.TopCenter).padding(bottom = gap),
-            contentAlignment = Alignment.BottomCenter
-        ) {
-            Text(v.toString(), color = col, fontWeight = FontWeight.Bold, fontSize = 18.sp,
-                lineHeight = 18.sp, maxLines = 1)
-        }
-        Box(
-            Modifier.fillMaxWidth().fillMaxHeight(0.5f).align(Alignment.BottomCenter).padding(top = gap),
-            contentAlignment = Alignment.TopCenter
-        ) {
-            Text("km/h", color = col.copy(alpha = 0.8f), fontSize = 7.sp, lineHeight = 7.sp, maxLines = 1)
         }
     }
 }

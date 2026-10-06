@@ -11,7 +11,7 @@
 volatile uint8_t  effect_id        = EFF_NONE;
 volatile int8_t   pending_effect   = -1;
 volatile bool     pending_effect_play = false;
-volatile uint16_t effect_speed_red = 45;     // км/ч, при которых шрифт красный (регулятора в UI нет)
+volatile uint16_t effect_speed_red = 45;     // км/ч, при которых шрифт красный
 
 // Пара буферов кадра. Выделяются при запуске эффекта и освобождаются при
 // остановке: длинной анимации нужен весь PSRAM, держать 62 кБ «на всякий
@@ -25,14 +25,22 @@ static uint8_t  eff_read   = 0;              // какой буфер сейча
 static SemaphoreHandle_t eff_mutex = nullptr;
 
 // --- служебные таблицы, строятся один раз ---
-static float   cos_s[SECTORS];        // косинус угла сектора
-static float   sin_s[SECTORS];
 static uint8_t sec_hue[SECTORS];      // сектор → 8-битный угол (0..255)
-static int8_t  sin8t[256];            // синус по 8-битному углу, −127..127
-static uint16_t fire_pal[256];        // палитра огня: чёрный → красный → жёлтый → белый
 static float   led_r_norm[LEDS_PER_SIDE];  // радиус диода в долях внешнего
 
-static inline int8_t sin8(int a) { return sin8t[(uint8_t)a]; }
+// --- параметры эффектов (OP_FX_GET / OP_FX_SET), живут в /fx.cfg ---
+#define FX_FILE "/fx.cfg"
+static volatile uint8_t fx_rb_speed  = 10;   // ≈ прежний оборот спектра за ~5 с
+static volatile uint8_t fx_rb_sharp  = 0;    // плавный спектр, как было всегда
+static volatile uint8_t fx_clk_mode  = 0;
+static volatile uint8_t fx_clk_r = 255, fx_clk_g = 255, fx_clk_b = 255;
+static volatile uint8_t fx_clk_speed = 30;
+static volatile bool    fx_dirty     = false;
+
+// Сдвиг тона радуги, 2^32 — полный круг. Копится по кадрам, а не считается от
+// millis(): тогда смена скорости с телефона не дёргает картину скачком.
+static uint32_t fx_hue_acc = 0;
+static uint32_t fx_last_ms = 0;
 
 static inline uint16_t pack565(int r, int g, int b) {
     if (r < 0) r = 0; else if (r > 255) r = 255;
@@ -60,25 +68,11 @@ static inline void hsv2rgb(uint8_t h, uint8_t s, uint8_t v,
     }
 }
 
-// Быстрый генератор псевдослучайных чисел. rand() тянет за собой блокировку
-// и деление, а огню нужно 15840 случайных чисел на кадр.
-static uint32_t rnd_state = 0x1234567u;
-static inline uint32_t rnd32() {
-    rnd_state ^= rnd_state << 13;
-    rnd_state ^= rnd_state >> 17;
-    rnd_state ^= rnd_state << 5;
-    return rnd_state;
-}
-static inline uint8_t  rnd8()  { return (uint8_t)(rnd32() >> 24); }
-static inline uint16_t rnd16() { return (uint16_t)(rnd32() >> 16); }
-
 const char* effectName(uint8_t id) {
     switch (id) {
         case EFF_SPEED:   return "Speed";
-        case EFF_FIRE:    return "Fire";
         case EFF_RAINBOW: return "Rainbow";
         case EFF_TESTING: return "Testing";
-        case EFF_RIPPLE:  return "Ripples";
         case EFF_CLOCK:   return "Clock";
         case EFF_TEXT:    return "Text";
         default:          return "Off";
@@ -100,127 +94,124 @@ float currentSpeedKmh() {
     return (float)wheel_circumference / (float)eff * 3600.0f;
 }
 
+// Сдвиг тона за прошедшее с прошлого кадра время. speed 100 — два оборота
+// цветового круга в секунду: 2^32 · 2 / (100 · 1000) ≈ 85899 на мс и единицу.
+static void advanceHue(uint8_t speed, uint32_t t) {
+    uint32_t dt = fx_last_ms ? (uint32_t)(t - fx_last_ms) : 0;
+    if (dt > 500) dt = 500;               // после паузы (лента гасла) — без скачка
+    fx_last_ms = t;
+    fx_hue_acc += (uint32_t)((uint64_t)dt * speed * 85899u);
+}
+
 // =====================================================================
 //                        ЭФФЕКТЫ
 //  Каждый пишет 360×44 пикселей RGB565 в out[sector * LEDS_PER_SIDE + led].
 // =====================================================================
 
+// Маска яркости → кадр: одним цветом или радугой, которая течёт по углу (тон
+// от сектора плюс сдвиг во времени). Общая для «Текста», часов и скорости.
+static void colorizeMask(uint16_t* out, const uint8_t* alpha, bool rainbow,
+                         int cr, int cg, int cb) {
+    uint8_t phase = (uint8_t)(fx_hue_acc >> 24);
+    for (int s = 0; s < SECTORS; s++) {
+        if (rainbow) hsv2rgb((uint8_t)(sec_hue[s] + phase), 255, 255, cr, cg, cb);
+        const uint8_t* a = alpha + s * LEDS_PER_SIDE;
+        uint16_t* row = out + s * LEDS_PER_SIDE;
+        for (int i = 0; i < LEDS_PER_SIDE; i++) {
+            int m = a[i];
+            row[i] = m ? pack565(cr * m / 255, cg * m / 255, cb * m / 255) : 0;
+        }
+    }
+}
+
 // --- Радуга: тон по углу и по радиусу ---
 // Чистое кольцо одного цвета на вращающемся колесе читается как мигание всей
 // плоскости, поэтому тон меняется ещё и вдоль луча — получается спираль,
 // которая честно выглядит движущейся.
+//
+// Положение на круге (10 бит: сектор, сдвиг во времени, +12 на диод) → цвет
+// через таблицу: резкость меняет только её, и кадр стоит одно чтение на диод.
+#define RB_LUT 1024
+static uint16_t rb_lut[RB_LUT];
+static int      rb_lut_sharp = -1;            // для какой резкости построена
+
+// Семь цветов радуги — тон в градусах: красный, оранжевый, жёлтый, зелёный,
+// голубой, синий, фиолетовый. Последний — снова красный, замыкает круг.
+// Те же числа — в приложении (ui/EffectPreviews.kt, RAINBOW_ANCHORS).
+static const float RB_ANCHORS[8] = {0, 30, 60, 120, 190, 240, 280, 360};
+
+// Тон для положения f (0…1) на круге при резкости p (0…1). Круг делится на
+// семь равных полос, у каждой «плато» её цвета шириной p и линейный переход к
+// соседней на остаток. Чистые полосы (p = 1) неравномерно распределённым тонам
+// ничем не обязаны, а при p = 0 тон обязан быть ровно прежним равномерным
+// спектром — поэтому итог плавно смешивает оба: (1 − p)·равномерный + p·полосы.
+// Смесь двух неубывающих функций сама неубывающая — спектр не идёт вспять.
+static float rainbowHue(float f, float p) {
+    float x = f * 7.0f;
+    int   k = (int)x;
+    if (k > 6) k = 6;
+    float t = x - k, g;
+    if (p >= 0.999f)      g = (t < 0.5f) ? 0.0f : 1.0f;
+    else {
+        g = (t - p * 0.5f) / (1.0f - p);
+        if (g < 0) g = 0; else if (g > 1) g = 1;
+    }
+    float band = RB_ANCHORS[k] + g * (RB_ANCHORS[k + 1] - RB_ANCHORS[k]);
+    return (1.0f - p) * f * 360.0f + p * band;
+}
+
+static void buildRainbowLut(int sharp) {
+    float p = sharp / 100.0f;
+    for (int u = 0; u < RB_LUT; u++) {
+        float h = fmodf(rainbowHue((float)u / RB_LUT, p), 360.0f);
+        // HSV при полной насыщенности и яркости, тон в градусах.
+        float hh = h / 60.0f;
+        int   sec = (int)hh;
+        float fr = hh - sec;
+        int up = (int)lroundf(255.0f * fr), dn = 255 - up;
+        int r, g, b;
+        switch (sec % 6) {
+            case 0:  r = 255; g = up;  b = 0;   break;
+            case 1:  r = dn;  g = 255; b = 0;   break;
+            case 2:  r = 0;   g = 255; b = up;  break;
+            case 3:  r = 0;   g = dn;  b = 255; break;
+            case 4:  r = up;  g = 0;   b = 255; break;
+            default: r = 255; g = 0;   b = dn;  break;
+        }
+        rb_lut[u] = pack565(r, g, b);
+    }
+    rb_lut_sharp = sharp;
+}
+
 static void effRainbow(uint16_t* out, uint32_t t) {
-    uint8_t phase = (uint8_t)(t / 20);            // полный круг тона за ~5 с
+    advanceHue(fx_rb_speed, t);
+    int sharp = fx_rb_sharp;
+    if (sharp != rb_lut_sharp) buildRainbowLut(sharp);
+    uint32_t phase = fx_hue_acc >> 22;          // 10 бит
     for (int s = 0; s < SECTORS; s++) {
-        uint8_t base = (uint8_t)(sec_hue[s] + phase);
+        uint32_t base = (uint32_t)(s * RB_LUT / SECTORS) + phase;
         uint16_t* row = out + s * LEDS_PER_SIDE;
-        for (int i = 0; i < LEDS_PER_SIDE; i++) {
-            int r, g, b;
-            hsv2rgb((uint8_t)(base + i * 3), 255, 255, r, g, b);
-            row[i] = pack565(r, g, b);
-        }
+        for (int i = 0; i < LEDS_PER_SIDE; i++) row[i] = rb_lut[(base + i * 12) & (RB_LUT - 1)];
     }
 }
 
-// --- Концентрические волны ---
-// Единственный радиально-симметричный эффект в наборе: он не зависит от угла,
-// поэтому стоит абсолютно неподвижно и не выдаёт остаточную ошибку фазы ФАПЧ.
-// Небольшая угловая модуляция добавлена, чтобы кольца всё же дышали.
-static void effRipple(uint16_t* out, uint32_t t) {
-    int phase = (int)(t / 12);
-    int hue   = (int)(t / 60);
-    int wob   = (int)(t / 25);
-    for (int s = 0; s < SECTORS; s++) {
-        int a = sec_hue[s];
-        uint16_t* row = out + s * LEDS_PER_SIDE;
-        int off = sin8(a * 2 + wob) >> 4;          // ±8: лёгкое «дыхание» колец
-        for (int i = 0; i < LEDS_PER_SIDE; i++) {
-            int w = sin8(i * 17 - phase + off);   // ~3 кольца на радиус
-            // Только гребни: впадины остаются чёрными, иначе вместо колец
-            // выходит равномерная засветка всего диска.
-            int v = (w > 0) ? (w * 2) : 0;
-            int r, g, b;
-            hsv2rgb((uint8_t)(hue + i * 2), 255, (uint8_t)(v > 255 ? 255 : v), r, g, b);
-            row[i] = pack565(r, g, b);
-        }
-    }
-}
+// --- Текст из растрового шрифта: скорость и часы ---
+// Строки рисуются не в промежуточную декартову маску, а прямо в полярную:
+// каждая ячейка «сектор × диод» усредняет FX_SS × FX_SS точек, и каждая точка
+// проверяется на попадание в «пиксель» шрифта аналитически. Отсюда дробный
+// масштаб (дата мельче времени — иначе не помещается в круг) и честное
+// сглаживание краёв без буфера 192 × 192. Тот же алгоритм — в приложении
+// (convert/FxMask.kt), миниатюры обязаны выглядеть как обод.
+//
+// Координаты — единицы, в которых крайний диод на радиусе 47.5 (как у прежней
+// маски 96 × 96), центр в нуле, ось y вниз.
+#define FX_SS     4
+#define FX_R_OUT  47.5f
 
-// --- Огонь ---
-// Поле температур живёт между кадрами: остывание, перенос тепла от ступицы к
-// ободу и искры у основания. Основание у СТУПИЦЫ, языки уходят к ободу —
-// там угловое разрешение лучше всего, и мелкая игра языков видна.
-static uint8_t* fire_heat = nullptr;     // 360×44, внутренняя память
-static uint8_t  fire_tmp[SECTORS];
-
-// Параметры подобраны на симуляции всего колеса, а не на глаз по одной колонке.
-// Ключевая величина — РАЗБРОС температуры между секторами: пока искры рождались
-// в одиночных секторах, он держался около 12 из 255, и огонь выглядел ровным
-// свечением, а не языками. С дугами разброс вырос примерно до 45.
-#define FIRE_COOL     8     // максимум остывания за кадр (0..7)
-#define FIRE_SPARKS   2     // новых языков за кадр
-#define FIRE_W_MIN   10     // полуширина языка в секторах
-#define FIRE_W_SPAN  20
-#define FIRE_BLUR     2     // проходов углового размытия
-
-static void effFire(uint16_t* out, uint32_t t) {
-    (void)t;
-    const int H = LEDS_PER_SIDE;
-    for (int s = 0; s < SECTORS; s++) {
-        uint8_t* col = fire_heat + s * H;
-        for (int i = 0; i < H; i++) {              // остывание
-            int c = rnd8() % FIRE_COOL;
-            col[i] = (col[i] > c) ? (uint8_t)(col[i] - c) : 0;
-        }
-        for (int i = H - 1; i >= 2; i--) {         // перенос тепла наружу
-            col[i] = (uint8_t)(((int)col[i - 1] + col[i - 2] + col[i - 2]) / 3);
-        }
-    }
-    // Искра рождается ДУГОЙ, а не одним сектором: язык пламени шире градуса, и
-    // одиночный сектор размытие ниже просто съело бы. Профиль треугольный —
-    // у дуги не должно быть ступеньки по краям.
-    for (int k = 0; k < FIRE_SPARKS; k++) {
-        int c   = rnd16() % SECTORS;
-        int w   = FIRE_W_MIN + rnd8() % FIRE_W_SPAN;
-        int amp = 190 + (rnd8() & 0x3F);
-        int i   = rnd8() & 3;
-        for (int d = -w; d <= w; d++) {
-            int s = (c + d) % SECTORS;
-            if (s < 0) s += SECTORS;
-            uint8_t* px = fire_heat + s * H + i;
-            int v = *px + amp * (w - (d < 0 ? -d : d)) / w;
-            *px = (uint8_t)(v > 255 ? 255 : v);
-        }
-    }
-    // Угловое размытие. Без него 360 колонок остывают независимо, и вместо
-    // пламени выходит радиальный шум.
-    for (int pass = 0; pass < FIRE_BLUR; pass++) {
-        for (int i = 0; i < H; i++) {
-            for (int s = 0; s < SECTORS; s++) fire_tmp[s] = fire_heat[s * H + i];
-            for (int s = 0; s < SECTORS; s++) {
-                int a = fire_tmp[(s + SECTORS - 1) % SECTORS];
-                int b = fire_tmp[s];
-                int c = fire_tmp[(s + 1) % SECTORS];
-                fire_heat[s * H + i] = (uint8_t)((a + 2 * b + c) >> 2);
-            }
-        }
-    }
-    for (int s = 0; s < SECTORS; s++) {
-        const uint8_t* col = fire_heat + s * H;
-        uint16_t* row = out + s * H;
-        for (int i = 0; i < H; i++) row[i] = fire_pal[col[i]];
-    }
-}
-
-// --- Общая текстовая маска (скорость и подписи циферблата) ---
-// Текст рисуется в декартову маску и уже оттуда переносится в полярный кадр:
-// строить шрифт сразу в полярных координатах значит гнуть его вместе с сеткой.
-#define MASKW 96
-static uint8_t* text_mask  = nullptr;    // MASKW × MASKW, оттенки серого
-static uint8_t* clock_base = nullptr;    // готовый циферблат: строится один раз
-
-// Шрифт 5×7, по строке на байт (младшие 5 бит). 0–9, затем 'k','m','/','h'.
-static const uint8_t FONT57[14][7] = {
+// Шрифт 5×7, по строке на байт (младшие 5 бит, старший — левый столбец).
+// Ширина у точки — один столбец: время «hh.mm.ss» иначе не влезает в круг.
+enum { G_K = 10, G_M, G_SLASH, G_H, G_DOT, G_DASH, G_COUNT };
+static const uint8_t FONT57[G_COUNT][7] = {
     {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}, // 0
     {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}, // 1
     {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}, // 2
@@ -235,206 +226,95 @@ static const uint8_t FONT57[14][7] = {
     {0x00,0x00,0x1A,0x15,0x15,0x15,0x15}, // m
     {0x01,0x02,0x02,0x04,0x08,0x08,0x10}, // /
     {0x10,0x10,0x16,0x19,0x11,0x11,0x11}, // h
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x10}, // .  (ширина 1)
+    {0x00,0x00,0x00,0x0E,0x00,0x00,0x00}, // -
+};
+static inline int glyphW(int g) { return g == G_DOT ? 1 : 5; }
+
+// Строка, разложенная по столбцам: в каждом — 7 бит горящих строк шрифта.
+#define RUN_COLS 64
+struct FxRun {
+    float   x0, y0, sc;      // левый верхний угол и размер «пикселя» шрифта
+    int     cols;
+    uint8_t col[RUN_COLS];
 };
 
-static void maskGlyph(int gi, int x0, int y0, int sc) {
-    for (int row = 0; row < 7; row++) {
-        uint8_t bits = FONT57[gi][row];
-        for (int col = 0; col < 5; col++) {
-            if (!(bits & (0x10 >> col))) continue;
-            for (int dy = 0; dy < sc; dy++) {
-                int y = y0 + row * sc + dy;
-                if (y < 0 || y >= MASKW) continue;
-                uint8_t* p = text_mask + y * MASKW;
-                for (int dx = 0; dx < sc; dx++) {
-                    int x = x0 + col * sc + dx;
-                    if (x >= 0 && x < MASKW) p[x] = 255;
-                }
-            }
-        }
-    }
-}
-
-static void maskText(const int* glyphs, int n, int cx, int y0, int sc) {
-    int w = n * 5 * sc + (n - 1) * sc;
-    int x = cx - w / 2;
+// Строка по центру по горизонтали; y0 — верх строки.
+static void fxRunMake(FxRun& r, const uint8_t* g, int n, float y0, float sc) {
+    int c = 0;
     for (int k = 0; k < n; k++) {
-        maskGlyph(glyphs[k], x, y0, sc);
-        x += 6 * sc;
-    }
-}
-
-// Переносит маску в полярный кадр. add=false — маска задаёт кадр целиком
-// (скорость), add=true — ложится поверх уже нарисованного (подписи часов).
-static void blitMask(uint16_t* out, int cr, int cg, int cb, bool add) {
-    const float C = (MASKW - 1) * 0.5f;
-    for (int s = 0; s < SECTORS; s++) {
-        float cx = cos_s[s], sy = sin_s[s];
-        uint16_t* row = out + s * LEDS_PER_SIDE;
-        for (int i = 0; i < LEDS_PER_SIDE; i++) {
-            float rp = led_r_norm[i] * C;
-            float x  = C + rp * cx;
-            // ПЛЮС, а не минус: в кадре ось y направлена вниз (тот же порядок,
-            // что и в браузерном конвертере), и «математический» знак
-            // переворачивал бы весь текст вверх ногами.
-            float y  = C + rp * sy;
-            int x0 = (int)x, y0 = (int)y;
-            int m = 0;
-            if (x0 >= 0 && y0 >= 0 && x0 < MASKW - 1 && y0 < MASKW - 1) {
-                float fx = x - x0, fy = y - y0;
-                const uint8_t* p0 = text_mask + y0 * MASKW + x0;
-                const uint8_t* p1 = p0 + MASKW;
-                // Билинейная выборка маски — бесплатное сглаживание краёв.
-                float m0 = p0[0] * (1 - fx) + p0[1] * fx;
-                float m1 = p1[0] * (1 - fx) + p1[1] * fx;
-                m = (int)(m0 * (1 - fy) + m1 * fy);
-            }
-            if (m == 0) { if (!add) row[i] = 0; continue; }
-            int r = cr * m / 255, g = cg * m / 255, b = cb * m / 255;
-            if (add) {
-                uint16_t v = row[i];
-                r += ((v >> 11) & 0x1F) << 3;
-                g += ((v >>  5) & 0x3F) << 2;
-                b += ( v        & 0x1F) << 3;
-            }
-            row[i] = pack565(r, g, b);
+        if (k) { if (c < RUN_COLS) r.col[c] = 0; c++; }       // столбец-зазор
+        for (int x = 0; x < glyphW(g[k]); x++) {
+            uint8_t bits = 0;
+            int bit = (g[k] == G_DOT) ? 0x10 : (0x10 >> x);
+            for (int row = 0; row < 7; row++) if (FONT57[g[k]][row] & bit) bits |= (1 << row);
+            if (c < RUN_COLS) r.col[c] = bits;
+            c++;
         }
     }
+    if (c > RUN_COLS) c = RUN_COLS;
+    r.cols = c;
+    r.sc   = sc;
+    r.x0   = -c * sc * 0.5f;
+    r.y0   = y0;
 }
 
-// Мелкий шрифт 3×5 только для цифр циферблата. Пятёрка по ширине сюда не
-// помещается: на радиусе подписей на один час приходится ~110 мм дуги, а «12»
-// шрифтом 5×7 заняло бы почти всю их.
-static const uint8_t FONT35[10][5] = {
-    {0x7,0x5,0x5,0x5,0x7}, {0x2,0x6,0x2,0x2,0x7}, {0x7,0x1,0x7,0x4,0x7},
-    {0x7,0x1,0x7,0x1,0x7}, {0x5,0x5,0x7,0x1,0x1}, {0x7,0x4,0x7,0x1,0x7},
-    {0x7,0x4,0x7,0x5,0x7}, {0x7,0x1,0x1,0x1,0x1}, {0x7,0x5,0x7,0x5,0x7},
-    {0x7,0x5,0x7,0x1,0x7},
-};
+static uint8_t* fx_alpha = nullptr;      // 360 × 44, полярная маска скорости/часов; PSRAM
 
-static void maskNum35(int v, int cx, int cy, int sc) {
-    int dig[2], nd = 0;
-    if (v >= 10) dig[nd++] = v / 10;
-    dig[nd++] = v % 10;
-    int x  = cx - (nd * 3 * sc + (nd - 1) * sc) / 2;
-    int y0 = cy - (5 * sc) / 2;
-    for (int k = 0; k < nd; k++) {
-        for (int row = 0; row < 5; row++) {
-            uint8_t bits = FONT35[dig[k]][row];
-            for (int col = 0; col < 3; col++) {
-                if (!(bits & (0x4 >> col))) continue;
-                for (int dy = 0; dy < sc; dy++) {
-                    int yy = y0 + row * sc + dy;
-                    if (yy < 0 || yy >= MASKW) continue;
-                    uint8_t* p = text_mask + yy * MASKW;
-                    for (int dx = 0; dx < sc; dx++) {
-                        int xx = x + col * sc + dx;
-                        if (xx >= 0 && xx < MASKW) p[xx] = 255;
+static void fxRender(uint8_t* alpha, const FxRun* runs, int nr) {
+    const float pitch = (LED_R_OUTER_MM - LED_R_INNER_MM) / (LEDS_PER_SIDE - 1) / LED_R_OUTER_MM * FX_R_OUT;
+    float jit[FX_SS];
+    for (int k = 0; k < FX_SS; k++) jit[k] = (k + 0.5f) / FX_SS - 0.5f;
+    const int full = FX_SS * FX_SS;
+    for (int s = 0; s < SECTORS; s++) {
+        float ca[FX_SS], sa[FX_SS];
+        for (int k = 0; k < FX_SS; k++) {
+            float a = (s + jit[k]) * (float)M_PI / 180.0f;
+            ca[k] = cosf(a); sa[k] = sinf(a);
+        }
+        uint8_t* outRow = alpha + s * LEDS_PER_SIDE;
+        for (int i = 0; i < LEDS_PER_SIDE; i++) {
+            float r0 = led_r_norm[i] * FX_R_OUT;
+            int hits = 0;
+            for (int ka = 0; ka < FX_SS; ka++) {
+                for (int kr = 0; kr < FX_SS; kr++) {
+                    float rr = r0 + jit[kr] * pitch;
+                    float x = rr * ca[ka], y = rr * sa[ka];
+                    for (int q = 0; q < nr; q++) {
+                        const FxRun& R = runs[q];
+                        float u = (x - R.x0) / R.sc, v = (y - R.y0) / R.sc;
+                        if (u < 0 || v < 0 || v >= 7.0f || u >= R.cols) continue;
+                        if ((R.col[(int)u] >> (int)v) & 1) { hits++; break; }
                     }
                 }
             }
-        }
-        x += 4 * sc;
-    }
-}
-
-// --- Часы ---
-// Сектор 0 смотрит вправо, номер сектора растёт по часовой стрелке (так же
-// заданы углы в браузерном конвертере), поэтому 12 часов — это сектор 270.
-// Куда именно на колесе попадёт «верх», определяет калибровка angle_offset.
-static void clockHand(uint16_t* out, float deg, int i_from, int i_to,
-                      float halfw_mm, int cr, int cg, int cb) {
-    float centre = fmodf(270.0f + deg, 360.0f);
-    if (i_from < 0) i_from = 0;
-    if (i_to > LEDS_PER_SIDE) i_to = LEDS_PER_SIDE;
-    for (int i = i_from; i < i_to; i++) {
-        float r_mm = LED_R_INNER_MM + i * ((LED_R_OUTER_MM - LED_R_INNER_MM) / (LEDS_PER_SIDE - 1));
-        // Постоянная физическая толщина: у ступицы стрелка занимает много
-        // градусов, у обода — единицы. Иначе она была бы клином.
-        float w = halfw_mm / r_mm * 57.2958f;
-        if (w < 0.6f) w = 0.6f;
-        int span = (int)(w + 1.0f);
-        for (int d = -span; d <= span; d++) {
-            float dist = fabsf((float)d) ;
-            // Мягкий край шириной в один сектор: жёсткая граница на ободе
-            // заметно «лестничная», а лишний сектор охвата почти бесплатен.
-            float cov = w + 0.5f - dist;
-            if (cov <= 0.0f) continue;
-            if (cov > 1.0f) cov = 1.0f;
-            int s = ((int)lroundf(centre) + d) % SECTORS;
-            if (s < 0) s += SECTORS;
-            uint16_t* px = out + s * LEDS_PER_SIDE + i;
-            int r = (int)(cr * cov), g = (int)(cg * cov), b = (int)(cb * cov);
-            // Складываем, а не заменяем: на пересечении стрелок иначе побеждала
-            // бы нарисованная последней.
-            int orr = ((*px >> 11) & 0x1F) << 3;
-            int org = ((*px >>  5) & 0x3F) << 2;
-            int orb = ( *px        & 0x1F) << 3;
-            *px = pack565(orr + r, org + g, orb + b);
+            outRow[i] = (uint8_t)((hits * 255 + full / 2) / full);
         }
     }
-}
-
-// Циферблат целиком — деления и подписи. Он не меняется никогда, поэтому
-// строится один раз при запуске эффекта, а каждый кадр только копируется:
-// перерисовывать двенадцать чисел десять раз в секунду не за что.
-static void buildClockBase(uint16_t* base) {
-    memset(base, 0, (size_t)SECTORS * LEDS_PER_SIDE * 2);
-    // Деления одинаковой длины: раньше «12» выделялось длинной риской, но с
-    // подписями это уже лишнее, а длинная риска налезала бы на само число.
-    for (int k = 0; k < 12; k++) {
-        clockHand(base, k * 30.0f, 39, LEDS_PER_SIDE, 5.0f, 90, 90, 90);
-    }
-    // Подписи ставим внутрь от делений: те занимают радиус 43.9…47.5 маски,
-    // число высотой 10 px с центром на 37 укладывается в 32…42 — с зазором.
-    memset(text_mask, 0, (size_t)MASKW * MASKW);
-    const float C = (MASKW - 1) * 0.5f;
-    const float R = 37.0f;
-    for (int k = 1; k <= 12; k++) {
-        float a = (270.0f + k * 30.0f) * (float)M_PI / 180.0f;
-        maskNum35(k, (int)lroundf(C + R * cosf(a)), (int)lroundf(C + R * sinf(a)), 2);
-    }
-    blitMask(base, 170, 170, 190, true);
-}
-
-static void effClock(uint16_t* out, uint32_t t) {
-    (void)t;
-    memcpy(out, clock_base, (size_t)SECTORS * LEDS_PER_SIDE * 2);
-
-    int hh = 0, mm = 0, ss = 0;
-    if (!localClock(hh, mm, ss)) return;   // время неизвестно — только циферблат
-
-    float sec_deg  = ss * 6.0f;
-    float min_deg  = mm * 6.0f + ss * 0.1f;
-    float hour_deg = (hh % 12) * 30.0f + mm * 0.5f;
-
-    clockHand(out, hour_deg, 0, 26, 7.0f, 255, 170,  40);   // часовая — янтарная
-    clockHand(out, min_deg,  0, 38, 5.0f, 220, 220, 255);   // минутная — белая
-    clockHand(out, sec_deg,  0, 42, 2.5f, 255,  40,  40);   // секундная — тонкая красная
 }
 
 // --- Скорость ---
+// Число НАД центром, подпись — под ним: в середине диска дырка радиусом 49 мм
+// (8.5 единиц), и всё, что её накроет, потеряет середину.
+static int speed_shown = -1;
+
 static void effSpeed(uint16_t* out, uint32_t t) {
     (void)t;
     int v = (int)(currentSpeedKmh() + 0.5f);
     if (v > 999) v = 999;
-
-    memset(text_mask, 0, (size_t)MASKW * MASKW);
-
-    int dig[3], nd = 0;
-    if (v >= 100) { dig[nd++] = v / 100; dig[nd++] = (v / 10) % 10; dig[nd++] = v % 10; }
-    else if (v >= 10) { dig[nd++] = v / 10; dig[nd++] = v % 10; }
-    else { dig[nd++] = v; }
-
-    // Число ставим НАД центром, подпись — под ним: в середине диска дырка
-    // радиусом 49 мм (это 8.5 px маски от центра), и всё, что её накроет,
-    // потеряет середину. Отсюда зазоры: низ числа на 9.5 px выше центра,
-    // верх подписи на 10.5 px ниже.
-    int sc = (nd >= 3) ? 3 : 4;
-    maskText(dig, nd, MASKW / 2, 38 - 7 * sc, sc);
-    static const int UNIT[4] = {10, 11, 12, 13};      // k m / h
-    maskText(UNIT, 4, MASKW / 2, 58, 2);
-
+    if (v != speed_shown) {
+        uint8_t dig[3]; int nd = 0;
+        if (v >= 100) { dig[nd++] = v / 100; dig[nd++] = (v / 10) % 10; dig[nd++] = v % 10; }
+        else if (v >= 10) { dig[nd++] = v / 10; dig[nd++] = v % 10; }
+        else { dig[nd++] = v; }
+        float sc = (nd >= 3) ? 3.0f : 4.0f;
+        static const uint8_t UNIT[4] = {G_K, G_M, G_SLASH, G_H};
+        FxRun runs[2];
+        fxRunMake(runs[0], dig, nd, -10.0f - 7.0f * sc, sc);   // низ числа на 10 выше центра
+        fxRunMake(runs[1], UNIT, 4, 10.0f, 2.0f);              // верх подписи на 10 ниже
+        fxRender(fx_alpha, runs, 2);
+        speed_shown = v;
+    }
     // Цвет: зелёный на малой скорости, красный на effect_speed_red и выше.
     // Идём по тону 85→0, поэтому переход проходит через жёлтый сам собой.
     float red = (float)effect_speed_red;
@@ -443,8 +323,49 @@ static void effSpeed(uint16_t* out, uint32_t t) {
     if (k > 1.0f) k = 1.0f;
     int rr, gg, bb;
     hsv2rgb((uint8_t)(85.0f * (1.0f - k) + 0.5f), 255, 255, rr, gg, bb);
+    colorizeMask(out, fx_alpha, false, rr, gg, bb);
+}
 
-    blitMask(out, rr, gg, bb, false);
+// --- Часы ---
+// Цифровые: время «hh.mm.ss» над центром, дата «yyyy.mm.dd» под ним. Дата
+// мельче — длиннее на два знака и обязана поместиться в хорду круга. Часы не
+// заведены — прочерки вместо цифр. Маска перестраивается раз в секунду (по
+// смене строки), каждый кадр — только цвет: радуга течёт и между секундами.
+#define CLK_SC_TIME 2.0f
+#define CLK_SC_DATE 1.6f
+static int32_t clock_shown = -2;
+
+static void effClock(uint16_t* out, uint32_t t) {
+    bool rainbow = fx_clk_mode == 1;
+    if (rainbow) advanceHue(fx_clk_speed, t);
+
+    int hh, mm, ss, yy, mo, dd;
+    bool ok = localClock(hh, mm, ss) && localDate(yy, mo, dd);
+    // Ключ строки: месяц, день и секунда суток. Год в него не входит — его смена
+    // при той же дате и секунде невозможна, а скачок часов поправит следующая.
+    int32_t key = ok ? ((mo * 32 + dd) * 86400 + hh * 3600 + mm * 60 + ss) : -1;
+    if (key != clock_shown) {
+        uint8_t tm[8], dt[10];
+        if (ok) {
+            uint8_t T[8] = {(uint8_t)(hh / 10), (uint8_t)(hh % 10), G_DOT,
+                            (uint8_t)(mm / 10), (uint8_t)(mm % 10), G_DOT,
+                            (uint8_t)(ss / 10), (uint8_t)(ss % 10)};
+            uint8_t D[10] = {(uint8_t)(yy / 1000 % 10), (uint8_t)(yy / 100 % 10),
+                             (uint8_t)(yy / 10 % 10), (uint8_t)(yy % 10), G_DOT,
+                             (uint8_t)(mo / 10), (uint8_t)(mo % 10), G_DOT,
+                             (uint8_t)(dd / 10), (uint8_t)(dd % 10)};
+            memcpy(tm, T, 8); memcpy(dt, D, 10);
+        } else {
+            for (int k = 0; k < 8; k++)  tm[k] = (k == 2 || k == 5) ? G_DOT : G_DASH;
+            for (int k = 0; k < 10; k++) dt[k] = (k == 4 || k == 7) ? G_DOT : G_DASH;
+        }
+        FxRun runs[2];
+        fxRunMake(runs[0], tm, 8, -10.0f - 7.0f * CLK_SC_TIME, CLK_SC_TIME);
+        fxRunMake(runs[1], dt, 10, 10.0f, CLK_SC_DATE);
+        fxRender(fx_alpha, runs, 2);
+        clock_shown = key;
+    }
+    colorizeMask(out, fx_alpha, rainbow, fx_clk_r, fx_clk_g, fx_clk_b);
 }
 
 // --- Текст по окружности ---
@@ -468,19 +389,9 @@ static void effText(uint16_t* out, uint32_t t) {
     if (!text_alpha) { memset(out, 0, FRAME_SIZE); return; }
     const bool rainbow = (text_mode == 1);
     // Радуга течёт по углу: тон зависит от сектора и сдвигается во времени.
-    // speed 100 — два оборота цветового круга в секунду (512 единиц 8-битного
-    // тона), в 64 битах — millis() за неделю на 100 × 512 не влезает в 32.
-    uint8_t phase = rainbow ? (uint8_t)(((uint64_t)t * text_speed * 512u / 100000u) & 0xFF) : 0;
-    int cr = text_r, cg = text_g, cb = text_b;
-    for (int s = 0; s < SECTORS; s++) {
-        if (rainbow) hsv2rgb((uint8_t)(sec_hue[s] + phase), 255, 255, cr, cg, cb);
-        const uint8_t* a = text_alpha + s * LEDS_PER_SIDE;
-        uint16_t* row = out + s * LEDS_PER_SIDE;
-        for (int i = 0; i < LEDS_PER_SIDE; i++) {
-            int m = a[i];
-            row[i] = m ? pack565(cr * m / 255, cg * m / 255, cb * m / 255) : 0;
-        }
-    }
+    // speed 100 — два оборота цветового круга в секунду.
+    if (rainbow) advanceHue(text_speed, t);
+    colorizeMask(out, text_alpha, rainbow, text_r, text_g, text_b);
 }
 
 // Распаковка и разбор блоба. Отдельно от публикации, чтобы загрузка из файла
@@ -584,18 +495,70 @@ static void textLoad() {
     f.close();
 }
 
+// ---- Параметры эффектов ----
+
+void effectsFxGet(FxParams& p) {
+    p.speed_red = effect_speed_red;
+    p.rb_speed  = fx_rb_speed;
+    p.rb_sharp  = fx_rb_sharp;
+    p.clk_mode  = fx_clk_mode;
+    p.clk_r = fx_clk_r; p.clk_g = fx_clk_g; p.clk_b = fx_clk_b;
+    p.clk_speed = fx_clk_speed;
+}
+
+void effectsFxSet(const FxParams& p) {
+    // Красная точка скорости — в SettingsBlob (так было до /fx.cfg), остальное — в файле.
+    if (p.speed_red >= 5 && p.speed_red <= 200 && p.speed_red != effect_speed_red) {
+        effect_speed_red = p.speed_red;
+        settings_dirty = true;
+    }
+    fx_rb_speed  = p.rb_speed  > 100 ? 100 : p.rb_speed;
+    fx_rb_sharp  = p.rb_sharp  > 100 ? 100 : p.rb_sharp;
+    fx_clk_mode  = p.clk_mode ? 1 : 0;
+    fx_clk_r = p.clk_r; fx_clk_g = p.clk_g; fx_clk_b = p.clk_b;
+    fx_clk_speed = p.clk_speed > 100 ? 100 : p.clk_speed;
+    fx_dirty = true;
+    settings_dirty = true;      // повод для flushSettings() дойти и до /fx.cfg
+}
+
+// /fx.cfg: "FXP1", rb_speed, rb_sharp, clk_mode, clk_r, clk_g, clk_b, clk_speed, rsv.
+void effectsFxFlush() {
+    if (!fx_dirty) return;
+    fx_dirty = false;
+    File f = LittleFS.open(FX_FILE, "w");
+    if (!f) { webLog("[EFF] Effect settings save failed"); return; }
+    uint8_t h[12] = {'F', 'X', 'P', '1', fx_rb_speed, fx_rb_sharp, fx_clk_mode,
+                     fx_clk_r, fx_clk_g, fx_clk_b, fx_clk_speed, 0};
+    f.write(h, sizeof(h));
+    f.close();
+    webLog("[EFF] Effect settings saved");
+}
+
+static void fxLoad() {
+    File f = LittleFS.open(FX_FILE, "r");
+    if (!f) return;
+    uint8_t h[12];
+    if (f.read(h, sizeof(h)) == sizeof(h) && memcmp(h, "FXP1", 4) == 0) {
+        fx_rb_speed  = h[4] > 100 ? 100 : h[4];
+        fx_rb_sharp  = h[5] > 100 ? 100 : h[5];
+        fx_clk_mode  = h[6] ? 1 : 0;
+        fx_clk_r = h[7]; fx_clk_g = h[8]; fx_clk_b = h[9];
+        fx_clk_speed = h[10] > 100 ? 100 : h[10];
+    }
+    f.close();
+}
+
 // =====================================================================
 //                   ГЕНЕРАТОР И УПРАВЛЕНИЕ
 // =====================================================================
 
 static uint32_t effPeriodMs(uint8_t id) {
     switch (id) {
-        case EFF_FIRE:
         case EFF_RAINBOW:
-        case EFF_RIPPLE:
         // Текст: радуга течёт, а смена цвета с телефона должна доезжать сразу.
         case EFF_TEXT:    return 40;      // 25 к/с — движение должно быть плавным
-        case EFF_CLOCK:   return 100;     // секундная стрелка
+        // Часы: радуге нужна плавность, одному цвету — только смена секунды.
+        case EFF_CLOCK:   return fx_clk_mode == 1 ? 40 : 100;
         // EFF_TESTING содержимого этого буфера не читает вообще (см.
         // fillSectorIntoBuffer() в main.cpp) — период не важен.
         default:          return 200;     // скорость меняется медленно
@@ -607,9 +570,7 @@ static void renderEffect(uint8_t id, uint8_t* buf) {
     uint32_t  t   = millis();
     switch (id) {
         case EFF_SPEED:   effSpeed(out, t);   break;
-        case EFF_FIRE:    effFire(out, t);    break;
         case EFF_RAINBOW: effRainbow(out, t); break;
-        case EFF_RIPPLE:  effRipple(out, t);  break;
         case EFF_CLOCK:   effClock(out, t);   break;
         case EFF_TEXT:    effText(out, t);    break;
         // EFF_TESTING рисуется в main.cpp прямо по ray, минуя этот буфер —
@@ -618,41 +579,24 @@ static void renderEffect(uint8_t id, uint8_t* buf) {
     }
 }
 
-// Память эффекта: два кадра в PSRAM плюс, если нужно этому эффекту, поле
-// температур или маска шрифта во внутренней памяти — к ним идёт много мелких
-// обращений, и PSRAM на таком доступе медленна. Вспомогательные буферы
-// выделяются ТОЛЬКО своему эффекту: держать 25 кБ внутреннего heap ради огня,
-// пока крутится радуга, незачем — эта память нужна WiFi.
+// Память эффекта: два кадра в PSRAM плюс, если нужно этому эффекту, полярная
+// маска текста. Вспомогательный буфер выделяется ТОЛЬКО своему эффекту:
+// держать его, пока крутится радуга, незачем.
 static bool effAlloc(uint8_t id) {
     if (!eff_buf[0]) eff_buf[0] = (uint8_t*)ps_malloc(FRAME_SIZE);
     if (!eff_buf[1]) eff_buf[1] = (uint8_t*)ps_malloc(FRAME_SIZE);
     if (!eff_buf[0] || !eff_buf[1]) return false;
 
-    if (id == EFF_FIRE) {
-        if (!fire_heat) fire_heat = (uint8_t*)calloc(SECTORS * LEDS_PER_SIDE, 1);
-        if (!fire_heat) return false;
-    } else if (fire_heat) { free(fire_heat); fire_heat = nullptr; }
-
-    // Маска нужна и цифрам скорости, и подписям циферблата.
     if (id == EFF_SPEED || id == EFF_CLOCK) {
-        if (!text_mask) text_mask = (uint8_t*)malloc((size_t)MASKW * MASKW);
-        if (!text_mask) return false;
-    } else if (text_mask) { free(text_mask); text_mask = nullptr; }
-
-    // Циферблат не меняется никогда — держим готовый кадр и копируем его.
-    if (id == EFF_CLOCK) {
-        if (!clock_base) clock_base = (uint8_t*)ps_malloc(FRAME_SIZE);
-        if (!clock_base) return false;
-        buildClockBase((uint16_t*)clock_base);
-    } else if (clock_base) { free(clock_base); clock_base = nullptr; }
+        if (!fx_alpha) fx_alpha = (uint8_t*)ps_malloc((size_t)SECTORS * LEDS_PER_SIDE);
+        if (!fx_alpha) return false;
+    } else if (fx_alpha) { free(fx_alpha); fx_alpha = nullptr; }
     return true;
 }
 
 static void effFree() {
     for (int i = 0; i < 2; i++) { if (eff_buf[i]) { free(eff_buf[i]); eff_buf[i] = nullptr; } }
-    if (fire_heat)  { free(fire_heat);  fire_heat  = nullptr; }
-    if (text_mask)  { free(text_mask);  text_mask  = nullptr; }
-    if (clock_base) { free(clock_base); clock_base = nullptr; }
+    if (fx_alpha) { free(fx_alpha); fx_alpha = nullptr; }
 }
 
 static void effectsTask(void* pv) {
@@ -679,35 +623,20 @@ static void effectsTask(void* pv) {
 }
 
 void effectsInit() {
-    for (int s = 0; s < SECTORS; s++) {
-        float a  = s * (float)M_PI / 180.0f;
-        cos_s[s] = cosf(a);
-        sin_s[s] = sinf(a);
-        sec_hue[s] = (uint8_t)((s * 256) / 360);
-    }
-    for (int i = 0; i < 256; i++) {
-        sin8t[i] = (int8_t)lroundf(127.0f * sinf(i * 2.0f * (float)M_PI / 256.0f));
-    }
+    for (int s = 0; s < SECTORS; s++) sec_hue[s] = (uint8_t)((s * 256) / 360);
     const float step = (LED_R_OUTER_MM - LED_R_INNER_MM) / (float)(LEDS_PER_SIDE - 1);
     for (int i = 0; i < LEDS_PER_SIDE; i++) {
         led_r_norm[i] = (LED_R_INNER_MM + i * step) / LED_R_OUTER_MM;
     }
-    // Палитра огня: три отрезка — разгорание до красного, до жёлтого, до белого.
-    for (int h = 0; h < 256; h++) {
-        int r, g, b;
-        if (h < 85)       { r = h * 3;             g = 0;               b = 0; }
-        else if (h < 170) { r = 255;               g = (h - 85) * 3;    b = 0; }
-        else              { r = 255;               g = 255;             b = (h - 170) * 3; }
-        fire_pal[h] = pack565(r, g > 255 ? 255 : g, b > 255 ? 255 : b);
-    }
     eff_mutex = xSemaphoreCreateMutex();
     textLoad();                          // после мьютекса: textApply() берёт его
+    fxLoad();
     xTaskCreatePinnedToCore(effectsTask, "effects", 4096, NULL, 1, NULL, 0);
 }
 
 bool effectsStart(uint8_t id) {
     if (id == EFF_NONE) { effectsStop(); return true; }
-    if (id >= EFF_COUNT) return false;
+    if (!effectValid(id)) return false;
 
     // Гасим ленту тем же приёмом, что и загрузчик файла: подменять frameBuffer
     // и освобождать старый под работающим рендером нельзя.
@@ -730,9 +659,11 @@ bool effectsStart(uint8_t id) {
     uint8_t* oldBuf = (frameBuffer == eff_buf[0] || frameBuffer == eff_buf[1])
                     ? nullptr : frameBuffer;
 
-    effect_id = id;
-    if (fire_heat) memset(fire_heat, 0, (size_t)SECTORS * LEDS_PER_SIDE);
-    eff_read = 0;
+    effect_id   = id;
+    speed_shown = -1;                    // маски строятся заново: буфер мог смениться
+    clock_shown = -2;
+    fx_last_ms  = 0;
+    eff_read    = 0;
     renderEffect(id, eff_buf[0]);        // первый кадр готовим до публикации
 
     totalFrames       = 1;               // эффект всегда один кадр: смешивать нечего
@@ -741,7 +672,7 @@ bool effectsStart(uint8_t id) {
     frame_fmt         = FRAME_FMT_565;
     // Speed, Clock и Text рисуют текст, его надо читать с обеих сторон колеса —
     // fillSectorIntoBuffer() зеркалит для этого дальнюю сторону луча (см. там).
-    // Fire/Rainbow/Ripples и диагностический Testing — им обе стороны одинаковы.
+    // Rainbow и диагностический Testing — им обе стороны одинаковы.
     mirror_back_face  = (id == EFF_SPEED || id == EFF_CLOCK || id == EFF_TEXT);
     frameBuffer       = eff_buf[0];
     palette_gen++;

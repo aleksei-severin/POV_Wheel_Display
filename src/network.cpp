@@ -119,6 +119,25 @@ bool localClock(int& h, int& m, int& s) {
     return true;
 }
 
+// Местная дата — для цифровых часов. Дни от эпохи в гражданский календарь
+// (алгоритм Хиннанта): gmtime_r() здесь не нужен, пояс уже сложен вручную.
+bool localDate(int& y, int& mo, int& d) {
+    uint32_t epoch = _currentEpoch();
+    if (epoch == 0) { y = mo = d = 0; return false; }
+    int64_t local = (int64_t)epoch + (int64_t)_tzOffset();
+    if (local < 0) local = 0;
+    int32_t z   = (int32_t)(local / 86400) + 719468;
+    int32_t era = z / 146097;
+    uint32_t doe = (uint32_t)(z - era * 146097);
+    uint32_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    uint32_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    uint32_t mp  = (5 * doy + 2) / 153;
+    d  = (int)(doy - (153 * mp + 2) / 5 + 1);
+    mo = (int)(mp < 10 ? mp + 3 : mp - 9);
+    y  = (int)yoe + era * 400 + (mo <= 2 ? 1 : 0);
+    return true;
+}
+
 // Вызывается в начале setup(). Сами часы здесь НЕ сбрасываются — они живут в
 // системном времени и обязаны пережить сон. Обнуляется только пара, по которой
 // задним числом проставляются метки строк лога: она привязана к millis(), а он
@@ -1090,7 +1109,7 @@ void setupNetwork() {
         }
         if (request->hasParam("id")) {
             long id = request->getParam("id")->value().toInt();
-            if (id < 0 || id >= EFF_COUNT) {
+            if (id != EFF_NONE && !effectValid((int)id)) {
                 request->send(400, "text/plain", "Bad effect id");
                 return;
             }

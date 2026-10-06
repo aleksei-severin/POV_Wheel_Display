@@ -24,6 +24,7 @@ import com.povwheel.app.ble.BleClient
 import com.povwheel.app.ble.BleException
 import com.povwheel.app.ble.DevFile
 import com.povwheel.app.ble.FsInfo
+import com.povwheel.app.ble.FxParams
 import com.povwheel.app.ble.Link
 import com.povwheel.app.ble.PreviewFrame
 import com.povwheel.app.ble.Proto
@@ -169,7 +170,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
 
     private fun cacheFile(addr: String) = File(cacheDir, addr.replace(":", "") + ".json")
 
-    private fun cacheJson(fl: List<DevFile>, fs: FsInfo, s: Settings?, t: TextFx?): String {
+    private fun cacheJson(fl: List<DevFile>, fs: FsInfo, s: Settings?, t: TextFx?, fx: FxParams?): String {
         val o = JSONObject()
         o.put("files", JSONArray().apply { fl.forEach { put(JSONArray().put(it.name).put(it.size)) } })
         o.put("fs", JSONArray().put(fs.total).put(fs.used).put(fs.free).put(fs.psramFree)
@@ -180,6 +181,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         if (t != null && tb != null) o.put("txt", JSONArray()
             .put(Base64.encodeToString(t.style.pack(), Base64.NO_WRAP))
             .put(Base64.encodeToString(tb, Base64.NO_WRAP)))
+        if (fx != null) o.put("fx", Base64.encodeToString(fx.pack(), Base64.NO_WRAP))
         return o.toString()
     }
 
@@ -205,6 +207,9 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 val blob = Base64.decode(a.getString(1), Base64.NO_WRAP)
                 TextMask.unpack(blob)?.let { (txt, mask) -> textFxByAddr[addr] = TextFx(txt, st, mask, blob) }
             }
+            if (!fxByAddr.containsKey(addr)) o.optString("fx").takeIf { it.isNotEmpty() }?.let {
+                fxByAddr[addr] = FxParams.parse(Base64.decode(it, Base64.NO_WRAP))
+            }
             cacheWritten[addr] = text
         }
     }
@@ -221,7 +226,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             val t = if (isCur) textFx.value else textFxByAddr[addr]
             // Колесо, о котором ещё ничего не узнали, пустым снимком не затираем.
             if (fl.isEmpty() && fs.total == 0L && s == null) continue
-            val js = cacheJson(fl, fs, s, t)
+            val js = cacheJson(fl, fs, s, t, fxByAddr[addr])
             if (cacheWritten[addr] == js) continue
             cacheWritten[addr] = js
             withContext(Dispatchers.IO) { runCatching { cacheFile(addr).writeText(js) } }
@@ -710,6 +715,14 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         syncPartners.value = syncPartners.value + members.associateWith { m -> members - m }
         slideIntervalMs.value = slideIntervalMs.value + members.associateWith { ms }
         if (settingsLoaded.value) applyGroupSyncedFields(group, settings.value)
+        // Настройки выбранных в показ эффектов (кроме «Текста») — с этого колеса
+        // на все остальные: один и тот же эффект должен выглядеть одинаково.
+        viewModelScope.launch {
+            val c = clients[addr]?.takeIf { it.hello?.hasFx == true } ?: return@launch
+            val src = runCatching { c.fxGet() }.getOrNull()?.also { adoptFx(addr, it) }
+                ?: fxByAddr[addr] ?: return@launch
+            syncFxToGroup(addr, src, freshBase = true)
+        }
         armGroupFallback(members, list, ms)
         startGroupTicker(group)
         val names = members.map { m -> wheels.value.firstOrNull { it.address == m }?.name ?: m }
@@ -756,6 +769,9 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      *  (loadCache) уже читает карту. */
     val textFx = MutableStateFlow(TextFx())
     private val textFxByAddr = HashMap<String, TextFx>()
+    /** Настройки Speed/Rainbow/Clock открытого колеса (см. «параметры эффектов» ниже). */
+    val fxParams = MutableStateFlow(FxParams())
+    private val fxByAddr = HashMap<String, FxParams>()
     val logLines = MutableStateFlow<List<String>>(emptyList())
     val toast = MutableStateFlow<String?>(null)
 
@@ -819,6 +835,21 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         rebuildWheels()
         registerBtStateReceiver()
         startConnectSweep()
+
+        // «Render POV Video»: свежий хвост лога Холла со всех колёс на связи —
+        // и пока колесо крутится (кольцо в PSRAM читается всегда). Колесо, которое
+        // как раз переподключается, недолго ждём: ролик сняли, пока приложение
+        // было в фоне, и связь могла только-только вернуться.
+        povVideo.logRefresher = {
+            coroutineScope {
+                clients.values.toList().map { c ->
+                    async {
+                        withTimeoutOrNull(8_000) { c.link.first { it != Link.Connecting } }
+                        if (c.link.value == Link.Ready && c.hello?.hasHallLog == true) c.pullHallLogNow()
+                    }
+                }.awaitAll()
+            }
+        }
     }
 
     /**
@@ -1372,6 +1403,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         files.value  = filesByAddr[addr] ?: emptyList()
         fsInfo.value = fsInfoByAddr[addr] ?: FsInfo()
         textFx.value = textFxByAddr[addr] ?: TextFx()
+        fxParams.value = fxByAddr[addr] ?: FxParams()
         magnetLocked.value = prefs.getBoolean(magnetLockKey(addr), false)
         logLines.value = emptyList()
         logTotal = 0
@@ -1509,6 +1541,9 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                             // и пробуем ещё раз на следующем витке.
                             lastState = -1L
                         }
+                        // Настройки эффектов могли поменять со второго телефона
+                        // или рассылкой синхронной группы (OP_FX_SET взводит версию).
+                        fetchFx(addr, c)
                     }
                     if (t.fileVer != lastFile) {
                         lastFile = t.fileVer
@@ -1546,6 +1581,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             }
             runCatching { c.telemetry() }
             fetchTextFx(addr, c)
+            fetchFx(addr, c)
         }
     }
 
@@ -1565,6 +1601,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             runCatching { c.list() }.getOrNull()?.let { filesByAddr[addr] = it }
             runCatching { c.fsInfo() }.getOrNull()?.let { fsInfoByAddr[addr] = it }
             fetchTextFx(addr, c)
+            fetchFx(addr, c)
         }
     }
 
@@ -1870,7 +1907,10 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         s.items.value = emptyList()
         s.sel.value = 0
         s.progress.value = -1f
-        s.status.value = "Reading " + picked.size + " file(s)…"
+        // Подсказок «N files selected / name ready. Press Upload.» нет: что выбрано,
+        // видно по жёлтым ячейкам, а кнопка Upload и так прямо над ними. Строка
+        // статуса — только для хода заливки и ошибок.
+        s.status.value = ""
         s.kind.value = 0
         viewModelScope.launch {
             // Uri в очереди уникальны: по нему ячейка плитки держит свой ключ, а
@@ -1880,9 +1920,6 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             }
             s.items.value = list
             recomputeUploadBusyAddrs()
-            s.status.value = if (list.size > 1) list.size.toString() + " files selected. Press Upload."
-                             else list[0].name + " ready. Press Upload."
-            s.kind.value = 1
             startPrep(addr, list.map { it.uri })
         }
     }
@@ -2748,6 +2785,116 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     /** Колесо открытого экрана умеет эффект «Текст» (или он уже знаком из кэша). */
     fun hasTextEffect(): Boolean =
         currentClient()?.hello?.hasText == true || textFx.value.mask != null
+
+    // ------------------------------------------------------ параметры эффектов
+    //
+    // Красная точка Speed, скорость и резкость Rainbow, цвет Clock (OP_FX_GET /
+    // OP_FX_SET). Правки из диалогов уходят на колесо сразу, как у «Текста», —
+    // последним значением, промежуточные StateFlow пропускает сам. В синхронной
+    // группе правка тех эффектов, что выбраны в показ, расходится и по остальным
+    // колёсам (см. [syncFxToGroup]); «Текст» не синхронизируется никогда — у
+    // каждого колеса своя строка и свой цвет.
+
+    private fun adoptFx(addr: String, p: FxParams) {
+        fxByAddr[addr] = p
+        if (current.value == addr) fxParams.value = p
+    }
+
+    /** Прочитать с колеса, если прошивка умеет. Пока открыт диалог — не затираем. */
+    private suspend fun fetchFx(addr: String, c: BleClient) {
+        if (c.hello?.hasFx != true) return
+        val p = runCatching { c.fxGet() }.getOrNull() ?: return
+        if (fxEditing && addr == current.value) return
+        adoptFx(addr, p)
+    }
+
+    private data class FxEdit(val addr: String, val p: FxParams, val effectId: Int, val n: Long)
+    private val fxEdits = MutableStateFlow<FxEdit?>(null)
+    @Volatile private var fxEditing = false
+    // На каком колесе в этом сеансе диалога эффект уже запущен (как у «Текста»).
+    private var fxStartedFor: String? = null
+
+    init {
+        viewModelScope.launch {
+            fxEdits.collect { e ->
+                if (e == null) return@collect
+                val c = client(e.addr)?.takeIf { it.link.value == Link.Ready && it.hello?.hasFx == true }
+                    ?: return@collect
+                try {
+                    c.fxSet(e.p)
+                    ensureFxPlaying(e.addr, c, e.effectId)
+                } catch (ex: Exception) {
+                    say((c.hello?.name ?: e.addr) + ": " + (ex.message ?: "effect settings not sent"))
+                }
+                syncFxToGroup(e.addr, e.p)
+            }
+        }
+    }
+
+    /**
+     * Первая правка в диалоге включает сам эффект — результат сразу виден на
+     * ободе. Кроме идущего слайдшоу (обычного или синхронного): правка настроек
+     * не должна его рвать — эффект покажется в свою очередь уже новым.
+     */
+    private suspend fun ensureFxPlaying(addr: String, c: BleClient, effectId: Int) {
+        if (fxStartedFor == addr) return
+        fxStartedFor = addr
+        if (syncGroups.containsKey(addr) || c.tele.value.slideshow) return
+        if (c.tele.value.effect != effectId) c.effect(effectId)
+    }
+
+    fun beginFxEdit() { fxEditing = true; fxStartedFor = null }
+    fun endFxEdit() { fxEditing = false }
+
+    /** Правка из диалога эффекта [effectId] (Speed, Rainbow или Clock). */
+    fun editFx(effectId: Int, p: FxParams) {
+        val addr = current.value ?: return
+        adoptFx(addr, p)
+        fxEdits.value = FxEdit(addr, p, effectId, ++editSeq)
+    }
+
+    /** Колесо открытого экрана умеет настройки эффектов (OP_FX_*). */
+    fun hasFxSettings(): Boolean = currentClient()?.hello?.hasFx == true
+
+    /**
+     * Из [src] — только поля эффектов, выбранных в показ ([tokens] — `@eN`):
+     * у партнёра остаются его собственные настройки эффектов, которых в
+     * синхронном показе нет.
+     */
+    private fun mergeFx(base: FxParams, src: FxParams, tokens: Collection<String>): FxParams {
+        var r = base
+        if ("@e1" in tokens) r = r.copy(speedRed = src.speedRed)
+        if ("@e3" in tokens) r = r.copy(rbSpeed = src.rbSpeed, rbSharp = src.rbSharp)
+        if ("@e6" in tokens) r = r.copy(clock = src.clock)
+        return r
+    }
+
+    /**
+     * Колесо [addr] в синхронной группе и в её показе есть Speed/Rainbow/Clock —
+     * их настройки с [src] расходятся по остальным участникам. Все сразу, а не по
+     * очереди: слабая связь с одним колесом не должна задерживать остальные.
+     */
+    private suspend fun syncFxToGroup(addr: String, src: FxParams, freshBase: Boolean = false) {
+        val group = syncGroups[addr] ?: return
+        val tokens = group.files.filter { isSlideEffect(it) }
+        if (tokens.none { it == "@e1" || it == "@e3" || it == "@e6" }) return
+        coroutineScope {
+            for (m in group.members) {
+                if (m == addr) continue
+                val c = clients[m]?.takeIf { it.link.value == Link.Ready && it.hello?.hasFx == true } ?: continue
+                launch {
+                    // Во время перетаскивания ползунка — по кэшу (лишний круг по
+                    // радио на каждое значение ни к чему), на старте показа — с колеса.
+                    val cached = if (freshBase) null else fxByAddr[m]
+                    val base = cached ?: runCatching { c.fxGet() }.getOrNull() ?: fxByAddr[m] ?: return@launch
+                    val merged = mergeFx(base, src, tokens)
+                    if (merged == base) return@launch
+                    if (runCatching { c.fxSet(merged) }.isSuccess) adoptFx(m, merged)
+                }
+            }
+        }
+    }
+
     fun album(start: Boolean, ms: Int) {
         if (start) endSync(current.value)
         onTargets { it.album(start, ms) }
@@ -2757,9 +2904,15 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
 
     private fun slideSelKey(addr: String) = "slidesel_" + addr
 
-    /** Токены эффектов в наборе выбранного для слайдшоу: `@e1`..`@e7`. */
-    val slideEffectTokens: List<String> = (1..TEXT_EFFECT_ID).map { "@e" + it }
+    /** Токены эффектов в наборе выбранного для слайдшоу: `@e1`, `@e3`… — по
+     *  существующим эффектам (2 и 5 удалены из прошивки, их токены из старого
+     *  сохранённого отбора просто отсеиваются). */
+    val slideEffectTokens: List<String> = com.povwheel.app.ui.EFFECT_IDS.map { "@e" + it }
     fun isSlideEffect(token: String) = token in slideEffectTokens
+
+    /** Маска эффектов для OP_ALBUM: бит N-1 — эффект N (EFF_SLIDE_MASK). */
+    private fun effectMaskOf(checked: Collection<String>): Int =
+        checked.mapNotNull { slideEffectId(it) }.fold(0) { m, id -> m or (1 shl (id - 1)) }
 
     /** Отмеченное для слайдшоу из прошлого раза: имена файлов (пересечённые с
      *  реально лежащими на колесе) плюс токены эффектов. Ничего не сохранено —
@@ -2782,7 +2935,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     /** [checked] (имена файлов + токены эффектов `@eN`) → [AlbumSelection]:
      *  маска эффектов плюс include/exclude-список файлов, тот что короче. */
     private fun albumSelectionFor(checked: Set<String>, fileNames: List<String>): AlbumSelection {
-        val effMask = slideEffectTokens.foldIndexed(0) { i, m, t -> if (t in checked) m or (1 shl i) else m }
+        val effMask = effectMaskOf(checked)
         val incl = fileNames.filter { it in checked }
         val excl = fileNames.filter { it !in checked }
         return when {
@@ -2803,7 +2956,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      * группы, а не в порядке, в котором каждое из них когда-то получило файлы.
      */
     private fun syncAlbumSelection(checked: Set<String>): AlbumSelection {
-        val effMask = slideEffectTokens.foldIndexed(0) { i, m, t -> if (t in checked) m or (1 shl i) else m }
+        val effMask = effectMaskOf(checked)
         val names = checked.filterNot { isSlideEffect(it) }
         return AlbumSelection(1, names, effMask, names.size > 20)
     }

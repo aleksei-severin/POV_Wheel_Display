@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.util.concurrent.Executors
 
@@ -64,14 +65,40 @@ class PovVideoController(private val app: Application, private val scope: Corout
         Thread(r, "pov-render").apply { isDaemon = true }
     }.asCoroutineDispatcher()
 
+    /**
+     * Внеочередная выгрузка лога Холла со всех колёс на связи (задаёт WheelVm).
+     * Ролик обычно снимают прямо перед тем, как открыть приложение, и хвост
+     * поездки фоновый опрос ещё не забрал — анализ тогда не нашёл бы лога на
+     * последние секунды или на весь ролик целиком.
+     */
+    var logRefresher: (suspend () -> Unit)? = null
+    private var logJob: Job? = null
+
+    /**
+     * Нажали «Render POV Video» — тянем лог сразу, пока человек выбирает ролик в
+     * галерее: к моменту выбора он, как правило, уже в архиве.
+     */
+    fun prefetchLog() {
+        if (logJob?.isActive == true) return
+        val r = logRefresher ?: return
+        logJob = scope.launch { runCatching { withTimeoutOrNull(15_000) { r() } } }
+    }
+
     fun pick(uri: Uri) {
         if (_busy.value) return
         cancelFlag = false
         autoRender = true
         _busy.value = true
         _state.value = State.Analyzing("video", "Reading video…")
+        if (logJob?.isActive != true) prefetchLog()
+        val pending = logJob
         job = scope.launch(renderDispatcher) {
             try {
+                if (pending?.isActive == true) {
+                    _state.value = State.Analyzing("video", "Fetching the latest Hall log…")
+                    pending.join()
+                    _state.value = State.Analyzing("video", "Reading video…")
+                }
                 val a = PovAnalyzer.analyze(app, uri,
                     step = { s -> (_state.value as? State.Analyzing)?.let { _state.value = it.copy(step = s) } },
                     cancelled = { cancelFlag || !isActive })

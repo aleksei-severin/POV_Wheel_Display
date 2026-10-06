@@ -474,16 +474,27 @@ class BleClient(
     suspend fun delete(name: String) { request(Proto.OP_DELETE, name.toByteArray(Charsets.US_ASCII)) }
 
     /**
-     * Запуск процедурного эффекта. Точка покраснения Speed зашита на 45 км/ч —
-     * регулятора в интерфейсе больше нет, а значение на устройстве могло
-     * остаться другим от старой прошивки.
+     * Запуск процедурного эффекта. Красная точка Speed здесь НЕ передаётся (0 —
+     * «не трогать»): её задаёт [fxSet] из настроек эффекта, а прежняя зашитая
+     * сюда 45 затирала бы выбранное пользователем при каждом запуске.
      */
     suspend fun effect(id: Int) {
         val b = Proto.buf(3)
         b.put(id.toByte())
-        b.putShort(45.toShort())   // км/ч красной зоны Speed
+        b.putShort(0)
         request(Proto.OP_EFFECT, b.array())
     }
+
+    /** Параметры эффектов (Speed, Rainbow, Clock) — нужен [Hello.hasFx]. */
+    suspend fun fxGet(): FxParams = FxParams.parse(request(Proto.OP_FX_GET))
+    /** Применяются сразу, во флеш колесо пишет их само позже. */
+    suspend fun fxSet(p: FxParams) { request(Proto.OP_FX_SET, p.pack()) }
+
+    /**
+     * Забрать свежие записи лога Холла прямо сейчас, не дожидаясь очередного
+     * витка фонового опроса, — перед анализом только что снятого ролика.
+     */
+    suspend fun pullHallLogNow() { hallSync?.pullNow() }
 
     /** Цвет эффекта «Текст» — применяется сразу, во флеш колесо пишет его само позже. */
     suspend fun textStyle(st: TextStyle) { request(Proto.OP_TEXT_STYLE, st.pack()) }
@@ -540,7 +551,7 @@ class BleClient(
      * Слайдшоу. При старте [names] задаёт отбор файлов (нужен [Hello.hasAlbumSel]):
      * `null` — отбор не трогать (стоп, либо смена только интервала); пустой список —
      * сбросить отбор; иначе [listMode] 0 — пропускать эти, 1 — играть только эти.
-     * [effectMask] — биты 0..5 = эффекты 1..6 тоже в показе.
+     * [effectMask] — биты 0..6 = эффекты 1..7 тоже в показе (EFF_SLIDE_MASK).
      */
     suspend fun album(
         start: Boolean, delayMs: Int,
@@ -562,7 +573,7 @@ class BleClient(
         b.put(if (listMode != 0) 1 else 0)
         b.putShort(enc.size.toShort())
         for (e in enc) { b.put(e.size.toByte()); b.put(e) }
-        b.put((effectMask and 0x3F).toByte())
+        b.put((effectMask and 0x7F).toByte())
         request(Proto.OP_ALBUM, b.array())
     }
 

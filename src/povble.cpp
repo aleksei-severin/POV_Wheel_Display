@@ -59,6 +59,7 @@ static_assert(sizeof(PovTime)     == 40, "PovTime != TimeInfo.SIZE в Proto.kt")
 static_assert(sizeof(PovHallPage) == 44, "PovHallPage != HallPage.SIZE в Proto.kt");
 static_assert(sizeof(PovHallHist) == 20, "PovHallHist != HallHist.SIZE в Proto.kt");
 static_assert(sizeof(PovTextStyle) == 8, "PovTextStyle != TextStyle.SIZE в Proto.kt");
+static_assert(sizeof(PovFxParams) == 16, "PovFxParams != FxParams.SIZE в Proto.kt");
 
 // Приём сжатой маски эффекта «Текст» (OP_TEXT_SET): куски складываются здесь,
 // пока не придёт последний. 16 кБ PSRAM — с запасом: маска 360 × 44 со строкой
@@ -787,7 +788,7 @@ static void handleCmd(const uint8_t* d, size_t n) {
         h.frame_stride  = FRAME_STRIDE_PAL;
         h.mtu           = peer_mtu;
         h.features      = POV_FEAT_DEFLATE | POV_FEAT_OTA | POV_FEAT_PREVIEW | POV_FEAT_WIFI |
-                          POV_FEAT_ALBUM_SEL | POV_FEAT_HALL_LOG | POV_FEAT_TEXT;
+                          POV_FEAT_ALBUM_SEL | POV_FEAT_HALL_LOG | POV_FEAT_TEXT | POV_FEAT_FX;
         h.uptime_s      = millis() / 1000;
         // Именно видимое имя: приложение подписывает им строку списка, и
         // расходиться с тем, что пришло в рекламе, оно не должно.
@@ -910,7 +911,7 @@ static void handleCmd(const uint8_t* d, size_t n) {
         // шлёт именно его: пересылка текущего id заново запускала бы эффект,
         // а тот ждёт освобождения буфера кадра и гасит ленту на это время.
         if (id == 0xFF) { sendRsp(op, seq, ST_OK); break; }
-        if (id >= EFF_COUNT) { sendRsp(op, seq, ST_BAD_ARG); break; }
+        if (id != EFF_NONE && !effectValid(id)) { sendRsp(op, seq, ST_BAD_ARG); break; }
         slideshowActive = false;
         pendingFilePath = "";
         if (id == EFF_NONE) {
@@ -970,6 +971,38 @@ static void handleCmd(const uint8_t* d, size_t n) {
         memcpy(stage + sizeof(st), &n, 2);
         stage_len = sizeof(st) + 2 + n;
         stageRsp(op, seq);
+        break;
+    }
+
+    case OP_FX_GET: {
+        FxParams f; effectsFxGet(f);
+        PovFxParams p; memset(&p, 0, sizeof(p));
+        p.speed_red = f.speed_red;
+        p.rb_speed  = f.rb_speed;
+        p.rb_sharp  = f.rb_sharp;
+        p.clock.mode = f.clk_mode;
+        p.clock.r = f.clk_r; p.clock.g = f.clk_g; p.clock.b = f.clk_b;
+        p.clock.speed = f.clk_speed;
+        sendRsp(op, seq, ST_OK, &p, sizeof(p));
+        break;
+    }
+
+    case OP_FX_SET: {
+        if (pn < sizeof(PovFxParams)) { sendRsp(op, seq, ST_BAD_ARG); break; }
+        PovFxParams p; memcpy(&p, pl, sizeof(p));
+        FxParams f;
+        f.speed_red = p.speed_red;
+        f.rb_speed  = p.rb_speed;
+        f.rb_sharp  = p.rb_sharp;
+        f.clk_mode  = p.clock.mode;
+        f.clk_r = p.clock.r; f.clk_g = p.clock.g; f.clk_b = p.clock.b;
+        f.clk_speed = p.clock.speed;
+        // Во флеш — отложенно (flushSettings()), только пока лента не светится:
+        // ползунки шлют это десятками раз за одно движение.
+        effectsFxSet(f);
+        // Второй телефон (или второе колесо синхронной группы) перечитает.
+        pov_state_version++;
+        sendRsp(op, seq, ST_OK);
         break;
     }
 

@@ -65,6 +65,9 @@ object Proto {
     const val OP_TEXT_STYLE = 0x20  // TextStyle
     const val OP_TEXT_SET   = 0x21  // [u16 total][u16 off][кусок сжатого блоба]
     const val OP_TEXT_GET   = 0x22  // ← staged: TextStyle + [u16 len][сжатый блоб]
+    // Параметры эффектов (FEAT_FX): красная точка Speed, радуга, цвет часов
+    const val OP_FX_GET     = 0x23  // ← FxParams
+    const val OP_FX_SET     = 0x24  // FxParams
 
     /**
      * Предел имени — столько же, сколько держит PovHello.name вместе с
@@ -107,6 +110,7 @@ object Proto {
     const val FEAT_ALBUM_SEL = 0x0010   // OP_ALBUM понимает отбор файлов для слайдшоу
     const val FEAT_HALL_LOG  = 0x0020   // OP_TIME / OP_TIME_SET / OP_HALL_LOG / OP_HALL_HIST
     const val FEAT_TEXT      = 0x0040   // эффект «Текст»: OP_TEXT_STYLE / OP_TEXT_SET / OP_TEXT_GET
+    const val FEAT_FX        = 0x0080   // OP_FX_GET / OP_FX_SET; часы цифровые, эффекты 2 и 5 удалены
 
     const val ST_BUSY = 3
 
@@ -135,6 +139,7 @@ data class Hello(
     val hasAlbumSel get() = features and Proto.FEAT_ALBUM_SEL != 0
     val hasHallLog  get() = features and Proto.FEAT_HALL_LOG != 0
     val hasText     get() = features and Proto.FEAT_TEXT != 0
+    val hasFx       get() = features and Proto.FEAT_FX != 0
 
     companion object {
         const val SIZE = 48
@@ -435,12 +440,45 @@ data class TextStyle(val rainbow: Boolean = false, val rgb: Int = 0xFFFFFF, val 
     }
     companion object {
         const val SIZE = 8
-        fun parse(a: ByteArray): TextStyle {
-            if (a.size < SIZE) return TextStyle()
-            val r = a[1].toInt() and 0xFF
-            val g = a[2].toInt() and 0xFF
-            val bl = a[3].toInt() and 0xFF
-            return TextStyle(a[0].toInt() != 0, (r shl 16) or (g shl 8) or bl, a[4].toInt() and 0xFF)
+        fun parse(a: ByteArray, off: Int = 0): TextStyle {
+            if (a.size < off + SIZE) return TextStyle()
+            val r = a[off + 1].toInt() and 0xFF
+            val g = a[off + 2].toInt() and 0xFF
+            val bl = a[off + 3].toInt() and 0xFF
+            return TextStyle(a[off].toInt() != 0, (r shl 16) or (g shl 8) or bl, a[off + 4].toInt() and 0xFF)
+        }
+    }
+}
+
+/**
+ * Параметры эффектов (PovFxParams, 16 байт): [speedRed] — км/ч, при которых цифры
+ * Speed красные; радуга — скорость [rbSpeed] (0…100, 100 — два оборота спектра в
+ * секунду) и резкость [rbSharp] (0 — плавный спектр, 100 — семь чистых полос);
+ * [clock] — цвет часов, устроен как у «Текста».
+ */
+data class FxParams(
+    val speedRed: Int = 45,
+    val rbSpeed: Int = 10,
+    val rbSharp: Int = 0,
+    val clock: TextStyle = TextStyle()
+) {
+    fun pack(): ByteArray {
+        val b = Proto.buf(SIZE)
+        b.putShort(speedRed.coerceIn(5, 200).toShort())
+        b.put(rbSpeed.coerceIn(0, 100).toByte())
+        b.put(rbSharp.coerceIn(0, 100).toByte())
+        b.put(clock.pack())
+        return b.array()
+    }
+    companion object {
+        const val SIZE = 16
+        fun parse(a: ByteArray): FxParams {
+            if (a.size < SIZE) return FxParams()
+            val p = Proto.wrap(a)
+            val red = p.short.toInt() and 0xFFFF
+            val sp = p.get().toInt() and 0xFF
+            val sh = p.get().toInt() and 0xFF
+            return FxParams(red, sp, sh, TextStyle.parse(a, 4))
         }
     }
 }

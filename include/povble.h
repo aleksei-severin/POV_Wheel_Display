@@ -48,7 +48,7 @@ enum PovOp : uint8_t {
     OP_ALBUM       = 0x0A,  // →  [u8 action 0=stop 1=start][u32 delay_ms]
                            //    старт может нести отбор (FEAT_ALBUM_SEL):
                            //    …[u8 mode 0=пропускать 1=играть-только][u16 n]{[u8 len][имя]}[u8 effMask]
-                           //    effMask: биты 0..5 — эффекты 1..6 тоже в показе
+                           //    effMask: биты 0..6 — эффекты 1..7 тоже в показе (EFF_SLIDE_MASK)
                            //    короткий пакет — отбор не трогать (стоп / смена интервала)
     OP_TELE        = 0x0B,  // →  ничего            ←  PovTele
     OP_PREVIEW     = 0x0C,  // →  имя файла         ←  [u8 sec][u8 rad][RGB565 sec*rad]
@@ -94,6 +94,12 @@ enum PovOp : uint8_t {
                            //    и применяется (ST_CRC — не распаковался)
     OP_TEXT_GET    = 0x22,  // →  ничего  ←  staged: PovTextStyle + [u16 len][сжатый блоб]
                            //    (len = 0 — текст ещё не задан)
+
+    // Параметры эффектов (POV_FEAT_FX): красная точка скорости, скорость и
+    // резкость радуги, цвет часов. Симметрично на чтение и запись, как настройки;
+    // применяется сразу, во флеш — отложенно (/fx.cfg и SettingsBlob).
+    OP_FX_GET      = 0x23,  // →  ничего            ←  PovFxParams
+    OP_FX_SET      = 0x24,  // →  PovFxParams       ←  ничего (значения зажимаются)
 };
 
 // Предел имени. 19 значащих символов — ровно столько, сколько влезает в
@@ -144,6 +150,7 @@ struct PovHello {
 #define POV_FEAT_ALBUM_SEL 0x0010   // OP_ALBUM понимает отбор файлов для слайдшоу
 #define POV_FEAT_HALL_LOG  0x0020   // OP_TIME / OP_TIME_SET / OP_HALL_LOG / OP_HALL_HIST
 #define POV_FEAT_TEXT      0x0040   // эффект «Текст»: OP_TEXT_STYLE / OP_TEXT_SET / OP_TEXT_GET
+#define POV_FEAT_FX        0x0080   // OP_FX_GET / OP_FX_SET; эффекты 2 и 5 удалены, часы цифровые
 
 // Цвет эффекта «Текст».
 struct PovTextStyle {
@@ -151,6 +158,15 @@ struct PovTextStyle {
     uint8_t r, g, b;  // цвет в режиме 0
     uint8_t speed;    // радуга: 0…100, 100 — два оборота цветового круга в секунду
     uint8_t rsv[3];
+};
+
+// Параметры эффектов, 16 байт. Цвет часов — тот же PovTextStyle, что у «Текста».
+struct PovFxParams {
+    uint16_t speed_red;      // Speed: км/ч, при которых цифры красные, 5…200
+    uint8_t  rb_speed;       // Rainbow: 0…100, 100 — два оборота спектра в секунду
+    uint8_t  rb_sharp;       // Rainbow: 0 — плавный спектр, 100 — семь чистых полос
+    PovTextStyle clock;      // Clock: цвет
+    uint8_t  rsv[4];
 };
 
 // Настройки, симметричные на чтение и запись. Всё, что имеет побочные эффекты

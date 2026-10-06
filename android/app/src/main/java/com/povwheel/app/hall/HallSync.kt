@@ -5,12 +5,16 @@ import android.os.SystemClock
 import com.povwheel.app.ble.BleClient
 import com.povwheel.app.ble.BleException
 import com.povwheel.app.ble.Link
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.TimeZone
 import kotlin.math.abs
 import kotlin.math.max
@@ -46,6 +50,26 @@ class HallSync(private val ctx: Context, private val c: BleClient) {
 
     fun stop() = scope.cancel()
 
+    // Фоновый виток и внеочередной [pullNow] не должны тянуть кольцо одновременно:
+    // оба спросили бы с одного и того же места и дважды прогнали одни записи.
+    private val pullLock = Mutex()
+
+    /**
+     * Забрать новые записи кольца сейчас же — для «Render POV Video»: ролик только
+     * что сняли, а фоновый виток доберёт хвост лишь через несколько секунд. Кольцо
+     * в PSRAM читается и пока лента светится (в отличие от истории на флеше).
+     */
+    suspend fun pullNow() {
+        if (c.link.value != Link.Ready) return
+        // Только что подключились — сначала первая серия пингов: без неё записи
+        // этой сессии не к чему привязать по времени телефона.
+        withTimeoutOrNull(6_000) { primed.await() }
+        runCatching { pullLock.withLock { pullLog(c.address) } }
+    }
+
+    /** Первая серия пингов часов прошла (см. [loop]). */
+    private val primed = CompletableDeferred<Unit>()
+
     private suspend fun pings(n: Int): List<BleClient.TimeSample> {
         val out = ArrayList<BleClient.TimeSample>(n)
         for (i in 0 until n) {
@@ -80,6 +104,7 @@ class HallSync(private val ctx: Context, private val c: BleClient) {
                     if (ti.wallUs != 0L) HallArchive.noteGen(addr, ti.clockGen, err, ti.sleepUs, ti.precise)
                     if (first) {
                         first = false
+                        primed.complete(Unit)
                         val tz = TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 1000
                         val tol = max(2_000L, best.rttUs / 2)
                         if (ti.wallUs == 0L || !ti.precise || abs(err) > tol) {
@@ -95,7 +120,7 @@ class HallSync(private val ctx: Context, private val c: BleClient) {
                 }
             }
 
-            runCatching { pullLog(addr) }
+            runCatching { pullLock.withLock { pullLog(addr) } }
 
             if (pwr != 2 && now - lastHist > 60_000) {
                 if (pullHist(addr)) lastHist = now

@@ -76,6 +76,9 @@ fun PovVideoCard(ctrl: PovVideoController) {
     }
 
     fun openGallery() {
+        // Лог Холла — сразу, пока выбирают ролик: колесо может ещё крутиться, а
+        // только что снятый ролик должен найти свежий хвост лога.
+        ctrl.prefetchLog()
         try {
             gallery.launch(Intent(Intent.ACTION_PICK, MediaStore.Video.Media.EXTERNAL_CONTENT_URI))
         } catch (_: ActivityNotFoundException) {

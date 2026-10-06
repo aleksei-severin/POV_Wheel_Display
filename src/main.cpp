@@ -36,7 +36,7 @@ volatile uint8_t  frame_fmt   = FRAME_FMT_565;
 volatile uint32_t palette_gen = 1;
 // По умолчанию заднюю сторону НЕ зеркалим — спереди и сзади горят те же пиксели.
 // Значение выставляют loadFrameFromFile() (из флага в заголовке ANI6) и
-// effectsStart() (true только для Speed и Clock).
+// effectsStart() (true только для Speed, Clock и Text).
 volatile bool     mirror_back_face = false;
 
 // Глобальные переменные для поддержки GIF анимаций
@@ -343,7 +343,8 @@ static void loadSettingsFromNVS() {
     slideshowActive    = (b.slideshow   != 0);
     // Эффект сам НЕ запускается здесь: буферы кадра ещё не выделены, а PSRAM
     // проверяется только в setup(). Запоминаем, запуск — ниже по setup().
-    if (b.effect > EFF_NONE && b.effect < EFF_COUNT) effect_id = b.effect;
+    // Удалённый эффект (пустой номер) не поднимаем — лента просто останется тёмной.
+    if (effectValid(b.effect)) effect_id = b.effect;
     if (b.speed_red >= 5 && b.speed_red <= 200)      effect_speed_red = b.speed_red;
     // b._rsvd_arm_trim / b._rsvd_spi_div — бывшие подстройка лучей и делитель
     // частоты SPI, больше не читаются (частота фиксирована на SK9822_SPI_HZ).
@@ -352,9 +353,11 @@ static void loadSettingsFromNVS() {
 
 // Сброс отложенных настроек. Вызывать только когда отрисовка остановлена.
 static void flushSettings() {
-    // Текст и цвет эффекта «Текст» — тем же отложенным путём и с тем же
-    // правилом: только пока лента не светится (их правки взводят settings_dirty).
+    // Текст и цвет эффекта «Текст», параметры радуги и часов — тем же
+    // отложенным путём и с тем же правилом: только пока лента не светится (их
+    // правки взводят settings_dirty).
     effectsTextFlush();
+    effectsFxFlush();
     if (!settings_dirty) return;
     SettingsBlob now, stored;
     fillSettingsBlob(now);
@@ -2484,7 +2487,7 @@ static bool advanceSlideshow() {
             c++;
         }
         // Тот же эффект уже крутится (тоже total==1 случай) — не перезапускаем
-        // его: effectsStart() сбросил бы состояние (искры Fire, стрелки Clock)
+        // его: effectsStart() сбросил бы состояние (фазу радуги, маску Clock)
         // и на миг погасил бы ленту ради ровно той же картинки.
         if (eid > 0 && eid != effect_id) {
             pendingFilePath    = "";
@@ -2573,7 +2576,7 @@ static int slideSequencePositionOf(const String& name, int effId) {
 bool syncTick(const String& name, int effId) {
     if (name.length()) {
         if (!LittleFS.exists("/" + name)) return false;
-    } else if (effId < 1 || effId >= EFF_COUNT) {
+    } else if (!effectValid(effId)) {
         return false;
     }
     int pos = slideSequencePositionOf(name, effId);

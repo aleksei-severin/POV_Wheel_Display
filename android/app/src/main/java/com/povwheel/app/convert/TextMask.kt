@@ -167,7 +167,26 @@ object TextMask {
      */
     fun disc(mask: ByteArray, size: Int): Bitmap {
         val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val idx = discIndex(size)
         val px = IntArray(size * size)
+        for (i in px.indices) {
+            val k = idx[i]
+            if (k < 0) continue
+            val a = mask[k].toInt() and 0xFF
+            if (a != 0) px[i] = (a shl 24) or 0xFFFFFF
+        }
+        bmp.setPixels(px, 0, size, 0, 0, size, size)
+        return bmp
+    }
+
+    // Пиксель картинки → ячейка маски (−1 — вне кольца диодов), по размеру. Часы
+    // перерисовывают миниатюру каждую секунду, и считать atan2 на каждый пиксель
+    // заново незачем: геометрия от маски не зависит.
+    private val discIdx = HashMap<Int, IntArray>()
+
+    @Synchronized
+    private fun discIndex(size: Int): IntArray = discIdx.getOrPut(size) {
+        val idx = IntArray(size * size) { -1 }
         val cx = size / 2.0
         val minR = size * Geom.R_INNER_FRAC
         val maxR = size * Geom.R_OUTER_FRAC
@@ -183,11 +202,9 @@ object TextMask {
                 if (ang < 0) ang += twoPi
                 val sec = (ang / twoPi * Geom.SECTORS).toInt().coerceIn(0, Geom.SECTORS - 1)
                 val led = ((rad - minR) / dR).roundToInt().coerceIn(0, Geom.LEDS_PER_SIDE - 1)
-                val a = mask[sec * Geom.LEDS_PER_SIDE + led].toInt() and 0xFF
-                if (a != 0) px[y * size + x] = (a shl 24) or 0xFFFFFF
+                idx[y * size + x] = sec * Geom.LEDS_PER_SIDE + led
             }
         }
-        bmp.setPixels(px, 0, size, 0, 0, size, size)
-        return bmp
+        idx
     }
 }

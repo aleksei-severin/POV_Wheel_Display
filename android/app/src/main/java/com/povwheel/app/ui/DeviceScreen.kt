@@ -616,12 +616,17 @@ private fun Hero(vm: WheelVm, tele: Tele, online: Boolean) {
                         modifier = Modifier.alignByBaseline().padding(start = 6.dp),
                         color = battColor
                     )
+                    // Напряжение — тем же стилем, что обороты слева: число
+                    // titleMedium, единица мелко. Прочерки без связи тогда той же
+                    // величины, что и «--» у rpm.
                     Text(
-                        (if (battKnown) String.format("%.2f", tele.vbatMv / 1000f) else "--") + " V",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.alignByBaseline().padding(start = 6.dp)
+                        if (battKnown) String.format("%.2f", tele.vbatMv / 1000f) else "--",
+                        style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.alignByBaseline().padding(start = 10.dp)
                     )
+                    Text(" V", style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.alignByBaseline())
                 }
                 // Бейдж — отдельной строкой только когда есть что сказать: не
                 // резервируем под него высоту, пока нет ни зарядки, ни защиты.
@@ -726,8 +731,11 @@ private fun AutoBrightnessRange(vm: WheelVm, s: Settings, tele: Tele, enabled: B
             onFinished = { vm.pushSettings(vm.settings.value); vm.saveSettings() },
             // Оранжевая метка — текущая эффективная яркость на пользовательской
             // шкале; ниже пола (лента выключена или очень тускло) не показываем —
-            // у левого края она читалась бы как «яркость 1».
-            marker = if (tele.effBri in BRI_LO..BRI_HI)
+            // у левого края она читалась бы как «яркость 1». Нет её и пока
+            // датчик света не запитан (PWR_OFF — колесо не крутится): он висит
+            // на DCDC №1, и яркость тогда посчитана по последнему, давно
+            // устаревшему замеру.
+            marker = if (tele.pwr != 0 && tele.effBri in BRI_LO..BRI_HI)
                 1f + (tele.effBri - BRI_LO) * (BRI_U_MAX - 1).toFloat() / (BRI_HI - BRI_LO) else null,
             modifier = Modifier.weight(1f)
         )
