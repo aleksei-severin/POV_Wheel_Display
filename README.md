@@ -16,8 +16,12 @@ your own text into a 55 cm disc of light. You control it from an Android app ove
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 
 https://github.com/user-attachments/assets/de3e84e7-838d-4e36-8ee6-f0384d49a477
-&nbsp;&nbsp;
-<img width="520" alt="POV Wheel Display" src="https://github.com/user-attachments/assets/ea52aa7b-4600-4c0e-bcde-7cd562d91a8a" />
+
+<a href="https://www.instagram.com/reel/DeDYKcECSC1/">
+  <img width="320" alt="POV Wheel Display on a mountain bike: watch the reel on Instagram" src="docs/images/instagram_reel.jpg" />
+</a>
+
+▶️ **[Watch it in action on Instagram](https://www.instagram.com/reel/DeDYKcECSC1/)**
 
 </div>
 
@@ -63,6 +67,8 @@ riders on either side of the bike read them correctly. Logos and pictures can do
 ---
 
 ## 📱 The app
+
+<img src="docs/images/app.gif" align="right" width="260" alt="POV Wheel Android app: library with animated previews, battery and settings" />
 
 The Android app (Kotlin + Jetpack Compose, Android 8.0+) is the main way to use the wheel. A
 built-in web UI is still there over opt-in Wi-Fi.
