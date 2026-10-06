@@ -46,7 +46,7 @@ The geometry and every engineering trade-off target one use case: a 29" MTB whee
 
 | | |
 |---|---|
-| **Display** | 6 arms × 88 LEDs = **528 SK9822** (APA102-class), double-sided, 44 LEDs per face |
+| **Display** | 6 arms × 88 LEDs = **528 SK9822-A** (27 kHz PWM, 20 MHz clock), double-sided, 44 LEDs per face |
 | **Image size** | **~55 cm disc** (LED radius 49–273 mm), fits inside a 29" rim |
 | **Resolution** | 360 × 44 polar pixels per frame, **256 colours per frame** (own palette for every frame) |
 | **Refresh** | Six arms draw the full image every **1/6 of a turn**: 20 Hz at ~28 km/h |
