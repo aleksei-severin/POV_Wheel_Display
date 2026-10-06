@@ -4,9 +4,9 @@
 
 ### Turn your 29" MTB wheel into a full-colour video screen
 
-A double-sided **persistence-of-vision display** that lives inside a mountain-bike wheel:
+A double-sided **Persistence-Of-Vision Display** that lives inside a mountain-bike wheel:
 528 LEDs on six spinning arms paint photos, animations, video, a live speedometer, a clock and
-your own text into a 55 cm disc of light. You control it from an Android app over Bluetooth.
+your own text right onto bike wheel! You control it from an Android app over Bluetooth.
 
 ![ESP32-S3](https://img.shields.io/badge/ESP32--S3-E7352C?logo=espressif&logoColor=white)
 ![PlatformIO](https://img.shields.io/badge/PlatformIO-F5822A?logo=platformio&logoColor=white)
@@ -50,7 +50,7 @@ The geometry and every engineering trade-off target one use case: a 29" MTB whee
 | **Image size** | **~55 cm disc** (LED radius 49–273 mm), fits inside a 29" rim |
 | **Resolution** | 360 × 44 polar pixels per frame, **256 colours per frame** (own palette for every frame) |
 | **Refresh** | Six arms draw the full image every **1/6 of a turn**: 20 Hz at ~28 km/h |
-| **Turns on** | from **~17 km/h** (120 rpm, adjustable in the app) |
+| **Turns on** | from **~15 km/h** (110 rpm, adjustable in the app) |
 | **Animation length** | up to **~48 s at 10 fps** in RAM, **13 MB** library on flash |
 | **Brains** | ESP32-S3, 16 MB flash, 8 MB PSRAM |
 | **Sync** | **6 Hall sensors** (one per arm) + one magnet on the fork or frame |
