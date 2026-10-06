@@ -15,8 +15,6 @@ your own text into a 55 cm disc of light. You control it from an Android app ove
 ![Bluetooth LE](https://img.shields.io/badge/Bluetooth-LE-0082FC?logo=bluetooth&logoColor=white)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 
-https://github.com/user-attachments/assets/de3e84e7-838d-4e36-8ee6-f0384d49a477
-
 <a href="https://www.instagram.com/reel/DeDYKcECSC1/">
   <img width="320" alt="POV Wheel Display on a mountain bike: watch the reel on Instagram" src="docs/images/instagram_reel.jpg" />
 </a>
