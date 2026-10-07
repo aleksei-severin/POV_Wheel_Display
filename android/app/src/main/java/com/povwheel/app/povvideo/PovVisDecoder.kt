@@ -10,8 +10,9 @@ import com.povwheel.app.convert.GlVideoScaler
 /**
  * Проход декодера для привязки ролика к логу Холла: каждый кадр отрезка уменьшается на
  * GPU до ~320 точек по длинной стороне, переводится в яркость и уходит в
- * [PovAlignCore.Binner]. Цвет и поворот из метаданных не нужны: полярные ячейки вокруг
- * колеса от ориентации кадра не зависят.
+ * [PovAlignCore.Collector] — средняя яркость, межкадровая разность и окна для оценки
+ * выдержки. Цвет и поворот из метаданных не нужны: эти числа от ориентации кадра и от
+ * того, где в нём колесо, не зависят.
  */
 internal object PovVisDecoder {
 
@@ -19,12 +20,12 @@ internal object PovVisDecoder {
 
     /**
      * Кадры с метками [fromUs]…[toUs] (мкс от первого кадра ролика; [startUs] — метка
-     * первого кадра в контейнере) → ячейки. [progress] — доля пройденного отрезка.
+     * первого кадра в контейнере) → сводка кадров. [progress] — доля пройденного отрезка.
      */
     fun bin(
         ctx: Context, uri: Uri, startUs: Long, fromUs: Long, toUs: Long,
         cancelled: () -> Boolean, progress: (Double) -> Unit
-    ): PovAlignCore.Binned {
+    ): PovAlignCore.Stats {
         val ex = MediaExtractor()
         var codec: MediaCodec? = null
         var scaler: GlVideoScaler? = null
@@ -53,7 +54,7 @@ internal object PovVisDecoder {
             val absTo = startUs + toUs
             ex.seekTo(absFrom, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
 
-            var binner: PovAlignCore.Binner? = null
+            var coll: PovAlignCore.Collector? = null
             var luma = ByteArray(ow * oh)
             var decW = codedW
             var decH = codedH
@@ -89,18 +90,18 @@ internal object PovVisDecoder {
                 c.releaseOutputBuffer(oi, take)
                 if (!take) continue
                 sc.awaitFrame()
-                if (binner == null) {
+                if (coll == null) {
                     val s = side(decW, decH)
                     ow = s.first; oh = s.second
                     sc.setOutputSize(ow, oh)
                     luma = ByteArray(ow * oh)
-                    binner = PovAlignCore.Binner(ow, oh)
+                    coll = PovAlignCore.Collector(ow, oh)
                 }
                 sc.renderLuma(luma, decW, decH)
-                binner.frame(luma, pts - startUs)
+                coll.frame(luma, pts - startUs)
                 if (toUs > fromUs) progress(((pts - absFrom).toDouble() / (toUs - fromUs)).coerceIn(0.0, 1.0))
             }
-            return binner?.finish() ?: PovAlignCore.Binned(FloatArray(0), LongArray(0), 0)
+            return coll?.finish() ?: PovAlignCore.Collector(1, 1).finish()
         } finally {
             runCatching { codec?.stop() }
             runCatching { codec?.release() }

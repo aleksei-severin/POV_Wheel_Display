@@ -68,15 +68,10 @@ internal class PovGl {
     private val uStUV: Int
     private val aPosPresent: Int
     private val aPosBlend: Int
-    private val uCap: Int
-    private val uJ0: Int
     private val uN: Int
-    private val uMode: Int
     private val uLut: Int
     private val uBlack: Int
-    private val uLo: Int
-    private val uHi: Int
-    private val uW: Int
+    private val uIdx: Int
 
     // ---- текстуры ----
     var w = 0; private set
@@ -118,15 +113,10 @@ internal class PovGl {
         aPosPresent = GLES20.glGetAttribLocation(progPresent, "aPos")
         progBlend = build(VS_300, FS_BLEND)
         aPosBlend = GLES20.glGetAttribLocation(progBlend, "aPos")
-        uCap = GLES20.glGetUniformLocation(progBlend, "uCap")
-        uJ0 = GLES20.glGetUniformLocation(progBlend, "uJ0")
         uN = GLES20.glGetUniformLocation(progBlend, "uN")
-        uMode = GLES20.glGetUniformLocation(progBlend, "uMode")
         uLut = GLES20.glGetUniformLocation(progBlend, "uLut")
         uBlack = GLES20.glGetUniformLocation(progBlend, "uBlack")
-        uLo = GLES20.glGetUniformLocation(progBlend, "uLo")
-        uHi = GLES20.glGetUniformLocation(progBlend, "uHi")
-        uW = GLES20.glGetUniformLocation(progBlend, "uW")
+        uIdx = GLES20.glGetUniformLocation(progBlend, "uIdx")
         GLES20.glUseProgram(progBlend)
         GLES20.glUniform1i(GLES20.glGetUniformLocation(progBlend, "uY"), 0)
         GLES20.glUniform1i(GLES20.glGetUniformLocation(progBlend, "uUV"), 1)
@@ -245,13 +235,11 @@ internal class PovGl {
     }
 
     /**
-     * Склейка окна в текстуру результата. Кадры окна — слои кольца подряд, начиная с
-     * [j0] (уже по модулю cap), [n] штук; окна k = 0..11 — отрезки [lo[k], hi[k]]
-     * (относительно первого кадра) с весами [wt].
-     * mode: 0 lighten (поканальный максимум), 1 average, 2 screen. [black] — порог
-     * отсечки шума (0..1) или < 0 — без отсечки.
+     * Склейка набора кадров в текстуру результата: поканальный максимум (lighten) слоёв
+     * кольца [layers] (уже по модулю cap), [n] штук, не больше [MAX_LAYERS]. [black] —
+     * порог отсечки шума (0..1) или < 0 — без отсечки.
      */
-    fun blend(j0: Int, n: Int, lo: IntArray, hi: IntArray, wt: FloatArray, mode: Int, black: Float) {
+    fun blend(layers: IntArray, n: Int, black: Float) {
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbo[0])
         GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, resTex, 0)
         GLES20.glViewport(0, 0, w, h)
@@ -261,15 +249,10 @@ internal class PovGl {
         GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
         GLES20.glBindTexture(GLES30.GL_TEXTURE_2D_ARRAY, ringUV)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-        GLES20.glUniform1i(uCap, cap)
-        GLES20.glUniform1i(uJ0, j0)
-        GLES20.glUniform1i(uN, n)
-        GLES20.glUniform1i(uMode, mode)
+        GLES20.glUniform1i(uN, n.coerceIn(1, MAX_LAYERS))
         GLES20.glUniform1i(uLut, if (black >= 0) 1 else 0)
         GLES20.glUniform1f(uBlack, if (black >= 0) black else 0f)
-        GLES20.glUniform1iv(uLo, 12, lo, 0)
-        GLES20.glUniform1iv(uHi, 12, hi, 0)
-        GLES20.glUniform1fv(uW, 12, wt, 0)
+        GLES20.glUniform1iv(uIdx, MAX_LAYERS, layers, 0)
         drawQuad(aPosBlend)
     }
 
@@ -416,12 +399,14 @@ internal class PovGl {
         if (e != GLES20.GL_NO_ERROR) throw RuntimeException("GL error 0x" + Integer.toHexString(e) + " at " + where)
     }
 
-    private companion object {
-        const val EGL_RECORDABLE_ANDROID = 0x3142
-        const val EGL_OPENGL_ES3_BIT = 0x40
+    companion object {
+        /** Кадров в одной склейке (= размер массива слоёв в шейдере). */
+        const val MAX_LAYERS = PovSync.MAX_SET
+        private const val EGL_RECORDABLE_ANDROID = 0x3142
+        private const val EGL_OPENGL_ES3_BIT = 0x40
 
         // Шейдеры без ведущих пробелов: часть драйверов капризничает к отступу перед #.
-        const val VS_EXT =
+        private const val VS_EXT =
             "attribute vec2 aPos;\n" +
             "uniform mat4 uSt;\n" +
             "varying vec2 vUV;\n" +
@@ -430,7 +415,7 @@ internal class PovGl {
             "  gl_Position = vec4(aPos, 0.0, 1.0);\n" +
             "}\n"
 
-        const val FS_EXT =
+        private const val FS_EXT =
             "#extension GL_OES_EGL_image_external : require\n" +
             "#ifdef GL_FRAGMENT_PRECISION_HIGH\n" +
             "precision highp float;\n" +
@@ -442,7 +427,7 @@ internal class PovGl {
             "void main() { gl_FragColor = texture2D(uTex, vUV); }\n"
 
         // Кадр декодера → яркость BT.709 (слой R8 кольца).
-        const val FS_EXT_Y =
+        private const val FS_EXT_Y =
             "#extension GL_OES_EGL_image_external : require\n" +
             "#ifdef GL_FRAGMENT_PRECISION_HIGH\n" +
             "precision highp float;\n" +
@@ -457,7 +442,7 @@ internal class PovGl {
             "}\n"
 
         // Кадр декодера → цветоразность BT.709 со сдвигом 0.5 (слой RG8 вдвое меньше).
-        const val FS_EXT_UV =
+        private const val FS_EXT_UV =
             "#extension GL_OES_EGL_image_external : require\n" +
             "#ifdef GL_FRAGMENT_PRECISION_HIGH\n" +
             "precision highp float;\n" +
@@ -472,7 +457,7 @@ internal class PovGl {
             "  gl_FragColor = vec4((c.b - y) / 1.8556 + 0.5, (c.r - y) / 1.5748 + 0.5, 0.0, 1.0);\n" +
             "}\n"
 
-        const val VS_2D =
+        private const val VS_2D =
             "attribute vec2 aPos;\n" +
             "varying vec2 vUV;\n" +
             "void main() {\n" +
@@ -480,7 +465,7 @@ internal class PovGl {
             "  gl_Position = vec4(aPos, 0.0, 1.0);\n" +
             "}\n"
 
-        const val FS_2D =
+        private const val FS_2D =
             "#ifdef GL_FRAGMENT_PRECISION_HIGH\n" +
             "precision highp float;\n" +
             "#else\n" +
@@ -490,7 +475,7 @@ internal class PovGl {
             "varying vec2 vUV;\n" +
             "void main() { gl_FragColor = texture2D(uTex, vUV); }\n"
 
-        const val VS_300 =
+        private const val VS_300 =
             "#version 300 es\n" +
             "in vec2 aPos;\n" +
             "out vec2 vUV;\n" +
@@ -499,53 +484,33 @@ internal class PovGl {
             "  gl_Position = vec4(aPos, 0.0, 1.0);\n" +
             "}\n"
 
-        // Склейка — то же, что PovRender.Run в скрипте: у каждого из 12 окон своя склейка
-        // кадров (максимум / среднее / screen), результат — среднее окон с весами.
-        // Отсечка шума — до склейки: всё, что не выше порога, считается чёрным.
-        const val FS_BLEND =
+        // Склейка набора кадров: поканальный максимум слоёв кольца. Отсечка шума — до
+        // максимума: всё, что не выше порога, считается чёрным (иначе шум фона копится).
+        private const val FS_BLEND =
             "#version 300 es\n" +
             "precision highp float;\n" +
             "precision highp int;\n" +
             "precision highp sampler2DArray;\n" +
             "uniform sampler2DArray uY;\n" +
             "uniform sampler2DArray uUV;\n" +
-            "uniform int uCap;\n" +
-            "uniform int uJ0;\n" +
             "uniform int uN;\n" +
-            "uniform int uMode;\n" +
             "uniform int uLut;\n" +
             "uniform float uBlack;\n" +
-            "uniform int uLo[12];\n" +
-            "uniform int uHi[12];\n" +
-            "uniform float uW[12];\n" +
+            "uniform int uIdx[32];\n" +
             "in vec2 vUV;\n" +
             "out vec4 oColor;\n" +
             "void main() {\n" +
-            "  vec3 acc[12];\n" +
-            "  for (int k = 0; k < 12; k++) acc[k] = vec3(0.0);\n" +
-            "  for (int i = 0; i < uN; i++) {\n" +
-            "    int layer = (uJ0 + i) % uCap;\n" +
-            "    float yy = texture(uY, vec3(vUV, float(layer))).r;\n" +
-            "    vec2 cc = texture(uUV, vec3(vUV, float(layer))).rg - 0.5;\n" +
+            "  vec3 acc = vec3(0.0);\n" +
+            "  for (int i = 0; i < 32; i++) {\n" +
+            "    if (i >= uN) break;\n" +
+            "    float layer = float(uIdx[i]);\n" +
+            "    float yy = texture(uY, vec3(vUV, layer)).r;\n" +
+            "    vec2 cc = texture(uUV, vec3(vUV, layer)).rg - 0.5;\n" +
             "    vec3 c = clamp(vec3(yy + 1.5748 * cc.y, yy - 0.1873 * cc.x - 0.4681 * cc.y, yy + 1.8556 * cc.x), 0.0, 1.0);\n" +
             "    if (uLut == 1) c *= vec3(greaterThan(c, vec3(uBlack)));\n" +
-            "    for (int k = 0; k < 12; k++) {\n" +
-            "      if (uW[k] <= 0.0 || i < uLo[k] || i > uHi[k]) continue;\n" +
-            "      if (uMode == 1) acc[k] += c;\n" +
-            "      else if (uMode == 2) acc[k] = vec3(1.0) - (vec3(1.0) - acc[k]) * (vec3(1.0) - c);\n" +
-            "      else acc[k] = max(acc[k], c);\n" +
-            "    }\n" +
+            "    acc = max(acc, c);\n" +
             "  }\n" +
-            "  vec3 res = vec3(0.0);\n" +
-            "  float ws = 0.0;\n" +
-            "  for (int k = 0; k < 12; k++) {\n" +
-            "    if (uW[k] <= 0.0) continue;\n" +
-            "    vec3 v = acc[k];\n" +
-            "    if (uMode == 1) v /= float(uHi[k] - uLo[k] + 1);\n" +
-            "    res += uW[k] * v;\n" +
-            "    ws += uW[k];\n" +
-            "  }\n" +
-            "  oColor = vec4(res / max(ws, 1e-6), 1.0);\n" +
+            "  oColor = vec4(acc, 1.0);\n" +
             "}\n"
     }
 }
