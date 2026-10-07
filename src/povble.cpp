@@ -62,9 +62,9 @@ static_assert(sizeof(PovTextStyle) == 8, "PovTextStyle != TextStyle.SIZE в Prot
 static_assert(sizeof(PovFxParams) == 16, "PovFxParams != FxParams.SIZE в Proto.kt");
 
 // Приём сжатой маски эффекта «Текст» (OP_TEXT_SET): куски складываются здесь,
-// пока не придёт последний. 16 кБ PSRAM — с запасом: маска 360 × 44 со строкой
-// сжимается в единицы килобайт.
-#define TEXT_RX_CAP  (16 * 1024)
+// пока не придёт последний. Маска 360 × 44 со строкой сжимается в единицы
+// килобайт; запас — под слой цвета эмодзи (см. TEXT_COMP_MAX в effects.h).
+#define TEXT_RX_CAP  TEXT_COMP_MAX
 static uint8_t*  text_rx       = nullptr;
 static uint16_t  text_rx_total = 0;
 static uint16_t  text_rx_len   = 0;
@@ -132,6 +132,7 @@ static volatile uint16_t peer_mtu  = 23;
 // вычитывает командой OP_FRAG по смещению — так фрагмент нельзя потерять
 // молча, и приложение не собирает поток уведомлений в конечный автомат.
 #define STAGE_CAP  (48 * 1024)
+static_assert(TEXT_COMP_MAX + sizeof(PovTextStyle) + 2 <= STAGE_CAP, "блоб текста не влезет в ответ OP_TEXT_GET");
 static uint8_t*  stage     = nullptr;
 static uint32_t  stage_len = 0;
 
@@ -788,7 +789,8 @@ static void handleCmd(const uint8_t* d, size_t n) {
         h.frame_stride  = FRAME_STRIDE_PAL;
         h.mtu           = peer_mtu;
         h.features      = POV_FEAT_DEFLATE | POV_FEAT_OTA | POV_FEAT_PREVIEW | POV_FEAT_WIFI |
-                          POV_FEAT_ALBUM_SEL | POV_FEAT_HALL_LOG | POV_FEAT_TEXT | POV_FEAT_FX;
+                          POV_FEAT_ALBUM_SEL | POV_FEAT_HALL_LOG | POV_FEAT_TEXT | POV_FEAT_FX |
+                          POV_FEAT_TEXT_RGB;
         h.uptime_s      = millis() / 1000;
         // Именно видимое имя: приложение подписывает им строку списка, и
         // расходиться с тем, что пришло в рекламе, оно не должно.

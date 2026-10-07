@@ -27,6 +27,14 @@ import kotlin.math.roundToInt
  * залитого файла. На колесо уходит только яркость 360 × 44 — цвет (в том числе
  * радугу, которая живёт во времени) накладывает колесо.
  *
+ * Эмодзи — исключение: они сохраняют свой цвет при любом выбранном (жёлтый
+ * смайлик, красное сердечко). Отличить их от букв по коду символа ненадёжно
+ * (вариационные селекторы, ZWJ-последовательности, флаги), поэтому строка
+ * рисуется дважды — белой кистью и чёрной. Цветной глиф кисти не слушается и
+ * в обоих проходах одинаков, буква — нет: разность проходов и есть маска букв,
+ * а второй проход — слой цвета эмодзи ([TextImage.rgb]), который колесо
+ * кладёт поверх как есть.
+ *
  * Размер шрифта подбирается сам: короткая строка — крупно (до [MAX_CAP_FRAC]
  * длины луча), длинная ужимается, пока не замкнёт круг: конец строки сходится с
  * началом через зазор ровно в пробел. [MAX_CHARS] выбран так, чтобы даже из
@@ -35,9 +43,58 @@ import kotlin.math.roundToInt
 object TextMask {
     const val MAX_CHARS = 40
 
+    /** Предел сжатого блоба — TEXT_COMP_MAX в include/effects.h. */
+    const val MAX_BLOB = 40 * 1024
+
     private const val S = 800                 // сторона рабочего холста, px
     private const val SS = 4                  // подвыборок на ячейку по каждой оси
     private const val MAX_CAP_FRAC = 0.60     // предел высоты букв — доля длины луча
+    private const val RGB_BYTES = Geom.IDX_BYTES * 3
+
+    /**
+     * Отрисованный текст, 360 × 44 (сектор → диод): [mask] — покрытие букв, их
+     * красит колесо; [rgb] — RGB888 цветных глифов, уже умноженный на их
+     * покрытие (нарисован на чёрном); null — эмодзи в строке нет.
+     */
+    class TextImage(val mask: ByteArray, val rgb: ByteArray?) {
+        /**
+         * Для прошивки без слоя цвета (нет FEAT_TEXT_RGB): эмодзи уходят в маску
+         * яркостью и красятся, как буквы, — как было до слоя. Яркость — по
+         * старшему каналу: по одному зелёному красное сердечко пропало бы.
+         */
+        fun flat(): TextImage {
+            val c = rgb ?: return this
+            val m = ByteArray(mask.size)
+            for (i in m.indices) {
+                val e = maxOf(c[i * 3].toInt() and 0xFF, c[i * 3 + 1].toInt() and 0xFF, c[i * 3 + 2].toInt() and 0xFF)
+                m[i] = minOf(255, (mask[i].toInt() and 0xFF) + e).toByte()
+            }
+            return TextImage(m, null)
+        }
+    }
+
+    /** Обрезать до [MAX_CHARS], не разрывая суррогатную пару (эмодзи — две UTF-16 единицы). */
+    fun clip(text: String): String {
+        if (text.length <= MAX_CHARS) return text
+        val n = if (Character.isHighSurrogate(text[MAX_CHARS - 1])) MAX_CHARS - 1 else MAX_CHARS
+        return text.substring(0, n)
+    }
+
+    /**
+     * Отрисовать и упаковать для колеса. [colour] — колесо умеет слой цвета
+     * эмодзи (FEAT_TEXT_RGB); без него или если блоб со слоем не влез в
+     * [MAX_BLOB] — эмодзи уходят в маску, как раньше. Возвращает ровно то, что
+     * покажет колесо, и блоб.
+     */
+    fun build(text: String, colour: Boolean): Pair<TextImage, ByteArray> {
+        val img = render(text)
+        if (colour && img.rgb != null) {
+            val blob = pack(text, img)
+            if (blob.size <= MAX_BLOB) return img to blob
+        }
+        val f = img.flat()
+        return f to pack(text, f)
+    }
 
     private val canvasBmp: Bitmap by lazy { Bitmap.createBitmap(S, S, Bitmap.Config.ARGB_8888) }
     private val sampler by lazy { PolarSampler() }
@@ -52,11 +109,11 @@ object TextMask {
         letterSpacing = 0.06f
     }
 
-    /** Маска яркости 360 × 44 (сектор → диод). Пустая строка — пустая маска. */
+    /** Маска букв и слой эмодзи 360 × 44 (сектор → диод). Пустая строка — пустая маска. */
     @Synchronized
-    fun render(text: String): ByteArray {
+    fun render(text: String): TextImage {
         val mask = ByteArray(Geom.IDX_BYTES)
-        if (text.isBlank()) return mask
+        if (text.isBlank()) return TextImage(mask, null)
 
         val c = Canvas(canvasBmp)
         c.drawColor(Color.BLACK)
@@ -84,7 +141,7 @@ object TextMask {
             val capH = -b.top.toDouble()
             paint.getTextBounds(text, 0, text.length, b)
             asc1 = maxOf(capH, -b.top.toDouble()) / size
-            if (w1 <= 0 || asc1 <= 0) return mask
+            if (w1 <= 0 || asc1 <= 0) return TextImage(mask, null)
             // Строка плюс пробел — не длиннее окружности по базовой линии:
             // s·(w1 + sp1) ≤ 2π·(top − s·asc1), где top − s·asc1 — её радиус.
             val sW = 2 * PI * top / (w1 + sp1 + 2 * PI * asc1)
@@ -101,22 +158,45 @@ object TextMask {
         // низом к центру, и строка читается слева направо.
         val oval = RectF((S / 2 - rb).toFloat(), (S / 2 - rb).toFloat(), (S / 2 + rb).toFloat(), (S / 2 + rb).toFloat())
         val path = Path().apply { addArc(oval, (270 - spanDeg / 2).toFloat(), 359.9f) }
-        c.drawTextOnPath(text, path, 0f, 0f, paint)
 
+        // Проход 1 — белой кистью: буквы белые, эмодзи своим цветом.
+        c.drawTextOnPath(text, path, 0f, 0f, paint)
         sampler.sample(canvasBmp, SS)
-        val rgb = sampler.rgbBuffer
-        // Белый текст на чёрном: яркость — любой канал, берём зелёный.
-        for (i in 0 until Geom.IDX_BYTES) mask[i] = rgb[i * 3 + 1]
-        return mask
+        val lit = sampler.rgbBuffer.copyOf()
+        // Проход 2 — чёрной: буквы исчезают, эмодзи те же. Геометрия та же,
+        // так что разность — ровно покрытие букв, и выборка у обоих одна.
+        c.drawColor(Color.BLACK)
+        paint.color = Color.BLACK
+        try {
+            c.drawTextOnPath(text, path, 0f, 0f, paint)
+        } finally {
+            paint.color = Color.WHITE
+        }
+        sampler.sample(canvasBmp, SS)
+        val fix = sampler.rgbBuffer
+        var any = false
+        for (i in 0 until Geom.IDX_BYTES) {
+            // Белые буквы: яркость — любой канал, берём зелёный.
+            val t = (lit[i * 3 + 1].toInt() and 0xFF) - (fix[i * 3 + 1].toInt() and 0xFF)
+            mask[i] = t.coerceIn(0, 255).toByte()
+            if (!any && (fix[i * 3].toInt() or fix[i * 3 + 1].toInt() or fix[i * 3 + 2].toInt()) != 0) any = true
+        }
+        return TextImage(mask, if (any) fix.copyOf() else null)
     }
 
-    /** Блоб для колеса: raw deflate от [u8 len][строка UTF-8][маска]. */
-    fun pack(text: String, mask: ByteArray): ByteArray {
+    /**
+     * Блоб для колеса: raw deflate от [u8 len][строка UTF-8][маска] и, если в
+     * строке есть эмодзи, следом [RGB888 360 × 44].
+     */
+    fun pack(text: String, img: TextImage): ByteArray {
         val t = text.toByteArray(Charsets.UTF_8).let { if (it.size > 255) it.copyOf(255) else it }
-        val raw = ByteArray(1 + t.size + mask.size)
+        val mask = img.mask
+        val rgb = img.rgb
+        val raw = ByteArray(1 + t.size + mask.size + (rgb?.size ?: 0))
         raw[0] = t.size.toByte()
         t.copyInto(raw, 1)
         mask.copyInto(raw, 1 + t.size)
+        rgb?.copyInto(raw, 1 + t.size + mask.size)
         // nowrap = true — без zlib-заголовка: так ждёт tinfl на колесе.
         val d = Deflater(Deflater.BEST_COMPRESSION, true)
         try {
@@ -135,14 +215,14 @@ object TextMask {
         }
     }
 
-    /** Обратное к [pack]: строка и маска, null — блоб пустой или битый. */
-    fun unpack(blob: ByteArray): Pair<String, ByteArray>? {
+    /** Обратное к [pack]: строка и картинка, null — блоб пустой или битый. */
+    fun unpack(blob: ByteArray): Pair<String, TextImage>? {
         if (blob.isEmpty()) return null
         val inf = Inflater(true)
         try {
             // Inflater с nowrap просит лишний байт в конце входа.
             inf.setInput(blob + byteArrayOf(0))
-            val raw = ByteArray(1 + 255 + Geom.IDX_BYTES)
+            val raw = ByteArray(1 + 255 + Geom.IDX_BYTES + RGB_BYTES)
             var n = 0
             while (n < raw.size && !inf.finished()) {
                 val got = inf.inflate(raw, n, raw.size - n)
@@ -150,9 +230,15 @@ object TextMask {
                 n += got
             }
             val len = raw[0].toInt() and 0xFF
-            if (n != 1 + len + Geom.IDX_BYTES) return null
+            val base = 1 + len + Geom.IDX_BYTES
+            // Без слоя эмодзи (прежние блобы и текст без них) или со слоем.
+            val rgb = when (n) {
+                base -> null
+                base + RGB_BYTES -> raw.copyOfRange(base, n)
+                else -> return null
+            }
             val text = String(raw, 1, len, Charsets.UTF_8)
-            return text to raw.copyOfRange(1 + len, n)
+            return text to TextImage(raw.copyOfRange(1 + len, base), rgb)
         } catch (e: Exception) {
             return null
         } finally {
@@ -174,6 +260,30 @@ object TextMask {
             if (k < 0) continue
             val a = mask[k].toInt() and 0xFF
             if (a != 0) px[i] = (a shl 24) or 0xFFFFFF
+        }
+        bmp.setPixels(px, 0, size, 0, 0, size, size)
+        return bmp
+    }
+
+    /**
+     * Слой эмодзи ([TextImage.rgb]) в круглую картинку — поверх [disc], уже
+     * окрашенного. Слой умножен на покрытие (нарисован на чёрном), а диод
+     * светит, а не закрашивает: прозрачность — по старшему каналу, цвет —
+     * поделённый на неё. Тёмное (контуры, глаза) становится прозрачным, как
+     * погасший диод на ободе.
+     */
+    fun discRgb(rgb: ByteArray, size: Int): Bitmap {
+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val idx = discIndex(size)
+        val px = IntArray(size * size)
+        for (i in px.indices) {
+            val k = idx[i]
+            if (k < 0) continue
+            val r = rgb[k * 3].toInt() and 0xFF
+            val g = rgb[k * 3 + 1].toInt() and 0xFF
+            val b = rgb[k * 3 + 2].toInt() and 0xFF
+            val a = maxOf(r, g, b)
+            if (a != 0) px[i] = (a shl 24) or ((r * 255 / a) shl 16) or ((g * 255 / a) shl 8) or (b * 255 / a)
         }
         bmp.setPixels(px, 0, size, 0, 0, size, size)
         return bmp

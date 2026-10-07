@@ -41,7 +41,7 @@ internal fun TextEffectDialog(vm: WheelVm, onDismiss: () -> Unit) {
             value = tf,
             onValueChange = { v ->
                 val t = if (v.text.length > TextMask.MAX_CHARS) {
-                    val cut = v.text.take(TextMask.MAX_CHARS)
+                    val cut = TextMask.clip(v.text)
                     v.copy(text = cut, selection = TextRange(minOf(v.selection.end, cut.length)))
                 } else v
                 val changed = t.text != tf.text

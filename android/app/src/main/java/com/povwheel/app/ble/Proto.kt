@@ -111,6 +111,7 @@ object Proto {
     const val FEAT_HALL_LOG  = 0x0020   // OP_TIME / OP_TIME_SET / OP_HALL_LOG / OP_HALL_HIST
     const val FEAT_TEXT      = 0x0040   // эффект «Текст»: OP_TEXT_STYLE / OP_TEXT_SET / OP_TEXT_GET
     const val FEAT_FX        = 0x0080   // OP_FX_GET / OP_FX_SET; часы цифровые, эффекты 2 и 5 удалены
+    const val FEAT_TEXT_RGB  = 0x0100   // блоб текста может нести слой цвета эмодзи (convert/TextMask)
 
     const val ST_BUSY = 3
 
@@ -140,6 +141,7 @@ data class Hello(
     val hasHallLog  get() = features and Proto.FEAT_HALL_LOG != 0
     val hasText     get() = features and Proto.FEAT_TEXT != 0
     val hasFx       get() = features and Proto.FEAT_FX != 0
+    val hasTextRgb  get() = features and Proto.FEAT_TEXT_RGB != 0
 
     companion object {
         const val SIZE = 48

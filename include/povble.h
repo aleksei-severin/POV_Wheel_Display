@@ -87,7 +87,9 @@ enum PovOp : uint8_t {
     // телефон: колесу приходит готовая маска яркости 360 × 44 (сектор → диод),
     // сжатая raw deflate вместе со строкой, из которой она нарисована, —
     // блоб [u8 len][строка UTF-8][маска]. Цвет накладывает колесо (радуга живёт
-    // во времени).
+    // во времени). С POV_FEAT_TEXT_RGB за маской может идти слой RGB888 360 × 44 —
+    // цветные эмодзи, уже умноженные на своё покрытие: колесо прибавляет его как
+    // есть, выбранный цвет на него не действует. Без эмодзи слоя нет.
     OP_TEXT_STYLE  = 0x20,  // →  PovTextStyle      ←  ничего
     OP_TEXT_SET    = 0x21,  // →  [u16 total][u16 off][кусок сжатого блоба]  ←  ничего
                            //    куски подряд с off = 0; на последнем блоб распаковывается
@@ -151,6 +153,7 @@ struct PovHello {
 #define POV_FEAT_HALL_LOG  0x0020   // OP_TIME / OP_TIME_SET / OP_HALL_LOG / OP_HALL_HIST
 #define POV_FEAT_TEXT      0x0040   // эффект «Текст»: OP_TEXT_STYLE / OP_TEXT_SET / OP_TEXT_GET
 #define POV_FEAT_FX        0x0080   // OP_FX_GET / OP_FX_SET; эффекты 2 и 5 удалены, часы цифровые
+#define POV_FEAT_TEXT_RGB  0x0100   // блоб OP_TEXT_SET может нести слой цвета эмодзи (до 40 кБ)
 
 // Цвет эффекта «Текст».
 struct PovTextStyle {

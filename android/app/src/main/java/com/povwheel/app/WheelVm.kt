@@ -109,8 +109,10 @@ data class WheelEntry(
 /** Номер эффекта «Текст» — EFF_TEXT в include/effects.h. */
 const val TEXT_EFFECT_ID = 7
 
-/** Текст эффекта «Текст», пока пользователь не задал свой (радугой). */
-const val DEFAULT_TEXT = "Hello World!"
+/** Текст эффекта «Текст», пока пользователь не задал свой (радугой; эмодзи —
+ *  своим цветом). У ❤️ обязателен U+FE0F: без него сердце — чёрно-белый
+ *  текстовый символ и красилось бы, как буквы. */
+const val DEFAULT_TEXT = "🔥😃😍😎Hello World!👍😈❤️👀"
 
 class WheelVm(app: Application) : AndroidViewModel(app) {
 
@@ -208,7 +210,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             if (!textFxByAddr.containsKey(addr)) o.optJSONArray("txt")?.let { a ->
                 val st = TextStyle.parse(Base64.decode(a.getString(0), Base64.NO_WRAP))
                 val blob = Base64.decode(a.getString(1), Base64.NO_WRAP)
-                TextMask.unpack(blob)?.let { (txt, mask) -> textFxByAddr[addr] = TextFx(txt, st, mask, blob) }
+                TextMask.unpack(blob)?.let { (txt, img) -> textFxByAddr[addr] = TextFx(txt, st, img.mask, blob, img.rgb) }
             }
             if (!fxByAddr.containsKey(addr)) o.optString("fx").takeIf { it.isNotEmpty() }?.let {
                 fxByAddr[addr] = FxParams.parse(Base64.decode(it, Base64.NO_WRAP))
@@ -2698,12 +2700,14 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     // новая строка — свежая маска, каждое касание палитры — новый цвет.
 
     /** Текст на колесе: строка, цвет, маска 360 × 44 и сжатый блоб — ровно то,
-     *  что лежит на колесе (для кэша экрана без связи). mask == null — не задан. */
+     *  что лежит на колесе (для кэша экрана без связи). mask == null — не задан.
+     *  rgb — слой эмодзи своим цветом (TextMask.TextImage), null — их нет. */
     data class TextFx(
         val text: String = "",
         val style: TextStyle = TextStyle(),
         val mask: ByteArray? = null,
-        val blob: ByteArray? = null
+        val blob: ByteArray? = null,
+        val rgb: ByteArray? = null
     )
 
     private fun adoptTextFx(addr: String, t: TextFx) {
@@ -2722,27 +2726,27 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             return
         }
         val un = withContext(Dispatchers.Default) { TextMask.unpack(blob) }
-        adoptTextFx(addr, TextFx(un?.first ?: "", st, un?.second, blob.takeIf { un != null }))
+        adoptTextFx(addr, TextFx(un?.first ?: "", st, un?.second?.mask, blob.takeIf { un != null }, un?.second?.rgb))
     }
 
     /** Колёса, которым в этом запуске уже отправляли текст по умолчанию. */
     private val textProvisioned = HashSet<String>()
 
     /**
-     * Текст на колесе ни разу не задавали (блоб пустой) — ставим «Hello World!»
-     * радугой. Само колесо до этого показывает ту же строку своим шрифтом 5×7;
-     * отсюда она уходит нарисованной телефоном и дальше хранится на колесе, как
-     * любой текст. Цвет трогаем, только если он заводской старой прошивки (белый):
+     * Текст на колесе ни разу не задавали (блоб пустой) — ставим [DEFAULT_TEXT]
+     * радугой. Само колесо до этого показывает голое «Hello World!» своим шрифтом
+     * 5×7 (эмодзи в нём нет); отсюда строка уходит нарисованной телефоном, с
+     * эмодзи своим цветом, и дальше хранится на колесе, как любой текст. Цвет трогаем, только если он заводской старой прошивки (белый):
      * новая и так начинает с радуги, а выбранный руками цвет не перезаписываем.
      */
     private suspend fun provisionDefaultText(addr: String, c: BleClient, st: TextStyle) {
-        val mask = withContext(Dispatchers.Default) { TextMask.render(DEFAULT_TEXT) }
-        val blob = withContext(Dispatchers.Default) { TextMask.pack(DEFAULT_TEXT, mask) }
+        val colour = c.hello?.hasTextRgb == true
+        val (img, blob) = withContext(Dispatchers.Default) { TextMask.build(DEFAULT_TEXT, colour) }
         val style = if (!st.rainbow && st.rgb == 0xFFFFFF && st.speed == 30) st.copy(rainbow = true) else st
         try {
             c.textSet(blob)
             if (style != st) c.textStyle(style)
-            adoptTextFx(addr, TextFx(DEFAULT_TEXT, style, mask, blob))
+            adoptTextFx(addr, TextFx(DEFAULT_TEXT, style, img.mask, blob, img.rgb))
         } catch (_: Exception) {
             adoptTextFx(addr, TextFx("", st, null, null))
         }
@@ -2765,9 +2769,12 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             textEdits.collect { e ->
                 if (e == null) return@collect
-                val mask = withContext(Dispatchers.Default) { TextMask.render(e.text) }
-                val blob = withContext(Dispatchers.Default) { TextMask.pack(e.text, mask) }
-                adoptTextFx(e.addr, (textFxByAddr[e.addr] ?: TextFx()).copy(text = e.text, mask = mask, blob = blob))
+                // Слой эмодзи своим цветом — только колесу, которое его понимает;
+                // прежняя прошивка красит их выбранным цветом, как буквы.
+                val colour = client(e.addr)?.hello?.hasTextRgb ?: true
+                val (img, blob) = withContext(Dispatchers.Default) { TextMask.build(e.text, colour) }
+                adoptTextFx(e.addr, (textFxByAddr[e.addr] ?: TextFx())
+                    .copy(text = e.text, mask = img.mask, blob = blob, rgb = img.rgb))
                 val c = client(e.addr)?.takeIf { it.link.value == Link.Ready && it.hello?.hasText == true }
                     ?: return@collect
                 try {
@@ -2809,7 +2816,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
 
     fun editText(text: String) {
         val addr = current.value ?: return
-        val t = text.take(TextMask.MAX_CHARS)
+        val t = TextMask.clip(text)
         // Строка в состоянии — сразу (подпись), маска догонит после отрисовки.
         adoptTextFx(addr, (textFxByAddr[addr] ?: TextFx()).copy(text = t))
         textEdits.value = TextEdit(addr, t, ++editSeq)

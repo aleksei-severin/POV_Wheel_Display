@@ -76,7 +76,6 @@ const char* effectName(uint8_t id) {
     switch (id) {
         case EFF_SPEED:   return "Speed";
         case EFF_RAINBOW: return "Rainbow";
-        case EFF_TESTING: return "Testing";
         case EFF_CLOCK:   return "Clock";
         case EFF_TEXT:    return "Text";
         default:          return "Off";
@@ -114,16 +113,28 @@ static void advanceHue(uint8_t speed, uint32_t t) {
 
 // Маска яркости → кадр: одним цветом или радугой, которая течёт по углу (тон
 // от сектора плюс сдвиг во времени). Общая для «Текста», часов и скорости.
+// fixed — необязательный слой RGB888 своего цвета поверх (эмодзи «Текста»): он
+// уже умножен на своё покрытие (нарисован на чёрном), поэтому просто
+// прибавляется — текст и эмодзи почти не перекрываются.
 static void colorizeMask(uint16_t* out, const uint8_t* alpha, bool rainbow,
-                         int cr, int cg, int cb) {
+                         int cr, int cg, int cb, const uint8_t* fixed = nullptr) {
     uint8_t phase = (uint8_t)(fx_hue_acc >> 24);
     for (int s = 0; s < SECTORS; s++) {
         if (rainbow) hsv2rgb((uint8_t)(sec_hue[s] + phase), 255, 255, cr, cg, cb);
         const uint8_t* a = alpha + s * LEDS_PER_SIDE;
         uint16_t* row = out + s * LEDS_PER_SIDE;
-        for (int i = 0; i < LEDS_PER_SIDE; i++) {
+        if (!fixed) {
+            for (int i = 0; i < LEDS_PER_SIDE; i++) {
+                int m = a[i];
+                row[i] = m ? pack565(cr * m / 255, cg * m / 255, cb * m / 255) : 0;
+            }
+            continue;
+        }
+        const uint8_t* e = fixed + s * LEDS_PER_SIDE * 3;
+        for (int i = 0; i < LEDS_PER_SIDE; i++, e += 3) {
             int m = a[i];
-            row[i] = m ? pack565(cr * m / 255, cg * m / 255, cb * m / 255) : 0;
+            row[i] = (m | e[0] | e[1] | e[2])
+                   ? pack565(cr * m / 255 + e[0], cg * m / 255 + e[1], cb * m / 255 + e[2]) : 0;
         }
     }
 }
@@ -480,13 +491,16 @@ static void effClock(uint16_t* out, uint32_t t) {
 // --- Текст по окружности ---
 // Маску рисует телефон: его шрифты, кириллица и честное сглаживание стоят
 // дешевле, чем любой шрифт, который влез бы в прошивку. Здесь — только цвет.
+// Эмодзи — исключение: их цвет не зависит от выбранного, и телефон присылает
+// его отдельным слоем RGB888 (text_rgb), который кладётся поверх как есть.
 #define TEXT_FILE      "/text.fx"
 #define TEXT_MASK_SIZE (SECTORS * LEDS_PER_SIDE)
+#define TEXT_RGB_SIZE  (TEXT_MASK_SIZE * 3)
 #define TEXT_STR_MAX   255
-#define TEXT_RAW_MAX   (1 + TEXT_STR_MAX + TEXT_MASK_SIZE)
-#define TEXT_COMP_MAX  (16 * 1024)
+#define TEXT_RAW_MAX   (1 + TEXT_STR_MAX + TEXT_MASK_SIZE + TEXT_RGB_SIZE)
 
 static uint8_t* text_alpha    = nullptr;   // 360 × 44, сектор → диод; PSRAM
+static uint8_t* text_rgb      = nullptr;   // 360 × 44 × RGB, эмодзи своим цветом; нет эмодзи — nullptr
 static uint8_t* text_comp     = nullptr;   // блоб как пришёл — для хранилища и OP_TEXT_GET
 static uint16_t text_comp_len = 0;
 static volatile uint8_t text_mode  = 1;    // по умолчанию — радуга
@@ -500,7 +514,7 @@ static void effText(uint16_t* out, uint32_t t) {
     // Радуга течёт по углу: тон зависит от сектора и сдвигается во времени.
     // speed 100 — два оборота цветового круга в секунду.
     if (rainbow) advanceHue(text_speed, t);
-    colorizeMask(out, text_alpha, rainbow, text_r, text_g, text_b);
+    colorizeMask(out, text_alpha, rainbow, text_r, text_g, text_b, text_rgb);
 }
 
 // Распаковка и разбор блоба. Отдельно от публикации, чтобы загрузка из файла
@@ -509,7 +523,7 @@ static bool textApply(const uint8_t* comp, size_t len) {
     if (!comp || len == 0 || len > TEXT_COMP_MAX) return false;
     uint8_t* raw = (uint8_t*)ps_malloc(TEXT_RAW_MAX);
     tinfl_decompressor* d = (tinfl_decompressor*)ps_malloc(sizeof(tinfl_decompressor));
-    bool ok = false;
+    bool ok = false, has_rgb = false;
     if (raw && d) {
         tinfl_init(d);
         size_t in_len = len, out_len = TEXT_RAW_MAX;
@@ -517,22 +531,38 @@ static bool textApply(const uint8_t* comp, size_t len) {
         tinfl_status st = tinfl_decompress(d, (const mz_uint8*)comp, &in_len,
                                            (mz_uint8*)raw, (mz_uint8*)raw, &out_len,
                                            TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
-        ok = st == TINFL_STATUS_DONE && out_len >= 1 &&
-             out_len == (size_t)1 + raw[0] + TEXT_MASK_SIZE;
+        // Два размера: голая маска (текст без эмодзи, прежние блобы) и маска
+        // со слоем цвета эмодзи.
+        size_t base = out_len >= 1 ? (size_t)1 + raw[0] + TEXT_MASK_SIZE : 0;
+        has_rgb = out_len == base + TEXT_RGB_SIZE;
+        ok = st == TINFL_STATUS_DONE && base && (out_len == base || has_rgb);
     }
+    // Слой цвета — тот, что пойдёт в публикацию: выделенный заранее, вне
+    // мьютекса (ps_malloc под ним задержал бы генератор).
+    uint8_t* rgb = nullptr;
     if (ok) {
         if (!text_alpha) text_alpha = (uint8_t*)ps_malloc(TEXT_MASK_SIZE);
         if (!text_comp)  text_comp  = (uint8_t*)ps_malloc(TEXT_COMP_MAX);
-        ok = text_alpha && text_comp;
+        if (has_rgb) {
+            rgb = text_rgb ? text_rgb : (uint8_t*)ps_malloc(TEXT_RGB_SIZE);
+            if (!rgb) ok = false;
+        }
+        ok = ok && text_alpha && text_comp;
     }
     if (ok) {
         // Под тем же мьютексом, что держит генератор на время кадра: иначе он
         // мог бы показать маску наполовину старой, наполовину новой.
         xSemaphoreTake(eff_mutex, portMAX_DELAY);
         memcpy(text_alpha, raw + 1 + raw[0], TEXT_MASK_SIZE);
+        if (rgb) memcpy(rgb, raw + 1 + raw[0] + TEXT_MASK_SIZE, TEXT_RGB_SIZE);
+        uint8_t* old_rgb = (text_rgb != rgb) ? text_rgb : nullptr;
+        text_rgb = rgb;
         memcpy(text_comp, comp, len);
         text_comp_len = (uint16_t)len;
         xSemaphoreGive(eff_mutex);
+        if (old_rgb) free(old_rgb);       // новый текст без эмодзи — слой не нужен
+    } else if (rgb && rgb != text_rgb) {
+        free(rgb);
     }
     if (raw) free(raw);
     if (d)   free(d);
@@ -568,7 +598,8 @@ size_t effectsTextBlob(uint8_t* dst, size_t cap) {
 // Запасной текст, пока его ни разу не задавали с телефона: «Hello World!» по
 // верхней дуге собственным шрифтом 5×7 (цвет — радуга по умолчанию). Блоба при
 // этом нет, OP_TEXT_GET отвечает длиной 0 — приложение, увидев это, присылает
-// ту же строку, нарисованную своим шрифтом, и она уже сохраняется.
+// свой текст по умолчанию (та же строка в обрамлении цветных эмодзи — шрифту
+// 5×7 они не по силам), нарисованный своим шрифтом, и он уже сохраняется.
 static void textDefault() {
     if (!text_alpha) text_alpha = (uint8_t*)ps_malloc(TEXT_MASK_SIZE);
     if (!text_alpha) return;
@@ -811,8 +842,6 @@ static uint32_t effPeriodMs(uint8_t id) {
         // Часы: радуге нужна плавность, одному цвету — смена секунды и
         // мигание двоеточий без заметного запаздывания.
         case EFF_CLOCK:   return fx_clk_mode == 1 ? 40 : 50;
-        // EFF_TESTING содержимого этого буфера не читает вообще (см.
-        // fillSectorIntoBuffer() в main.cpp) — период не важен.
         default:          return 200;     // скорость меняется медленно
     }
 }
@@ -825,8 +854,6 @@ static void renderEffect(uint8_t id, uint8_t* buf) {
         case EFF_RAINBOW: effRainbow(out, t); break;
         case EFF_CLOCK:   effClock(out, t);   break;
         case EFF_TEXT:    effText(out, t);    break;
-        // EFF_TESTING рисуется в main.cpp прямо по ray, минуя этот буфер —
-        // он никогда не читается, memset ниже просто держит его валидным.
         default: memset(buf, 0, FRAME_SIZE);  break;
     }
 }
@@ -935,7 +962,7 @@ bool effectsStart(uint8_t id) {
     frame_fmt         = FRAME_FMT_565;
     // Speed, Clock и Text рисуют текст, его надо читать с обеих сторон колеса —
     // fillSectorIntoBuffer() зеркалит для этого дальнюю сторону луча (см. там).
-    // Rainbow и диагностический Testing — им обе стороны одинаковы.
+    // Rainbow — ему обе стороны одинаковы.
     mirror_back_face  = (id == EFF_SPEED || id == EFF_CLOCK || id == EFF_TEXT);
     frameBuffer       = eff_buf[0];
     palette_gen++;

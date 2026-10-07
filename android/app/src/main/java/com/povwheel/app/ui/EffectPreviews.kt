@@ -7,7 +7,6 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -16,11 +15,9 @@ import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntSize
-import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.povwheel.app.TEXT_EFFECT_ID
 import com.povwheel.app.WheelVm
@@ -32,28 +29,24 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.time.LocalDateTime
-import kotlin.math.PI
-import kotlin.math.cos
 import kotlin.math.roundToInt
-import kotlin.math.sin
 
 /**
  * Круглые превью процедурных эффектов для плитки библиотеки. Эффект генерится на
  * колесе, файла-источника нет — поэтому Speed, Clock, Rainbow и Text рисуются
- * тем же алгоритмом и с теми же настройками, что на ободе (см. convert/FxMask),
- * а Testing — схемой. `id` — `EffectId` из include/effects.h.
+ * тем же алгоритмом и с теми же настройками, что на ободе (см. convert/FxMask).
+ * `id` — `EffectId` из include/effects.h.
  */
 internal const val EFF_SPEED = 1
 internal const val EFF_RAINBOW = 3
-internal const val EFF_TESTING = 4
 internal const val EFF_CLOCK = 6
 
-/** Эффекты в хвосте плитки. Номера 2 (Fire) и 5 (Ripples) удалены из прошивки. */
-internal val EFFECT_IDS = listOf(EFF_SPEED, EFF_RAINBOW, EFF_TESTING, EFF_CLOCK, TEXT_EFFECT_ID)
+/** Эффекты в хвосте плитки. Номера 2 (Fire), 4 (Testing) и 5 (Ripples) удалены из прошивки. */
+internal val EFFECT_IDS = listOf(EFF_SPEED, EFF_RAINBOW, EFF_CLOCK, TEXT_EFFECT_ID)
 
 /** Короткое имя эффекта (для тоста). */
 internal fun effectName(id: Int): String = when (id) {
-    EFF_SPEED -> "Speed"; EFF_RAINBOW -> "Rainbow"; EFF_TESTING -> "Testing"
+    EFF_SPEED -> "Speed"; EFF_RAINBOW -> "Rainbow"
     EFF_CLOCK -> "Clock"; TEXT_EFFECT_ID -> "Text"; else -> "Effect"
 }
 
@@ -73,7 +66,6 @@ internal fun EffectPreview(
         when (id) {
             EFF_SPEED -> SpeedDisc(kmh, fx.speedRed, 160, Modifier.fillMaxSize())
             EFF_RAINBOW -> RainbowDisc(fx, 96, Modifier.fillMaxSize())
-            EFF_TESTING -> TestingPreview()
             EFF_CLOCK -> ClockDisc(fx.clock, 160, Modifier.fillMaxSize())
             TEXT_EFFECT_ID -> TextDisc(text, 160, Modifier.fillMaxSize())
         }
@@ -107,20 +99,36 @@ private fun rainbowDeg(speed: Int): Float {
  * Маска колеса (360 × 44), окрашенная как на ободе: одним цветом или радугой,
  * которая течёт по углу с той же скоростью (тон от сектора плюс сдвиг во
  * времени, speed 100 — два оборота круга в секунду). [px] — сторона растра.
+ * [rgb] — слой эмодзи «Текста» своим цветом поверх окраски, как на колесе.
  */
 @Composable
-internal fun StyledMaskDisc(mask: ByteArray, style: TextStyle, px: Int, modifier: Modifier = Modifier) {
+internal fun StyledMaskDisc(
+    mask: ByteArray, style: TextStyle, px: Int, modifier: Modifier = Modifier, rgb: ByteArray? = null
+) {
     val bmp = remember(mask, px) { TextMask.disc(mask, px).asImageBitmap() }
+    val over = remember(rgb, px) { rgb?.let { TextMask.discRgb(it, px).asImageBitmap() } }
     if (!style.rainbow) {
-        Image(bmp, null, modifier, colorFilter = ColorFilter.tint(Color(0xFF000000.toInt() or style.rgb)))
+        val tint = ColorFilter.tint(Color(0xFF000000.toInt() or style.rgb))
+        if (over == null) {
+            Image(bmp, null, modifier, colorFilter = tint)
+            return
+        }
+        Canvas(modifier) {
+            val dst = IntSize(size.width.roundToInt(), size.height.roundToInt())
+            drawImage(bmp, dstSize = dst, colorFilter = tint)
+            drawImage(over, dstSize = dst)
+        }
         return
     }
     val deg = rainbowDeg(style.speed)
     Canvas(modifier.graphicsLayer(compositingStrategy = CompositingStrategy.Offscreen)) {
-        drawImage(bmp, dstSize = IntSize(size.width.roundToInt(), size.height.roundToInt()))
+        val dst = IntSize(size.width.roundToInt(), size.height.roundToInt())
+        drawImage(bmp, dstSize = dst)
         // На колесе тон растёт с номером сектора — по часовой стрелке от «3 часов»,
         // как и у sweepGradient; растущий сдвиг уводит картину против часовой.
         rotate(-deg) { drawRect(Brush.sweepGradient(RAINBOW_COLORS), blendMode = BlendMode.SrcIn) }
+        // Эмодзи — после радуги: SrcIn выше их бы перекрасил.
+        over?.let { drawImage(it, dstSize = dst) }
     }
 }
 
@@ -137,7 +145,7 @@ internal fun TextDisc(fx: WheelVm.TextFx?, px: Int, modifier: Modifier = Modifie
         }
         return
     }
-    StyledMaskDisc(mask, fx.style, px, modifier)
+    StyledMaskDisc(mask, fx.style, px, modifier, fx.rgb)
 }
 
 /**
@@ -208,49 +216,5 @@ internal fun RainbowDisc(fx: FxParams, px: Int, modifier: Modifier = Modifier) {
         val img = disc.draw(lut, phase.toInt()).asImageBitmap()
         drawImage(img, dstSize = IntSize(size.width.roundToInt(), size.height.roundToInt()),
             filterQuality = FilterQuality.Low)
-    }
-}
-
-// ---- Анимация без зависимости от animation-core: фазовые часы на withFrameNanos ----
-
-/** Линейная фаза 0→1, зацикленная каждые [periodMs]. */
-@Composable
-private fun phase(periodMs: Int): Float {
-    var p by remember { mutableStateOf(0f) }
-    LaunchedEffect(periodMs) {
-        var t0 = 0L
-        while (true) {
-            withFrameNanos { now ->
-                if (t0 == 0L) t0 = now
-                val ms = (now - t0) / 1_000_000f
-                p = (ms % periodMs) / periodMs
-            }
-        }
-    }
-    return p
-}
-
-@Composable
-private fun TestingPreview() {
-    // 2 c — крест синий целиком, 2 c — по секторам своими цветами (модель эффекта).
-    val split = phase(4000) > 0.5f
-    val armCols = listOf(
-        Color(0xFFFF3B30), Color(0xFFFFCC00), Color(0xFF34C759),
-        Color(0xFF32ADE6), Color(0xFF5856D6), Color(0xFFAF52DE)
-    )
-    // Ячейка уже отступила 3 dp под серое поле — вместе это прежние 6 dp.
-    Canvas(Modifier.fillMaxSize().padding(3.dp)) {
-        val c = Offset(size.width / 2f, size.height / 2f)
-        val r = size.minDimension / 2f
-        val w = 2.6f.dp.toPx()
-        if (!split) {
-            drawLine(Color(0xFF32ADE6), Offset(c.x - r, c.y), Offset(c.x + r, c.y), w, cap = StrokeCap.Round)
-            drawLine(Color(0xFF32ADE6), Offset(c.x, c.y - r), Offset(c.x, c.y + r), w, cap = StrokeCap.Round)
-        } else {
-            for (k in 0 until 6) {
-                val ang = k * PI.toFloat() / 3f
-                drawLine(armCols[k], c, Offset(c.x + cos(ang) * r, c.y + sin(ang) * r), w, cap = StrokeCap.Round)
-            }
-        }
     }
 }

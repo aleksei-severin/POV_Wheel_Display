@@ -1047,40 +1047,6 @@ static void fillSectorIntoBuffer(uint8_t* buf, uint8_t buf_idx, float sector0, f
         uint8_t* dst_f = led_ptr + (ray * LEDS_PER_ARM) * 4;                      // LED 0–43
         uint8_t* dst_b = led_ptr + (ray * LEDS_PER_ARM + LEDS_PER_ARM - 1) * 4;   // LED 87–44
 
-        // Диагностический крест (эффект Testing). Контент считается прямо
-        // здесь, а не в generator'е эффектов: «какой физически луч сейчас
-        // рисует» знает только этот цикл по ray — effects.cpp наполняет один
-        // общий на все лучи мировой буфер и понятия не имеет, кто его читает.
-        // Первые 5 с 10-секундного цикла — весь крест синим (эталон), следующие
-        // 5 с — каждый луч своим цветом: сразу видно, у какого луча и на сколько
-        // его отрезок креста разошёлся с соседями.
-        if (effect_id == EFF_TESTING) {
-            uint32_t t      = millis();
-            bool     phase2 = ((t / 5000) % 2) == 1;
-            static const uint8_t TEST_COLORS[NUM_ARMS][3] = {
-                {0, 0, 255}, {255, 0, 0}, {0, 255, 0},
-                {255, 255, 0}, {255, 0, 255}, {0, 255, 255},
-            };
-            const uint8_t* col = phase2 ? TEST_COLORS[ray] : TEST_COLORS[0];
-            // Ближайшее кратное 90° — крест из двух диаметров. Ширина линии —
-            // тот же span, что и у обычного контента: дрожание/размытие должно
-            // читаться так же, как на настоящей картинке, а не быть искусственно
-            // резче или мягче его.
-            float half = span * 0.5f; if (half < 0.5f) half = 0.5f;
-            float df = fmodf(a_f, 90.0f); if (df > 45.0f) df = 90.0f - df;
-            float kf  = 1.0f - df / half; if (kf < 0.0f) kf = 0.0f; if (kf > 1.0f) kf = 1.0f;
-            float db = fmodf(a_b, 90.0f); if (db > 45.0f) db = 90.0f - db;
-            float kbk = 1.0f - db / half; if (kbk < 0.0f) kbk = 0.0f; if (kbk > 1.0f) kbk = 1.0f;
-            int rF = (int)(col[0] * kf),  gF = (int)(col[1] * kf),  bF = (int)(col[2] * kf);
-            int rB = (int)(col[0] * kbk), gB = (int)(col[1] * kbk), bB = (int)(col[2] * kbk);
-            for (int i = 0; i < LEDS_PER_SIDE; i++) {
-                int krg = gain_r[i], kgg = gain_g[i], kbg = gain_b[i];
-                pixel_sum += finishPix(rF, gF, bF, sat, krg, kgg, kbg, dst_f + i * 4);
-                pixel_sum += finishPix(rB, gB, bB, sat, krg, kgg, kbg, dst_b - i * 4);
-            }
-            continue;
-        }
-
         // Лучи расходятся строго из центра, поэтому все 44 диода стороны лежат на
         // одном радиусе — набор секторов и весов у них общий, и разбор угла
         // выносится из цикла по диодам.
@@ -1352,7 +1318,8 @@ void renderingTask(void* pvParameters) {
                     // Без этого rotor_omega остаётся оценкой на оборот назад, и
                     // render множит эту ошибку на dtf (упреждение ∝ 1/такт SPI) —
                     // ровно та раскачка тонкой линии на «ровной» скорости, что
-                    // видно эффектом Testing и сильнее на низкой частоте SPI.
+                    // была видна на диагностическом кресте и сильнее на низкой
+                    // частоте SPI.
                     // Разовая правка (rotor_omega пересчитывается заново на
                     // следующем событии), клип ±10 % — контур не раскрутить.
                     //

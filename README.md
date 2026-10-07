@@ -135,7 +135,6 @@ so another phone's archive can be rendered here as well.
 | 🕐 **Clock** | Time `hh:mm:ss` with blinking colons around the top of the rim, the date `yyyy.mm.dd` around the bottom, solid or rainbow |
 | ✍️ **Text** | Your text around the rim, solid or rainbow |
 | 🌈 **Rainbow** | A colour spiral flowing across the disc — speed and band sharpness set in the app |
-| 🎯 **Testing** | Alignment cross with a colour per arm, for calibration |
 
 Long-press an effect in the app to set it up; the library thumbnail shows it exactly as the rim
 will — the real speed, the current time, the chosen colours.

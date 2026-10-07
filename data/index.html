@@ -1987,11 +1987,11 @@ function showTab(name) {
 // ===================== ЭФФЕКТЫ =====================
 // Порядок и id обязаны совпадать с enum EffectId в include/effects.h:
 // наружу уходит только число, и разъехавшийся список включит не тот эффект.
-// Номера 2 (бывший «Огонь») и 5 (бывшие «Волны») удалены и не переиспользуются.
+// Номера 2 (бывший «Огонь»), 4 (бывший «Testing») и 5 (бывшие «Волны») удалены
+// и не переиспользуются.
 const EFFECTS = [
     {id: 1, icon: '🏁', name: 'Speed',   desc: 'Current speed in km/h — green at a crawl, red at the limit you set below.'},
     {id: 3, icon: '🌈', name: 'Rainbow', desc: 'A spectrum spiral turning against the wheel. Speed and band sharpness are set in the Android app.'},
-    {id: 4, icon: '➕', name: 'Testing', desc: 'Diagnostic cross through the hub — blue for 5 s, then each arm in its own colour for 5 s, to spot a per-arm angle offset by eye.'},
     {id: 6, icon: '🕑', name: 'Clock',   desc: 'Time hh:mm:ss (blinking colons) around the top of the rim, the date yyyy.mm.dd around the bottom. Any open browser tab sets the clock; it then survives deep sleep.'},
     // Текст задаётся только из приложения (маску рисует телефон) — здесь лишь запуск сохранённого.
     {id: 7, icon: '🔤', name: 'Text',    desc: 'A line of text along the rim. Set the text and colour in the Android app.'},
