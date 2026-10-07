@@ -2077,6 +2077,10 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      * друга барьером на каждом файле: колесо с плохим сигналом просто отстаёт
      * само по себе, не придерживая остальных.
      */
+    /** Как часто во время заливки напоминать колёсам пачки, что они нужны (см.
+     *  [startUpload]) — с запасом короче их 5-минутного порога сна при связи. */
+    private val UPLOAD_KEEPAWAKE_MS = 60_000L
+
     fun startUpload() {
         val origin = current.value ?: return
         val originSession = session(origin)
@@ -2198,10 +2202,34 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             // цели прогресс её текущего файла реально движется, пока её ход,
             // а не имитирует движение чужим трафиком.
             val radioMutex = Mutex()
-            coroutineScope {
-                for (addr in validTargets) launch {
-                    runUploadTarget(addr, jobs, ::getConverted, cachedPreviews, radioMutex)
+            // Пока идёт пачка, ВСЕ её колёса держим бодрыми. Сами байты сбрасывают
+            // колесу таймер сна, но у пачки есть долгие паузы без обмена: радио
+            // отдаётся целям по очереди (radioMutex), и колесо ждёт, пока тяжёлый
+            // файл льётся на соседа; телефон минутами конвертирует ролик; колесо,
+            // закончившее свою часть, ждёт остальных. С подключённым телефоном
+            // колесо засыпает после 5 минут без команд — и засыпало посреди
+            // большой синхронной заливки. OP_HELLO ничего не меняет на колесе, а
+            // активностью считается (и старой прошивкой тоже).
+            val keepAwake = launch {
+                val pings = HashMap<String, kotlinx.coroutines.Job>()
+                while (isActive) {
+                    delay(UPLOAD_KEEPAWAKE_MS)
+                    for (addr in validTargets) {
+                        val c = client(addr)?.takeIf { it.link.value == Link.Ready } ?: continue
+                        // Предыдущий ещё ждёт своей очереди за передачей — не копим.
+                        if (pings[addr]?.isActive == true) continue
+                        pings[addr] = launch { runCatching { c.keepAwake() } }
+                    }
                 }
+            }
+            try {
+                coroutineScope {
+                    for (addr in validTargets) launch {
+                        runUploadTarget(addr, jobs, ::getConverted, cachedPreviews, radioMutex)
+                    }
+                }
+            } finally {
+                keepAwake.cancel()
             }
 
             restoreUploadLinks()   // все колёса обратно на быстрый линк
