@@ -27,9 +27,9 @@ import kotlin.math.sqrt
  *   → шейдер склейки окна → поверхность H.264-кодировщика → MediaMuxer (MP4).
  *
  * Вне отрисовки кадры исходника идут как есть, а каждая прорисовка становится одним кадром —
- * склейкой (поканальный максимум) набора кадров, подобранного анализатором по фазе ротора
- * (см. PovSync.phaseSet), который стоит на экране до следующего: частота кадров
- * результата переменная. Метки времени — настоящие, делённые на замедление, так что slow
+ * склейкой набора кадров, подобранного анализатором по фазе ротора (см. PovSync.phaseSet):
+ * каждая точка берётся из ближайшего по времени кадра, который её снимал (PovGl.FS_BLEND).
+ * Кадр стоит на экране до следующего: частота кадров результата переменная. Метки времени — настоящие, делённые на замедление, так что slow
  * motion выходит в реальном времени.
  *
  * Разрешение результата — как у исходника. Кольцо держит в памяти видеокарты десятки
@@ -52,9 +52,14 @@ internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis)
      * Элемент плана: [a]..[b] — его место на шкале исходника (столько он стоит на экране),
      * [set] — кадры, которые склеиваются (у kind 0 пусто: кадры идут как есть).
      */
-    private class Elem(val kind: Int, val a: Int, val b: Int, val set: IntArray)
+    private class Elem(val kind: Int, val a: Int, val b: Int, val set: IntArray, val ring: IntArray, val phase: FloatArray, val near: Int)
 
-    private fun elem(si: Int, a0: Int) = Elem(a.plan.kinds[si], a0, a0 + a.plan.counts[si] - 1, a.plan.setOf(si))
+    private fun elem(si: Int, a0: Int): Elem {
+        val p = a.plan
+        val s0 = p.setStart[si]; val s1 = p.setStart[si + 1]
+        return Elem(p.kinds[si], a0, a0 + p.counts[si] - 1, p.setIdx.copyOfRange(s0, s1),
+            p.setRing.copyOfRange(s0, s1), p.setPhase.copyOfRange(s0, s1), p.near[si])
+    }
 
     /** Сколько кадров кольцо должно держать одновременно — проход по плану всухую. */
     private fun ringCap(): Int {
@@ -217,7 +222,10 @@ internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis)
             }
 
             val layers = IntArray(PovGl.MAX_LAYERS)
+            val rings = IntArray(PovGl.MAX_LAYERS)
+            val phases = FloatArray(PovGl.MAX_LAYERS)
             val black = (BLACK_LEVEL + 0.5f) / 255f
+            val refDeg = a.plan.refDeg.toFloat()
             var pos = 0
             planLoop@ for (si in a.plan.kinds.indices) {
                 if (cancelled()) throw InterruptedException()
@@ -240,9 +248,17 @@ internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis)
                 val b = min(e.b, loaded - 1)
                 val first = max(0, loaded - cap)
                 var n = 0
-                for (j in e.set) if (j in first until loaded && n < layers.size) layers[n++] = j % cap
+                var nearK = 0
+                for (k in e.set.indices) {
+                    val j = e.set[k]
+                    if (j !in first until loaded || n >= layers.size) continue
+                    if (j == e.near) nearK = n
+                    layers[n] = j % cap; rings[n] = e.ring[k]; phases[n] = e.phase[k]; n++
+                }
                 if (n == 0) { layers[0] = max(first, e.a) % cap; n = 1 }
-                g.blend(layers, n, if (n > 1) black else -1f)
+                // часть длинной прорисовки — максимум; прорисовка — свой кадр для каждой точки
+                if (e.kind == 2) g.blend(layers, n, if (n > 1) black else -1f, rings, phases, nearK, refDeg)
+                else g.blend(layers, n, if (n > 1) black else -1f)
                 // Склейка уходит одним кадром, который стоит до метки следующего (переменная
                 // частота кадров). Последний элемент плана — ещё и кадр на своём конце, иначе
                 // ролик обрывался бы раньше на длину прорисовки.

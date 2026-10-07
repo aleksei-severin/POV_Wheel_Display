@@ -21,8 +21,13 @@ internal object PovSync {
     private const val LIT_MIN = 10.0
     /** Гашение длиннее этого (мкс) — колесо стояло или не набрало обороты: склейку рвём. */
     private const val DARK_SPLIT_US = 1_000_000.0
-    /** Доля оценки выдержки, с которой планируется склейка: недооценка стоит лишнего кадра, переоценка — щели. */
-    private const val ARC_SAFETY = 0.6
+    /**
+     * Доля оценки выдержки, с которой подбирается набор кадров. Оценка по свету завышена
+     * (размытие, ореол, насыщение): на полном разрешении освещённая дуга точки — около трети
+     * её. Недооценка стоит лишних кадров, но шейдер берёт для точки ближайший по времени
+     * снимавший её кадр, так что лишние дальние кадры не мутят картинку; переоценка — щели.
+     */
+    private const val ARC_SAFETY = 0.35
     /** Не больше стольких кадров в одной склейке (= размер массива слоёв в шейдере склейки). */
     const val MAX_SET = 32
     /** Дальше этого (мкс реального времени) от середины прорисовки кадры не берём. */
@@ -316,6 +321,7 @@ internal object PovSync {
         src.phiInto(fq, phiAll, DoubleArray(nF))
         val wAll = DoubleArray(nF) { src.wAt(fq[it]) }
         val halfFrameReal = 0.5e6 / (fileFps * slow)
+        val halfFrameFile = 0.5e6 / fileFps
         val segAll = IntArray(nF) { src.litSeg(fq[it] + halfFrameReal) }
 
         class Seg(val native: Boolean, val t0: Double, val t1: Double, val wins: Int)
@@ -343,13 +349,16 @@ internal object PovSync {
         val counts = ArrayList<Int>()
         val setStart = ArrayList<Int>().apply { add(0) }
         val setIdx = ArrayList<Int>()
+        val setRing = ArrayList<Int>()
+        val setPhase = ArrayList<Float>()
+        val near = ArrayList<Int>()
         val setSizes = ArrayList<Int>()
         val setSpans = ArrayList<Double>()
         var openSweeps = 0
         for (sg in segs) {
             if (sg.native) {
                 val nn = frameAt(sg.t1) - frameAt(sg.t0)
-                if (nn > 0) { kinds.add(0); counts.add(nn); setStart.add(setIdx.size) }
+                if (nn > 0) { kinds.add(0); counts.add(nn); setStart.add(setIdx.size); near.add(frameAt(sg.t0)) }
                 continue
             }
             for (w in 0 until sg.wins) {
@@ -364,7 +373,18 @@ internal object PovSync {
                              else phaseSet(pts, phiAll, wAll, segAll, seg, slow, fileFps, ta * 1e6, tb * 1e6, expModel)
                     val set = if (ps.frames.isNotEmpty()) ps.frames else IntArray(min(nn, MAX_SET)) { fa + it }
                     kinds.add(2); counts.add(nn)
-                    for (j in set) setIdx.add(j)
+                    // кольцо — удаление середины кадра от середины прорисовки, в прорисовках
+                    val tc = 0.5 * (ta + tb) * 1e6
+                    val sweepUs = max(1.0, (tb - ta) * 1e6)
+                    var best = set[0]
+                    for (j in set) {
+                        val dt = abs(pts[j] + halfFrameFile - tc)
+                        setIdx.add(j)
+                        setRing.add(floor(dt / sweepUs + 0.5).toInt())
+                        setPhase.add(phase60(phiAll[j]))
+                        if (dt < abs(pts[best] + halfFrameFile - tc)) best = j
+                    }
+                    near.add(best)
                     setSizes.add(set.size)
                     setSpans.add((pts[set.last()] - pts[set.first()]) / slow)
                     if (seg >= 0 && ps.coverage < 0.9) openSweeps++
@@ -372,7 +392,11 @@ internal object PovSync {
                     // часть длинной прорисовки — её собственные кадры (не больше MAX_SET, равномерно)
                     kinds.add(1); counts.add(nn)
                     val m = min(nn, MAX_SET)
-                    for (q in 0 until m) setIdx.add(fa + (q.toLong() * nn / m).toInt())
+                    for (q in 0 until m) {
+                        val j = fa + (q.toLong() * nn / m).toInt()
+                        setIdx.add(j); setRing.add(0); setPhase.add(phase60(phiAll[min(j, nF - 1)]))
+                    }
+                    near.add(fa + nn / 2)
                 }
                 setStart.add(setIdx.size)
                 sweeps++
@@ -380,11 +404,24 @@ internal object PovSync {
         }
         val natives = segs.filter { it.native && it.t1 - it.t0 > 0.05 }.map { doubleArrayOf(it.t0, it.t1) }
         val wMed = median(wAll.filter { !it.isNaN() }) ?: 0.0
+        // Окно фаз, в котором шейдер собирает кадры, снимавшие точку: шире освещённой дуги
+        // (≈ треть оценки по свету) с запасом, но не настолько, чтобы дрожь камеры и
+        // размытие собрали кадры, которые точку не видели.
+        val refDeg = if (expUs > 0 && wMed > 0) (0.6 * expUs * wMed).coerceIn(4.0, 12.0) else 6.0
         return Planned(
             tracks, syncRanges,
-            PovPlan(kinds.toIntArray(), counts.toIntArray(), setStart.toIntArray(), setIdx.toIntArray()),
+            PovPlan(kinds.toIntArray(), counts.toIntArray(), setStart.toIntArray(), setIdx.toIntArray(),
+                setRing.toIntArray(), setPhase.toFloatArray(), near.toIntArray(), refDeg),
             sweeps, fpsSplit, natives, setSizes.toIntArray(), setSpans.toDoubleArray(), openSweeps, expUs, wMed
         )
+    }
+
+    /** Фаза ротора по модулю 60°, градусы (NaN — 0: кадр вне лога в набор не попадает). */
+    private fun phase60(p: Double): Float {
+        if (p.isNaN()) return 0f
+        var x = p % 60.0
+        if (x < 0) x += 60.0
+        return x.toFloat()
     }
 
     /** Набор кадров одной прорисовки и доля круга, которую закрывают их дуги (по модели выдержки). */

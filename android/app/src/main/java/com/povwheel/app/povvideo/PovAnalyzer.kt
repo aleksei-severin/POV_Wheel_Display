@@ -38,13 +38,21 @@ class TickTrack(val times: DoubleArray, val real: BooleanArray, val dir: Int = 1
  *  - kind 2 — ровно одна прорисовка (1/6 оборота): склейка набора кадров, подобранного по
  *    фазе ротора так, чтобы их дуги выдержки закрыли все 60° (см. [PovSync.phaseSet]).
  * Набор кадров элемента i — [setIdx] с [setStart][i] до [setStart][i + 1] (номера кадров
- * исходника, по возрастанию); у kind 0 он пуст.
+ * исходника, по возрастанию); у kind 0 он пуст. Для каждого кадра набора — [setRing]
+ * (удаление от середины прорисовки в прорисовках, 0 — своя) и [setPhase] (фаза ротора по
+ * модулю 60°, градусы): по ним шейдер выбирает для каждой точки ближайший по времени кадр,
+ * который её снимал. [near] — ближайший кадр элемента (для фона), [refDeg] — ширина окна
+ * фаз, в котором ищутся кадры, снимавшие точку (см. PovGl.FS_BLEND).
  */
 class PovPlan(
     val kinds: IntArray,
     val counts: IntArray,
     val setStart: IntArray,
-    val setIdx: IntArray
+    val setIdx: IntArray,
+    val setRing: IntArray,
+    val setPhase: FloatArray,
+    val near: IntArray,
+    val refDeg: Double
 ) {
     val totalFrames: Int = counts.sum()
     fun setOf(i: Int): IntArray = setIdx.copyOfRange(setStart[i], setStart[i + 1])
