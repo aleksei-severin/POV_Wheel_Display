@@ -748,23 +748,18 @@ static void handleCmd(const uint8_t* d, size_t n) {
     const uint8_t* pl = d + 2;
     size_t pn = n - 2;
 
-    // Телеметрию, поллинг и синхро-тик слайдшоу не считаем активностью —
-    // иначе устройство не уснёт никогда, пока приложение открыто в фоне.
-    // OP_SYNC_TICK — тот же случай: его шлют автоматически раз в интервал
-    // слайдшоу (даже из фонового SyncSlideshowService после закрытия
-    // приложения, см. Slideshow в CLAUDE.md), без какого-либо участия
-    // человека, и колесо на зарядке/на полке в составе синхронной группы
-    // получало бы его вечно, никогда не доходя до простоя — та же лазейка,
-    // которую last_hall_time уже закрыли для вращения (см. комментарий в
-    // Slideshow: «Nothing outside the Hall ISR may write last_hall_time»).
-    // Реальное взаимодействие (OP_PLAY, OP_STOP, настройки и т.п.) по-прежнему
-    // сбрасывает таймер как обычно.
+    // Телеметрию и поллинг не считаем активностью — иначе устройство не уснёт
+    // никогда, пока приложение открыто в фоне. Реальное взаимодействие
+    // (OP_PLAY, OP_STOP, настройки и т.п.) сбрасывает таймер как обычно;
+    // повторная присылка того же расписания синхронного показа — нет (см.
+    // OP_ALBUM ниже).
     //
     // Обмен лога Холла (OP_TIME/OP_TIME_SET/OP_HALL_LOG/OP_HALL_HIST) — того же
     // рода: приложение ведёт его само, пока колесо на связи, чтобы архив для
     // склейки видео был полным. Колесо на полке рядом с телефоном обязано
     // уснуть, как и без него.
-    if (op != OP_TELE && op != OP_FRAG && op != OP_SYNC_TICK &&
+    const uint32_t prev_activity = last_web_activity_time;
+    if (op != OP_TELE && op != OP_FRAG &&
         op != OP_TIME && op != OP_TIME_SET && op != OP_HALL_LOG && op != OP_HALL_HIST)
         last_web_activity_time = millis();
 
@@ -782,7 +777,7 @@ static void handleCmd(const uint8_t* d, size_t n) {
         h.mtu           = peer_mtu;
         h.features      = POV_FEAT_DEFLATE | POV_FEAT_OTA | POV_FEAT_PREVIEW |
                           POV_FEAT_ALBUM_SEL | POV_FEAT_HALL_LOG | POV_FEAT_TEXT | POV_FEAT_FX |
-                          POV_FEAT_TEXT_RGB;
+                          POV_FEAT_TEXT_RGB | POV_FEAT_SLIDE_CLOCK;
         h.uptime_s      = millis() / 1000;
         // Именно видимое имя: приложение подписывает им строку списка, и
         // расходиться с тем, что пришло в рекламе, оно не должно.
@@ -1008,9 +1003,10 @@ static void handleCmd(const uint8_t* d, size_t n) {
             webLog("[BLE] Slideshow stop");
             sendRsp(op, seq, ST_OK);
         } else {
+            bool changed = false;
             if (pn >= 5) {
                 uint32_t ms; memcpy(&ms, pl + 1, 4);
-                if (ms >= 1000 && ms <= 300000) slideInterval = ms;
+                if (ms >= 1000 && ms <= 300000 && ms != slideInterval) { slideInterval = ms; changed = true; }
             }
             // Необязательный отбор (FEAT_ALBUM_SEL):
             // [u8 mode 0=пропускать 1=играть-только][u16 count]{[u8 len][имя]}[u8 effMask].
@@ -1027,10 +1023,21 @@ static void handleCmd(const uint8_t* d, size_t n) {
                     o += l;
                 }
                 uint8_t effMask = (o < pn) ? pl[o] : 0;   // хвостовой байт маски эффектов
-                applySlideList(inc, sel, effMask);
+                // За маской — t0 (FEAT_SLIDE_CLOCK): показ по абсолютным часам.
+                // Нет поля — обычный показ по своему таймеру (t0 = 0).
+                int64_t t0 = 0;
+                if (o + 1 + 8 <= pn) memcpy(&t0, pl + o + 1, 8);
+                changed |= applySlideList(inc, sel, effMask);
+                changed |= slideClockSet(t0);
             }
             if (slideshowActive) {         // уже идёт — интервал и отбор обновили, индекс не трогаем
-                settings_dirty = true;
+                if (changed) settings_dirty = true;
+                // То же самое расписание ещё раз — это телефон заново вооружает
+                // колесо после переподключения, а не человек: таймер простоя не
+                // трогаем, иначе каждое переподключение держало бы колесо
+                // бодрым лишние минуты.
+                else last_web_activity_time = prev_activity;
+                slideClockKick();
                 sendRsp(op, seq, ST_OK);
                 break;
             }
@@ -1042,28 +1049,11 @@ static void handleCmd(const uint8_t* d, size_t n) {
             slideLastSwitch    = 0;
             settings_dirty     = true;
             pov_state_version++;
-            webLogf("[BLE] Slideshow start, interval %lus", (unsigned long)(slideInterval / 1000));
+            webLogf("[BLE] Slideshow start, interval %lus%s", (unsigned long)(slideInterval / 1000),
+                    slideClockT0 > 0 ? ", clock-synced" : "");
+            slideClockKick();
             sendRsp(op, seq, ST_OK);
         }
-        break;
-    }
-
-    case OP_SYNC_TICK: {
-        // Правка позиции внутри уже идущего слайдшоу — только пока оно
-        // действительно идёт: без запущенного OP_ALBUM слейдшоу нечего
-        // синхронизировать, а начинать его отсюда, минуя отбор/интервал —
-        // значит гадать за телефон, что показывать после того, как он уйдёт.
-        if (!slideshowActive) { sendRsp(op, seq, ST_STATE); break; }
-        if (pn < 2) { sendRsp(op, seq, ST_BAD_ARG); break; }
-        uint8_t kind = pl[0];
-        bool ok;
-        if (kind == 1) {
-            ok = syncTick(String(), pl[1]);
-        } else {
-            String fname((const char*)(pl + 1), pn - 1);
-            ok = nameOk(fname) && syncTick(fname, -1);
-        }
-        sendRsp(op, seq, ok ? ST_OK : ST_NOT_FOUND);
         break;
     }
 

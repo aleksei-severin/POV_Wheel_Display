@@ -162,14 +162,16 @@ class BleClient(
             return@withContext false
         }
         lastError = null
-        _link.value = Link.Ready
         // Лог Холла собирается ВСЕГДА, пока колесо на связи, — кто бы ни держал
         // соединение (экран, фоновая служба, синхронный показ): архив для склейки
         // видео должен быть полным, а не только пока открыт нужный экран.
-        if (hello?.hasHallLog == true) {
-            hallSync?.stop()
-            hallSync = HallSync(context.applicationContext, this@BleClient).also { it.start() }
-        }
+        // Объект — ДО Ready: подписчики Ready ждут через него часы колеса
+        // ([awaitClock]); запуск — после: его цикл живёт, пока связь Ready.
+        val hs = if (hello?.hasHallLog == true) HallSync(context.applicationContext, this@BleClient) else null
+        hallSync?.stop()
+        hallSync = hs
+        _link.value = Link.Ready
+        hs?.start()
         true
     }
 
@@ -496,6 +498,12 @@ class BleClient(
      */
     suspend fun pullHallLogNow() { hallSync?.pullNow() }
 
+    /** Дождаться (не дольше [timeoutMs]), пока HallSync выставит часы колеса после
+     *  подключения, — синхронному показу по часам нужны верные часы до того, как
+     *  колесо начнёт считать по ним слоты. false — не дождались. */
+    suspend fun awaitClock(timeoutMs: Long): Boolean =
+        withTimeoutOrNull(timeoutMs) { hallSync?.awaitClock(); true } ?: false
+
     /** Цвет эффекта «Текст» — применяется сразу, во флеш колесо пишет его само позже. */
     suspend fun textStyle(st: TextStyle) { request(Proto.OP_TEXT_STYLE, st.pack()) }
 
@@ -529,33 +537,17 @@ class BleClient(
     }
 
     /**
-     * Правка позиции внутри уже идущего на колесе слайдшоу — жёсткая
-     * коррекция от телефона, пока он на связи, для синхронного показа
-     * нескольких колёс сразу (см. WheelVm — «синхронизация слайдшоу»).
-     * В отличие от [play]/[effect], НЕ останавливает автономный ход
-     * слайдшоу — на устройстве должен быть заранее заведён `album(true, …)`
-     * с этим же отбором, иначе колесо ответит ST_STATE и ничего не покажет.
-     * [name] — файл; иначе показываем эффект [effectId] (1..6).
-     */
-    suspend fun syncTick(name: String?, effectId: Int = -1) {
-        val b = if (name != null) {
-            val n = name.toByteArray(Charsets.US_ASCII)
-            Proto.buf(1 + n.size).apply { put(0); put(n) }
-        } else {
-            Proto.buf(2).apply { put(1); put(effectId.toByte()) }
-        }
-        request(Proto.OP_SYNC_TICK, b.array())
-    }
-
-    /**
      * Слайдшоу. При старте [names] задаёт отбор файлов (нужен [Hello.hasAlbumSel]):
      * `null` — отбор не трогать (стоп, либо смена только интервала); пустой список —
      * сбросить отбор; иначе [listMode] 0 — пропускать эти, 1 — играть только эти.
      * [effectMask] — биты 0..6 = эффекты 1..7 тоже в показе (EFF_SLIDE_MASK).
+     * [t0Ms] > 0 (нужен [Hello.hasSlideClock]) — показ по абсолютным часам: UTC, мс,
+     * начало нулевого слота; колесо само считает пункт по своим часам (их
+     * выставляет HallSync), см. slideClockStep() в прошивке.
      */
     suspend fun album(
         start: Boolean, delayMs: Int,
-        listMode: Int = 0, names: List<String>? = null, effectMask: Int = 0
+        listMode: Int = 0, names: List<String>? = null, effectMask: Int = 0, t0Ms: Long = 0L
     ) {
         if (!start || names == null) {
             val b = Proto.buf(5)
@@ -565,7 +557,7 @@ class BleClient(
             return
         }
         val enc = names.map { it.toByteArray(Charsets.US_ASCII) }.filter { it.size in 1..255 }
-        var size = 9
+        var size = 9 + if (t0Ms > 0) 8 else 0
         for (e in enc) size += 1 + e.size
         val b = Proto.buf(size)
         b.put(1)
@@ -574,6 +566,7 @@ class BleClient(
         b.putShort(enc.size.toShort())
         for (e in enc) { b.put(e.size.toByte()); b.put(e) }
         b.put((effectMask and 0x7F).toByte())
+        if (t0Ms > 0) b.putLong(t0Ms)
         request(Proto.OP_ALBUM, b.array())
     }
 

@@ -192,6 +192,7 @@ std::vector<String> slideList;
 bool slideListInclude = false;
 uint8_t slideEffectMask = 0;                      // бит N-1 — эффект N в показе (EFF_SLIDE_MASK)
 static volatile bool slide_list_dirty = false;   // нужно сбросить в NVS, когда рендер стоит
+static SemaphoreHandle_t slide_mutex = nullptr;  // slideList: пишет BLE, читает загрузчик (слайдшоу по часам)
 
 RTC_DATA_ATTR volatile float global_gamma         = 2.5f;
 RTC_DATA_ATTR volatile float global_saturation    = 1.5f;
@@ -1868,12 +1869,22 @@ static String slideListJoin() {
     return s;
 }
 
-void applySlideList(bool include, const std::vector<String>& names, uint8_t effectMask) {
-    slideList = names;
-    slideListInclude = include;
-    slideEffectMask  = effectMask & EFF_SLIDE_MASK;
-    slide_list_dirty = true;
-    settings_dirty   = true;   // разбудить отложенный сброс в NVS в loop()
+// true — отбор действительно поменялся (повторная присылка того же — false).
+bool applySlideList(bool include, const std::vector<String>& names, uint8_t effectMask) {
+    effectMask &= EFF_SLIDE_MASK;
+    if (slide_mutex) xSemaphoreTake(slide_mutex, portMAX_DELAY);
+    bool changed = include != slideListInclude || effectMask != slideEffectMask || names != slideList;
+    if (changed) {
+        slideList        = names;
+        slideListInclude = include;
+        slideEffectMask  = effectMask;
+    }
+    if (slide_mutex) xSemaphoreGive(slide_mutex);
+    if (changed) {
+        slide_list_dirty = true;
+        settings_dirty   = true;   // разбудить отложенный сброс в NVS в loop()
+    }
+    return changed;
 }
 
 // Играется ли файл в текущем слайдшоу.
@@ -1889,6 +1900,7 @@ static void loadSlideList() {
     String joined = prefs.getString("slidelist", "");
     slideListInclude = prefs.getUChar("slidelistmode", 0) != 0;
     slideEffectMask  = prefs.getUChar("slideeffmask", 0) & EFF_SLIDE_MASK;
+    slideClockT0     = prefs.getLong64("slidet0", 0);
     slideList.clear();
     int start = 0;
     while (start < (int)joined.length()) {
@@ -1902,11 +1914,16 @@ static void loadSlideList() {
 // Сбрасывает отбор в NVS. Вызывать только когда отрисовка остановлена.
 static void flushSlideList() {
     if (!slide_list_dirty) return;
+    // Под тем же замком, что и applySlideList(): телефон может прислать новый
+    // отбор (BLE, ядро 0) прямо посреди этого обхода (loop(), ядро 1).
+    if (slide_mutex) xSemaphoreTake(slide_mutex, portMAX_DELAY);
     String joined = slideListJoin();
+    if (slide_mutex) xSemaphoreGive(slide_mutex);
     if (prefs.getString("slidelist", "") != joined) prefs.putString("slidelist", joined);
     uint8_t mode = slideListInclude ? 1 : 0;
     if (prefs.getUChar("slidelistmode", 0) != mode)  prefs.putUChar("slidelistmode", mode);
     if (prefs.getUChar("slideeffmask", 0) != slideEffectMask) prefs.putUChar("slideeffmask", slideEffectMask);
+    if (prefs.getLong64("slidet0", 0) != slideClockT0) prefs.putLong64("slidet0", slideClockT0);
     slide_list_dirty = false;
 }
 
@@ -2472,101 +2489,137 @@ static bool advanceSlideshow() {
     return true;
 }
 
-// Позиция файла [name] (пустая строка — не ищем файл) или, если name пуст,
-// эффекта [effId] (1..6) в ТОЙ ЖЕ виртуальной последовательности, которую
-// строит advanceSlideshow() — общая логика продублирована, а не вынесена в
-// одну функцию с ней: там нужен N-й элемент, здесь — позиция ДАННОГО
-// элемента, и совмещать оба запроса в одном проходе не стоило усложнения.
-// -1, если не нашли (например, отбор сменился между командой и её обработкой).
-static int slideSequencePositionOf(const String& name, int effId) {
-    bool explicitOrder = slideListInclude && !slideList.empty();
-    int fileCount = 0, filePos = -1;
-    if (explicitOrder) {
-        for (const String& f : slideList) {
-            if (!LittleFS.exists("/" + f)) continue;
-            if (name.length() && filePos < 0 && f == name) filePos = fileCount;
-            fileCount++;
-        }
-    } else {
-        for (const String& f : savedFiles) {
-            if (!slideInSlideshow(f)) continue;
-            if (name.length() && filePos < 0 && f == name) filePos = fileCount;
-            fileCount++;
-        }
-    }
-    if (name.length()) return filePos;
-    if (effId < 1 || effId >= EFF_COUNT || !(slideEffectMask & (1 << (effId - 1)))) return -1;
-    int c = 0;
-    for (int e = 1; e < EFF_COUNT; e++) {
-        if (!(slideEffectMask & (1 << (e - 1)))) continue;
-        if (e == effId) return fileCount + c;
-        c++;
-    }
-    return -1;
+// =====================================================================
+//  Слайдшоу по абсолютным часам (синхронная группа колёс)
+//
+//  Раньше синхронность держал телефон: раз в интервал он называл каждому
+//  колесу пункт показа (OP_SYNC_TICK), а у колеса шёл ещё и свой таймер — с
+//  паузой, пока лента тёмная. Два хода спорили между собой, тик доходил до
+//  колёс с разной задержкой BLE и ждал подтверждения загрузки, и колёса
+//  подолгу показывали разное. Теперь ход один: телефон один раз присылает
+//  всем одно и то же расписание (t0, интервал, список — OP_ALBUM) и держит
+//  часы колёс выставленными (HallSync, OP_TIME_SET), а каждое колесо само
+//  считает, что показывать в любой момент:
+//      слот k = (UTC_мс − t0) / интервал,   пункт = k mod (файлов + эффектов).
+//  Границы слотов у всех колёс приходятся на один и тот же момент с
+//  точностью до хода часов (единицы мс), а не до задержки радио, и телефон
+//  для этого не нужен вовсе — только чтобы часы не уплывали.
+//
+//  Переключает fileLoaderTask: он и так грузит файлы, а ждать семафор умеет
+//  с таймаутом — до ближайшей границы. Грузим при любом состоянии питания:
+//  у стоящего колеса на ободе пусто, но приложение видит, какой пункт сейчас
+//  загружен, а раскрутившись, колесо сразу показывает нужный.
+//
+//  Фаза анимации — тоже от расписания (alignFramePhase): от начала слота, а
+//  если пункт в показе один — от t0, иначе на каждой границе он прыгал бы на
+//  первый кадр. Загрузка у колёс длится по-разному, кадры — одинаковые.
+//
+//  Ни request_play_flag, ни таймер простоя не трогаем: смена по расписанию —
+//  не действие человека (см. «never sleeps» в Slideshow, CLAUDE.md).
+// =====================================================================
+int64_t slideClockT0 = 0;          // UTC, мс; 0 — обычный показ по таймеру loop()
+
+#define SLIDE_CLOCK_POLL_MS 250    // перепроверка: питание, переставленные телефоном часы
+
+bool slideClockSet(int64_t t0Ms) {
+    if (t0Ms < 0) t0Ms = 0;
+    if (t0Ms == slideClockT0) return false;
+    slideClockT0     = t0Ms;
+    slide_list_dirty = true;
+    settings_dirty   = true;
+    return true;
 }
 
-// Разовая правка "какой пункт слайдшоу сейчас показываем" от более точного
-// внешнего источника времени — см. OP_SYNC_TICK в povble.cpp: пока телефон
-// подключён к нескольким колёсам сразу, он поддерживает между ними жёсткую
-// синхронизацию, посылая эту команду вместо того, чтобы полагаться на то, что
-// автономные часы каждого колеса совпадают. В ОТЛИЧИЕ от OP_PLAY/OP_EFFECT,
-// НЕ трогает slideshowActive — автономный ход (advanceSlideshow() по таймеру
-// в loop()) остаётся вооружён, и в этом весь смысл: если телефон пропадёт без
-// единого шанса на явную передачу (сел Bluetooth, само приложение не
-// закрывали штатно, колесо ушло в глубокий сон) — колесо не застывает на
-// последнем кадре, а продолжает крутить ту же последовательность по
-// собственным часам, начиная ровно с того места, где остановился телефон.
-//
-// slideCurrentIndex ставится на позицию этого пункта в общей
-// последовательности (см. slideSequencePositionOf) — если не нашли (отбор
-// уже успел смениться), просто не трогаем индекс, следующий автономный шаг
-// посчитает сам. slideLastSwitch сбрасывается на "сейчас": иначе набежавшая
-// с последней автономной смены выдержка сработала бы сразу же следующим
-// проходом loop(), доиграв то, что телефон только что и без того показал.
-//
-// Возвращает false, если файл не нашёлся на флеше (список эффектов, в
-// отличие от файлов, фиксирован прошивкой и всегда "существует").
-// НЕ ставит request_play_flag, в отличие от OP_PLAY/OP_EFFECT — и это не
-// упущение: fileLoaderTask() грузит pendingFilePath/pending_effect по
-// одному лишь семафору, request_play_flag ему вообще не нужен.
-// request_play_flag — это отдельный сигнал "перед нами настоящий, только что
-// поступивший запрос показа", по которому loop() (1) считает его
-// ПОДТВЕРЖДЁННОЙ активностью для таймера простоя (last_motion_ms/
-// last_play_ms) и (2) пытается поднять DCDC1 из PWR_OFF, чтобы измерить
-// обороты (play_pending). Автотик синхронной группы прилетает каждый
-// интервал слайдшоу САМ ПО СЕБЕ, без участия человека и независимо от того,
-// крутится ли колесо вообще — если бы он тоже поднимал этот флаг,
-// неподвижное колесо в составе группы никогда не доходило бы ни до PWR_OFF
-// (откат PWR_SPINUP → PWR_OFF в loop() требует now_ms - last_play_ms > 10000,
-// то есть 10 с БЕЗ обновлений last_play_ms — а тик прилетает как раз каждый
-// интервал слайдшоу, обычно короче, и держал бы last_play_ms свежим
-// бесконечно), ни тем более до глубокого сна, вдобавок раз за разом напрасно
-// поднимая арм 1 на неподвижном колесе. Контент всё равно подгружается —
-// просто без этих двух побочных эффектов.
-bool syncTick(const String& name, int effId) {
-    if (name.length()) {
-        if (!LittleFS.exists("/" + name)) return false;
-    } else if (!effectValid(effId)) {
-        return false;
+// Разбудить загрузчик: расписание (или сам показ) только что поменялось.
+void slideClockKick() {
+    if (fileLoaderSemaphore) xSemaphoreGive(fileLoaderSemaphore);
+}
+
+// Один шаг расписания — только из fileLoaderTask. Возвращает, сколько мс можно
+// ждать до следующей проверки (UINT32_MAX — расписания нет, ждём семафор).
+static uint32_t slideClockStep() {
+    if (!slideshowActive || slideClockT0 <= 0) return UINT32_MAX;
+    int64_t wall = hallWallUs();
+    if (wall == 0) return 1000;            // часы не заведены — пока ведёт таймер loop()
+    int64_t now = wall / 1000;
+    int64_t I   = slideInterval ? (int64_t)slideInterval : 10000;
+    if (now < slideClockT0) {              // показ ещё не начался — до t0 держим, что есть
+        int64_t w = slideClockT0 - now;
+        return (uint32_t)(w < SLIDE_CLOCK_POLL_MS ? w : SLIDE_CLOCK_POLL_MS);
     }
-    int pos = slideSequencePositionOf(name, effId);
-    if (pos >= 0) slideCurrentIndex = pos;
-    slideLastSwitch = millis();
-    if (name.length()) {
-        if (("/" + name) != currentDisplayFile) {
-            pending_effect     = -1;
-            pendingFilePath    = "/" + name;
-            pending_last_file  = name;
-            force_stop_display = false;
-            xSemaphoreGive(fileLoaderSemaphore);
+    int64_t  slot      = (now - slideClockT0) / I;
+    int64_t  slotStart = slideClockT0 + slot * I;
+    int64_t  toNext    = slotStart + I - now;
+    uint32_t wait      = (uint32_t)(toNext < SLIDE_CLOCK_POLL_MS ? toNext : SLIDE_CLOCK_POLL_MS);
+    if (wait == 0) wait = 1;
+    // Грузим и на стоящем колесе: приложение показывает текущий пункт показа по
+    // тому, что загружено, и неподвижный участник группы иначе выглядел бы
+    // «ничего не играет». Активностью это не считается — сон не откладывается.
+    // Пункт этого слота уже не загрузился (не хватило PSRAM, файл битый) —
+    // до следующего слота не пробуем. Без этого шаг повторялся бы каждую
+    // миллисекунду: лента гасла и зажигалась без остановки, флеш читался
+    // непрерывно, и BLE отваливался.
+    static int64_t failed_slot = -1;
+    if (slot == failed_slot) return wait;
+
+    // Пункт — по ПОЛНОМУ присланному списку, а не по тому, что нашлось на
+    // этом колесе: иначе при недостающем файле у колёс разошлась бы длина
+    // круга, а с ней и все следующие слоты. Недостающий пункт пропускаем — на
+    // ободе остаётся предыдущий.
+    String name;
+    int total, pos, nFiles;
+    xSemaphoreTake(slide_mutex, portMAX_DELAY);
+    nFiles = slideListInclude ? (int)slideList.size() : 0;
+    total  = nFiles + __builtin_popcount(slideEffectMask);
+    pos    = total ? (int)(slot % total) : 0;
+    if (pos < nFiles) name = slideList[pos];
+    xSemaphoreGive(slide_mutex);
+    if (total == 0) return wait;
+    int64_t origin = (total == 1) ? slideClockT0 : slotStart;
+
+    if (pos >= nFiles) {
+        int ord = pos - nFiles, c = 0, eid = 0;
+        for (int e = 1; e < EFF_COUNT; e++) {
+            if (!(slideEffectMask & (1 << (e - 1)))) continue;
+            if (c == ord) { eid = e; break; }
+            c++;
         }
-    } else if (effId != effect_id) {
-        pendingFilePath    = "";
-        pending_effect     = (int8_t)effId;
-        force_stop_display = false;
-        xSemaphoreGive(fileLoaderSemaphore);
+        if (eid == 0 || eid == effect_id) return wait;
+        // Строка ДО запуска: лог переживает аварийный сброс (storage.cpp), и
+        // если что-то упадёт внутри, последней в нём окажется именно она.
+        webLogf("[DISP] Clock slideshow: starting effect %s", effectName(eid));
+        if (!effectsStart((uint8_t)eid)) {
+            failed_slot = slot;
+            return wait;
+        }
+        return 1;                           // запуск занял время — пересчитать ожидание
     }
-    return true;
+
+    String path = "/" + name;
+    if (effect_id == EFF_NONE && path == currentDisplayFile) {
+        // Уже на ободе (пункт в показе один, или файл загрузили раньше не по
+        // расписанию) — без перечитывания, только фаза.
+        if (currentPhaseOriginMs != origin) alignFramePhase(origin);
+        return wait;
+    }
+    if (!LittleFS.exists(path)) return wait;
+    // pending_last_file (автозапуск после сна) отсюда НЕ пишем: эта задача на
+    // ядре 0, а сбрасывает его loop() на ядре 1 — String без замка на двух
+    // ядрах портит кучу. Показу по часам он и не нужен: после пробуждения
+    // нужный пункт выберет само расписание.
+    webLogf("[DISP] Clock slideshow: loading %s", name.c_str());
+    force_stop_display = false;
+    loadFrameFromFile(path, origin);
+    if (currentDisplayFile != path) {
+        failed_slot = slot;
+        webLogf("[DISP] Clock slideshow: %s did not load, skipping this slot", name.c_str());
+        return wait;
+    }
+    // Насколько позже границы слота загорелся новый пункт — у колёс группы эти
+    // числа и надо сравнивать: часы у них общие, разница — это и есть разнобой.
+    webLogf("[DISP] Clock slideshow: %s, lit %ld ms after the boundary", name.c_str(),
+            (long)(hallWallUs() / 1000 - slotStart));
+    return 1;
 }
 
 // Сама работа за pending_unload — вызывается ТОЛЬКО из fileLoaderTask, где
@@ -2624,8 +2677,16 @@ void stopDisplayAndSlideshow() {
 // Задача загрузки файлов — работает на Core 0 (не мешает рендерингу на Core 1),
 // приоритет 2 — не блокирует хост NimBLE во время чтения LittleFS.
 void fileLoaderTask(void* pvParameters) {
+    // Первый проход — сразу: расписание показа по часам могло пережить сон
+    // (NVS), и семафор ради него никто не отдаст.
+    uint32_t wait = 0;
     while (true) {
-        xSemaphoreTake(fileLoaderSemaphore, portMAX_DELAY);
+        // Проснулись по таймауту (шаг расписания), а не по семафору — заявок
+        // никто не ставил, и pendingFilePath не трогаем: его пишут другие задачи
+        // (OP_PLAY, слайдшоу в loop()) и отдают семафор ПОСЛЕ записи, а String,
+        // прочитанный посреди чужой записи, портит кучу.
+        bool kicked = xSemaphoreTake(fileLoaderSemaphore,
+                                     wait == UINT32_MAX ? portMAX_DELAY : pdMS_TO_TICKS(wait)) == pdTRUE;
         // Чистка за удалённым активным файлом — первой: если следом в этом же
         // проходе просят загрузить что-то новое (pendingFilePath/pending_effect),
         // тот файл к тому моменту уже не активен (currentDisplayFile меняет
@@ -2646,10 +2707,12 @@ void fileLoaderTask(void* pvParameters) {
             // (см. pending_effect_play в effects.h).
             if (effectsStart(want) && play && !force_stop_display) request_play_flag = true;
         }
-        if (pendingFilePath.length() > 0) {
+        if (kicked && pendingFilePath.length() > 0) {
             loadFrameFromFile(pendingFilePath);
             pendingFilePath = "";
         }
+        // Слайдшоу по абсолютным часам: переключение ровно на границе слота.
+        wait = slideClockStep();
     }
 }
 
@@ -2855,6 +2918,7 @@ void setup() {
             default:                                            break;
         }
         webLogf("[SYS] Full reset: %s", rr_str);
+        crashReportLog();
     } else {
         webLogf("[SYS] Boot, wakeup cause: %d", (int)wakeup_reason);
     }
@@ -2924,6 +2988,7 @@ void setup() {
     hallLogInit();
     loadSettingsFromNVS();              // до построения таблиц: они зависят от гаммы и балансов
     loadHallCalibration();
+    slide_mutex = xSemaphoreCreateMutex();
     loadSlideList();                    // отбор файлов для слайдшоу переживает сон и питание
 
     // Таблицы рендера — до первого кадра: пока они не построены,
@@ -2986,7 +3051,10 @@ void setup() {
     }
 
     // Задача асинхронной загрузки файлов: Core 0, приоритет 2.
-    xTaskCreatePinnedToCore(fileLoaderTask, "loader", 4096, NULL, 2, NULL, 0);
+    // 8 КБ, а не 4: загрузчик теперь ещё и ведёт показ по часам, а глубина
+    // чтения LittleFS (VFS → newlib → littlefs → флеш) плюс печать в лог
+    // библиотек не оставляли бы запаса. Внутренней ОЗУ после удаления Wi-Fi с избытком.
+    xTaskCreatePinnedToCore(fileLoaderTask, "loader", 8192, NULL, 2, NULL, 0);
 
     // Core 1, приоритет 2: выше loop() (prio 1), ниже системных задач.
     xTaskCreatePinnedToCore(renderingTask, "render", 4096, NULL, 2, NULL, 1);
@@ -3110,7 +3178,14 @@ void loop() {
     // время стоянки набегает вся выдержка целиком, и при первом же обороте
     // слайдшоу мгновенно перескакивает через ту картинку, на которой
     // остановились, — а продолжиться должно именно с неё.
-    if (slideshowActive) {
+    //
+    // Показ синхронной группы по абсолютным часам (t0 задан) ведёт не этот
+    // таймер, а slideClockStep() в загрузчике — здесь только обычный показ.
+    // Проверка — по t0, а не по часам: gettimeofday() на каждом проходе loop()
+    // держал мьютекс времени newlib почти постоянно, и webLog() на другом ядре
+    // натыкался на него и ронял колесо (см. webLog в storage.cpp). Часы ещё не
+    // выставлены — показ по часам просто ждёт телефона.
+    if (slideshowActive && slideClockT0 <= 0) {
         bool due = (slideCurrentIndex < 0) || (now_ms - slideLastSwitch) >= slideInterval;
         if (!rendering_active && slideCurrentIndex >= 0) {
             slideLastSwitch = now_ms;

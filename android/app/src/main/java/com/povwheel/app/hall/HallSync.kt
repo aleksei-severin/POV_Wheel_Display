@@ -32,6 +32,8 @@ import kotlin.math.max
  *    архив переводит время событий в часы телефона;
  *  - при первом контакте измеряет ошибку часов колеса (для сессий, проезженных без
  *    телефона, см. [HallArchive.noteGen]) и выставляет их точно (OP_TIME_SET);
+ *  - дальше, раз в полминуты, подправляет их, если ушли больше чем на
+ *    [RESYNC_TOL_US]: по ним идёт синхронный показ нескольких колёс;
  *  - забирает новые записи кольца (OP_HALL_LOG): раз в 3 с, пока лента светится,
  *    раз в 10 с — пока нет;
  *  - пока лента НЕ светится, дочитывает файлы истории с флеша колеса (OP_HALL_HIST) —
@@ -69,6 +71,11 @@ class HallSync(private val ctx: Context, private val c: BleClient) {
 
     /** Первая серия пингов часов прошла (см. [loop]). */
     private val primed = CompletableDeferred<Unit>()
+
+    /** Часы колеса выставлены после подключения (или оказались верными и так). */
+    private val clockReady = CompletableDeferred<Unit>()
+
+    suspend fun awaitClock() = clockReady.await()
 
     private suspend fun pings(n: Int): List<BleClient.TimeSample> {
         val out = ArrayList<BleClient.TimeSample>(n)
@@ -116,6 +123,14 @@ class HallSync(private val ctx: Context, private val c: BleClient) {
                             // секундной точности старой команды).
                             runCatching { c.setTime(System.currentTimeMillis() / 1000, tz) }
                         }
+                        clockReady.complete(Unit)
+                    } else if (ti.wallUs == 0L || !ti.precise || abs(err) > RESYNC_TOL_US) {
+                        // Кварц колеса и телефона расходятся на десятки ppm — за час
+                        // это до сотни мс, а синхронный показ по часам ждёт от колёс
+                        // группы единиц мс. Подправляем, когда ушло заметно больше
+                        // шума измерения (асимметрия круга BLE — единицы мс).
+                        val tz = TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 1000
+                        runCatching { c.timeSet(best.wallMidUs, ti.espUs, tz) }
                     }
                 }
             }
@@ -129,6 +144,11 @@ class HallSync(private val ctx: Context, private val c: BleClient) {
             delay(if (pwr == 2) 3_000 else 10_000)
             if (c.link.value == Link.Ready) runCatching { pwr = c.tele.value.pwr }
         }
+    }
+
+    private companion object {
+        /** Порог подстройки часов колеса на ходу (см. [loop]), мкс. */
+        const val RESYNC_TOL_US = 10_000L
     }
 
     private suspend fun pullLog(addr: String) {

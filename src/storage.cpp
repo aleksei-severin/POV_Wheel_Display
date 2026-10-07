@@ -22,18 +22,27 @@ String pendingPlayFile = "";
 // последней известной и обновляет UI только при расхождении.
 
 // ===================== LOG BUFFER =====================
-// Кольцевой буфер в RTC SLOW RAM — переживает deep sleep.
+// Кольцевой буфер в RTC SLOW RAM — переживает deep sleep и любой сброс,
+// кроме включения питания (в том числе падение: см. RTC_NOINIT ниже).
 // ESP32-S3 RTC SLOW RAM = 8192 байт, из них ~1 кБ занимает ESP-IDF.
 // 64 строки × 96 байт = 6144 байт — укладываемся с запасом.
 #define WEB_LOG_COUNT   64
 #define WEB_LOG_LINE    96
 
-// Хранит строку сообщения без временно́й метки (она добавляется при записи в буфер)
 // Формат в буфере: "YYYY-MM-DD HH:MM:SS msg\0"
-RTC_DATA_ATTR static char     _log_buf[WEB_LOG_COUNT][WEB_LOG_LINE];
-RTC_DATA_ATTR static uint32_t _log_ms[WEB_LOG_COUNT];  // millis() в момент записи каждой строки
-RTC_DATA_ATTR static uint32_t _log_head  = 0;  // Индекс следующей записи (кольцо)
-RTC_DATA_ATTR static uint32_t _log_total = 0;  // Всего записей с начала времён
+//
+// RTC_NOINIT, а не RTC_DATA. RTC_DATA загрузчик заново заполняет начальными
+// значениями при любом сбросе, кроме пробуждения из сна, — и после падения
+// (panic, WDT, brownout) лог начинался с чистого листа, теряя ровно те строки,
+// что вели к сбою. NOINIT не трогает никто; после включения питания там мусор,
+// его отличает метка (_logEnsure).
+#define LOG_MAGIC 0x4C4F4731u   // "LOG1"
+RTC_NOINIT_ATTR static uint32_t _log_magic;
+RTC_NOINIT_ATTR static char     _log_buf[WEB_LOG_COUNT][WEB_LOG_LINE];
+RTC_NOINIT_ATTR static uint32_t _log_ms[WEB_LOG_COUNT];  // millis() в момент записи каждой строки
+RTC_NOINIT_ATTR static uint32_t _log_head;   // Индекс следующей записи (кольцо)
+RTC_NOINIT_ATTR static uint32_t _log_total;  // Всего записей с начала времён
+static bool _log_checked = false;            // обычная RAM: false на каждом старте
 
 // Unix-время в момент последней синхронизации + millis() в тот же момент.
 // Переживают deep sleep — позволяют считать текущее время без NTP.
@@ -42,6 +51,23 @@ RTC_DATA_ATTR static uint32_t _time_millis_base = 0;  // millis() при син�
 RTC_DATA_ATTR static int32_t  _time_tz_offset   = 0;  // Смещение часового пояса в секундах (UTC+2 = +7200)
 
 static portMUX_TYPE _log_mux = portMUX_INITIALIZER_UNLOCKED;
+
+// Первое обращение к кольцу за сеанс — проверить, что в нём не мусор после
+// включения питания. Вызывать под _log_mux.
+static void _logEnsure() {
+    if (_log_checked) return;
+    _log_checked = true;
+    if (_log_magic != LOG_MAGIC || _log_head != _log_total) {
+        memset(_log_buf, 0, sizeof(_log_buf));
+        memset(_log_ms, 0, sizeof(_log_ms));
+        _log_head = _log_total = 0;
+        _log_magic = LOG_MAGIC;
+        return;
+    }
+    // Пережили сброс: строка, которую писали в момент сбоя, могла остаться без
+    // завершающего нуля.
+    for (int i = 0; i < WEB_LOG_COUNT; i++) _log_buf[i][WEB_LOG_LINE - 1] = '\0';
+}
 
 // Часы идут по СИСТЕМНОМУ времени newlib, а не по паре «epoch + millis()».
 // Разница принципиальная: системное время привязано к счётчику RTC, который
@@ -142,15 +168,24 @@ static void _fmtDateTime(uint32_t epoch, char* buf) {
     uint32_t m   = (mp < 10) ? (mp + 3) : (mp - 9);
     y += (m <= 2) ? 1 : 0;
 
-    snprintf(buf, 20, "%04u-%02u-%02u %02u:%02u:%02u",
-             y, m, d,
-             secs / 3600, (secs % 3600) / 60, secs % 60);
+    // Вручную, без snprintf: функцию зовут и под спин-блокировкой лога
+    // (_retroFillTimestamps), а там нельзя ничего, что может взять мьютекс.
+    uint32_t hh = secs / 3600, mi = (secs % 3600) / 60, ss = secs % 60;
+    buf[0] = '0' + (y / 1000) % 10; buf[1] = '0' + (y / 100) % 10;
+    buf[2] = '0' + (y / 10) % 10;   buf[3] = '0' + y % 10;
+    buf[4] = '-';  buf[5] = '0' + m / 10;  buf[6] = '0' + m % 10;
+    buf[7] = '-';  buf[8] = '0' + d / 10;  buf[9] = '0' + d % 10;
+    buf[10] = ' '; buf[11] = '0' + hh / 10; buf[12] = '0' + hh % 10;
+    buf[13] = ':'; buf[14] = '0' + mi / 10; buf[15] = '0' + mi % 10;
+    buf[16] = ':'; buf[17] = '0' + ss / 10; buf[18] = '0' + ss % 10;
+    buf[19] = '\0';
 }
 
 // Ретроспективно проставляет метки времени строкам у которых метка начинается с '?'.
 // Вызывается после первой синхронизации часов с телефоном.
 // Использует сохранённый millis() каждой строки для восстановления точного времени.
 static void _retroFillTimestamps() {
+    _logEnsure();
     // Граница буфера: строки доступны от (total - min(total, COUNT)) до total
     uint32_t count = (_log_total < WEB_LOG_COUNT) ? _log_total : WEB_LOG_COUNT;
     uint32_t from  = _log_total - count;
@@ -169,24 +204,32 @@ static void _retroFillTimestamps() {
 }
 
 void webLog(const char* msg) {
+    // Строку собираем ДО спин-блокировки. Внутри неё (прерывания выключены)
+    // нельзя ничего, что берёт мьютекс, а time() берёт мьютекс newlib: если в
+    // этот момент его держит другая задача, ESP-IDF вызывает abort(). Так и
+    // падало колесо в синхронном показе — loop() на другом ядре постоянно
+    // читал часы, и первая же строка лога из загрузчика попадала в него.
+    char ts[20];
+    _fmtDateTime(_currentEpoch(), ts);
+    char line[WEB_LOG_LINE];
+    snprintf(line, sizeof(line), "%s %s", ts, msg);
+    const uint32_t ms = millis();
+
     // Дедупликация: не записываем если последнее сообщение идентично текущему.
     // Сравниваем только текст без временно́й метки (метка занимает первые 20 символов: "YYYY-MM-DD HH:MM:SS ").
     portENTER_CRITICAL(&_log_mux);
+    _logEnsure();
     if (_log_total > 0) {
         const char* last = _log_buf[(_log_head - 1) % WEB_LOG_COUNT];
         const char* last_msg = (strlen(last) > 20) ? last + 20 : last;
-        if (strcmp(last_msg, msg) == 0) {
+        if (strcmp(last_msg, line + 20) == 0) {
             portEXIT_CRITICAL(&_log_mux);
             return;  // Дубликат — не пишем
         }
     }
-
-    char ts[20];
-    _fmtDateTime(_currentEpoch(), ts);
-
     uint32_t idx = _log_head % WEB_LOG_COUNT;
-    _log_ms[idx] = millis();  // Сохраняем millis() для ретроспективной метки
-    snprintf(_log_buf[idx], WEB_LOG_LINE, "%s %s", ts, msg);
+    _log_ms[idx] = ms;        // millis() для ретроспективной метки
+    memcpy(_log_buf[idx], line, sizeof(line));
     _log_head++;
     _log_total++;
     portEXIT_CRITICAL(&_log_mux);
@@ -265,7 +308,25 @@ static void frame888to565(const uint8_t* src, uint8_t* dst) {
 }
 
 
-void loadFrameFromFile(String path) {
+// Фаза анимации от абсолютного момента [originMs] (UTC, мс): кадр, который
+// сейчас на ободе, — тот, что шёл бы, начнись анимация ровно тогда. Нужна
+// синхронному показу: два колеса грузят один и тот же файл не одинаково долго,
+// а кадры у них обязаны совпадать. millis() и системное время идут от одного
+// esp_timer, поэтому разность, снятая один раз, дальше не уплывает.
+int64_t currentPhaseOriginMs = 0;
+
+bool alignFramePhase(int64_t originMs) {
+    int64_t wall = hallWallUs();
+    if (originMs <= 0 || wall == 0) return false;
+    uint32_t m = millis();
+    int64_t elapsed = wall / 1000 - originMs;
+    if (elapsed < 0) elapsed = 0;
+    lastFrameSwitchTime  = m - (uint32_t)elapsed;   // рендер считает millis() − это, беззнаково
+    currentPhaseOriginMs = originMs;
+    return true;
+}
+
+void loadFrameFromFile(String path, int64_t phaseOriginMs) {
     File f = LittleFS.open(path, "r");
     if (!f) return;
     if (f.size() == 0) {
@@ -469,7 +530,11 @@ void loadFrameFromFile(String path) {
 
     // Запускаем таймер кадров только ПОСЛЕ завершения чтения файла:
     // если поставить в начало, первый кадр будет немедленно пропущен в renderingTask.
-    lastFrameSwitchTime = millis();
+    // В синхронном показе — от начала слота, а не от конца чтения (см. выше).
+    if (!alignFramePhase(phaseOriginMs)) {
+        lastFrameSwitchTime  = millis();
+        currentPhaseOriginMs = 0;
+    }
     newFrameReady = true;
     currentDisplayFile = path;
     frame_loading = false;          // отрисовка возобновляется
@@ -500,6 +565,7 @@ void unloadCurrentFrame() {
     if (frameBuffer != nullptr) { free(frameBuffer); frameBuffer = nullptr; }
     totalFrames        = 0;
     currentDisplayFile = "";
+    currentPhaseOriginMs = 0;
     newFrameReady      = false;
     force_stop_display = true;
     frame_loading      = false;
@@ -583,6 +649,7 @@ uint32_t povBuildLogs(uint8_t* out, size_t cap, uint32_t since) {
     if (!out || cap < 8) return 0;
 
     portENTER_CRITICAL(&_log_mux);
+    _logEnsure();
     uint32_t total = _log_total;
     portEXIT_CRITICAL(&_log_mux);
 
@@ -619,3 +686,86 @@ uint32_t povBuildLogs(uint8_t* out, size_t cap, uint32_t since) {
 void setupStorage() {
     prefs.begin("pov_config", false);
 }
+
+// =====================================================================
+//  Паника: что и где упало
+//
+//  Штатный обработчик паники ESP-IDF печатает причину и цепочку вызовов в
+//  консоль, а консоли у колеса нет (Serial не поднят, USB на ходу не
+//  подключён) — после сброса оставалось только «panic/crash». Перехватываем
+//  его (-Wl,--wrap=esp_panic_handler в platformio.ini): до штатной печати
+//  запоминаем причину, адрес и цепочку вызовов в RTC_NOINIT — её не трогает
+//  ни один сброс, кроме включения питания, — а после перезагрузки выводим в
+//  лог (crashReportLog()). Адреса — для addr2line по firmware.elf той же сборки.
+// =====================================================================
+#include "esp_private/panic_internal.h"
+#include "esp_debug_helpers.h"
+#include "xtensa/xtensa_context.h"
+
+#define CRASH_MAGIC 0x43525348u   // "CRSH"
+#define CRASH_DEPTH 12
+struct CrashRec {
+    uint32_t    magic;
+    uint32_t    core;
+    uint32_t    exccause;
+    uint32_t    excvaddr;
+    const char* reason;
+    uint32_t    n;
+    uint32_t    pc[CRASH_DEPTH];
+};
+RTC_NOINIT_ATTR static CrashRec crash_rec;
+
+extern "C" void __real_esp_panic_handler(panic_info_t* info);
+
+extern "C" void IRAM_ATTR __wrap_esp_panic_handler(panic_info_t* info) {
+    crash_rec.magic    = 0;
+    crash_rec.core     = (uint32_t)info->core;
+    crash_rec.reason   = info->reason;
+    crash_rec.exccause = 0;
+    crash_rec.excvaddr = 0;
+    crash_rec.n        = 0;
+    const XtExcFrame* f = (const XtExcFrame*)info->frame;
+    if (f) {
+        crash_rec.exccause = (uint32_t)f->exccause;
+        crash_rec.excvaddr = (uint32_t)f->excvaddr;
+        esp_backtrace_frame_t fr;
+        fr.pc        = (uint32_t)f->pc;
+        fr.sp        = (uint32_t)f->a1;
+        fr.next_pc   = (uint32_t)f->a0;
+        fr.exc_frame = f;
+        crash_rec.pc[crash_rec.n++] = fr.pc;
+        while (crash_rec.n < CRASH_DEPTH && fr.next_pc != 0 && esp_backtrace_get_next_frame(&fr)) {
+            crash_rec.pc[crash_rec.n++] = fr.pc;
+        }
+    }
+    crash_rec.magic = CRASH_MAGIC;
+    __real_esp_panic_handler(info);
+}
+
+// Адрес из цепочки — так же, как его печатает сам ESP-IDF
+// (esp_cpu_process_stack_pc): старшие биты — счётчик окна, минус 3 — сама
+// инструкция вызова, а не адрес возврата.
+static uint32_t crashPc(uint32_t pc) {
+    if (pc & 0x80000000u) pc = (pc & 0x3fffffffu) | 0x40000000u;
+    return pc - 3;
+}
+
+void crashReportLog() {
+    if (crash_rec.magic != CRASH_MAGIC) return;
+    crash_rec.magic = 0;
+    // Строка причины лежит во флеше прошивки (DROM) — читать её можно, только
+    // если указатель туда и смотрит.
+    uint32_t r = (uint32_t)crash_rec.reason;
+    const char* reason = (r >= 0x3C000000u && r < 0x3E000000u) ? crash_rec.reason : "?";
+    webLogf("[SYS] Panic core %u: %.40s, cause %u, vaddr 0x%08x", (unsigned)crash_rec.core, reason,
+            (unsigned)crash_rec.exccause, (unsigned)crash_rec.excvaddr);
+    uint32_t n = crash_rec.n > CRASH_DEPTH ? CRASH_DEPTH : crash_rec.n;
+    for (uint32_t i = 0; i < n; i += 4) {
+        char line[64];
+        int  p = snprintf(line, sizeof(line), "[SYS] BT%u:", (unsigned)i);
+        for (uint32_t k = i; k < n && k < i + 4; k++)
+            p += snprintf(line + p, sizeof(line) - p, " %08x", (unsigned)(k ? crashPc(crash_rec.pc[k]) : crash_rec.pc[k]));
+        webLog(line);
+    }
+}
+

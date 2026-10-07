@@ -50,6 +50,9 @@ enum PovOp : uint8_t {
                            //    старт может нести отбор (FEAT_ALBUM_SEL):
                            //    …[u8 mode 0=пропускать 1=играть-только][u16 n]{[u8 len][имя]}[u8 effMask]
                            //    effMask: биты 0..6 — эффекты 1..7 тоже в показе (EFF_SLIDE_MASK)
+                           //    …[i64 t0_ms] (FEAT_SLIDE_CLOCK) — показ по абсолютным часам:
+                           //    слот k = (UTC_мс − t0) / delay, пункт = k mod (имён + эффектов).
+                           //    Нет поля или 0 — обычный показ по своему таймеру.
                            //    короткий пакет — отбор не трогать (стоп / смена интервала)
     OP_TELE        = 0x0B,  // →  ничего            ←  PovTele
     OP_PREVIEW     = 0x0C,  // →  имя файла         ←  [u8 sec][u8 rad][RGB565 sec*rad]
@@ -68,10 +71,9 @@ enum PovOp : uint8_t {
     OP_FRAG        = 0x18,  // →  [u32 off][u16 len] ←  срез большого ответа
     OP_SETNAME     = 0x19,  // →  новое имя (ASCII, без завершающего нуля)
     OP_POWEROFF    = 0x1A,  // →  ничего — транспортный режим, будит только кнопка
-    OP_SYNC_TICK   = 0x1B,  // →  [u8 kind 0=файл 1=эффект][kind=0: имя файла | kind=1: u8 id]
-                           //    правка позиции ВНУТРИ уже идущего слайдшоу — в отличие от
-                           //    OP_PLAY/OP_EFFECT, не сбрасывает slideshowActive (см. syncTick()
-                           //    в main.cpp): нужен FEAT_ALBUM_SEL, слайдшоу должно уже идти
+    // 0x1B — бывший OP_SYNC_TICK (телефон называл колесу пункт показа раз в
+    // интервал). Заменён показом по абсолютным часам (t0 в OP_ALBUM); номер не
+    // переиспользуется.
 
     // Лог Холла для склейки POV-видео (POV_FEAT_HALL_LOG, см. hall_log.h).
     // Все три — фоновый обмен приложения: таймер простоя они не сбрасывают.
@@ -156,6 +158,7 @@ struct PovHello {
 #define POV_FEAT_TEXT      0x0040   // эффект «Текст»: OP_TEXT_STYLE / OP_TEXT_SET / OP_TEXT_GET
 #define POV_FEAT_FX        0x0080   // OP_FX_GET / OP_FX_SET; эффекты 2 и 5 удалены, часы цифровые
 #define POV_FEAT_TEXT_RGB  0x0100   // блоб OP_TEXT_SET может нести слой цвета эмодзи (до 40 кБ)
+#define POV_FEAT_SLIDE_CLOCK 0x0200 // OP_ALBUM понимает t0: синхронный показ по абсолютным часам
 
 // Цвет эффекта «Текст».
 struct PovTextStyle {

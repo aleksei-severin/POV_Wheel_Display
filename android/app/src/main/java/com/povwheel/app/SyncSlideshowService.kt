@@ -22,29 +22,30 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeoutOrNull
 
 /**
- * Держит уведомление синхронного показа и подхватывает тикер (явные
- * `play`/`effect` на все адреса группы разом — см. WheelVm.startGroupTicker и
- * комментарий в начале секции синхронизации слайдшоу в WheelVm.kt), когда
- * приложение закрывают.
+ * Держит уведомление синхронного показа и, когда приложение закрывают,
+ * соединения с колёсами группы.
+ *
+ * Показ идёт на самих колёсах по абсолютным часам (OP_ALBUM с t0, см.
+ * slideClockStep() в прошивке и секцию синхронизации в WheelVm.kt): никаких
+ * команд раз в интервал больше нет. Соединения нужны ради двух вещей — чтобы
+ * HallSync держал часы колёс выставленными (кварцы расходятся, а после сна
+ * часы колеса уходят на секунды) и чтобы колесо, переподключившись, заново
+ * получило расписание ([armMember] — та же присылка, колесо её узнаёт и
+ * ничего не перегружает).
  *
  * Обычно (экран открыт) сама она НИЧЕГО не шлёт и никуда не подключается —
- * тикер живёт во ViewModel, на её же, уже открытых соединениях. Служба лишь
- * ЗАПОМИНАЕТ состав/отбор/интервал последней активной группы ([track]) — само
- * запоминание уже не требует её запуска, это просто statics, живущие пока жив
- * процесс. Как только `WheelVm.onCleared()` замечает, что приложение
- * закрывается, она просит службу взять тикер на себя ([takeOverTicking]) — и
- * вот тогда служба подключается к участникам с нуля и продолжает слать те же
- * команды сама. Если экран потом открывают заново и успешно подключаются хотя
- * бы к одному участнику, ViewModel просит службу отпустить тикер обратно
- * ([releaseTicking]) — служба гасит СВОИ соединения (ничего не разослав, показ
- * на колёсах не трогаем), и тикер возвращается во ViewModel.
+ * всё это делает ViewModel на своих соединениях. Служба лишь ЗАПОМИНАЕТ
+ * состав/отбор/интервал/t0 последней активной группы ([track]) — просто
+ * statics, живущие пока жив процесс. Как только `WheelVm.onCleared()` замечает,
+ * что приложение закрывается, она просит службу взять группу на себя
+ * ([takeOver]) — и вот тогда служба подключается к участникам с нуля. Если
+ * экран потом открывают заново, ViewModel просит службу отпустить их обратно
+ * ([release]) — служба гасит СВОИ соединения (показ на колёсах не трогает).
  *
  * Ключевое правило, ради которого всё это разделение: НИКОГДА не пытаться
  * подключиться к адресу, который в этот момент уже подключён во ViewModel
@@ -58,11 +59,11 @@ import kotlinx.coroutines.withTimeoutOrNull
  * Уведомление — живой индикатор, а не флаг «пользователь нажал Start»: оно
  * показывается РОВНО когда у группы реально на связи два участника и больше,
  * и прячется, как только их снова меньше двух (одно из колёс заснуло/вышло из
- * радиуса) — независимо от того, кто в этот момент ведёт тикер. Пока ведёт
+ * радиуса) — независимо от того, кто в этот момент держит группу. Пока держит
  * ViewModel (экран открыт), решение принимает она сама через [setLiveVisible]
  * — обычным `Notification`, безо всякого foreground-статуса службы, которой
- * в этот момент даже не обязательно быть живой. Как только тикер переходит
- * сюда ([startDriving]), решение переходит вместе с ним — [updateNotificationVisibility]
+ * в этот момент даже не обязательно быть живой. Как только группа переходит
+ * сюда ([startDriving]), решение переходит вместе с ней — [updateNotificationVisibility]
  * дальше делает то же самое через startForeground/stopForeground, потому что
  * здесь показ уже обязан быть foreground (иначе Android убьёт службу за
  * несколько секунд простоя без него).
@@ -75,7 +76,10 @@ class SyncSlideshowService : Service() {
      *  восстановление состояния экрана при повторном открытии (см.
      *  WheelVm.restoreSyncStateIfNeeded — она читает это напрямую, в этом же
      *  процессе, а не через Binder). */
-    data class TrackedGroup(val members: List<String>, val names: List<String>, val files: List<String>, val intervalMs: Int)
+    data class TrackedGroup(
+        val members: List<String>, val names: List<String>, val files: List<String>,
+        val intervalMs: Int, val t0Ms: Long
+    )
 
     companion object {
         private const val CHANNEL_ID = "sync_slideshow"
@@ -95,8 +99,8 @@ class SyncSlideshowService : Service() {
         /** Группа для этого адреса, если служба о ней ещё помнит (см. класс). */
         fun trackedGroupFor(addr: String): TrackedGroup? = tracked?.takeIf { addr in it.members }
 
-        /** Служба САМА сейчас подключена и тикает за этот адрес (а не просто
-         *  помнит о нём) — второе соединение к нему сейчас небезопасно. */
+        /** Служба САМА сейчас подключена к этому адресу (а не просто помнит о
+         *  нём) — второе соединение к нему сейчас небезопасно. */
         fun isDrivingAddress(addr: String): Boolean = addr in drivingMembers
 
         /**
@@ -104,29 +108,53 @@ class SyncSlideshowService : Service() {
          * НЕ запускает и не трогает саму службу и НЕ показывает уведомление:
          * пока ведёт ViewModel, ей самой ничего из этого не нужно (см. класс).
          */
-        fun track(members: List<String>, names: List<String>, files: List<String>, intervalMs: Int) {
-            tracked = TrackedGroup(members, names, files, intervalMs)
+        fun track(members: List<String>, names: List<String>, files: List<String>, intervalMs: Int, t0Ms: Long) {
+            tracked = TrackedGroup(members, names, files, intervalMs, t0Ms)
         }
 
-        /** Обновить отбор/интервал уже запомненной группы — на лету, без
-         *  пересоздания соединений (используется и когда тикер здесь, и когда
-         *  во ViewModel: сама рассылку в обоих случаях делает её текущий
-         *  владелец, эта запись — только чтобы держать копию в курсе на
-         *  случай будущей передачи). */
-        fun updateConfig(files: List<String>, intervalMs: Int) {
-            tracked = tracked?.copy(files = files, intervalMs = intervalMs) ?: return
+        /** Обновить отбор/интервал/t0 уже запомненной группы — на лету, без
+         *  пересоздания соединений. Рассылку делает текущий владелец группы,
+         *  эта запись — только чтобы держать копию в курсе на случай передачи. */
+        fun updateConfig(files: List<String>, intervalMs: Int, t0Ms: Long) {
+            tracked = tracked?.copy(files = files, intervalMs = intervalMs, t0Ms = t0Ms) ?: return
+        }
+
+        /**
+         * Отбор группы ([files]: имена файлов и токены эффектов `@eN`) → то, что
+         * уходит в OP_ALBUM: имена файлов в ТОМ ЖЕ порядке и маска эффектов.
+         * Один и тот же для всех колёс группы — по нему каждое считает пункт слота.
+         */
+        fun schedulePayload(files: List<String>): Pair<List<String>, Int> {
+            val names = files.filterNot { it.startsWith("@e") }
+            val mask = files.mapNotNull { if (it.startsWith("@e")) it.removePrefix("@e").toIntOrNull() else null }
+                .filter { it in 1..7 }.fold(0) { m, id -> m or (1 shl (id - 1)) }
+            return names to mask
+        }
+
+        /**
+         * Вручить колесу расписание группы — после подключения и при каждой
+         * правке. Сначала ждём, пока HallSync выставит часы колеса: по ним оно
+         * считает слоты, и неверные часы на эти секунды дали бы чужой пункт.
+         * Повторная присылка того же расписания колесу ничего не стоит: оно
+         * ничего не перегружает и не считает её активностью (см. OP_ALBUM).
+         */
+        suspend fun armMember(c: BleClient, files: List<String>, intervalMs: Int, t0Ms: Long): Boolean {
+            if (c.hello?.hasSlideClock != true) return false
+            c.awaitClock(5_000)
+            val (names, mask) = schedulePayload(files)
+            return runCatching { c.album(true, intervalMs, 1, names, mask, t0Ms) }.isSuccess
         }
 
         /** ViewModel умирает (закрыли приложение) — служба подключается к
-         *  участникам с нуля и продолжает тикать сама. */
-        fun takeOverTicking(ctx: Context) {
+         *  участникам с нуля и держит их сама. */
+        fun takeOver(ctx: Context) {
             ctx.startService(Intent(ctx, SyncSlideshowService::class.java).apply { action = ACTION_TAKE_OVER })
         }
 
         /** Экран снова открыт и подключился — служба гасит СВОИ соединения,
          *  ничего не рассылая (показ на колёсах не трогаем), и остаётся
-         *  только «tracked», ожидая следующего takeOverTicking. */
-        fun releaseTicking(ctx: Context) {
+         *  только «tracked», ожидая следующего takeOver. */
+        fun release(ctx: Context) {
             ctx.startService(Intent(ctx, SyncSlideshowService::class.java).apply { action = ACTION_RELEASE })
         }
 
@@ -138,11 +166,11 @@ class SyncSlideshowService : Service() {
 
         /**
          * Показать (или спрятать) живое уведомление синхронного показа —
-         * ПОКА тикер ведёт ViewModel, то есть службе для этого не обязательно
+         * ПОКА группу держит ViewModel, то есть службе для этого не обязательно
          * быть запущена вовсе: обычный `Notification`, не связанный ни с каким
          * foreground-статусом. [namesIfLive] — участники, реально на связи
          * ([Link.Ready]), числом два и больше; null — меньше двух, уведомление
-         * прячем. Как только тикер переходит службе ([startDriving]), эту же
+         * прячем. Как только группа переходит службе ([startDriving]), эту же
          * запись (тот же канал/id) начинает вести она сама, через
          * [updateNotificationVisibility] — двух одновременных писателей в
          * один и тот же момент не бывает по построению: пока ViewModel жива и
@@ -197,41 +225,11 @@ class SyncSlideshowService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val clients = HashMap<String, BleClient>()
-    private var driveJob: Job? = null   // покрывает и паузу-перед-подключением, и сам тикер
+    private var driveJob: Job? = null   // пауза перед подключением и цикл переподключения
+    /** Кому уже вручено расписание на текущем соединении (см. [refreshDriving]). */
+    private val armed = HashSet<String>()
 
     override fun onBind(intent: Intent?): IBinder? = null
-
-    /** Один OP_SYNC_TICK с короткими повторами — см. WheelVm.sendSyncTick,
-     *  та же причина: `index` здесь общий на группу счётчик, и одиночный
-     *  неудачный тик (обычное дело на движущемся велосипеде) без повтора
-     *  навсегда сдвигал бы ровно ЭТО колесо на шаг назад относительно
-     *  остальных участников, вместо того чтобы просто досчитать через долю
-     *  секунды в пределах того же интервала. */
-    private suspend fun sendSyncTick(c: BleClient, name: String, effId: Int?) {
-        repeat(3) { attempt ->
-            val ok = runCatching { if (effId != null) c.syncTick(null, effId) else c.syncTick(name) }.isSuccess
-            if (ok || attempt == 2) return
-            delay(150)
-        }
-    }
-
-    /** См. WheelVm.waitUntilApplied — та же причина: без ожидания подтверждения
-     *  по телеметрии (`currentDisplayFile` в прошивке меняется только когда
-     *  файл ДЕЙСТВИТЕЛЬНО дочитан) тикер отсчитывал бы интервал по своим
-     *  часам, даже если чьё-то колесо ещё грузит текущий файл дольше самого
-     *  интервала — рассинхрон копился бы тик за тиком. 8 с — тот же потолок:
-     *  колесо, не успевшее вовремя, просто не задерживает остальных. */
-    private suspend fun waitUntilApplied(members: Collection<BleClient>, name: String, effId: Int?) {
-        withTimeoutOrNull(8000L) {
-            members.map { c ->
-                launch {
-                    runCatching {
-                        c.tele.first { t -> if (effId != null) t.effect == effId else t.effect == 0 && t.file == name }
-                    }
-                }
-            }.joinAll()
-        }
-    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -242,11 +240,11 @@ class SyncSlideshowService : Service() {
         return START_NOT_STICKY
     }
 
-    /** Подключается к участникам группы С НУЛЯ и заводит тикер — только по
-     *  запросу [takeOverTicking], то есть когда ViewModel уже точно закрыла
+    /** Подключается к участникам группы С НУЛЯ — только по
+     *  запросу [takeOver], то есть когда ViewModel уже точно закрыла
      *  свои собственные соединения к тем же адресам. Небольшая пауза перед
      *  подключением — подстраховка на случай, если оба события (закрытие
-     *  экрана и передача тикера) пришли не в идеальном порядке. */
+     *  экрана и передача группы) пришли не в идеальном порядке. */
     @SuppressLint("MissingPermission")
     private fun startDriving() {
         val group = tracked ?: return
@@ -265,39 +263,7 @@ class SyncSlideshowService : Service() {
                 .map { c -> launch { if (c.link.value != Link.Ready) runCatching { c.connect() } } }
                 .joinAll()
             refreshDriving()
-            launch { reconnectLoop() }
-            var index = -1
-            while (isActive) {
-                val cfg = tracked ?: break
-                if (cfg.files.isEmpty()) break
-                index = (index + 1).let { if (it >= cfg.files.size) 0 else it }
-                val name = cfg.files[index]
-                val effId = if (name.startsWith("@e")) name.removePrefix("@e").toIntOrNull() else null
-                val readyClients = clients.values.filter { it.link.value == Link.Ready }
-                for (c in readyClients) {
-                    // syncTick, не play()/effect(): не должен гасить автономный
-                    // ход слайдшоу на колесе — та же причина, что и во ViewModel
-                    // (см. WheelVm.startGroupTicker), только здесь ещё важнее:
-                    // если это соединение тоже пропадёт (Bluetooth выключили,
-                    // саму службу убила система), колесу продолжать самому
-                    // ровно за счёт того, что этот тикер его не разоружал.
-                    //
-                    // launch, не прямой suspend-вызов — та же причина, что и в
-                    // WheelVm.startGroupTicker: рассылка по очереди отдавала
-                    // задержку/таймаут (до 8 с) одного просевшего соединения
-                    // остальным участникам цикла, что и читалось как
-                    // периодическое расхождение показа при исправной связи.
-                    // sendSyncTick — то же самое лекарство, но для ОДНОЙ
-                    // неудачной посылки: без повтора она тихо теряется, и это
-                    // колесо навсегда остаётся на шаг позади остальных.
-                    launch { sendSyncTick(c, name, effId) }
-                }
-                // Держим пункт на экране хотя бы intervalMs, но не короче —
-                // сначала ждём подтверждения от ВСЕХ (см. waitUntilApplied),
-                // и только потом отсчитываем сам интервал.
-                waitUntilApplied(readyClients, name, effId)
-                delay(cfg.intervalMs.toLong())
-            }
+            reconnectLoop()
         }
     }
 
@@ -324,14 +290,12 @@ class SyncSlideshowService : Service() {
      * Повторяет попытку подключения к участникам, которые ещё (или уже) не
      * Ready. Единственная попытка при старте [startDriving] исходила из того,
      * что колесо либо уже в эфире, либо не наша забота — но самый обычный
-     * повод для передачи тикера сюда (ViewModel закрылась, потому что колёса
+     * повод для передачи группы сюда (ViewModel закрылась, потому что колёса
      * заснули) — это ровно тот случай, когда колесо ещё СПИТ в момент этого
      * первого подключения: BLE-стек и реклама поднимаются не мгновенно после
-     * пробуждения. Без повтора такое колесо оставалось бы вне тиков до самого
-     * doStop/следующего takeOverTicking — крутило бы свой автономный запасной
-     * ход (WheelVm.armGroupFallback), с тем же интервалом, но расходясь по
-     * фазе с остальными участниками, которые тикер всё это время получают, —
-     * снаружи это выглядит как «переключается синхронно, показывает разное».
+     * пробуждения. Без повтора такое колесо оставалось бы без подстройки часов
+     * до самого doStop/следующего takeOver: после сна они уходят на секунды, и
+     * колесо показывало бы пункты расписания со сдвигом от остальных.
      * Фиксированный интервал, без экспоненциального роста, как у
      * WheelVm.onLinkLost на экране: участников здесь единицы, а не десятки
      * экранов сразу, так что телефон от этого заметно не греется.
@@ -350,18 +314,28 @@ class SyncSlideshowService : Service() {
         }
     }
 
-    /** Пересчитывает, кто из участников сейчас реально на связи, и поправляет
-     *  видимость уведомления по этому факту. Вызывается после каждой попытки
-     *  подключения и на каждый обрыв ([BleClient.onLinkLost]) — то есть именно
-     *  тогда, когда true-состояние группы могло измениться. */
+    /** Пересчитывает, кто из участников сейчас реально на связи, вручает
+     *  расписание тем, кто только что подключился, и поправляет видимость
+     *  уведомления. Вызывается после каждой попытки подключения и на каждый
+     *  обрыв ([BleClient.onLinkLost]) — то есть именно тогда, когда
+     *  true-состояние группы могло измениться. */
     private fun refreshDriving() {
         drivingMembers = clients.filterValues { it.link.value == Link.Ready }.keys
+        armed.retainAll(drivingMembers)
+        val group = tracked
+        if (group != null) {
+            for (a in drivingMembers - armed) {
+                val c = clients[a] ?: continue
+                armed.add(a)
+                scope.launch { armMember(c, group.files, group.intervalMs, group.t0Ms) }
+            }
+        }
         updateNotificationVisibility()
     }
 
     /** Показывает уведомление, когда у группы два участника и больше реально
      *  на связи, и прячет его иначе — не останавливая саму службу: она обязана
-     *  продолжать сканирование/тикер и после того, как один из участников
+     *  держать оставшихся и переподключать ушедших и после того, как один из участников
      *  отвалился, поэтому это [stopForeground], а не [stopSelf]. */
     private fun updateNotificationVisibility() {
         val group = tracked
@@ -372,15 +346,16 @@ class SyncSlideshowService : Service() {
         }
     }
 
-    /** Отменяет и паузу-перед-подключением, и сам тикер (см. [driveJob]),
+    /** Отменяет и паузу-перед-подключением, и цикл переподключения (см. [driveJob]),
      *  закрывает СВОИ соединения — и, если [sendStop], сначала гасит показ
      *  на них ([BleClient.stop]). Всегда завершает саму службу: экран уже
      *  забирает управление обратно (см. WheelVm.enterForeground/connect), и
-     *  держать её живой без дела до следующего takeOverTicking незачем. */
+     *  держать её живой без дела до следующего takeOver незачем. */
     private fun stopDriving(sendStop: Boolean) {
         driveJob?.cancel(); driveJob = null
         val toClose = ArrayList(clients.values)
         clients.clear()
+        armed.clear()
         drivingMembers = emptySet()
         stopForeground(STOP_FOREGROUND_REMOVE)
         scope.launch {
@@ -393,7 +368,7 @@ class SyncSlideshowService : Service() {
     }
 
     /** Stop насовсем: гасит показ у всех участников группы — через уже
-     *  открытые соединения, если служба сейчас сама ведёт тикер, иначе
+     *  открытые соединения, если служба сейчас сама держит группу, иначе
      *  подключается с нуля только на время самой команды (обычный случай —
      *  Stop из уведомления, когда экран приложения и так закрыт). */
     @SuppressLint("MissingPermission")
@@ -404,6 +379,7 @@ class SyncSlideshowService : Service() {
         driveJob?.cancel(); driveJob = null
         val toClose = ArrayList(clients.values)
         clients.clear()
+        armed.clear()
         drivingMembers = emptySet()
         // Единственный путь, которым Stop может прийти, пока сам процесс с
         // ViewModel мёртв целиком (кнопка в уведомлении) — WheelVm.endSync()
@@ -413,6 +389,7 @@ class SyncSlideshowService : Service() {
         // всё ещё должна идти, и воскресил бы её сам, вопреки явному Stop.
         getSharedPreferences("pov", MODE_PRIVATE).edit()
             .remove("syncgroup_members").remove("syncgroup_files").remove("syncgroup_interval")
+            .remove("syncgroup_t0")
             .apply()
         scope.launch {
             if (wasDriving) {

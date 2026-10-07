@@ -429,15 +429,15 @@ extern void handleFileDeleted(const String& fname);
 extern std::vector<String> slideList;
 extern bool slideListInclude;   // true — slideList это то, что играем; false — то, что пропускаем
 extern uint8_t slideEffectMask; // биты 0..5 — эффекты 1..6 в слайдшоу; 0 — только файлы
-extern void applySlideList(bool include, const std::vector<String>& names, uint8_t effectMask);
+extern bool applySlideList(bool include, const std::vector<String>& names, uint8_t effectMask);  // true — поменялся
 extern bool slideInSlideshow(const String& name);
-// Разовая правка позиции внутри УЖЕ идущего слайдшоу от внешних, более точных
-// часов (см. OP_SYNC_TICK в povble.cpp и комментарий у syncTick() в main.cpp)
-// — в отличие от applySlideList()/OP_PLAY, не трогает slideshowActive: показ
-// продолжает крутиться автономно, если внешние часы (телефон) потом пропадут.
-// name пуст → показываем эффект effId (1..6); иначе — файл name, effId не
-// используется. false — файл не найден на флеше.
-extern bool syncTick(const String& name, int effId);
+// Показ по абсолютным часам (синхронная группа, OP_ALBUM с t0): t0Ms — UTC, мс,
+// начало нулевого слота; 0 — обычный показ по своему таймеру. Возвращает true,
+// если что-то поменялось (повторная присылка того же расписания — false).
+// См. slideClockStep() в main.cpp.
+extern bool slideClockSet(int64_t t0Ms);
+extern int64_t slideClockT0;
+extern void slideClockKick();   // разбудить загрузчик: показ или расписание поменялись
 // Полная остановка показа: слайдшоу, эффект и файл — гасим всё разом. Общая
 // часть для OP_STOP/`/stop` и OP_ALBUM(стоп)/`/album?action=stop`: «остановить
 // слайдшоу» должно гасить ленту, а не оставлять последнюю картинку висеть до

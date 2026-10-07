@@ -33,7 +33,7 @@ your own text right onto bike wheel! You control it from an Android app over Blu
 | 💧 **Water-resistant enclosure** | Sealed housing made for real rides: rain, mud and puddles. |
 | 🔋 **Up to 6 hours of animation** | One charge covers a whole evening ride. A smart battery gauge shows the real remaining percentage. |
 | 💤 **Up to a year on standby** | It draws about 10 µA asleep and wakes when you **shake the wheel**. Transport mode ignores vibration completely, so it won't wake up in a car or on a bike rack. |
-| 📱 **Android app over BLE** | No Wi-Fi hotspot needed, so your mobile data keeps working. Connect **both wheels at once** and run a synced slideshow across them. |
+| 📱 **Android app over BLE** | Connect **several displays at once** and run a synced slideshow across them. |
 | 🎬 **Render POV video from any camera** | Film your ride with a phone, action cam or drone. The app matches the clip to the wheel's rotation log **by its metadata** and stitches it into a clean, flicker-free POV video. |
 | 🖼️ **Photos, GIFs, video, text** | Drop in a picture, GIF, animated WebP or MP4. The phone converts it and shows you a preview of exactly what the wheel will display. |
 | 🎯 **Sharp, stable image** | 1° angular resolution, sub-degree interpolation, anti-aliasing and acceleration-aware rotor tracking. The picture stays put while you speed up or brake hard. |
@@ -68,8 +68,8 @@ riders on either side of the bike read them correctly. Logos and pictures can do
 
 <img src="docs/images/app.gif" align="right" width="260" alt="POV Wheel Android app: library with animated previews, battery and settings" />
 
-The Android app (Kotlin + Jetpack Compose, Android 8.0+) is the way to use the wheel: it talks
-to it over Bluetooth LE only — there is no Wi-Fi and no web UI on the wheel.
+Everything runs from a handy Android app (Kotlin + Jetpack Compose, Android 8.0+) over Bluetooth LE,
+and it can drive several displays at once.
 
 - 📚 **Library.** Your files and effects in one grid, each with an animated round preview that
   matches what the rim shows. Tap to play.

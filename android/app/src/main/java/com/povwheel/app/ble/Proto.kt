@@ -51,11 +51,8 @@ object Proto {
     const val OP_FRAG      = 0x18
     const val OP_SETNAME   = 0x19
     const val OP_POWEROFF  = 0x1A   // транспортный режим — будит только удержание кнопки
-    // Правка позиции ВНУТРИ уже идущего слайдшоу (см. syncTick() в main.cpp)
-    // — в отличие от OP_PLAY/OP_EFFECT, не сбрасывает slideshowActive:
-    // автономный ход слайдшоу остаётся вооружён, и колесо не застывает на
-    // последнем кадре, если телефон потом пропадёт без предупреждения.
-    const val OP_SYNC_TICK = 0x1B
+    // 0x1B — бывший OP_SYNC_TICK: синхронный показ теперь идёт по абсолютным
+    // часам (t0 в OP_ALBUM, FEAT_SLIDE_CLOCK); номер не переиспользуется
     // Лог Холла для склейки POV-видео (FEAT_HALL_LOG, см. include/hall_log.h)
     const val OP_TIME      = 0x1C   // пинг часов  ← TimeInfo
     const val OP_TIME_SET  = 0x1D   // [i64 wall_us][i64 at_esp_us][i32 tz]  ← TimeInfo
@@ -112,6 +109,7 @@ object Proto {
     const val FEAT_TEXT      = 0x0040   // эффект «Текст»: OP_TEXT_STYLE / OP_TEXT_SET / OP_TEXT_GET
     const val FEAT_FX        = 0x0080   // OP_FX_GET / OP_FX_SET; часы цифровые, эффекты 2 и 5 удалены
     const val FEAT_TEXT_RGB  = 0x0100   // блоб текста может нести слой цвета эмодзи (convert/TextMask)
+    const val FEAT_SLIDE_CLOCK = 0x0200 // OP_ALBUM понимает t0: синхронный показ по абсолютным часам
 
     const val ST_BUSY = 3
 
@@ -142,6 +140,7 @@ data class Hello(
     val hasText     get() = features and Proto.FEAT_TEXT != 0
     val hasFx       get() = features and Proto.FEAT_FX != 0
     val hasTextRgb  get() = features and Proto.FEAT_TEXT_RGB != 0
+    val hasSlideClock get() = features and Proto.FEAT_SLIDE_CLOCK != 0
 
     companion object {
         const val SIZE = 48
