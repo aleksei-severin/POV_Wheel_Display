@@ -158,6 +158,10 @@ internal fun LibraryTab(
     // слайдшоу, и общий с ними список файлов (имя+размер совпадают у всех).
     var pickedPartners by remember { mutableStateOf<Set<String>>(emptySet()) }
     var commonNames by remember { mutableStateOf<Set<String>>(emptySet()) }
+    // Для какого набора партнёров commonNames уже посчитан. Пока не совпадает с
+    // pickedPartners — общий список ещё читается с колёс (плитка серая), и
+    // запускать синхронный показ нельзя: он ушёл бы со старым отбором.
+    var commonFor by remember { mutableStateOf<Set<String>>(emptySet()) }
 
     // Интервал — ОДНО значение что для синхронного, что для обычного показа
     // (см. комментарий у [WheelVm.slideIntervalMs]): экран берёт его из этой
@@ -207,8 +211,10 @@ internal fun LibraryTab(
             val common = vm.commonFileNames(addr, partners)
             commonNames = common
             checks = (common + checks.filter { vm.isSlideEffect(it) }).toSet()
+            commonFor = partners
         } else {
             commonNames = emptySet()
+            commonFor = emptySet()
             if (mode == LibMode.SLIDESHOW) checks = vm.savedSlideSelection(allNames)
         }
     }
@@ -368,7 +374,7 @@ internal fun LibraryTab(
                 val synced = pickedPartners.isNotEmpty()
                 ActionBar(
                     label = if (synced) "▶ Start sync slideshow" else "▶ Start slideshow",
-                    danger = false, enabled = checks.isNotEmpty(),
+                    danger = false, enabled = checks.isNotEmpty() && (!synced || commonFor == pickedPartners),
                     // Длинная надпись «Start sync slideshow» должна уместиться в
                     // одну строку — расширяем кнопку действия за счёт Cancel.
                     cancelWeight = if (synced) 0.7f else 1f,

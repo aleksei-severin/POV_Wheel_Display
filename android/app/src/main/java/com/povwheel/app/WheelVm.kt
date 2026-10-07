@@ -676,13 +676,15 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     val logLines = MutableStateFlow<List<String>>(emptyList())
     val toast = MutableStateFlow<String?>(null)
 
-    /** Замок «Magnet Position» — защита от случайной правды на ходу. Своё
-     *  значение на колесо, в prefs (`maglock_<addr>`). */
-    val magnetLocked = MutableStateFlow(false)
-    private fun magnetLockKey(addr: String) = "maglock_" + addr
+    /** Замок «Magnet Position» — защита от случайной правки на ходу. Закрыт
+     *  всегда, когда колесо открывают и когда оно заново выходит на связь (в
+     *  том числе после перепрошивки): разблокировка — на время одной правки, до
+     *  отключения, и нигде не хранится. Раньше хранилась в prefs по адресу, с
+     *  «открыто» по умолчанию, — и любое колесо без записи (новое, забытое и
+     *  найденное снова, после очистки данных) открывалось разблокированным. */
+    val magnetLocked = MutableStateFlow(true)
     fun setMagnetLocked(v: Boolean) {
         magnetLocked.value = v
-        current.value?.let { prefs.edit().putBoolean(magnetLockKey(it), v).apply() }
     }
 
     // Пишется с Dispatchers.IO, читается из отрисовки списка — обычный HashMap
@@ -1150,7 +1152,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         nameCache.remove(addr)
         filesByAddr.remove(addr); fsInfoByAddr.remove(addr); settingsByAddr.remove(addr)
         uploadSessions.remove(addr); recomputeUploadBusyAddrs()
-        prefs.edit().remove(magnetLockKey(addr)).apply()
+        prefs.edit().remove("maglock_" + addr).apply()   // след прежней версии
         found.value = found.value.filter { it.address != addr }
         rebuildWheels()
         cacheWritten.remove(addr)
@@ -1200,6 +1202,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 // Соседнее колесо вышло на связь — тихо прогреваем кэш, чтобы
                 // свайп на него открывал библиотеку сразу, а не с задержкой.
                 if (lk == Link.Ready) {
+                    if (addr == current.value) magnetLocked.value = true   // новое подключение — замок закрыт
                     prefetchWheel(addr); restoreSyncStateIfNeeded(addr)
                     syncGroups[addr]?.let { armSyncMember(it, addr) }
                 }
@@ -1308,7 +1311,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         fsInfo.value = fsInfoByAddr[addr] ?: FsInfo()
         textFx.value = textFxByAddr[addr] ?: TextFx()
         fxParams.value = fxByAddr[addr] ?: FxParams()
-        magnetLocked.value = prefs.getBoolean(magnetLockKey(addr), false)
+        magnetLocked.value = true
         logLines.value = emptyList()
         logTotal = 0
         refreshAll()
