@@ -46,7 +46,7 @@ object Proto {
     const val OP_OTA_BEGIN = 0x13
     const val OP_OTA_END   = 0x14
     const val OP_REBOOT    = 0x15
-    const val OP_WIFI      = 0x16
+    // 0x16 — бывший OP_WIFI: Wi-Fi удалён из прошивки, номер не переиспользуется
     const val OP_SLEEP     = 0x17
     const val OP_FRAG      = 0x18
     const val OP_SETNAME   = 0x19
@@ -106,7 +106,7 @@ object Proto {
     const val FEAT_DEFLATE   = 0x0001
     const val FEAT_OTA       = 0x0002
     const val FEAT_PREVIEW   = 0x0004
-    const val FEAT_WIFI      = 0x0008
+    // 0x0008 — бывший FEAT_WIFI, не переиспользуется
     const val FEAT_ALBUM_SEL = 0x0010   // OP_ALBUM понимает отбор файлов для слайдшоу
     const val FEAT_HALL_LOG  = 0x0020   // OP_TIME / OP_TIME_SET / OP_HALL_LOG / OP_HALL_HIST
     const val FEAT_TEXT      = 0x0040   // эффект «Текст»: OP_TEXT_STYLE / OP_TEXT_SET / OP_TEXT_GET
@@ -228,7 +228,7 @@ data class Tele(
     val lux: Int = 0, val bri: Int = 0, val effBri: Int = 0,
     val ablRms: Int = 0, val ablCap: Int = 100, val cutoff: Boolean = false,
     val effect: Int = 0, val play: Boolean = false, val slideshow: Boolean = false,
-    val framesTotal: Int = 0, val wifi: Boolean = false,
+    val framesTotal: Int = 0,
     val stateVer: Long = 0, val fileVer: Long = 0, val epoch: Long = 0,
     val file: String = "",
     /** Интервал слайдшоу на устройстве, секунды. */
@@ -262,14 +262,14 @@ data class Tele(
             val play = (p.get().toInt() and 0xFF) != 0
             val slide = (p.get().toInt() and 0xFF) != 0
             val ft = p.get().toInt() and 0xFF
-            val wifi = (p.get().toInt() and 0xFF) != 0
+            p.get()                                 // бывший флаг Wi-Fi, всегда 0
             val sv = p.int.toLong() and 0xFFFFFFFFL
             val fv = p.int.toLong() and 0xFFFFFFFFL
             val ep = p.int.toLong() and 0xFFFFFFFFL
             val file = Proto.readStr(p, 32)
             val slideSecs = p.short.toInt() and 0xFFFF
             return Tele(rpm, dir, pwr, step, fill, kmh, vbat, vusb, ocv, sag, rise,
-                soc, chg, usb, lux, bri, eb, rms, cap, cut, eff, play, slide, ft, wifi,
+                soc, chg, usb, lux, bri, eb, rms, cap, cut, eff, play, slide, ft,
                 sv, fv, ep, file, slideSecs)
         }
     }

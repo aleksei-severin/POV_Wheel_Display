@@ -129,7 +129,7 @@ size_t hallLogHistRead(uint8_t which, uint32_t off, uint8_t* dst, size_t max,
 // читается.
 uint32_t hallLogFsReserveLeft();
 // Свободное место LittleFS для файлов анимаций: свободное минус остаток резерва
-// под лог. Именно это число — «свободно» для приложения и веба и предел заливки.
+// под лог. Именно это число — «свободно» для приложения и предел заливки.
 size_t   fsFreeForAnimations();
 
 // Часы. Установка часов (точная — OP_TIME_SET, грубая — OP_SETTIME по

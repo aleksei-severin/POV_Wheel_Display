@@ -296,9 +296,6 @@ private fun MainContent(vm: WheelVm, tele: Tele, online: Boolean) {
                         val can = fw == null && online
                         MaintBtn("OFF", can, danger = true) { confirmOff = true }
                         MaintBtn("Reboot", can) { vm.reboot() }
-                        MaintBtn("Wi-Fi", can) {
-                            vm.wifi(true); vm.say("Wi-Fi is coming up for OTA")
-                        }
                         MaintBtn("Update", can) {
                             fwPicker.launch(arrayOf("application/octet-stream", "*/*"))
                         }
@@ -1438,7 +1435,7 @@ private fun RpmDialog(on: Int, off: Int, onDismiss: () -> Unit, onSave: (Int, In
         confirmButton = {
             TextButton(onClick = hapticClick {
                 val nOn = (a.toIntOrNull() ?: on).coerceIn(30, 600)
-                // Разрыв в 5 об/мин обязателен, как и на веб-странице: без
+                // Разрыв в 5 об/мин обязателен: без
                 // гистерезиса картинка мигает на самом пороге.
                 val nOff = (b.toIntOrNull() ?: off).coerceIn(20, nOn - 5)
                 onSave(nOn, nOff)

@@ -2,9 +2,7 @@
 #include "config.h"
 #include <WString.h>
 
-void setupStorage();                // NVS + имя устройства. Всегда, даже без Wi-Fi
-void setupNetwork();                // Подъём радио. Только по команде OP_WIFI из приложения
-void loopNetwork();
+void setupStorage();                // Открыть NVS. Безусловно, в начале setup()
 void loadFrameFromFile(String path);
 void unloadCurrentFrame();          // Освободить буфер кадра, ничего не загружая взамен
 void webLog(const char* msg);
@@ -16,7 +14,7 @@ void safeOTAShutdown();
 
 extern String currentDisplayFile;   // Имя файла, загруженного в frameBuffer
 
-// --- Мостики для BLE (реализованы в network.cpp) ---
+// --- Мостики для BLE ---
 // Кольцо лога и база времени лежат в RTC-памяти и должны иметь ровно одну
 // точку записи, поэтому povble.cpp работает с ними только через эти две.
 void     povSetTime(uint32_t epoch, int32_t tz);       // по секундам; точные часы не сбивает

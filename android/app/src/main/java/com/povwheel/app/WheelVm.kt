@@ -486,7 +486,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      * реально показал именно [name] (или эффект [effId]) — по телеметрии
      * (`tele.file`/`tele.effect`): прошивка выставляет `currentDisplayFile`
      * только когда файл ДЕЙСТВИТЕЛЬНО дочитан (см. `currentDisplayFile = path`
-     * в конце `loadFrameFromFile()`, main.cpp/network.cpp), а не в момент,
+     * в конце `loadFrameFromFile()`, main.cpp/storage.cpp), а не в момент,
      * когда его попросили показать. Без этого ожидания тикер отсчитывал бы
      * следующий интервал по своим часам, даже если чьё-то колесо ещё грузит
      * ТЕКУЩИЙ файл дольше самого интервала — рассинхрон копился бы тик за
@@ -3160,7 +3160,6 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     }
 
     fun reboot() = onTargets { it.reboot() }
-    fun wifi(on: Boolean) = onTargets { it.wifi(on) }
 
     /**
      * Выключение в транспортный режим: колесо гаснет и до удержания кнопки уже

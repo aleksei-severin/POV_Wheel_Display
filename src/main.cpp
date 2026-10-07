@@ -1,15 +1,13 @@
 #include "config.h"
-#include "network.h"
+#include "storage.h"
 #include "effects.h"
 #include "povble.h"
 #include "hall_log.h"
-#include <WiFi.h>
 
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <vector>
 #include <algorithm>
-#include <ESPAsyncWebServer.h>
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_heap_caps.h"
@@ -18,9 +16,6 @@
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include <sys/time.h>
-
-// Экспортируем сервер из network.cpp для добавления нового эндпоинта
-extern AsyncWebServer server;
 
 // --- ИНИЦИАЛИЗАЦИЯ ГЛОБАЛЬНЫХ ПЕРЕМЕННЫХ ---
 volatile uint8_t global_brightness = 8; // единицы SK9822 (0–31)
@@ -178,8 +173,8 @@ SemaphoreHandle_t          fileLoaderSemaphore = nullptr;
 String                     pendingFilePath;
 // Заявка «текущий файл только что удалили» — обрабатывается в fileLoaderTask,
 // а не на месте: снятие буфера ждёт render_in_fill/rendering_active (до ~1.2 с),
-// и делать это прямо в колбэке BLE/HTTP значит держать задачу хоста NimBLE (или
-// обработчик HTTP) всё это время — тот же риск обрыва связи по супервизии, что
+// и делать это прямо в колбэке BLE значит держать задачу хоста NimBLE всё это
+// время — тот же риск обрыва связи по супервизии, что
 // у синхронной записи во флеш. См. handleFileDeleted()/handleActiveFileUnload().
 static volatile bool pending_unload = false;
 
@@ -243,7 +238,7 @@ uint8_t lut_tone8[256];
 // отключает кеш инструкций на ОБОИХ ядрах, а renderingTask исполняется из
 // флеша и замирает на десятки миллисекунд. Ползунок настройки двигают
 // непрерывно, и запись на каждое движение означала бы рваную картинку и сотни
-// циклов стирания за минуту. Флаг взводится в обработчике /settings, сброс —
+// циклов стирания за минуту. Флаг взводится в обработчике OP_SET_SET, сброс —
 // когда отрисовка заведомо не идёт.
 struct __attribute__((packed)) SettingsBlob {
     uint16_t magic;
@@ -276,7 +271,7 @@ static const size_t   SETTINGS_V2_SIZE = 52;
 static const size_t   SETTINGS_V3_SIZE = 56;
 static const size_t   SETTINGS_V4_SIZE = 80;
 
-volatile bool   settings_dirty       = false;    // взводится из /settings и /album
+volatile bool   settings_dirty       = false;    // взводится из OP_SET_SET и OP_ALBUM
 static uint32_t settings_dirty_since = 0;
 
 static void fillSettingsBlob(SettingsBlob& b) {
@@ -1116,7 +1111,7 @@ static void fillSectorIntoBuffer(uint8_t* buf, uint8_t buf_idx, float sector0, f
 // =====================================================================
 // Ping-pong DMA: spi_device_queue_trans ставит передачу в очередь,
 // spi_device_get_trans_result ждёт завершения не держа spinlock —
-// WiFi ISR (prio >10) прерывает задачу когда нужно обработать пакеты.
+// системные прерывания (BLE) обслуживаются, пока задача ждёт.
 //
 // Угол ротора вычисляется непрерывно из micros():
 //   sector0 = anchor_deg + ω·Δt + ½·α·Δt² + angle_offset
@@ -1775,7 +1770,7 @@ static void updateBatteryProtection(uint32_t vbat_mv, bool usb_ok) {
         if (off_hits < 255) off_hits++;
         if (off_hits >= BATT_PROT_HITS && !batt_cutoff) {
             batt_cutoff        = true;
-            force_stop_display = true;   // чтобы веб показал остановку, а не «играет»
+            force_stop_display = true;   // чтобы приложение показало остановку, а не «играет»
             webLogf("[BATT] %lu mV: display off, cell is empty (BMS cuts at 2700 mV)",
                     (unsigned long)vbat_mv);
         }
@@ -1969,7 +1964,7 @@ static void powerRailUpAndBlank(uint8_t en_pin) {
 // частота CPU иначе всегда фиксирована на 240 МГц, и это доминирует над
 // потреблением BLE-адвертайзинга на порядок. 80 МГц ничего не портит на шинах:
 // у ESP32-S3 APB держится на 80 МГц что при 240, что при 160, что при 80 МГц
-// CPU (делится только множитель ядра, не APB) — SPI/DMA к SK9822, BLE и Wi-Fi
+// CPU (делится только множитель ядра, не APB) — SPI/DMA к SK9822 и BLE
 // работают на том же самом тактировании независимо от этого переключения.
 static void setCpuFreqForPower(PowerState st) {
     setCpuFrequencyMhz(st == PWR_FULL ? 240 : 80);
@@ -2175,7 +2170,7 @@ static void enterDeepSleep() {
 //
 // Пробуждение по таймеру И по вибрации: таймер — чтобы замерить
 // напряжение, вибрация — чтобы у человека был способ добудиться до
-// веб-интерфейса, пока батарея восстанавливается.
+// колеса из приложения, пока батарея восстанавливается.
 static void enterTrickleSleep(uint32_t seconds) {
     // Пишет флеш, только если с прошлого раза пришли новые события, то есть
     // не на каждом минутном цикле предзаряда, а лишь когда колесо крутили.
@@ -2593,8 +2588,7 @@ static void handleActiveFileUnload() {
     }
 }
 
-// Вызывать СРАЗУ после LittleFS.remove() обоими путями удаления (BLE
-// OP_DELETE, HTTP /delete) с именем файла, включая ведущий "/" (как в
+// Вызывать СРАЗУ после LittleFS.remove() (BLE OP_DELETE) с именем файла, включая ведущий "/" (как в
 // currentDisplayFile). Если удалённый файл не тот, что сейчас на ободе, —
 // рендеру всё равно, он адресует уже загруженный в PSRAM буфер и файла на
 // флеше больше не касается: выходим сразу же, не блокируя вызывающего.
@@ -2612,8 +2606,7 @@ void handleFileDeleted(const String& fname) {
 // чтобы просто перестать листать и оставить последнюю картинку висеть до
 // повторного нажатия Stop. Эффект снимаем через заявку fileLoaderTask —
 // сама остановка не должна ждать, пока рендер отпустит буфер кадра (вызывается
-// и из BLE-колбэка, и из обработчика HTTP, которым блокироваться нельзя, см.
-// handleFileDeleted). settings_dirty — БЕЗУСЛОВНО: slideshowActive входит в
+// из BLE-колбэка, которому блокироваться нельзя, см. handleFileDeleted). settings_dirty — БЕЗУСЛОВНО: slideshowActive входит в
 // SettingsBlob (см. fillSettingsBlob), и без флага его новое значение может
 // не долететь до NVS перед сном — тогда loadSettingsFromNVS() на пробуждении
 // поднимет слайдшоу заново, ровно то, что пользователь только что остановил.
@@ -2629,7 +2622,7 @@ void stopDisplayAndSlideshow() {
 }
 
 // Задача загрузки файлов — работает на Core 0 (не мешает рендерингу на Core 1),
-// приоритет 2 (ниже WiFi) — не блокирует HTTP-стек во время чтения LittleFS.
+// приоритет 2 — не блокирует хост NimBLE во время чтения LittleFS.
 void fileLoaderTask(void* pvParameters) {
     while (true) {
         xSemaphoreTake(fileLoaderSemaphore, portMAX_DELAY);
@@ -2643,7 +2636,7 @@ void fileLoaderTask(void* pvParameters) {
             handleActiveFileUnload();
         }
         // Эффект проверяем первым: он не читает флеш, но так же ждёт, пока
-        // рендер отпустит буфер кадра, и в обработчике HTTP этому не место.
+        // рендер отпустит буфер кадра, и в колбэке BLE этому не место.
         if (pending_effect >= 0) {
             uint8_t want = (uint8_t)pending_effect;
             bool    play = pending_effect_play;
@@ -2657,16 +2650,6 @@ void fileLoaderTask(void* pvParameters) {
             loadFrameFromFile(pendingFilePath);
             pendingFilePath = "";
         }
-    }
-}
-
-// Сетевая задача: ArduinoOTA + ElegantOTA + переподключение WiFi.
-// Вынесена из loop() на Core 0: renderingTask на Core 1 вытесняет loop()
-// во время рендеринга, из-за чего loopNetwork() не вызывался достаточно часто.
-void networkTask(void* pvParameters) {
-    for (;;) {
-        loopNetwork();
-        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 
@@ -2885,14 +2868,14 @@ void setup() {
     // (переподключили батарею / нажали reset) без USB — это осознанное
     // «разбуди»: просыпаемся в рабочий режим с волной-подтверждением. Если
     // после этого ничего не происходит, обычный таймер простоя (60 с) всё равно
-    // уложит колесо спать. На USB волну не крутим — там и так видно по serial/
-    // веб, и не мигать синим на каждой заливке.
+    // уложит колесо спать. На USB волну не крутим — там и так видно по логу
+    // в приложении, и не мигать синим на каждой заливке.
     wake_wave = xport_wake ||
         (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED &&
          reset_reason  == ESP_RST_POWERON && !usb_present);
 
-    // Зарядник в предзаряде даёт 100 мА — ровно столько же съедает работающий
-    // Wi-Fi, и ячейка не растёт. Спим, пока не выберется. Пробуждение по
+    // Зарядник в предзаряде даёт 100 мА — почти столько же съедает бодрствующий
+    // ESP32, и ячейка не растёт. Спим, пока не выберется. Пробуждение по
     // вибрации и перезагрузка по OTA дают окно доступа: иначе до устройства
     // с севшей батареей вообще не добраться.
     uint32_t vbat_mv = (uint32_t)(readMilliVoltsAvg(PIN_ADC_VBAT, 8) * ADC_DIVIDER_RATIO);
@@ -2919,8 +2902,16 @@ void setup() {
         if (frameBuffer) memset(frameBuffer, 0, FRAME_SIZE);
     }
     LittleFS.begin(true);
+    // Веб-интерфейса больше нет. На колесе, обновлённом по воздуху (разметка
+    // флеша прежняя, ФС не переформатировалась), его страница осталась лежать в
+    // LittleFS — ~210 кБ, которые библиотеке анимаций нужнее. Лента ещё не
+    // светится, так что запись флеша здесь ничего не морозит.
+    if (LittleFS.exists("/index.html")) {
+        LittleFS.remove("/index.html");
+        webLog("[FS] Removed the old web UI page");
+    }
 
-    setupStorage();                     // NVS и имя устройства; Wi-Fi НЕ поднимается
+    setupStorage();                     // NVS
 
     // Буферы BLE забираются до кадровых: сборочный буфер и кольцо заливки — это
     // 112 кБ подряд, и после того как анимация разберёт PSRAM мегабайтами,
@@ -2939,29 +2930,7 @@ void setup() {
     // радиальные коэффициенты нулевые и картинка была бы чёрной.
     rebuildGammaLUT();
     updateGainTablesIfNeeded();
-    last_web_activity_time = millis();  // Считаем загрузку страницы активностью
-
-    // Эндпоинт телеметрии питания — отдаёт кешированные данные без обращения к АЦП.
-    server.on("/battery", HTTP_GET, [](AsyncWebServerRequest *request){
-        // Фоновый поллинг — не сбрасывает таймер активности.
-        // soc — заряд по восстановленной ЭДС; остальное для калибровки:
-        // ocv не должен меняться при включении отрисовки и подключении зарядника,
-        // sag и rise показывают, к чему сошлись самокалибровки.
-        char buf[240];
-        snprintf(buf, sizeof(buf),
-            "{\"vbat\":%d,\"vusb\":%d,\"chg\":%u,\"usb\":%s,\"connected\":%s"
-            ",\"soc\":%u,\"ocv\":%d,\"sag\":%d,\"rise\":%u"
-            ",\"abl_cap\":%.0f,\"cutoff\":%s}",
-            (int)pwr_cache.vbat_mv, (int)pwr_cache.vusb_mv,
-            (unsigned)pwr_cache.chg,
-            pwr_cache.usb ? "true" : "false",
-            pwr_cache.usb ? "true" : "false",
-            (unsigned)pwr_cache.soc, (int)pwr_cache.ocv_mv,
-            (int)batt_sag_k, (unsigned)batt_chg_rise,
-            (float)batt_abl_cap, batt_cutoff ? "true" : "false"
-        );
-        request->send(200, "application/json", buf);
-    });
+    last_web_activity_time = millis();  // Считаем загрузку активностью
 
     updateFileList();
 
@@ -3019,11 +2988,7 @@ void setup() {
     // Задача асинхронной загрузки файлов: Core 0, приоритет 2.
     xTaskCreatePinnedToCore(fileLoaderTask, "loader", 4096, NULL, 2, NULL, 0);
 
-    // Сетевая задача НЕ создаётся здесь: без радио ей нечего обслуживать, а
-    // крутиться каждые 5 мс и стоить 4 кБ внутренней ОЗУ она будет всё равно.
-    // Появляется вместе с Wi-Fi — см. обработчик pending_wifi_on в loop().
-
-    // Core 1, приоритет 2: выше loop() (prio 1), ниже WiFi ISR и системных задач.
+    // Core 1, приоритет 2: выше loop() (prio 1), ниже системных задач.
     xTaskCreatePinnedToCore(renderingTask, "render", 4096, NULL, 2, NULL, 1);
 
     // loopTask (Arduino loop) работает на Core 1 с приоритетом 1 и вытесняется
@@ -3042,19 +3007,17 @@ void setup() {
     // и успел бы поднять DCDC по тряске или автозапуску.
     updatePowerTelemetry();
 
-    // Основной транспорт — BLE. Поднимаем последним: к этому моменту существуют
-    // семафоры, задача загрузчика и генератор эффектов, то есть команду,
-    // прилетевшую в первую же миллисекунду после старта адвертайзинга, есть
-    // кому исполнить.
-    //
-    // server.begin() здесь больше нет: без Wi-Fi слушать некому, а поднимается
-    // он теперь из loop() по заявке pending_wifi_on (команда OP_WIFI).
+    // Единственный транспорт — BLE. Поднимаем последним: к этому моменту
+    // существуют семафоры, задача загрузчика и генератор эффектов, то есть
+    // команду, прилетевшую в первую же миллисекунду после старта
+    // адвертайзинга, есть кому исполнить.
     if (!bleSetup()) {
-        // Единственный оставшийся путь к устройству, кроме кабеля. Молча
-        // остаться без обоих интерфейсов — это кирпич, до которого не
-        // достучаться даже чтобы перепрошить по воздуху.
-        webLog("[BLE] Setup failed, raising Wi-Fi as a fallback");
-        pending_wifi_on = true;
+        // Запасного радио больше нет. Колесо при этом не кирпич: показ,
+        // автозапуск и сон работают, а следующее пробуждение — это полная
+        // загрузка, и BLE попробует подняться заново. Перезагружаться прямо
+        // сейчас не стоит: устойчивый отказ превратился бы в цикл перезагрузок,
+        // который сажает батарею.
+        webLog("[BLE] Setup failed, will retry on the next wake");
     }
 
     // Инициализация закончена — переходим на 80 МГц (см. setCpuFreqForPower):
@@ -3070,11 +3033,11 @@ void setup() {
 // =====================================================================
 
 void loop() {
-    static uint32_t last_play_ms = 0; // Время последнего запроса /play
+    static uint32_t last_play_ms = 0; // Время последнего запроса Play
 
     uint32_t now_ms = millis();
 
-    // --- Перезагрузка по команде (OP_REBOOT, выключение Wi-Fi) ---
+    // --- Перезагрузка по команде (OP_REBOOT) ---
     // Здесь, а не в задаче хоста NimBLE: перед ней всё отложенное уходит во флеш —
     // лог Холла (иначе пропало бы накопленное с последней остановки колеса),
     // настройки, последний файл. Сначала гасим ленту: запись флеша поверх идущей
@@ -3095,7 +3058,7 @@ void loop() {
     // Ждать выключения питания необязательно: пока колесо не раскручено до
     // порога, renderingTask ничего не рисует, и запись во флеш никому не мешает.
     // Пауза в 3 с нужна, чтобы перетаскивание ползунка (десятки запросов
-    // /settings подряд) уложилось в одну запись.
+    // OP_SET_SET подряд) уложилось в одну запись.
     if (settings_dirty) {
         if (settings_dirty_since == 0) settings_dirty_since = now_ms;
         else if (power_state != PWR_FULL && (now_ms - settings_dirty_since) > 3000) {
@@ -3183,9 +3146,9 @@ void loop() {
     // PWR_OFF → PWR_SPINUP : вибрация или запрос Play (есть что показывать)
     // PWR_SPINUP → PWR_FULL: обороты достигли RPM_RENDER_ON
     // PWR_FULL → PWR_SPINUP: обороты упали ниже RPM_RENDER_OFF (гистерезис 20 RPM)
-    // любое → PWR_OFF      : нет вращения дольше 3 с либо Stop из Web UI
+    // любое → PWR_OFF      : нет вращения дольше 3 с либо Stop из приложения
     // batt_cutoff — защёлка, а не мгновенное условие: она же блокирует и
-    // повторный Play из веба, и розжиг после пробуждения от тряски.
+    // повторный Play из приложения, и розжиг после пробуждения от тряски.
     bool content_ready = newFrameReady && !force_stop_display && !ota_in_progress &&
                          !batt_cutoff;
 
@@ -3278,18 +3241,14 @@ void loop() {
     uint32_t time_since_motion_ms       = now_ms - last_motion_ms;
 
     //
-    // Пока к нашей точке доступа кто-то подключён, порог простоя заметно выше.
-    // Браузер молчит по вполне рабочим причинам: конвертация GIF в полярный
-    // формат — синхронный цикл, на длинном ролике он держит поток десятки
-    // секунд, а на телефоне таймеры замирают, стоит погаснуть экрану. Минуты
-    // тишины не хватало, и устройство засыпало ровно посреди подготовки файлов
-    // к заливке. Бодрствовать бесконечно тоже нельзя — отсюда порог конечный,
-    // просто щедрый: связь при этом уже установлена, и лишние минуты работы
-    // стоят куда меньше, чем потерянная посреди загрузки анимация.
-    // Считаем «клиент на связи» и подключённый по BLE телефон тоже — теперь это
-    // основной способ работы с колесом, и конвертация ролика на телефоне молчит
-    // ровно так же долго, как молчала вкладка браузера.
-    const bool client_attached = bleConnected() || (wifi_enabled && WiFi.softAPgetStationNum() > 0);
+    // Пока телефон на связи по BLE, порог простоя заметно выше. Приложение
+    // молчит по вполне рабочим причинам: конвертация ролика в полярный формат
+    // на телефоне занимает минуты, и минуты тишины не хватало — устройство
+    // засыпало ровно посреди подготовки файлов к заливке. Бодрствовать
+    // бесконечно тоже нельзя — отсюда порог конечный, просто щедрый: связь при
+    // этом уже установлена, и лишние минуты работы стоят куда меньше, чем
+    // потерянная посреди загрузки анимация.
+    const bool client_attached = bleConnected();
     const uint32_t idle_limit_ms = client_attached ? 300000UL : 60000UL;
 
     // Обратный отсчёт до сна: лог каждые 10 секунд + уведомление при сбросе таймера.
@@ -3328,8 +3287,8 @@ void loop() {
     }
 
     // Севшая батарея на кабеле: уходим спать, чтобы предзарядный ток шёл в
-    // ячейку, а не в Wi-Fi. Ждём 30 с тишины в вебе: пока человек смотрит
-    // страницу, выдёргивать у него связь невежливо.
+    // ячейку, а не в процессор. Ждём 30 с тишины в командах: пока человек
+    // работает с колесом из приложения, выдёргивать у него связь невежливо.
     if (pwr_cache.usb && !ota_in_progress && power_state == PWR_OFF &&
         pwr_cache.vbat_mv > 0 && pwr_cache.vbat_mv < BATT_TRICKLE_MV &&
         time_since_web_activity_ms > 30000) {
@@ -3350,17 +3309,17 @@ void loop() {
     // Спящее устройство берёт около 10 мкА и не мешает ни тому, ни другому.
     // Будит, как и раньше, только вибродатчик.
     //
-    // Открытая вкладка держит устройство бодрым сама: поллинг обновляет
-    // last_web_activity_time, так что заливать файлы и смотреть телеметрию на
-    // зарядке по-прежнему можно сколько угодно.
+    // Команды из приложения держат устройство бодрым сами: они обновляют
+    // last_web_activity_time, так что заливать файлы на зарядке по-прежнему
+    // можно сколько угодно.
     if (power_state == PWR_OFF && !ota_in_progress && hall_age_us > 60000000UL &&
         time_since_web_activity_ms > idle_limit_ms && time_since_motion_ms > idle_limit_ms) {
         webLogf("[SYS] Idle >%lus (web: %lus%s), sleeping...",
                 (unsigned long)(idle_limit_ms / 1000),
                 (unsigned long)(time_since_web_activity_ms / 1000),
                 pwr_cache.usb ? ", on USB" : "");
-        // Ждём минимум 3 поллинга браузера (интервал 2с) — лог об уходе в сон
-        // должен дойти до UI до фактического отключения.
+        // Ждём 3 с — лог об уходе в сон должен успеть уйти в приложение до
+        // фактического отключения.
         delay(3000);
         enterDeepSleep();
     }
@@ -3377,30 +3336,6 @@ void loop() {
     if (now_ms - last_power_ms >= 1000) {
         last_power_ms = now_ms;
         updatePowerTelemetry();
-    }
-
-    // --- Отложенный подъём Wi-Fi (команда OP_WIFI из приложения) ---
-    // Не в колбэке ATT: setupNetwork() ждёт домашнюю сеть до десяти секунд, а
-    // задача хоста NimBLE, простоявшая столько, теряет соединение по супервизии —
-    // телефон получил бы «ok» и тут же обрыв.
-    //
-    // И не при работающей ленте: те же десять секунд loop() не крутит ни автомат
-    // питания, ни защиту батареи (updatePowerTelemetry строкой выше). Отрисовку
-    // это не затронет — renderingTask живёт на своих порогах, — а вот отсечка по
-    // разряду замерла бы, и это уже про сохранность ячейки. Заявка ждёт
-    // остановки: Wi-Fi включают, чтобы прошиться, то есть на стоящем колесе.
-    if (pending_wifi_on && power_state == PWR_OFF) {
-        pending_wifi_on = false;
-        webLog("[NET] Wi-Fi requested, bringing the radio up...");
-        setupNetwork();
-        // ArduinoOTA + ElegantOTA + переподключение к домашней сети. Отдельная
-        // задача на Core 0, а не вызовы из loop(): renderingTask на Core 1
-        // вытесняет loop() во время отрисовки, и OTA не успевала бы отвечать.
-        static bool net_task_started = false;
-        if (!net_task_started) {
-            net_task_started = true;
-            xTaskCreatePinnedToCore(networkTask, "network", 4096, NULL, 3, NULL, 0);
-        }
     }
 
     // --- Транспортный режим по BLE (OP_POWEROFF) ---

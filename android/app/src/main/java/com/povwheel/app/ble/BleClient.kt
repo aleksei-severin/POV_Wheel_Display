@@ -651,8 +651,6 @@ class BleClient(
         request(Proto.OP_SETTIME, b.array())
     }
 
-    suspend fun wifi(on: Boolean) { request(Proto.OP_WIFI, byteArrayOf(if (on) 1 else 0)) }
-
     /** Переименование. Имя видно в списке устройств и приходит в HELLO. */
     suspend fun setName(n: String) {
         request(Proto.OP_SETNAME, n.toByteArray(Charsets.US_ASCII))

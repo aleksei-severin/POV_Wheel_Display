@@ -24,7 +24,7 @@
 
 #include "config.h"
 #include "povble.h"
-#include "network.h"
+#include "storage.h"
 #include "effects.h"
 #include "hall_log.h"
 #include <NimBLEDevice.h>
@@ -70,27 +70,21 @@ static uint16_t  text_rx_total = 0;
 static uint16_t  text_rx_len   = 0;
 
 // ---------------------------------------------------------------------
-//  Общие счётчики версий. Раньше жили static в network.cpp; теперь их
-//  дёргает и BLE, а веб может быть вообще не поднят.
+//  Общие счётчики версий состояния и списка файлов.
 // ---------------------------------------------------------------------
 volatile uint32_t pov_state_version = 0;
 volatile uint32_t pov_file_version  = 0;
-volatile bool     wifi_enabled      = false;
 
-// Из network.cpp: имя, которое загрузчик кадра запишет в NVS уже с погашенной
+// Из storage.cpp: имя, которое загрузчик кадра запишет в NVS уже с погашенной
 // лентой. Писать его здесь нельзя — стирание флеша заморозит renderingTask.
 extern String pendingPlayFile;
-
-// Заявка на подъём Wi-Fi. Исполняет loop(): setupNetwork() блокирует вызвавшую
-// задачу почти на десять секунд, и задаче хоста NimBLE там делать нечего.
-volatile bool pending_wifi_on = false;
 
 // Заявка на транспортный режим (OP_POWEROFF). Исполняет loop():
 // enterTransportSleep() гасит ленту через SPI, сбрасывает настройки и
 // калибровку во флеш и уходит в сон, из которого будит только удержание кнопки.
 volatile bool pending_transport_off = false;
 
-// Заявка на перезагрузку (OP_REBOOT, выключение Wi-Fi). Исполняет loop().
+// Заявка на перезагрузку (OP_REBOOT). Исполняет loop().
 volatile bool pending_reboot = false;
 
 // ---------------------------------------------------------------------
@@ -591,8 +585,7 @@ static void fillSettings(PovSettings* s) {
     s->rpm_off      = (uint16_t)lroundf(rpm_render_off);
 }
 
-// Границы — те же, что в HTTP-обработчике /settings: расходиться двум входам
-// в одно и то же состояние нельзя.
+// Границы значений настроек: всё, что приходит снаружи, зажимается здесь.
 static void applySettings(const PovSettings* s) {
     if (s->bmin >= 1 && s->bmin <= 31) min_brightness = s->bmin;
     if (s->bmax >= 1 && s->bmax <= 31) max_brightness = s->bmax;
@@ -664,7 +657,6 @@ static void fillTele(PovTele* t) {
     t->play       = force_stop_display ? 0 : 1;
     t->slideshow  = slideshowActive ? 1 : 0;
     t->frames_total = (uint8_t)(totalFrames > 255 ? 255 : totalFrames);
-    t->wifi       = wifi_enabled ? 1 : 0;
     t->state_ver  = pov_state_version;
     t->file_ver   = pov_file_version;
     time_t nowt = time(nullptr);
@@ -678,7 +670,7 @@ static void fillTele(PovTele* t) {
 }
 
 // ---------------------------------------------------------------------
-//  Проверка имени файла. Правила те же, что у браузерного buildFileName():
+//  Проверка имени файла. Правила те же, что у Ani6.buildFileName() в приложении:
 //  LittleFS в arduino-esp32 держит имя не длиннее 31 байта, и только ASCII.
 // ---------------------------------------------------------------------
 // ---------------------------------------------------------------------
@@ -788,7 +780,7 @@ static void handleCmd(const uint8_t* d, size_t n) {
         h.sectors       = SECTORS;
         h.frame_stride  = FRAME_STRIDE_PAL;
         h.mtu           = peer_mtu;
-        h.features      = POV_FEAT_DEFLATE | POV_FEAT_OTA | POV_FEAT_PREVIEW | POV_FEAT_WIFI |
+        h.features      = POV_FEAT_DEFLATE | POV_FEAT_OTA | POV_FEAT_PREVIEW |
                           POV_FEAT_ALBUM_SEL | POV_FEAT_HALL_LOG | POV_FEAT_TEXT | POV_FEAT_FX |
                           POV_FEAT_TEXT_RGB;
         h.uptime_s      = millis() / 1000;
@@ -1199,8 +1191,7 @@ static void handleCmd(const uint8_t* d, size_t n) {
         uint32_t size, crc;
         memcpy(&size, pl, 4); memcpy(&crc, pl + 4, 4);
         if (!size) { sendRsp(op, seq, ST_BAD_ARG); break; }
-        // Тот же самый останов, что делает веб-путь через ElegantOTA.onStart.
-        // Здесь он был пропущен, а поднять два флага — это не то же самое:
+        // Полный останов, а не два флага. Когда-то здесь он был пропущен, а поднять два флага — это не то же самое:
         // safeOTAShutdown() ещё и дожидается текущей DMA-транзакции, гасит
         // ленту, снимает оба DCDC и РАЗМОНТИРУЕТ LittleFS. Без последнего
         // прошивка пишется поверх смонтированной ФС и рушит библиотеку
@@ -1261,7 +1252,7 @@ static void handleCmd(const uint8_t* d, size_t n) {
         else if (was_ota)   { ota_in_progress = false; }
         // updateFileList() отсюда НЕ вызываем: он чистит и перестраивает
         // savedFiles, а loop() на ядре 1 индексирует тот же вектор в слайдшоу.
-        // HTTP-загрузка его тоже не трогала — список обновится при старте показа.
+        // Список обновится при старте показа.
         else if (ok) { pov_state_version++; pov_file_version++; }
         sendRsp(op, seq, st);
         if (ok && was_ota) { vTaskDelay(pdMS_TO_TICKS(400)); ESP.restart(); }
@@ -1274,24 +1265,6 @@ static void handleCmd(const uint8_t* d, size_t n) {
         if (was_ota) otaShutdownUndo();
         webLog("[BLE] Upload aborted by client");
         sendRsp(op, seq, ST_OK);
-        break;
-    }
-
-    case OP_WIFI: {
-        if (pn < 1) { sendRsp(op, seq, ST_BAD_ARG); break; }
-        bool want = pl[0] != 0;
-        sendRsp(op, seq, ST_OK);
-        if (want && !wifi_enabled) {
-            // Заявку исполняет loop(), а не эта задача. setupNetwork() внутри
-            // себя до десяти секунд ждёт подключения к домашней сети, и всё это
-            // время задача хоста NimBLE не разбирает ни ATT, ни GAP: телефон
-            // ловил бы таймауты, а разрыв связи остался бы незамеченным.
-            webLog("[BLE] Wi-Fi requested, bringing it up from loop()");
-            pending_wifi_on = true;
-        } else if (!want && wifi_enabled) {
-            webLog("[BLE] Wi-Fi off, rebooting");
-            pending_reboot = true;           // перезагрузит loop(), сбросив лог Холла
-        }
         break;
     }
 
@@ -1380,7 +1353,7 @@ static void handleCmd(const uint8_t* d, size_t n) {
         // Сон случится штатным путём из loop(), со всеми его сбросами настроек
         // в NVS. Состарить надо ОБА таймера: порог простоя смотрит и на
         // последнее движение, а колесо, только что снятое с велосипеда, имеет
-        // его свежим — по одному веб-таймеру устройство бы не уснуло.
+        // его свежим — по одному таймеру команд устройство бы не уснуло.
         povRequestSleep();
         break;
 
@@ -1467,19 +1440,6 @@ bool bleSetup() {
     ble_name = prefs.getString("ble_name", "");
     if (!bleNameOk(ble_name)) ble_name = bleDefaultName();
     const char* nm = ble_name.c_str();
-
-    // hostName раньше задавался в setupNetwork(); теперь Wi-Fi может не
-    // подниматься вовсе, а имя нужно и BLE, и логу. Оно НАМЕРЕННО остаётся
-    // MAC-производным и переименованию не поддаётся: на нём висят mDNS и
-    // цели OTA в platformio.ini, и менять его вместе с видимым именем значило
-    // бы тихо ломать `pio run -e wheel_3 --target upload`.
-    if (hostName.length() == 0) {
-        uint8_t mac[6];
-        esp_read_mac(mac, ESP_MAC_WIFI_STA);
-        char hn[24];
-        snprintf(hn, sizeof(hn), "pov-wheel-%02x%02x", mac[4], mac[5]);
-        hostName = String(hn);
-    }
 
     NimBLEDevice::init(nm);
     NimBLEDevice::setMTU(517);

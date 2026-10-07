@@ -68,8 +68,8 @@ riders on either side of the bike read them correctly. Logos and pictures can do
 
 <img src="docs/images/app.gif" align="right" width="260" alt="POV Wheel Android app: library with animated previews, battery and settings" />
 
-The Android app (Kotlin + Jetpack Compose, Android 8.0+) is the main way to use the wheel. A
-built-in web UI is still there over opt-in Wi-Fi.
+The Android app (Kotlin + Jetpack Compose, Android 8.0+) is the way to use the wheel: it talks
+to it over Bluetooth LE only — there is no Wi-Fi and no web UI on the wheel.
 
 - 📚 **Library.** Your files and effects in one grid, each with an animated round preview that
   matches what the rim shows. Tap to play.
@@ -191,15 +191,13 @@ More engineering notes are in [CLAUDE.md](CLAUDE.md).
 |---|---|
 | [src/](src/) · [include/](include/) | ESP32-S3 firmware: rotor tracking, rendering, power management, BLE, effects, Hall log |
 | [android/](android/) | Android app (Kotlin / Compose): library, conversion, upload, effects, POV video renderer. See [android/README.md](android/README.md) |
-| [data/](data/) | Web UI served from the wheel over opt-in Wi-Fi |
 | [tools/](tools/) | Offline helpers |
 
 ## 🛠️ Build & flash
 
 ```bash
 # Firmware
-pio run -e cable --target upload      # firmware over USB
-pio run -e cable --target uploadfs    # web UI (LittleFS image)
+pio run -e cable --target upload      # firmware over USB (never run uploadfs: it would wipe the library)
 
 # Android app
 cd android && ./build.sh assembleRelease

@@ -7,8 +7,7 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
 
-// Палитра та же, что на веб-странице: два интерфейса не должны выглядеть как
-// два разных продукта.
+// Палитра та же, что была у веб-страницы (удалена), — приложение её наследник.
 val Accent = Color(0xFF3B82F6)
 val Ok = Color(0xFF22C55E)
 val Warn = Color(0xFFF59E0B)

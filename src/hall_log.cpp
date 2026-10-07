@@ -10,7 +10,7 @@
 #include <sys/time.h>
 
 // Системные часы считаются заведёнными с начала 2023 года — тот же порог,
-// что у часов в network.cpp.
+// что у часов в storage.cpp.
 #define HLOG_TIME_VALID_US  (1700000000LL * 1000000LL)
 
 #define HLOG_NCP  (HLOG_CAP / HLOG_CP_EVERY)
