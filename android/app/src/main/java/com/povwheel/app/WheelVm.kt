@@ -597,16 +597,19 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             return
         }
         // Порядок отбора — общий для всех колёс: по нему каждое считает пункт
-        // слота. Список имён обязан целиком влезть в ОДНУ запись OP_ALBUM на
-        // каждом колесе (MTU согласуется на каждое соединение отдельно), иначе у
-        // колёс разошлась бы длина круга, — режем один раз, по самому тесному.
+        // слота, и список у всех обязан быть одним и тем же. Прошивка с
+        // FEAT_ALBUM_LONG принимает его любой длины (кусками, OP_ALBUM_LIST).
+        // Если хоть одно колесо её не умеет, список должен целиком влезть в
+        // ОДНУ запись OP_ALBUM на каждом колесе (MTU согласуется на каждое
+        // соединение отдельно), — тогда режем один раз, по самому тесному.
+        val longList = members.all { clients[it]?.hello?.hasAlbumLong == true }
         val payload = members.mapNotNull { clients[it]?.payloadSize }.minOrNull() ?: 244
         // Файлы — в порядке библиотеки, как у обычного слайдшоу: отбор с экрана —
         // множество (порядок нажатий или вовсе хеша), и показ начинался «со
         // случайного» файла.
         val libOrder = (if (current.value == addr) files.value else filesByAddr[addr] ?: emptyList()).map { it.name }
         val wanted = libOrder.filter { it in checked } + checked.filter { !isSlideEffect(it) && it !in libOrder }
-        val fileNames = fitNamesToOneWrite(wanted, payload)
+        val fileNames = if (longList) wanted else fitNamesToOneWrite(wanted, payload)
         val list = fileNames + checked.filter { isSlideEffect(it) }
         if (list.isEmpty()) { say("Tick at least one shared animation"); return }
         endSync(addr); others.forEach { endSync(it) }
@@ -2872,20 +2875,24 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     }
 
     /** Отбор, готовый уйти в `BleClient.album()`. [overflowed] — оба списка,
-     *  include и exclude, длиннее, чем одна ATT-посылка выдержит (~20 имён);
-     *  тогда шлём "все файлы" и вызывающий решает, стоит ли об этом сказать. */
+     *  include и exclude, длиннее, чем одна ATT-посылка выдержит (~20 имён),
+     *  а колесо не умеет длинный отбор; тогда шлём "все файлы" и вызывающий
+     *  решает, стоит ли об этом сказать. */
     private data class AlbumSelection(
         val mode: Int, val names: List<String>, val effectMask: Int, val overflowed: Boolean
     )
 
     /** [checked] (имена файлов + токены эффектов `@eN`) → [AlbumSelection]:
      *  маска эффектов плюс include/exclude-список файлов, тот что короче. */
-    private fun albumSelectionFor(checked: Set<String>, fileNames: List<String>): AlbumSelection {
+    private fun albumSelectionFor(checked: Set<String>, fileNames: List<String>, longList: Boolean): AlbumSelection {
         val effMask = effectMaskOf(checked)
         val incl = fileNames.filter { it in checked }
         val excl = fileNames.filter { it !in checked }
         return when {
             excl.isEmpty() -> AlbumSelection(0, emptyList(), effMask, false)   // exclude нечего = все файлы
+            // Длинный отбор (FEAT_ALBUM_LONG) — всегда include: любой длины, в
+            // порядке библиотеки.
+            longList -> AlbumSelection(1, incl, effMask, false)
             incl.size <= excl.size && incl.size <= 20 -> AlbumSelection(1, incl, effMask, false)
             excl.size <= 20 -> AlbumSelection(0, excl, effMask, false)
             else -> AlbumSelection(0, emptyList(), effMask, true)
@@ -2919,7 +2926,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         current.value?.let {
             prefs.edit().putString(slideSelKey(it), checked.joinToString(",")).apply()
         }
-        val sel = albumSelectionFor(checked, fileNames)
+        val sel = albumSelectionFor(checked, fileNames, currentClient()?.hello?.hasAlbumLong == true)
         val ms = (delaySecs * 1000).coerceIn(1000, 300000)
         onTargets { it.album(true, ms, sel.mode, sel.names, sel.effectMask) }
         say(if (sel.overflowed) "Too many files to pick one by one — all files shown" else "Slideshow started")

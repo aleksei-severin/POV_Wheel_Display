@@ -50,6 +50,9 @@ enum PovOp : uint8_t {
                            //    старт может нести отбор (FEAT_ALBUM_SEL):
                            //    …[u8 mode 0=пропускать 1=играть-только][u16 n]{[u8 len][имя]}[u8 effMask]
                            //    effMask: биты 0..6 — эффекты 1..7 тоже в показе (EFF_SLIDE_MASK)
+                           //    n = 0xFFFF (FEAT_ALBUM_LONG) — имён в пакете нет, взять список,
+                           //    присланный перед этим кусками OP_ALBUM_LIST (длинный отбор не
+                           //    влезает в одну запись ATT)
                            //    …[i64 t0_ms] (FEAT_SLIDE_CLOCK) — показ по абсолютным часам:
                            //    слот k = (UTC_мс − t0) / delay, пункт = k mod (имён + эффектов).
                            //    Нет поля или 0 — обычный показ по своему таймеру.
@@ -106,6 +109,11 @@ enum PovOp : uint8_t {
     // применяется сразу, во флеш — отложенно (/fx.cfg и SettingsBlob).
     OP_FX_GET      = 0x23,  // →  ничего            ←  PovFxParams
     OP_FX_SET      = 0x24,  // →  PovFxParams       ←  ничего (значения зажимаются)
+
+    // Длинный отбор слайдшоу (POV_FEAT_ALBUM_LONG): имена кусками, по порядку,
+    // first = номер первого имени куска (0 — начать заново), total — сколько
+    // всего. Сам показ запускает следующий OP_ALBUM с n = 0xFFFF.
+    OP_ALBUM_LIST  = 0x25,  // →  [u16 first][u16 total]{[u8 len][имя]}  ←  ничего
 };
 
 // Предел имени. 19 значащих символов — ровно столько, сколько влезает в
@@ -159,6 +167,7 @@ struct PovHello {
 #define POV_FEAT_FX        0x0080   // OP_FX_GET / OP_FX_SET; эффекты 2 и 5 удалены, часы цифровые
 #define POV_FEAT_TEXT_RGB  0x0100   // блоб OP_TEXT_SET может нести слой цвета эмодзи (до 40 кБ)
 #define POV_FEAT_SLIDE_CLOCK 0x0200 // OP_ALBUM понимает t0: синхронный показ по абсолютным часам
+#define POV_FEAT_ALBUM_LONG  0x0400 // отбор слайдшоу любой длины: OP_ALBUM_LIST + OP_ALBUM n = 0xFFFF
 
 // Цвет эффекта «Текст».
 struct PovTextStyle {

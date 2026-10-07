@@ -65,6 +65,9 @@ object Proto {
     // Параметры эффектов (FEAT_FX): красная точка Speed, радуга, цвет часов
     const val OP_FX_GET     = 0x23  // ← FxParams
     const val OP_FX_SET     = 0x24  // FxParams
+    // Длинный отбор слайдшоу кусками (FEAT_ALBUM_LONG): [u16 first][u16 total]{[u8 len][имя]};
+    // запускает показ следующий OP_ALBUM со счётчиком имён 0xFFFF
+    const val OP_ALBUM_LIST = 0x25
 
     /**
      * Предел имени — столько же, сколько держит PovHello.name вместе с
@@ -110,6 +113,7 @@ object Proto {
     const val FEAT_FX        = 0x0080   // OP_FX_GET / OP_FX_SET; часы цифровые, эффекты 2 и 5 удалены
     const val FEAT_TEXT_RGB  = 0x0100   // блоб текста может нести слой цвета эмодзи (convert/TextMask)
     const val FEAT_SLIDE_CLOCK = 0x0200 // OP_ALBUM понимает t0: синхронный показ по абсолютным часам
+    const val FEAT_ALBUM_LONG  = 0x0400 // отбор слайдшоу любой длины (OP_ALBUM_LIST)
 
     const val ST_BUSY = 3
 
@@ -141,6 +145,7 @@ data class Hello(
     val hasFx       get() = features and Proto.FEAT_FX != 0
     val hasTextRgb  get() = features and Proto.FEAT_TEXT_RGB != 0
     val hasSlideClock get() = features and Proto.FEAT_SLIDE_CLOCK != 0
+    val hasAlbumLong  get() = features and Proto.FEAT_ALBUM_LONG != 0
 
     companion object {
         const val SIZE = 48

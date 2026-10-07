@@ -1897,7 +1897,18 @@ bool slideInSlideshow(const String& name) {
 }
 
 static void loadSlideList() {
-    String joined = prefs.getString("slidelist", "");
+    // Список — блобом ("slidelistb"): у строки в NVS предел 4000 байт, а длинный
+    // отбор (OP_ALBUM_LIST) его перерастает. Строка "slidelist" — от прежних
+    // прошивок, читается, только если блоба ещё нет.
+    String joined;
+    size_t blen = prefs.getBytesLength("slidelistb");
+    if (blen > 0) {
+        std::vector<char> tmp(blen + 1, '\0');
+        prefs.getBytes("slidelistb", tmp.data(), blen);
+        joined = String(tmp.data());
+    } else {
+        joined = prefs.getString("slidelist", "");
+    }
     slideListInclude = prefs.getUChar("slidelistmode", 0) != 0;
     slideEffectMask  = prefs.getUChar("slideeffmask", 0) & EFF_SLIDE_MASK;
     slideClockT0     = prefs.getLong64("slidet0", 0);
@@ -1919,7 +1930,20 @@ static void flushSlideList() {
     if (slide_mutex) xSemaphoreTake(slide_mutex, portMAX_DELAY);
     String joined = slideListJoin();
     if (slide_mutex) xSemaphoreGive(slide_mutex);
-    if (prefs.getString("slidelist", "") != joined) prefs.putString("slidelist", joined);
+    {
+        size_t blen = prefs.getBytesLength("slidelistb");
+        bool same = blen == joined.length();
+        if (same && blen > 0) {
+            std::vector<char> tmp(blen);
+            prefs.getBytes("slidelistb", tmp.data(), blen);
+            same = memcmp(tmp.data(), joined.c_str(), blen) == 0;
+        }
+        if (!same) {
+            if (joined.length()) prefs.putBytes("slidelistb", joined.c_str(), joined.length());
+            else prefs.remove("slidelistb");
+        }
+        if (prefs.isKey("slidelist")) prefs.remove("slidelist");   // строка прежних прошивок
+    }
     uint8_t mode = slideListInclude ? 1 : 0;
     if (prefs.getUChar("slidelistmode", 0) != mode)  prefs.putUChar("slidelistmode", mode);
     if (prefs.getUChar("slideeffmask", 0) != slideEffectMask) prefs.putUChar("slideeffmask", slideEffectMask);

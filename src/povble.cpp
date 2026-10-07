@@ -65,6 +65,12 @@ static_assert(sizeof(PovFxParams) == 16, "PovFxParams != FxParams.SIZE в Proto.
 // пока не придёт последний. Маска 360 × 44 со строкой сжимается в единицы
 // килобайт; запас — под слой цвета эмодзи (см. TEXT_COMP_MAX в effects.h).
 #define TEXT_RX_CAP  TEXT_COMP_MAX
+
+// Приём длинного отбора слайдшоу (OP_ALBUM_LIST): имена копятся здесь, пока
+// OP_ALBUM с n = 0xFFFF не заберёт их. Предел — с запасом на всю библиотеку.
+#define ALBUM_RX_MAX 1000
+static std::vector<String> album_rx;
+static uint16_t            album_rx_total = 0;
 static uint8_t*  text_rx       = nullptr;
 static uint16_t  text_rx_total = 0;
 static uint16_t  text_rx_len   = 0;
@@ -759,7 +765,8 @@ static void handleCmd(const uint8_t* d, size_t n) {
     // склейки видео был полным. Колесо на полке рядом с телефоном обязано
     // уснуть, как и без него.
     const uint32_t prev_activity = last_web_activity_time;
-    if (op != OP_TELE && op != OP_FRAG &&
+    // OP_ALBUM_LIST — только данные: решает следующий за ним OP_ALBUM.
+    if (op != OP_TELE && op != OP_FRAG && op != OP_ALBUM_LIST &&
         op != OP_TIME && op != OP_TIME_SET && op != OP_HALL_LOG && op != OP_HALL_HIST)
         last_web_activity_time = millis();
 
@@ -777,7 +784,7 @@ static void handleCmd(const uint8_t* d, size_t n) {
         h.mtu           = peer_mtu;
         h.features      = POV_FEAT_DEFLATE | POV_FEAT_OTA | POV_FEAT_PREVIEW |
                           POV_FEAT_ALBUM_SEL | POV_FEAT_HALL_LOG | POV_FEAT_TEXT | POV_FEAT_FX |
-                          POV_FEAT_TEXT_RGB | POV_FEAT_SLIDE_CLOCK;
+                          POV_FEAT_TEXT_RGB | POV_FEAT_SLIDE_CLOCK | POV_FEAT_ALBUM_LONG;
         h.uptime_s      = millis() / 1000;
         // Именно видимое имя: приложение подписывает им строку списка, и
         // расходиться с тем, что пришло в рекламе, оно не должно.
@@ -1016,11 +1023,21 @@ static void handleCmd(const uint8_t* d, size_t n) {
                 uint16_t cnt; memcpy(&cnt, pl + 6, 2);
                 std::vector<String> sel;
                 size_t o = 8;
-                for (uint16_t i = 0; i < cnt && o < pn; i++) {
-                    uint8_t l = pl[o++];
-                    if (o + l > pn) break;
-                    sel.push_back(String((const char*)(pl + o), (unsigned int)l));
-                    o += l;
+                if (cnt == 0xFFFF) {
+                    // Имена пришли заранее кусками (OP_ALBUM_LIST) — только целиком.
+                    if (album_rx_total == 0 || album_rx.size() != album_rx_total) {
+                        sendRsp(op, seq, ST_STATE);
+                        break;
+                    }
+                    sel.swap(album_rx);
+                    album_rx_total = 0;
+                } else {
+                    for (uint16_t i = 0; i < cnt && o < pn; i++) {
+                        uint8_t l = pl[o++];
+                        if (o + l > pn) break;
+                        sel.push_back(String((const char*)(pl + o), (unsigned int)l));
+                        o += l;
+                    }
                 }
                 uint8_t effMask = (o < pn) ? pl[o] : 0;   // хвостовой байт маски эффектов
                 // За маской — t0 (FEAT_SLIDE_CLOCK): показ по абсолютным часам.
@@ -1054,6 +1071,25 @@ static void handleCmd(const uint8_t* d, size_t n) {
             slideClockKick();
             sendRsp(op, seq, ST_OK);
         }
+        break;
+    }
+
+    case OP_ALBUM_LIST: {
+        if (pn < 4) { sendRsp(op, seq, ST_BAD_ARG); break; }
+        uint16_t first, total;
+        memcpy(&first, pl, 2); memcpy(&total, pl + 2, 2);
+        if (total == 0 || total > ALBUM_RX_MAX) { sendRsp(op, seq, ST_BAD_ARG); break; }
+        if (first == 0) { album_rx.clear(); album_rx_total = total; }
+        // Куски строго подряд: потерянный или повторный молча сдвинул бы список.
+        else if (total != album_rx_total || first != album_rx.size()) { sendRsp(op, seq, ST_STATE); break; }
+        size_t o = 4;
+        while (o < pn) {
+            uint8_t l = pl[o++];
+            if (o + l > pn || album_rx.size() >= album_rx_total) break;
+            album_rx.push_back(String((const char*)(pl + o), (unsigned int)l));
+            o += l;
+        }
+        sendRsp(op, seq, ST_OK);
         break;
     }
 

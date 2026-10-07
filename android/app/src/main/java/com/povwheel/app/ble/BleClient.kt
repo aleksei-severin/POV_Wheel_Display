@@ -557,8 +557,41 @@ class BleClient(
             return
         }
         val enc = names.map { it.toByteArray(Charsets.US_ASCII) }.filter { it.size in 1..255 }
-        var size = 9 + if (t0Ms > 0) 8 else 0
+        val tail = 9 + if (t0Ms > 0) 8 else 0
+        var size = tail
         for (e in enc) size += 1 + e.size
+        // Не влезает в одну запись ATT — имена отдельными кусками (OP_ALBUM_LIST),
+        // а в самом OP_ALBUM вместо них счётчик 0xFFFF. Под одним замком: чужой
+        // OP_ALBUM между кусками и стартом подменил бы колесу список.
+        if (2 + size > payloadSize && hello?.hasAlbumLong == true) {
+            opLock.withLock {
+                val chunkMax = minOf(payloadSize, 512) - 2 - 4
+                var i = 0
+                while (i < enc.size) {
+                    var n = 0
+                    var bytes = 0
+                    while (i + n < enc.size && bytes + 1 + enc[i + n].size <= chunkMax) {
+                        bytes += 1 + enc[i + n].size
+                        n++
+                    }
+                    val c = Proto.buf(4 + bytes)
+                    c.putShort(i.toShort())
+                    c.putShort(enc.size.toShort())
+                    for (k in i until i + n) { c.put(enc[k].size.toByte()); c.put(enc[k]) }
+                    requestUnlocked(Proto.OP_ALBUM_LIST, c.array(), 8000)
+                    i += n
+                }
+                val b = Proto.buf(tail)
+                b.put(1)
+                b.putInt(delayMs)
+                b.put(if (listMode != 0) 1 else 0)
+                b.putShort(0xFFFF.toShort())
+                b.put((effectMask and 0x7F).toByte())
+                if (t0Ms > 0) b.putLong(t0Ms)
+                requestUnlocked(Proto.OP_ALBUM, b.array(), 8000)
+            }
+            return
+        }
         val b = Proto.buf(size)
         b.put(1)
         b.putInt(delayMs)
