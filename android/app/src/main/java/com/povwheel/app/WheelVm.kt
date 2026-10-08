@@ -1505,9 +1505,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         val c = clients[addr] ?: return
         viewModelScope.launch {
             runCatching { c.getSettings() }.getOrNull()?.let {
-                var f = if (it.ablX10 != 1000) it.copy(ablX10 = 1000) else it
-                if (f.bmin < 6) f = f.copy(bmin = 6, bmax = f.bmax.coerceAtLeast(6))
-                settingsByAddr[addr] = f
+                settingsByAddr[addr] = if (it.ablX10 != 1000) it.copy(ablX10 = 1000) else it
             }
             runCatching { c.list() }.getOrNull()?.let { filesByAddr[addr] = it }
             runCatching { c.fsInfo() }.getOrNull()?.let { fsInfoByAddr[addr] = it }
@@ -1520,7 +1518,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      * Принять настройки, прочитанные с колеса.
      *
      * Мелкие несоответствия правим ТОЛЬКО в локальной копии для показа
-     * (Power Limit держим на 100 %, пол яркости 6 — шкала 1..25 = байт 6..31):
+     * (Power Limit держим на 100 %):
      * `pushSettings` при первой же правке пользователя всё равно отправит на
      * колесо весь блок целиком, уже с поправками.
      *
@@ -1530,8 +1528,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      * приложение НИЧЕГО не пишет само; только показывает прочитанное.
      */
     private fun adoptSettings(got: Settings) {
-        var fixed = if (got.ablX10 != 1000) got.copy(ablX10 = 1000) else got
-        if (fixed.bmin < 6) fixed = fixed.copy(bmin = 6, bmax = fixed.bmax.coerceAtLeast(6))
+        val fixed = if (got.ablX10 != 1000) got.copy(ablX10 = 1000) else got
         settings.value = fixed
         settingsLoaded.value = true
         current.value?.let { settingsByAddr[it] = fixed }

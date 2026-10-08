@@ -685,13 +685,14 @@ internal const val DIM_ALPHA = 0.4f
  * отдельных. Оранжевая метка на той же шкале — текущая яркость
  * (`global_effective_brightness`) по нынешней освещённости.
  *
- * Шкала для пользователя 1..25 линейно натянута на реальный brightness-байт
- * [BRI_LO]..[BRI_HI]: user 1 = байт 6 (ниже лента едва различима даже в
- * темноте), user 25 = байт 31 (максимум 5-битного поля тока SK9822).
+ * Шкала для пользователя 1..30 — это brightness-байт [BRI_LO]..[BRI_HI] со
+ * сдвигом на единицу, шаг в шаг: user 1 = байт 2, user 30 = байт 31 (максимум
+ * 5-битного поля тока SK9822). Ни один байт внутри диапазона не пропускается;
+ * недоступен только самый нижний ненулевой, байт 1.
  */
-private const val BRI_LO = 6
+private const val BRI_LO = 2
 private const val BRI_HI = 31
-private const val BRI_U_MAX = 25
+private const val BRI_U_MAX = 30
 
 private fun briToUser(b: Int): Int =
     (1 + ((b - BRI_LO) * (BRI_U_MAX - 1).toFloat() / (BRI_HI - BRI_LO)).roundToInt())
@@ -727,7 +728,7 @@ private fun AutoBrightnessRange(vm: WheelVm, s: Settings, tele: Tele, enabled: B
             },
             onFinished = { vm.pushSettings(vm.settings.value); vm.saveSettings() },
             // Оранжевая метка — текущая эффективная яркость на пользовательской
-            // шкале; ниже пола (лента выключена или очень тускло) не показываем —
+            // шкале; ниже пола (ABL срезал ток до байта 1 или 0) не показываем —
             // у левого края она читалась бы как «яркость 1». Нет её и пока
             // датчик света не запитан (PWR_OFF — колесо не крутится): он висит
             // на DCDC №1, и яркость тогда посчитана по последнему, давно
