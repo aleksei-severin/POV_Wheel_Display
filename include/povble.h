@@ -78,7 +78,7 @@ enum PovOp : uint8_t {
     // интервал). Заменён показом по абсолютным часам (t0 в OP_ALBUM); номер не
     // переиспользуется.
 
-    // Лог Холла для склейки POV-видео (POV_FEAT_HALL_LOG, см. hall_log.h).
+    // Лог Холла для склейки POV-видео (POV_FEAT_HALL_LOG2, см. hall_log.h).
     // Все три — фоновый обмен приложения: таймер простоя они не сбрасывают.
     OP_TIME        = 0x1C,  // →  ничего            ←  PovTime (пинг часов: телефон
                            //    сопоставляет esp_timer со своими часами по min-RTT)
@@ -162,7 +162,11 @@ struct PovHello {
 #define POV_FEAT_PREVIEW   0x0004
 // 0x0008 — бывший POV_FEAT_WIFI, больше не выставляется и не переиспользуется
 #define POV_FEAT_ALBUM_SEL 0x0010   // OP_ALBUM понимает отбор файлов для слайдшоу
-#define POV_FEAT_HALL_LOG  0x0020   // OP_TIME / OP_TIME_SET / OP_HALL_LOG / OP_HALL_HIST
+// 0x0020 — бывший POV_FEAT_HALL_LOG: те же команды, но в логе была одна запись
+// на событие. Больше не выставляется: старое приложение не знает упакованных
+// записей (HLOG_P4/HLOG_P2), сочло бы их младшие биты паузами и безвозвратно
+// испортило бы время всей сессии в своём архиве. Без бита оно лог просто не видит.
+#define POV_FEAT_HALL_LOG2 0x0800   // OP_TIME / OP_TIME_SET / OP_HALL_LOG / OP_HALL_HIST, лог с упаковкой
 #define POV_FEAT_TEXT      0x0040   // эффект «Текст»: OP_TEXT_STYLE / OP_TEXT_SET / OP_TEXT_GET
 #define POV_FEAT_FX        0x0080   // OP_FX_GET / OP_FX_SET; эффекты 2 и 5 удалены, часы цифровые
 #define POV_FEAT_TEXT_RGB  0x0100   // блоб OP_TEXT_SET может нести слой цвета эмодзи (до 40 кБ)

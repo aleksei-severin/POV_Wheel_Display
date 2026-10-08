@@ -53,7 +53,7 @@ object Proto {
     const val OP_POWEROFF  = 0x1A   // транспортный режим — будит только удержание кнопки
     // 0x1B — бывший OP_SYNC_TICK: синхронный показ теперь идёт по абсолютным
     // часам (t0 в OP_ALBUM, FEAT_SLIDE_CLOCK); номер не переиспользуется
-    // Лог Холла для склейки POV-видео (FEAT_HALL_LOG, см. include/hall_log.h)
+    // Лог Холла для склейки POV-видео (FEAT_HALL_LOG / FEAT_HALL_LOG2, см. include/hall_log.h)
     const val OP_TIME      = 0x1C   // пинг часов  ← TimeInfo
     const val OP_TIME_SET  = 0x1D   // [i64 wall_us][i64 at_esp_us][i32 tz]  ← TimeInfo
     const val OP_HALL_LOG  = 0x1E   // [u32 from_seq][u16 max]  ← staged: HallPage + n × u32
@@ -109,6 +109,8 @@ object Proto {
     // 0x0008 — бывший FEAT_WIFI, не переиспользуется
     const val FEAT_ALBUM_SEL = 0x0010   // OP_ALBUM понимает отбор файлов для слайдшоу
     const val FEAT_HALL_LOG  = 0x0020   // OP_TIME / OP_TIME_SET / OP_HALL_LOG / OP_HALL_HIST
+    const val FEAT_HALL_LOG2 = 0x0800   // то же, но в логе бывают упакованные записи (HallDecode);
+                                        // прошивка с ним прежний бит не выставляет
     const val FEAT_TEXT      = 0x0040   // эффект «Текст»: OP_TEXT_STYLE / OP_TEXT_SET / OP_TEXT_GET
     const val FEAT_FX        = 0x0080   // OP_FX_GET / OP_FX_SET; часы цифровые, эффекты 2 и 5 удалены
     const val FEAT_TEXT_RGB  = 0x0100   // блоб текста может нести слой цвета эмодзи (convert/TextMask)
@@ -140,7 +142,7 @@ data class Hello(
     val hasOta      get() = features and Proto.FEAT_OTA != 0
     val hasPreview  get() = features and Proto.FEAT_PREVIEW != 0
     val hasAlbumSel get() = features and Proto.FEAT_ALBUM_SEL != 0
-    val hasHallLog  get() = features and Proto.FEAT_HALL_LOG != 0
+    val hasHallLog  get() = features and (Proto.FEAT_HALL_LOG or Proto.FEAT_HALL_LOG2) != 0
     val hasText     get() = features and Proto.FEAT_TEXT != 0
     val hasFx       get() = features and Proto.FEAT_FX != 0
     val hasTextRgb  get() = features and Proto.FEAT_TEXT_RGB != 0

@@ -783,7 +783,7 @@ static void handleCmd(const uint8_t* d, size_t n) {
         h.frame_stride  = FRAME_STRIDE_PAL;
         h.mtu           = peer_mtu;
         h.features      = POV_FEAT_DEFLATE | POV_FEAT_OTA | POV_FEAT_PREVIEW |
-                          POV_FEAT_ALBUM_SEL | POV_FEAT_HALL_LOG | POV_FEAT_TEXT | POV_FEAT_FX |
+                          POV_FEAT_ALBUM_SEL | POV_FEAT_HALL_LOG2 | POV_FEAT_TEXT | POV_FEAT_FX |
                           POV_FEAT_TEXT_RGB | POV_FEAT_SLIDE_CLOCK | POV_FEAT_ALBUM_LONG;
         h.uptime_s      = millis() / 1000;
         // Именно видимое имя: приложение подписывает им строку списка, и

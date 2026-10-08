@@ -27,9 +27,19 @@ RTC_DATA_ATTR static uint8_t  rtc_clock_prec  = 0;
 static uint32_t* hl_ring = nullptr;
 static int64_t*  hl_cp   = nullptr;          // время ДО записи с номером k·HLOG_CP_EVERY
 static volatile uint32_t hl_head = 0;        // номер следующей записи
-static int64_t   hl_last_t = 0;              // время последнего события
+static int64_t   hl_last_t = 0;              // время последнего события в записанных записях
 static uint32_t  hl_boot   = 0;
 static portMUX_TYPE hl_mux = portMUX_INITIALIZER_UNLOCKED;
+
+// --- Упаковка (см. «УПАКОВКА» в hall_log.h). Всё — под hl_mux. ---
+#define PK_HIST 7                              // K = 6 требует шага по 7 датчикам
+static uint8_t  pk_sens[PK_HIST];              // датчики последних событий, [0] — самое свежее
+static uint32_t pk_gap[PK_HIST];               // их Δt (восстановленные), мкс
+static uint8_t  pk_n    = 0;                   // сколько событий в истории
+static int16_t  pk_q[4];                       // поправки ожидающей записи
+static uint8_t  pk_cnt  = 0;                   // сколько их
+static uint8_t  pk_wide = 0;                   // ожидающая запись — HLOG_P2, а не HLOG_P4
+static int64_t  pk_t    = 0;                   // время последнего события, включая ожидающие
 
 // Что уже во флеше: номер первой несброшенной записи и время до неё.
 static uint32_t  hl_flushed   = 0;
@@ -108,24 +118,75 @@ void hallLogInit() {
     }
     hl_boot = esp_random() | 1u;            // 0 оставляем под «нет сессии»
     hl_last_t    = esp_timer_get_time();
+    pk_t         = hl_last_t;
+    pk_n = pk_cnt = 0;
     hl_cp[0]     = hl_last_t;
     hl_head      = 0;
     hl_flushed   = 0;
     hl_flushed_t = hl_last_t;
-    webLogf("[HLOG] Ring %u events (%u kB), session %08lx",
+    webLogf("[HLOG] Ring %u records (%u kB), session %08lx",
             (unsigned)HLOG_CAP, (unsigned)(HLOG_PSRAM_BYTES / 1024), (unsigned long)hl_boot);
 }
 
-// Запись в кольцо. Вызывается под hl_mux.
+// Запись в кольцо. Вызывается под hl_mux. Запись на контрольной точке начинает
+// новый отрезок: читатель может начать с неё, не зная ничего раньше, поэтому
+// предсказание упаковки забывает всё, что было до неё.
 static inline IRAM_ATTR void hlPutRaw(uint32_t e) {
     uint32_t s = hl_head;
-    if ((s & (HLOG_CP_EVERY - 1)) == 0) hl_cp[(s / HLOG_CP_EVERY) & (HLOG_NCP - 1)] = hl_last_t;
+    if ((s & (HLOG_CP_EVERY - 1)) == 0) {
+        hl_cp[(s / HLOG_CP_EVERY) & (HLOG_NCP - 1)] = hl_last_t;
+        pk_n = 0;
+    }
     hl_ring[s & (HLOG_CAP - 1)] = e;
     hl_head = s + 1;
 }
 
-static inline IRAM_ATTR void hlPush(int64_t t, uint8_t type, uint8_t arg) {
-    int64_t dt = t - hl_last_t;
+// Дописать ожидающую упакованную запись (незанятые слоты — минимальным значением).
+static inline IRAM_ATTR void hlCommit() {
+    if (!pk_cnt) return;
+    uint32_t e;
+    if (pk_wide) {
+        e = ((uint32_t)HLOG_P2 << 28) | (((uint32_t)pk_q[0] & 0x3FFF) << 14) |
+            ((uint32_t)(pk_cnt > 1 ? pk_q[1] : -8192) & 0x3FFF);
+    } else {
+        e = (uint32_t)HLOG_P4 << 28;
+        for (uint8_t i = 0; i < 4; i++)
+            e |= ((uint32_t)(i < pk_cnt ? pk_q[i] : -64) & 0x7F) << (21 - 7 * i);
+    }
+    hlPutRaw(e);
+    hl_last_t = pk_t;
+    pk_cnt = 0;
+}
+
+static inline IRAM_ATTR void hlRemember(uint8_t sensor, uint32_t gap) {
+    for (uint8_t i = PK_HIST - 1; i > 0; i--) { pk_sens[i] = pk_sens[i - 1]; pk_gap[i] = pk_gap[i - 1]; }
+    pk_sens[0] = sensor;
+    pk_gap[0]  = gap;
+    if (pk_n < PK_HIST) pk_n++;
+}
+
+// Поправку — в ожидающую запись. false — ставить некуда: новую упакованную
+// запись пришлось бы начать на контрольной точке, а там читателю не на что
+// опереться. Тогда событие идёт полной записью. Заполненную запись дописывает
+// вызывающий — после того как учтёт время события (hlCommit берёт его из pk_t).
+static inline IRAM_ATTR bool hlPlace(int32_t q) {
+    bool small = q >= -63 && q <= 63;
+    if (pk_cnt && !pk_wide && !small) {
+        if (pk_cnt == 1) pk_wide = 1;          // одна мелкая влезает и в P2
+        else hlCommit();                       // две-три мелких — своей записью P4
+    }
+    if (!pk_cnt) {
+        if ((hl_head & (HLOG_CP_EVERY - 1)) == 0) return false;
+        pk_wide = small ? 0 : 1;
+    }
+    pk_q[pk_cnt++] = (int16_t)q;
+    return true;
+}
+
+// Полная запись события (с EXT, если пауза длиннее 24 бит). Возвращает Δt.
+static inline IRAM_ATTR uint32_t hlFull(int64_t t, uint8_t type, uint8_t arg) {
+    hlCommit();
+    int64_t dt = t - pk_t;
     if (dt < 0) dt = 0;
     if (dt > 0xFFFFFF) {
         // Пара EXT + событие не должна разрываться контрольной точкой: читатель,
@@ -135,13 +196,43 @@ static inline IRAM_ATTR void hlPush(int64_t t, uint8_t type, uint8_t arg) {
         hlPutRaw(((uint32_t)HLOG_EXT << 28) | (uint32_t)((dt >> 24) & 0xFFFFFF));
     }
     hlPutRaw(((uint32_t)type << 28) | ((uint32_t)(arg & 0x0F) << 24) | (uint32_t)(dt & 0xFFFFFF));
-    hl_last_t = t;
+    hl_last_t = pk_t = t;
+    return dt > 0xFFFFFFFFLL ? 0xFFFFFFFFu : (uint32_t)dt;
+}
+
+// Событие Холла: упаковать, если оно продолжает ровный ход, иначе — полной записью.
+static inline IRAM_ATTR void hlHall(int64_t t, uint8_t sensor) {
+    int64_t dt = t - pk_t;
+    if (pk_n >= 2 && dt > 0 && dt <= 0xFFFFFF) {
+        uint8_t step = (uint8_t)((pk_sens[0] + 6 - pk_sens[1]) % 6);
+        uint8_t K = step ? 6 : 1;
+        // Тот же шаг у нового события и у K предыдущих: иначе промежуток K событий
+        // назад — между другой парой датчиков (пропуск магнита, смена направления).
+        bool ok = pk_n >= K + 1 && (uint8_t)((sensor + 6 - pk_sens[0]) % 6) == step;
+        for (uint8_t i = 1; ok && i < K; i++)
+            ok = (uint8_t)((pk_sens[i] + 6 - pk_sens[i + 1]) % 6) == step;
+        if (ok && pk_gap[K - 1] <= 0xFFFFFF) {
+            int32_t pred = (int32_t)pk_gap[K - 1];
+            int32_t d = (int32_t)dt - pred;
+            int32_t q = d >= 0 ?  (d + HLOG_PACK_US / 2) / HLOG_PACK_US
+                               : -((-d + HLOG_PACK_US / 2) / HLOG_PACK_US);
+            int32_t g = pred + q * HLOG_PACK_US;
+            if (g > 0 && q >= -8191 && q <= 8191 && hlPlace(q)) {
+                pk_t += g;
+                hlRemember(sensor, (uint32_t)g);
+                if (pk_cnt == (pk_wide ? 2 : 4)) hlCommit();
+                return;
+            }
+        }
+    }
+    uint32_t g = hlFull(t, HLOG_HALL, sensor);
+    hlRemember(sensor, g);
 }
 
 void IRAM_ATTR hallLogIsr(int64_t t_us, uint8_t sensor) {
     if (!hl_ring) return;
     portENTER_CRITICAL_ISR(&hl_mux);
-    hlPush(t_us, HLOG_HALL, sensor);
+    hlHall(t_us, sensor);
     portEXIT_CRITICAL_ISR(&hl_mux);
 }
 
@@ -149,7 +240,7 @@ void hallLogMark(uint8_t type, uint8_t arg) {
     if (!hl_ring) return;
     int64_t t = esp_timer_get_time();
     portENTER_CRITICAL(&hl_mux);
-    hlPush(t, type, arg);
+    hlFull(t, type, arg);
     portEXIT_CRITICAL(&hl_mux);
 }
 
@@ -167,6 +258,7 @@ size_t hallLogRead(uint32_t from, uint32_t* dst, size_t max,
     *seq0 = 0; *t0 = 0; *oldest = 0; *head = 0;
     if (!hl_ring) return 0;
     portENTER_CRITICAL(&hl_mux);
+    hlCommit();                   // телефону — всё до последнего события, без недобранной записи
     uint32_t h = hl_head;
     portEXIT_CRITICAL(&hl_mux);
     uint32_t old = hlOldestSafe(h);
@@ -215,6 +307,10 @@ static bool hlFileKey(const char* path, uint32_t* size, uint32_t* key_boot, uint
 void hallLogFlush() {
     if (!hl_ring) return;
     portENTER_CRITICAL(&hl_mux);
+    hlCommit();
+    // Следующий блок начнётся с записи h — предсказание упаковки не должно
+    // опираться на то, что в него не попадёт.
+    pk_n = 0;
     uint32_t h  = hl_head;
     int64_t  th = hl_last_t;      // время до записи h: head никогда не стоит внутри пары EXT
     portEXIT_CRITICAL(&hl_mux);
@@ -277,7 +373,7 @@ void hallLogFlush() {
     if (!ok) { webLog("[HLOG] Flush write failed (flash full?)"); return; }
     hl_flushed   = h;
     hl_flushed_t = th;
-    webLogf("[HLOG] Flushed %lu events", (unsigned long)n);
+    webLogf("[HLOG] Flushed %lu records", (unsigned long)n);
 }
 
 size_t hallLogHistRead(uint8_t which, uint32_t off, uint8_t* dst, size_t max,

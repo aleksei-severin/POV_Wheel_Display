@@ -47,7 +47,8 @@ object HallArchive {
 
     /** Размер заголовка блока на флеше (HallBlockHdr). */
     const val BLOCK_HDR = 68
-    private const val BLOCK_MAGIC = 0x31424C48
+    private const val BLOCK_MAGIC = 0x31424C48     // "HLB1": только полные записи
+    private const val BLOCK_MAGIC2 = 0x32424C48    // "HLB2": могут быть упакованные (HallDecode)
 
     private lateinit var root: File
 
@@ -214,7 +215,8 @@ object HallArchive {
         val all = f.readBytes()
         while (parsed + BLOCK_HDR <= all.size) {
             val p = ByteBuffer.wrap(all, parsed.toInt(), all.size - parsed.toInt()).order(ByteOrder.LITTLE_ENDIAN)
-            if (p.int != BLOCK_MAGIC) { parsed = all.size.toLong(); break }   // испорчено — дальше не разобрать
+            val magic = p.int
+            if (magic != BLOCK_MAGIC && magic != BLOCK_MAGIC2) { parsed = all.size.toLong(); break }   // испорчено — дальше не разобрать
             val boot = p.int.toLong() and 0xFFFFFFFFL
             val seq0 = p.int.toLong() and 0xFFFFFFFFL
             val n = p.int
@@ -299,7 +301,7 @@ object HallArchive {
         return out
     }
 
-    /** Все записи файла событий, по времени, без повторов номеров. */
+    /** Все записи файла событий, по времени, без повторов. */
     private fun readEvents(f: File): Triple<LongArray, ByteArray, ByteArray> {
         val e = readEventsFull(f)
         return Triple(e.esp, e.type, e.arg)
@@ -318,10 +320,18 @@ object HallArchive {
             seq[i] = b.int.toLong() and 0xFFFFFFFFL
             ty[i] = b.get(); ar[i] = b.get(); b.short
         }
+        // Повтор — тот же номер записи И то же время: в упакованной записи кольца
+        // несколько событий делят один номер, а время у них разное. Одну запись,
+        // пришедшую и из кольца, и из истории на флеше, разбор даёт с точно тем же
+        // временем, так что повторы отсекаются и здесь.
         val idx = (0 until n).sortedWith(compareBy({ seq[it] }, { esp[it] }))
         val keep = ArrayList<Int>(n)
-        var last = -1L
-        for (i in idx) { if (seq[i] != last) keep.add(i); last = seq[i] }
+        var lastSeq = -1L
+        var lastEsp = Long.MIN_VALUE
+        for (i in idx) {
+            if (seq[i] != lastSeq || esp[i] != lastEsp) keep.add(i)
+            lastSeq = seq[i]; lastEsp = esp[i]
+        }
         // Номера идут по времени, но после сортировки по номеру ещё раз — по времени
         // (страховка на случай перезапуска счётчика в одной сессии).
         keep.sortBy { esp[it] }
@@ -458,7 +468,7 @@ object HallArchive {
         |  <display>/<date>_<time>_s<session>.csv — one line per event, opens in any
         |      spreadsheet. Columns: time (local, phone clock), esp_us (the display's own
         |      microsecond timer since power-up), seq (record number in the display's
-        |      log), event, arg.
+        |      log; one record can hold several events), event, arg.
         |      event: hall = a magnet passed Hall sensor <arg> (0…5);
         |             lit  = the image switched on (arg 1 = forward, 0 = reverse spin);
         |             dark = the image switched off.
