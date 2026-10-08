@@ -693,6 +693,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     // Пишется с Dispatchers.IO, читается из отрисовки списка — обычный HashMap
     // здесь может уйти в бесконечный цикл на рехэше.
     private val thumbs = ConcurrentHashMap<String, PreviewFrame>()
+    private val THUMB_MAGIC = 0x31465650                 // "PVF1", см. saveThumb
 
     // ---- Локальные анимированные превью ----
     // При заливке рядом с файлом кладётся компактный рендер (спрайт-лист ~0.5 МБ),
@@ -2447,6 +2448,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                     runCatching { cl.fsInfo() }.getOrNull()?.let { fsInfoByAddr[addr] = it }
                 }
                 if (current.value == addr) { files.value = fl; fsInfo.value = fsInfoByAddr[addr]!! }
+                withContext(Dispatchers.IO) { dropThumb(res.fileName) }
                 // Рендерим и кладём в кэш компактное превью, пока доступ к
                 // исходнику ещё жив — один раз на файл, не на каждую цель.
                 if (cachedPreviews.add(item.uri)) cachePreview(item, res.fileName)
@@ -2542,8 +2544,8 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 for (pf in list.sortedByDescending { it.lastModified() }) {
                     // .tmp-обрывок не трогаем: следующая запись того же имени его
                     // усечёт, а гонка с идущим save() тут ни к чему.
-                    if (!pf.name.endsWith(".pvc")) continue
-                    if (strict && pf.name.removeSuffix(".pvc") !in keep) { pf.delete(); continue }
+                    if (!pf.name.endsWith(".pvc") && !pf.name.endsWith(".pvf")) continue
+                    if (strict && pf.name.dropLast(4) !in keep) { pf.delete(); continue }
                     total += pf.length()
                     if (total > CLIP_DISK_MAX) pf.delete()
                 }
@@ -3162,6 +3164,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 synchronized(clipMem) { clipMem.remove(n) }
                 withContext(Dispatchers.IO) {
                     runCatching { PreviewClips.fileFor(previewDir, n).delete() }
+                    dropThumb(n)
                 }
             }
             runCatching { files.value = c.list() }
@@ -3218,18 +3221,64 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
 
     // --------------------------------------------------------------- превью
 
+    /**
+     * Первый кадр файла — плитке, у которой нет локального клипа (файл залит с
+     * другого телефона или до переустановки приложения). Память → диск → колесо
+     * (OP_PREVIEW). Полученный по BLE кадр ложится на диск рядом с клипами, так что
+     * тянется один раз на файл, а не на каждый запуск, и виден и без связи.
+     * null — колеса нет на связи или оно не ответило: плитка попросит снова
+     * ([canFetchThumb]).
+     */
     suspend fun thumb(f: DevFile): PreviewFrame? {
         val key = f.name + "|" + f.size
         thumbs[key]?.let { return it }
-        val c = currentClient() ?: return null
+        withContext(Dispatchers.IO) { loadThumb(f) }?.let { thumbs[key] = it; return it }
+        val c = readyClient() ?: return null
         if (c.hello?.hasPreview == false) return null
         return withContext(Dispatchers.IO) {
             try {
                 val p = c.preview(f.name)
-                if (p != null) thumbs[key] = p
+                if (p != null) { thumbs[key] = p; saveThumb(f, p) }
                 p
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) { null }
         }
+    }
+
+    /** Есть смысл просить кадр у колеса снова: оно на связи и превью умеет. */
+    fun canFetchThumb(): Boolean = readyClient()?.let { it.hello?.hasPreview != false } ?: false
+
+    // Кадр на диске: "PVF1", размер файла на колесе (по нему видно, что файл
+    // перезалили), секторы, радиусы, RGB565.
+    private fun thumbFile(name: String) = File(previewDir, name + ".pvf")
+
+    private fun loadThumb(f: DevFile): PreviewFrame? = runCatching {
+        val file = thumbFile(f.name)
+        if (!file.exists()) return null
+        val b = java.nio.ByteBuffer.wrap(file.readBytes()).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        if (b.remaining() < 10 || b.int != THUMB_MAGIC || b.int.toLong() and 0xFFFFFFFFL != f.size) return null
+        val sec = b.get().toInt() and 0xFF
+        val rad = b.get().toInt() and 0xFF
+        if (sec == 0 || rad == 0 || b.remaining() < sec * rad * 2) return null
+        val px = ByteArray(sec * rad * 2); b.get(px)
+        PreviewFrame(sec, rad, px)
+    }.getOrNull()
+
+    private fun saveThumb(f: DevFile, p: PreviewFrame) {
+        runCatching {
+            val b = java.nio.ByteBuffer.allocate(10 + p.rgb565.size).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            b.putInt(THUMB_MAGIC).putInt(f.size.toInt()).put(p.sectors.toByte()).put(p.radii.toByte()).put(p.rgb565)
+            val tmp = File(previewDir, f.name + ".pvf.tmp")
+            tmp.writeBytes(b.array())
+            if (!tmp.renameTo(thumbFile(f.name))) tmp.delete()
+        }
+    }
+
+    /** Файл [name] на колесе заменён или удалён — его кадр больше не годится. */
+    private fun dropThumb(name: String) {
+        thumbs.keys.removeIf { it.startsWith("$name|") }
+        runCatching { thumbFile(name).delete() }
     }
 
     // -------------------------------------------------------------------- лог

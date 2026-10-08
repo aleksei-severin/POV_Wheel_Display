@@ -729,7 +729,7 @@ private fun LibraryCell(
                     else
                         CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp,
                             color = cs.onSurfaceVariant)
-                is Cell.Stored -> StoredDisc(vm, cell.file)
+                is Cell.Stored -> StoredDisc(vm, cell.file, online)
                 // Чёрный диск с тем же серым полем по краю, что у файлов: ободок
                 // «играет» (зелёный) ложится на это поле, как у остальных ячеек.
                 is Cell.Effect -> EffectPreview(cell.id,
@@ -836,16 +836,23 @@ private fun CheckDot(checked: Boolean, modifier: Modifier = Modifier) {
 
 /** Круглое превью файла с колеса: локальный клип, иначе один кадр по BLE. */
 @Composable
-private fun StoredDisc(vm: WheelVm, f: DevFile) {
+private fun StoredDisc(vm: WheelVm, f: DevFile, online: Boolean) {
     val pv by vm.previewVersion.collectAsState()
     var thumb by remember(f.name + f.size) { mutableStateOf<Bitmap?>(null) }
     var clip by remember(f.name + f.size) { mutableStateOf<PreviewClip?>(null) }
-    LaunchedEffect(f.name, f.size, pv) {
+    // online — в ключах: кадр, который не дали без связи, просится снова, как только
+    // колесо на связи. Раньше неудачная попытка (связь ещё не готова, таймаут на
+    // забитом канале) оставляла плитку серой до перезапуска приложения.
+    LaunchedEffect(f.name, f.size, pv, online) {
         val c = vm.localClip(f)
-        if (c != null) clip = c
-        else if (thumb == null) {
+        if (c != null) { clip = c; return@LaunchedEffect }
+        var pause = 2_000L
+        while (thumb == null) {
             val p = vm.thumb(f)
-            if (p != null) thumb = WheelThumb.render(p, 96)
+            if (p != null) { thumb = WheelThumb.render(p, 96); break }
+            if (!vm.canFetchThumb()) break         // ждём связи — перезапуск по online
+            kotlinx.coroutines.delay(pause)        // колесо не ответило — реже и реже, пока плитка на экране
+            pause = minOf(pause * 2, 30_000L)
         }
     }
     AnimatedDisc(clip, thumb, Modifier.fillMaxSize().padding(3.dp).clip(CircleShape))

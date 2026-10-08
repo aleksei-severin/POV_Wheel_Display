@@ -13,6 +13,7 @@ import android.os.SystemClock
 import com.povwheel.app.hall.HallSync
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.sync.Mutex
@@ -33,6 +34,9 @@ class BleException(message: String, val status: Int = -1) : Exception(message)
  * посмотрит на экран, уже исчез.
  */
 enum class Link { Disconnected, Connecting, Ready, Error }
+
+/** Дольше фоновый запрос лога Холла запросы экрана вперёд не пропускает. */
+private const val BG_YIELD_MS = 10_000L
 
 /**
  * Одно подключённое колесо.
@@ -98,6 +102,25 @@ class BleClient(
     @Volatile private var linkDown = false
 
     private val opLock = Mutex()
+
+    // Запросы экрана (превью, список, Play…), которые сейчас ждут связи или идут
+    // по ней. Фоновая выгрузка лога Холла ([hallLog], [hallHist]) пропускает их
+    // вперёд: на свежем приложении она тянет с колеса до полутора мегабайт кусками
+    // по нескольку секунд, и каждое превью иначе стояло бы в очереди за таким куском.
+    private val fgBusy = AtomicInteger(0)
+
+    private suspend inline fun <T> foreground(block: () -> T): T {
+        fgBusy.incrementAndGet()
+        try { return block() } finally { fgBusy.decrementAndGet() }
+    }
+
+    /** Фоновый запрос ждёт, пока экрану ничего не нужно, — но не дольше [BG_YIELD_MS]:
+     *  непрерывный поток запросов экрана не должен остановить архив насовсем. */
+    private suspend fun yieldToForeground() {
+        val until = SystemClock.elapsedRealtime() + BG_YIELD_MS
+        while (fgBusy.get() > 0 && SystemClock.elapsedRealtime() < until) delay(20)
+    }
+
     private val seqGen = AtomicInteger(0)
 
     // Ответ сопоставляется по байту последовательности из запроса.
@@ -374,7 +397,7 @@ class BleClient(
 
     /** Шлёт команду и ждёт ответа. Бросает исключение при ненулевом статусе. */
     suspend fun request(op: Int, payload: ByteArray = ByteArray(0), timeoutMs: Long = 8000): ByteArray =
-        opLock.withLock { requestUnlocked(op, payload, timeoutMs) }
+        foreground { opLock.withLock { requestUnlocked(op, payload, timeoutMs) } }
 
     private suspend fun requestUnlocked(op: Int, payload: ByteArray, timeoutMs: Long): ByteArray {
         val g = gatt ?: throw BleException("not connected")
@@ -436,7 +459,11 @@ class BleClient(
      * самим, а не принимать поток уведомлений, значит, что потерянный фрагмент
      * нельзя пропустить молча.
      */
-    private suspend fun requestStaged(op: Int, payload: ByteArray = ByteArray(0)): ByteArray =
+    private suspend fun requestStaged(op: Int, payload: ByteArray = ByteArray(0), background: Boolean = false): ByteArray =
+        if (background) { yieldToForeground(); stagedLocked(op, payload) }
+        else foreground { stagedLocked(op, payload) }
+
+    private suspend fun stagedLocked(op: Int, payload: ByteArray): ByteArray =
         opLock.withLock {
             val head = requestUnlocked(op, payload, 12_000)
             if (head.size < 4) return@withLock ByteArray(0)
@@ -663,14 +690,14 @@ class BleClient(
     suspend fun hallLog(fromSeq: Long, max: Int): HallPage {
         val b = Proto.buf(6)
         b.putInt(fromSeq.toInt()); b.putShort(max.toShort())
-        return HallPage.parse(requestStaged(Proto.OP_HALL_LOG, b.array()))
+        return HallPage.parse(requestStaged(Proto.OP_HALL_LOG, b.array(), background = true))
     }
 
     /** Кусок файла истории лога Холла: [which] 0 — /hall.old, 1 — /hall.log. */
     suspend fun hallHist(which: Int, off: Long, max: Int): HallHist {
         val b = Proto.buf(7)
         b.put(which.toByte()); b.putInt(off.toInt()); b.putShort(max.toShort())
-        return HallHist.parse(requestStaged(Proto.OP_HALL_HIST, b.array()))
+        return HallHist.parse(requestStaged(Proto.OP_HALL_HIST, b.array(), background = true))
     }
 
     suspend fun telemetry(): Tele = Tele.parse(request(Proto.OP_TELE)).also { _tele.value = it }
