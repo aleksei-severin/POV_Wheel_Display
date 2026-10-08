@@ -138,7 +138,10 @@ class HallSync(private val ctx: Context, private val c: BleClient) {
             runCatching { pullLock.withLock { pullLog(addr) } }
 
             if (pwr != 2 && now - lastHist > 60_000) {
-                if (pullHist(addr)) lastHist = now
+                // Сбой разбора истории не должен останавливать весь сбор: раньше такое
+                // исключение выходило из loop(), и до переподключения лог не шёл вовсе.
+                // Повтор — через минуту, как после удачного прохода.
+                if (runCatching { pullHist(addr) }.getOrDefault(true)) lastHist = now
             }
             // pwr обновляется и по странице: лента могла зажечься между пингами.
             delay(if (pwr == 2) 3_000 else 10_000)

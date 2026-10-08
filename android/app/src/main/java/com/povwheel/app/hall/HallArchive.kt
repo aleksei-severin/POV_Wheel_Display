@@ -155,12 +155,20 @@ object HallArchive {
         if (cal != null) s.put("cal", JSONArray().apply { cal.forEach { put(it) } })
         if (armReverse != null) s.put("rev", armReverse)
         val have = ranges(s)
-        val buf = ByteBuffer.allocate(count * 16).order(ByteOrder.LITTLE_ENDIAN)
+        // Событий бывает больше, чем записей: упакованная запись (P4/P2) несёт до четырёх.
+        // Буфер на одно событие в запись переполнялся на первой же странице ровного хода —
+        // исключение глушилось выше, и в архив с упаковкой не попадало ничего.
+        var buf = ByteBuffer.allocate(count * 16).order(ByteOrder.LITTLE_ENDIAN)
         var added = 0
         var minEsp = Long.MAX_VALUE
         var maxEsp = Long.MIN_VALUE
         HallDecode.decode(seq0, t0, entries, count) { seq, t, type, arg ->
             if (!covered(have, seq)) {
+                if (buf.remaining() < 16) {
+                    val nb = ByteBuffer.allocate(buf.capacity() * 2).order(ByteOrder.LITTLE_ENDIAN)
+                    nb.put(buf.array(), 0, buf.position())
+                    buf = nb
+                }
                 buf.putLong(t).putInt(seq.toInt()).put(type.toByte()).put(arg.toByte()).putShort(0)
                 added++
                 minEsp = min(minEsp, t); maxEsp = max(maxEsp, t)

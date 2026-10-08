@@ -15,9 +15,10 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.isActive
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -26,45 +27,76 @@ import java.util.Locale
 import java.util.concurrent.Executors
 
 /**
- * «Render POV Video»: выбор ролика → сводка (как в консоли у скрипта) → рендер с
- * прогрессом и оценкой оставшегося времени → MP4 в галерее рядом с исходником.
+ * «Render POV Video»: выбор роликов (одного или нескольких) → по очереди для каждого
+ * сводка (как в консоли у скрипта) → рендер с прогрессом и оценкой оставшегося
+ * времени → MP4 в галерее рядом с исходником.
  *
  * Живёт во [com.povwheel.app.WheelVm], поэтому переживает поворот экрана и уход с
- * карточки. Рендер идёт в собственном потоке: GL-контекст привязан к потоку.
+ * карточки. Очередь разбирает один собственный поток: GL-контекст привязан к потоку,
+ * да и два рендера разом телефон всё равно не потянет.
  */
 class PovVideoController(private val app: Application, private val scope: CoroutineScope) {
 
-    sealed interface State {
-        data object Idle : State
-        data class Analyzing(val name: String, val step: String) : State
-        data class Ready(val a: PovAnalysis) : State
+    /**
+     * Что экран показывает о ролике после анализа. Сам анализ (метки кадров, тики, план)
+     * держим только пока ролик в работе: в очереди их может быть много, а занимают они
+     * мегабайты.
+     */
+    class Summary(
+        val displayName: String,
+        val durationSec: Double,
+        val slow: Double,
+        val rotation: Int,
+        val codedW: Int,
+        val codedH: Int,
+        val syncRanges: List<DoubleArray>,
+        val report: List<String>
+    ) {
+        constructor(a: PovAnalysis) : this(a.displayName, a.durationSec, a.slow, a.rotation,
+            a.codedW, a.codedH, a.syncRanges, a.report)
+    }
+
+    sealed interface Status {
+        data object Queued : Status
+        data class Analyzing(val step: String) : Status
         data class Rendering(
-            val a: PovAnalysis,
             val done: Int,
             val total: Int,
             val elapsedSec: Int,
             /** null — пока не набралось данных для оценки. */
             val etaSec: Int?,
             val step: String
-        ) : State
-        data class Done(val a: PovAnalysis, val path: String, val uri: Uri?, val seconds: Int, val w: Int, val h: Int) : State
-        /** [retry] — ролик, который не дали прочитать: после разрешения на видео пробуем снова. */
-        data class Failed(val message: String, val a: PovAnalysis?, val retry: Uri? = null) : State
+        ) : Status
+        data class Done(val path: String, val uri: Uri?, val seconds: Int, val w: Int, val h: Int) : Status
+        /** [retry] — ролик не дали прочитать: после разрешения на видео можно поставить его снова. */
+        data class Failed(val message: String, val retry: Boolean = false) : Status
+        /** Остановлен кнопкой (Skip / Stop) — можно поставить в очередь заново. */
+        data object Stopped : Status
     }
 
-    private val _state = MutableStateFlow<State>(State.Idle)
-    val state: StateFlow<State> = _state
+    /** Ролик в очереди. [name] — null, пока не узнали имя файла. */
+    data class Entry(val id: Long, val uri: Uri, val name: String?, val summary: Summary?, val status: Status) {
+        val finished: Boolean get() = status is Status.Done || status is Status.Failed || status is Status.Stopped
+    }
+
+    private val _entries = MutableStateFlow<List<Entry>>(emptyList())
+    /** Все ролики по порядку: готовые со своими сводками, текущий, ждущие очереди. */
+    val entries: StateFlow<List<Entry>> = _entries
     private val _busy = MutableStateFlow(false)
-    /** Идёт анализ или рендер — экран держим включённым. */
+    /** Очередь в работе (анализ или рендер) — экран держим включённым. */
     val busy: StateFlow<Boolean> = _busy
 
-    @Volatile private var cancelFlag = false
-    /** Рендер стартует сам, как только анализ нашёл лог (хотя бы на часть ролика). */
-    @Volatile private var autoRender = false
-
-    /** true — однократно: экран запускает рендер сам (через свой запрос разрешений). */
-    fun consumeAutoRender(): Boolean { val v = autoRender; autoRender = false; return v }
-    private var job: Job? = null
+    /** Очередь и смена текущего ролика — под ним: добавляют с главного потока, берёт рабочий. */
+    private val lock = Any()
+    private var nextId = 1L
+    /** Ролик, который сейчас в работе (-1 — никакого). */
+    @Volatile private var currentId = -1L
+    /**
+     * Ролик, которому велели остановиться. По id, а не флагом: Skip, нажатый в момент
+     * смены ролика, не должен зацепить следующий.
+     */
+    @Volatile private var cancelId = -1L
+    private var worker: Job? = null
     private val renderDispatcher = Executors.newSingleThreadExecutor { r ->
         Thread(r, "pov-render").apply { isDaemon = true }
     }.asCoroutineDispatcher()
@@ -88,86 +120,169 @@ class PovVideoController(private val app: Application, private val scope: Corout
         logJob = scope.launch { runCatching { withTimeoutOrNull(15_000) { r() } } }
     }
 
-    fun pick(uri: Uri) {
-        if (_busy.value) return
-        cancelFlag = false
-        autoRender = true
-        _busy.value = true
-        _state.value = State.Analyzing("video", "Reading video…")
+    private fun edit(id: Long, f: (Entry) -> Entry) = _entries.update { l -> l.map { if (it.id == id) f(it) else it } }
+    private fun setStatus(id: Long, s: Status) = edit(id) { it.copy(status = s) }
+
+    /**
+     * Ролики из галереи — в конец очереди. Можно и посреди работы: очередь просто
+     * станет длиннее. Каждый анализируется и, если лог нашёлся хотя бы на часть
+     * ролика, сразу рендерится; сводки готовых остаются на экране друг за другом.
+     */
+    fun pick(uris: List<Uri>) {
+        val add = synchronized(lock) {
+            // Тот же ролик, ещё ждущий или в работе, второй раз не ставим.
+            val waiting = _entries.value.filter { !it.finished }.map { it.uri }.toSet()
+            val add = uris.distinct().filter { it !in waiting }.map { Entry(nextId++, it, null, null, Status.Queued) }
+            if (add.isEmpty()) return
+            _entries.update { it + add }
+            add
+        }
+        // Лог — раньше рабочего: первый анализ дождётся свежего хвоста.
         if (logJob?.isActive != true) prefetchLog()
-        val pending = logJob
-        job = scope.launch(renderDispatcher) {
-            try {
-                if (pending?.isActive == true) {
-                    _state.value = State.Analyzing("video", "Fetching the latest Hall log…")
-                    pending.join()
-                    _state.value = State.Analyzing("video", "Reading video…")
-                }
-                val a = PovAnalyzer.analyze(app, uri,
-                    step = { s -> (_state.value as? State.Analyzing)?.let { _state.value = it.copy(step = s) } },
-                    cancelled = { cancelFlag || !isActive })
-                _state.value = State.Ready(a)
-            } catch (_: InterruptedException) {
-                _state.value = State.Idle
-            } catch (e: SecurityException) {
-                _state.value = State.Failed("The gallery did not share this video with the app. Allow access to videos and try again.", null, uri)
-            } catch (e: PovAnalyzer.NoLog) {
-                _state.value = State.Failed(e.message ?: "There is no Hall log for this video.", null)
-            } catch (e: Throwable) {
-                _state.value = State.Failed("Could not read this video: " + (e.message ?: e.javaClass.simpleName), null)
-            } finally {
-                _busy.value = false
+        synchronized(lock) { startWorkerLocked() }
+        // Имена — сразу, чтобы ждущие в очереди не висели безымянными.
+        scope.launch(Dispatchers.IO) {
+            for (e in add) {
+                val n = runCatching { PovAnalyzer.sourceInfo(app, e.uri).first }.getOrNull() ?: continue
+                edit(e.id) { if (it.name == null) it.copy(name = n) else it }
             }
         }
     }
 
-    fun render() {
-        val a = (_state.value as? State.Ready)?.a ?: return
-        if (_busy.value || !a.renderable) return
-        cancelFlag = false
+    /**
+     * Остановленный или упавший ролик — снова в очередь (в конец, чтобы сводки шли по
+     * порядку). С новым id: старый мог остаться в [cancelId] от Skip.
+     */
+    fun requeue(id: Long) {
+        if (logJob?.isActive != true) prefetchLog()
+        synchronized(lock) {
+            val e = _entries.value.firstOrNull { it.id == id } ?: return
+            if (e.status !is Status.Failed && e.status !is Status.Stopped) return
+            _entries.update { l -> l.filter { it.id != id } + e.copy(id = nextId++, summary = null, status = Status.Queued) }
+            startWorkerLocked()
+        }
+    }
+
+    /** Убрать ждущий ролик из очереди. */
+    fun remove(id: Long) {
+        synchronized(lock) { _entries.update { l -> l.filter { !(it.id == id && it.status == Status.Queued) } } }
+    }
+
+    /** Пропустить ролик, который сейчас в работе, — очередь пойдёт дальше. */
+    fun skip(id: Long) { if (currentId == id) cancelId = id }
+
+    /** Остановить текущий ролик и снять с очереди все ждущие. */
+    fun stopAll() {
+        synchronized(lock) {
+            _entries.update { l -> l.map { if (it.status == Status.Queued) it.copy(status = Status.Stopped) else it } }
+            cancelId = currentId
+        }
+    }
+
+    /** Убрать сводки готовых роликов (ждущие и текущий остаются). */
+    fun clear() {
+        synchronized(lock) { _entries.update { l -> l.filter { !it.finished } } }
+    }
+
+    private fun startWorkerLocked() {
+        if (_busy.value) return
         _busy.value = true
-        _state.value = State.Rendering(a, 0, a.plan.totalFrames, 0, null, "Preparing…")
-        job = scope.launch(renderDispatcher) {
-            val t0 = System.nanoTime()
-            var target: Saver.Target? = null
+        worker = scope.launch(renderDispatcher) {
             try {
-                val tgt = Saver.create(app, a.outName, a.relativePath)
-                target = tgt
-                var lastUi = 0L
-                var etaSmooth = -1.0
-                val res = withContext(renderDispatcher) {
-                    PovRenderer(app, a).render(
-                        tgt.pfd.fileDescriptor,
-                        cancelled = { cancelFlag || !isActive },
-                        progress = { done, total ->
-                            val now = System.nanoTime()
-                            if (now - lastUi >= 250_000_000L || done >= total) {
-                                lastUi = now
-                                val el = (now - t0) / 1e9
-                                // Оценка по средней скорости с начала — после первых 2 % и
-                                // 3 с, сглаженная, чтобы цифра не прыгала от кадра к кадру.
-                                var eta: Int? = null
-                                if (done > 0 && done >= total / 50 && el > 3) {
-                                    val raw = el / done * (total - done)
-                                    etaSmooth = if (etaSmooth < 0) raw else 0.8 * etaSmooth + 0.2 * raw
-                                    eta = etaSmooth.toInt()
-                                }
-                                _state.value = State.Rendering(a, done, total, el.toInt(), eta, "Rendering…")
-                            }
+                while (true) {
+                    val e = synchronized(lock) {
+                        val n = _entries.value.firstOrNull { it.status == Status.Queued }
+                        if (n == null) {
+                            currentId = -1
+                            _busy.value = false
+                        } else {
+                            currentId = n.id
+                            setStatus(n.id, Status.Analyzing("Reading video…"))
                         }
-                    )
+                        n
+                    } ?: break
+                    process(e)
                 }
-                val path = Saver.publish(app, tgt)
-                target = null
-                _state.value = State.Done(a, path.first, path.second, ((System.nanoTime() - t0) / 1e9).toInt(), res.width, res.height)
-            } catch (_: InterruptedException) {
-                _state.value = State.Ready(a)
-            } catch (e: Throwable) {
-                _state.value = State.Failed("Rendering failed: " + (e.message ?: e.javaClass.simpleName), a)
-            } finally {
-                target?.let { Saver.discard(app, it) }
-                _busy.value = false
+            } catch (c: CancellationException) {
+                synchronized(lock) { currentId = -1; _busy.value = false }
+                throw c
             }
+        }
+    }
+
+    /** Один ролик: анализ, затем (если лог нашёлся) рендер. Исход — в статус ролика. */
+    private suspend fun process(e: Entry) {
+        val id = e.id
+        val job = currentCoroutineContext()[Job]
+        val cancelled = { cancelId == id || job?.isActive == false }
+
+        val a: PovAnalysis
+        try {
+            logJob?.let { j ->
+                if (j.isActive) {
+                    setStatus(id, Status.Analyzing("Fetching the latest Hall log…"))
+                    j.join()
+                    setStatus(id, Status.Analyzing("Reading video…"))
+                }
+            }
+            a = PovAnalyzer.analyze(app, e.uri,
+                step = { s -> edit(id) { if (it.status is Status.Analyzing) it.copy(status = Status.Analyzing(s)) else it } },
+                cancelled = cancelled)
+        } catch (c: CancellationException) {
+            throw c
+        } catch (_: InterruptedException) {
+            setStatus(id, Status.Stopped); return
+        } catch (_: SecurityException) {
+            setStatus(id, Status.Failed("The gallery did not share this video with the app. Allow access to videos and try again.", retry = true)); return
+        } catch (x: PovAnalyzer.NoLog) {
+            setStatus(id, Status.Failed(x.message ?: "There is no Hall log for this video.")); return
+        } catch (x: Throwable) {
+            setStatus(id, Status.Failed("Could not read this video: " + (x.message ?: x.javaClass.simpleName))); return
+        }
+        edit(id) { it.copy(name = a.displayName, summary = Summary(a)) }
+        if (!a.renderable) { setStatus(id, Status.Failed("Nothing to render: the Hall log does not cover this video.")); return }
+        if (cancelled()) { setStatus(id, Status.Stopped); return }
+
+        setStatus(id, Status.Rendering(0, a.plan.totalFrames, 0, null, "Preparing…"))
+        val t0 = System.nanoTime()
+        var target: Saver.Target? = null
+        try {
+            val tgt = Saver.create(app, a.outName, a.relativePath)
+            target = tgt
+            var lastUi = 0L
+            var etaSmooth = -1.0
+            // Рендер — прямо в потоке очереди: GL-контекст привязан к потоку.
+            val res = PovRenderer(app, a).render(
+                tgt.pfd.fileDescriptor,
+                cancelled = cancelled,
+                progress = { done, total ->
+                    val now = System.nanoTime()
+                    if (now - lastUi >= 250_000_000L || done >= total) {
+                        lastUi = now
+                        val el = (now - t0) / 1e9
+                        // Оценка по средней скорости с начала — после первых 2 % и
+                        // 3 с, сглаженная, чтобы цифра не прыгала от кадра к кадру.
+                        var eta: Int? = null
+                        if (done > 0 && done >= total / 50 && el > 3) {
+                            val raw = el / done * (total - done)
+                            etaSmooth = if (etaSmooth < 0) raw else 0.8 * etaSmooth + 0.2 * raw
+                            eta = etaSmooth.toInt()
+                        }
+                        setStatus(id, Status.Rendering(done, total, el.toInt(), eta, "Rendering…"))
+                    }
+                }
+            )
+            val path = Saver.publish(app, tgt)
+            target = null
+            setStatus(id, Status.Done(path.first, path.second, ((System.nanoTime() - t0) / 1e9).toInt(), res.width, res.height))
+        } catch (c: CancellationException) {
+            throw c
+        } catch (_: InterruptedException) {
+            setStatus(id, Status.Stopped)
+        } catch (x: Throwable) {
+            setStatus(id, Status.Failed("Rendering failed: " + (x.message ?: x.javaClass.simpleName)))
+        } finally {
+            target?.let { Saver.discard(app, it) }
         }
     }
 
@@ -258,12 +373,8 @@ class PovVideoController(private val app: Application, private val scope: Corout
 
     private fun plural(n: Int, word: String) = n.toString() + " " + word + (if (n == 1) "" else "s")
 
-    fun cancel() { cancelFlag = true }
-
-    fun reset() { if (!_busy.value) _state.value = State.Idle }
-
     /** Для onCleared ViewModel: остановить рендер, файл-заготовка удалится сам. */
-    fun shutdown() { cancelFlag = true; job?.cancel() }
+    fun shutdown() { stopAll(); worker?.cancel() }
 
     /**
      * Запись результата в галерею. С Android 10 — через MediaStore в ту же папку, что

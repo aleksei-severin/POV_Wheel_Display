@@ -378,7 +378,7 @@ internal object PovAnalyzer {
         SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date((us / 1e3).toLong()))
 
     /** Имя файла и его папка в галерее (RELATIVE_PATH есть с Android 10). */
-    private fun sourceInfo(ctx: Context, uri: Uri): Pair<String, String?> {
+    fun sourceInfo(ctx: Context, uri: Uri): Pair<String, String?> {
         var name = "video.mp4"
         var rel: String? = null
         val cols = if (Build.VERSION.SDK_INT >= 29)
