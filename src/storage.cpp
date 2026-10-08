@@ -259,6 +259,7 @@ void safeOTAShutdown() {
 
     // 3. Гасим светодиоды и снимаем питание обоих DCDC.
     blankAllLEDs_DMA();
+    ledBusPark();       // DATA/CLK на землю до снятия питания
     digitalWrite(PIN_EN_DCDC_REST, LOW);
     digitalWrite(PIN_EN_DCDC_ARM1, LOW);
 

@@ -10,6 +10,8 @@
 #include <algorithm>
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
+#include "soc/spi_periph.h"
+#include "esp_rom_gpio.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "esp_sleep.h"
@@ -564,6 +566,44 @@ static void initSK9822Device() {
             (int)SK9822_BUF_SIZE, (double)SK9822_FRAME_US);
 }
 
+// Линии шины SK9822 — либо у SPI, либо прижаты к земле как обычные GPIO.
+//
+// Пока луч обесточен, DATA/CLK обязаны лежать на земле. Высокий уровень на
+// входе обесточенного SK9822 через защитный диод запитывает его шину питания —
+// чипы оказываются полуживыми, при подъёме DCDC не проходят нормальный сброс
+// по питанию и вспыхивают случайными диодами. Именно так и было: setup() слал
+// гашение в ещё обесточенные лучи, посылка кончается end-frame из 0xFF, и MOSI
+// оставался в HIGH до самого включения DCDC.
+static volatile bool led_bus_live = false;
+
+// Чисто GPIO-часть: защёлка в 0 до включения выхода, и только потом пад
+// уходит из-под FSPI на GPIO — переключение без единого фронта на линиях.
+static void ledPinsToGround() {
+    const gpio_num_t pins[2] = { (gpio_num_t)PIN_LED_DATA, (gpio_num_t)PIN_LED_CLK };
+    for (gpio_num_t p : pins) {
+        gpio_set_level(p, 0);
+        gpio_set_direction(p, GPIO_MODE_OUTPUT);
+        esp_rom_gpio_pad_select_gpio(p);
+    }
+}
+
+// Под мьютексом DMA: гашение или волна не обрываются на середине посылки.
+void ledBusPark() {
+    if (dmaMutex) xSemaphoreTake(dmaMutex, portMAX_DELAY);
+    ledPinsToGround();
+    led_bus_live = false;
+    if (dmaMutex) xSemaphoreGive(dmaMutex);
+}
+
+// Вернуть пады SPI. IO11/IO12 — родные пины SPI2, spi_bus_initialize() вывел
+// их через IO_MUX, так что достаточно вернуть падам функцию FSPI.
+// Звать только когда питание лучей поднято не меньше LED_RAIL_SETTLE_MS.
+static void ledBusAttach() {
+    gpio_iomux_out(PIN_LED_DATA, spi_periph_signal[SPI2_HOST].func, false);
+    gpio_iomux_out(PIN_LED_CLK,  spi_periph_signal[SPI2_HOST].func, false);
+    led_bus_live = true;
+}
+
 void initSK9822_DMA() {
     spi_bus_config_t buscfg = {};
     buscfg.mosi_io_num     = PIN_LED_DATA;
@@ -574,6 +614,10 @@ void initSK9822_DMA() {
     buscfg.max_transfer_sz = SK9822_BUF_SIZE;
 
     ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
+    // spi_bus_initialize() забрал пады себе — лучи обесточены, возвращаем их
+    // на землю до первого включения DCDC.
+    ledPinsToGround();
+    led_bus_live = false;
     initSK9822Device();
 
     for (int b = 0; b < 2; b++) {
@@ -593,9 +637,11 @@ void initSK9822_DMA() {
 static uint8_t buf_bri_cache[2] = {0, 0};
 
 // Гасит все 528 диодов — ток=0, цвет=0.
-// Используется при включении питания и при остановке рендеринга.
+// Используется при остановке рендеринга и перед снятием питания с лучей.
+// Пока шина прижата к земле, слать некуда (и незачем: лучи либо обесточены,
+// либо с момента включения не получили ни одной посылки).
 void blankAllLEDs_DMA() {
-    if (!dma_tx_buffer || !sk9822_spi || !dmaMutex) return;
+    if (!dma_tx_buffer || !sk9822_spi || !dmaMutex || !led_bus_live) return;
     xSemaphoreTake(dmaMutex, portMAX_DELAY);
     uint8_t* led_ptr = dma_tx_buffer + 4;
     for (int i = 0; i < NUM_LEDS; i++) {
@@ -1978,24 +2024,17 @@ static void setHallMask(uint8_t mask) {
     interrupts();
 }
 
-// Подаёт питание на шину светодиодов и гасит их как можно раньше.
+// Подаёт питание на лучи и ждёт, пока TPS631000 выйдет на режим. DATA/CLK всё
+// это время на земле (шину к SPI подключает только переход в PWR_FULL).
 //
-// SK9822 включаются со СЛУЧАЙНЫМ содержимым PWM-регистров: пока в них не
-// приедет первый кадр, диоды светят чем попало. Паузы «на стабилизацию питания»
-// с последующим одиночным гашением мало — все эти миллисекунды луч уже горит, и
-// при пробуждении по вибрации, когда колесо неподвижно, это видно как вспышка
-// случайных цветов.
-//
-// Меньше, чем время подъёма шины плюс две посылки по SPI (~1.7 мс на 20 МГц),
-// окно не сделать в принципе: SK9822 защёлкивает данные только по приходу
-// СЛЕДУЮЩЕГО старт-фрейма, поэтому одного кадра нулей не хватает. Пауза перед
-// первой посылкой нужна, чтобы не гнать данные в чипы с ещё не поднявшимся
-// питанием; дальше шлём нули подряд — какая-то из посылок обязательно ляжет уже
-// на готовые чипы, и ждать «с запасом» больше не требуется.
-static void powerRailUpAndBlank(uint8_t en_pin) {
+// Гасить диоды сразу после включения больше не пытаемся: SK9822-A сами по
+// себе при подаче питания не светятся (проверено на отдельном луче, много
+// циклов). Вспышку случайными диодами давали как раз попытки гашения — посылки
+// в чипы на ещё поднимающемся питании и высокий уровень на линиях обесточенного
+// луча (см. led_bus_live).
+static void powerRailUp(uint8_t en_pin) {
     digitalWrite(en_pin, HIGH);
-    delay(2);                       // TPS631000 выходит на режим быстрее
-    for (int i = 0; i < 3; i++) blankAllLEDs_DMA();
+    delay(LED_RAIL_SETTLE_MS);
 }
 
 // 240 МГц нужны ровно там, где счёт идёт на микросекунды — заливка кадра и
@@ -2028,6 +2067,7 @@ static void applyPowerState(PowerState target) {
             setHallMask(0);
             delay(3);
             blankAllLEDs_DMA();
+            ledBusPark();       // линии на землю ДО снятия питания
             digitalWrite(PIN_EN_DCDC_REST, LOW);
             digitalWrite(PIN_EN_DCDC_ARM1, LOW);
             peripherals_active = false;
@@ -2046,19 +2086,24 @@ static void applyPowerState(PowerState target) {
         case PWR_SPINUP:
             setCpuFreqForPower(PWR_SPINUP);
             if (power_state == PWR_FULL) {
-                // Обороты упали — гасим лучи 2–6, первый оставляем под питанием
+                // Обороты упали — гасим лучи 2–6, первый оставляем под питанием.
+                // В PWR_SPINUP в шину ничего не шлём, так что она тоже на землю.
                 power_state = PWR_SPINUP;
                 setHallMask(0x01);
                 delay(3);
                 blankAllLEDs_DMA();
+                ledBusPark();
                 digitalWrite(PIN_EN_DCDC_REST, LOW);
                 webLog("[PWR] RPM low, arms 2-6 off");
             } else {
-                // Просыпаемся: включаем только первый луч и его датчик Холла
+                // Просыпаемся: включаем только первый луч и его датчик Холла.
+                // Шина остаётся на земле: в PWR_SPINUP лента не светится, и
+                // слать в неё нечего. Маску Холла — после выхода питания на
+                // режим, чтобы не поймать фронт на подъёме.
                 last_dcdc_on_time = millis();  // до пауз — иначе now_ms < last_dcdc_on_time
                 peripherals_active = true;
                 power_state = PWR_SPINUP;
-                powerRailUpAndBlank(PIN_EN_DCDC_ARM1);
+                powerRailUp(PIN_EN_DCDC_ARM1);
                 setHallMask(0x01);
                 webLog("[PWR] Arm 1 on, measuring RPM");
             }
@@ -2073,9 +2118,13 @@ static void applyPowerState(PowerState target) {
             last_dcdc_on_time = millis();
             last_motion_ms    = last_dcdc_on_time;
             peripherals_active = true;
-            powerRailUpAndBlank(PIN_EN_DCDC_REST);
+            // Лучи 2–6 тактируются через первый, поэтому шину к SPI подключаем
+            // только когда выдержку прошёл и DCDC №2. Первый луч к этому моменту
+            // под питанием уже не меньше RPM_UP_HOLD_MS.
+            powerRailUp(PIN_EN_DCDC_REST);
             setHallMask((uint8_t)((1u << HALL_COUNT) - 1));
-            power_state = PWR_FULL;
+            ledBusAttach();
+            power_state = PWR_FULL;   // только теперь renderingTask начнёт слать кадры
             webLog("[PWR] All arms on, rendering enabled");
             break;
     }
@@ -2141,11 +2190,21 @@ static bool waitPinReleased(uint8_t pin, uint32_t stable_ms, uint32_t timeout_ms
 //   ток сна поднимается до ориентировочно ~50–100 мкА, но это на порядок
 //   дешевле прежнего периодического опроса и не растёт с тем, сколько
 //   времени колесо проводит в этой позе.
-static void armWakeSourcesAndSleep(bool arm_vib) {
-    hallLogNoteSleep();   // время сна копится для поправки часов (см. hall_log.h)
+// Перед любым глубоким сном: оба EN DCDC и линии шины SK9822 замораживаются в
+// LOW на всё время сна — лучи обесточены, и на их входах не должно быть ничего.
+// setup() снимает удержание первым делом.
+static void holdPinsForSleep() {
+    ledBusPark();
     gpio_hold_en((gpio_num_t)PIN_EN_DCDC_ARM1);
     gpio_hold_en((gpio_num_t)PIN_EN_DCDC_REST);
+    gpio_hold_en((gpio_num_t)PIN_LED_DATA);
+    gpio_hold_en((gpio_num_t)PIN_LED_CLK);
     gpio_deep_sleep_hold_en();
+}
+
+static void armWakeSourcesAndSleep(bool arm_vib) {
+    hallLogNoteSleep();   // время сна копится для поправки часов (см. hall_log.h)
+    holdPinsForSleep();
 
     if (arm_vib) {
         vib_stuck_wait = false;
@@ -2218,9 +2277,7 @@ static void enterTrickleSleep(uint32_t seconds) {
     hallLogFlush();
     digitalWrite(PIN_EN_DCDC_REST, LOW);
     digitalWrite(PIN_EN_DCDC_ARM1, LOW);
-    gpio_hold_en((gpio_num_t)PIN_EN_DCDC_ARM1);
-    gpio_hold_en((gpio_num_t)PIN_EN_DCDC_REST);
-    gpio_deep_sleep_hold_en();
+    holdPinsForSleep();
 
     // Толчок вибродатчика ИЛИ нажатие кнопки — оба в LOW. Заклинивший в LOW
     // датчик исключаем, иначе ANY_LOW сработал бы сразу. Тот же дебаунс на
@@ -2319,10 +2376,14 @@ static void transportWipe(bool outward) {
 static void transportShowWave(bool outward) {
     gpio_hold_dis((gpio_num_t)PIN_EN_DCDC_ARM1);
     gpio_hold_dis((gpio_num_t)PIN_EN_DCDC_REST);
-    powerRailUpAndBlank(PIN_EN_DCDC_ARM1);
-    powerRailUpAndBlank(PIN_EN_DCDC_REST);
+    // Если лучи уже под питанием (уход в сон во время отрисовки), выдержка
+    // просто лишние 60 мс; шина к SPI — только после неё.
+    powerRailUp(PIN_EN_DCDC_ARM1);
+    powerRailUp(PIN_EN_DCDC_REST);
+    ledBusAttach();
     peripherals_active = true;
     transportWipe(outward);
+    ledBusPark();
     digitalWrite(PIN_EN_DCDC_REST, LOW);
     digitalWrite(PIN_EN_DCDC_ARM1, LOW);
     peripherals_active = false;
@@ -2352,9 +2413,7 @@ static void transportSleepArm() {
 
     digitalWrite(PIN_EN_DCDC_REST, LOW);
     digitalWrite(PIN_EN_DCDC_ARM1, LOW);
-    gpio_hold_en((gpio_num_t)PIN_EN_DCDC_ARM1);
-    gpio_hold_en((gpio_num_t)PIN_EN_DCDC_REST);
-    gpio_deep_sleep_hold_en();
+    holdPinsForSleep();
 
     // Единственный источник пробуждения — кнопка, замкнутая на землю.
     // Вибродатчик здесь НЕ подключается: в этом вся суть режима.
@@ -2806,6 +2865,13 @@ void setup() {
     peripherals_active = false;
     power_state        = PWR_OFF;
 
+    // Линии шины SK9822 — на землю, пока лучи обесточены (см. led_bus_live).
+    // Сначала конфигурация, потом снятие удержания: пад переходит из
+    // «замороженного LOW» сразу в выход LOW, без промежуточного состояния.
+    ledPinsToGround();
+    gpio_hold_dis((gpio_num_t)PIN_LED_DATA);
+    gpio_hold_dis((gpio_num_t)PIN_LED_CLK);
+
     // Входы. Выходы DRV5023 и вибродатчика подтянуты внешними резисторами
     // к неотключаемой линии 3V3 — внутренняя подтяжка нужна лишь как страховка.
     // gpio_hold_dis: прошивка V4 замораживала GPIO21 перед сном, и защёлка
@@ -3023,11 +3089,11 @@ void setup() {
 
     updateFileList();
 
-    // SPI инициализируется ДО включения DCDC: пины DATA и CLK переходят под
-    // контроль SPI-драйвера (LOW в idle), и светодиоды не видят мусорный
-    // сигнал в момент подачи питания.
+    // SPI-драйвер поднимается сразу, но шину он получит только вместе с
+    // питанием лучей (applyPowerState(PWR_FULL) / transportShowWave). Гасить
+    // здесь нечего: лучи обесточены, а посылка в них оставила бы MOSI в HIGH
+    // (end-frame из 0xFF) и подпитала бы первый луч через вход DATA.
     initSK9822_DMA();
-    blankAllLEDs_DMA();
 
     // Волна от центра к ободу — подтверждение, что колесо проснулось (выход из
     // транспортного режима или сброс по питанию). Здесь, а не раньше: до
