@@ -12,6 +12,7 @@ import com.povwheel.app.convert.VideoFrames
 import java.io.FileDescriptor
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
@@ -27,10 +28,10 @@ import kotlin.math.sqrt
  *   → шейдер склейки окна → поверхность H.264-кодировщика → MediaMuxer (MP4).
  *
  * Вне отрисовки кадры исходника идут как есть, а каждая прорисовка становится одним кадром —
- * склейкой набора кадров, подобранного анализатором по фазе ротора (см. PovSync.phaseSet):
- * каждая точка берётся из ближайшего по времени кадра, который её снимал (PovGl.FS_BLEND).
- * Кадр стоит на экране до следующего: частота кадров результата переменная. Метки времени — настоящие, делённые на замедление, так что slow
- * motion выходит в реальном времени.
+ * склейкой (6 окон длиной в прорисовку со сдвигом 0..5/6 и дробным началом, см. [windows]),
+ * который стоит на экране до следующего: частота кадров результата переменная. Метки
+ * времени — настоящие, делённые на замедление, так что slow motion выходит в реальном
+ * времени.
  *
  * Разрешение результата — как у исходника. Кольцо держит в памяти видеокарты десятки
  * кадров, поэтому хранит их в YUV 4:2:0 (1.5 байта на пиксель вместо 4 у RGBA): кадр 4K —
@@ -46,41 +47,73 @@ internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis)
         const val RING_BUDGET = 512L shl 20   // байт на кольцо кадров в памяти видеокарты
         const val MAX_BPS = 120e6             // потолок битрейта (и не выше, чем умеет кодировщик)
         const val BLACK_LEVEL = 16            // отсечка шума, как -BlackLevel по умолчанию
+        const val SPREAD = 1.0                // разнос шести окон (CheckerSpread)
+        const val SHORT_FRAC = 0.15           // см. Windows в скрипте
     }
 
-    /**
-     * Элемент плана: [a]..[b] — его место на шкале исходника (столько он стоит на экране),
-     * [set] — кадры, которые склеиваются (у kind 0 пусто: кадры идут как есть).
-     */
-    private class Elem(val kind: Int, val a: Int, val b: Int, val set: IntArray, val ring: IntArray, val phase: FloatArray, val near: Int)
+    /** Окна одного элемента плана: 12 отрезков кадров (абсолютные номера) и веса. */
+    private class Win(val kind: Int, val a: Int, val b: Int, val lo: IntArray, val hi: IntArray, val wt: DoubleArray)
 
-    private fun elem(si: Int, a0: Int): Elem {
+    /**
+     * Окна склейки элемента плана, начинающегося с кадра [a0]. Прорисовка (kind 2) — шесть
+     * окон одной длины, сдвинутых на 0..5/6 прорисовки: у каждого стык начала и конца
+     * прорисовки (анимация, неровное число кадров) под своим углом, и среднее делает из
+     * шести чётких стыков мягкий переход. Длина окна — целое число кадров не меньше
+     * прорисовки (не короче [PovSync.MIN_WIN_FRAMES]): каждое окно закрывает весь круг, и
+     * склейки не мигают нахлёстом и щелями. Начало дробное: окно — смесь размещений с кадра k
+     * и с кадра k+1 с весами по дробной части, иначе стыки прыгали бы от склейки к склейке.
+     * Любое такое окно содержит всю картинку, с какой бы фазы ротора оно ни начиналось, —
+     * поэтому склейке не нужна фаза, только длина прорисовки.
+     */
+    private fun windows(si: Int, a0: Int): Win {
         val p = a.plan
-        val s0 = p.setStart[si]; val s1 = p.setStart[si + 1]
-        return Elem(p.kinds[si], a0, a0 + p.counts[si] - 1, p.setIdx.copyOfRange(s0, s1),
-            p.setRing.copyOfRange(s0, s1), p.setPhase.copyOfRange(s0, s1), p.near[si])
+        val n = p.counts[si]
+        val b0 = a0 + n - 1
+        val lo = IntArray(12) { a0 }
+        val hi = IntArray(12) { b0 }
+        val wt = DoubleArray(12)
+        when (p.kinds[si]) {
+            2 -> {
+                val tLen = p.segT[si]
+                val fl = floor(tLen + 1e-9).toInt()
+                var len = if (tLen - fl < SHORT_FRAC) fl else fl + 1
+                if (len < PovSync.MIN_WIN_FRAMES) len = PovSync.MIN_WIN_FRAMES
+                for (k in 0 until 6) {
+                    val c = p.segT0[si] + tLen / 2 + (k - 2.5) / 6.0 * SPREAD * tLen
+                    val s = c - len / 2.0
+                    val f0 = floor(s + 1e-9).toInt()
+                    val beta = (s - f0).coerceIn(0.0, 1.0)
+                    lo[2 * k] = f0; hi[2 * k] = f0 + len - 1; wt[2 * k] = 1 - beta
+                    lo[2 * k + 1] = f0 + 1; hi[2 * k + 1] = f0 + len; wt[2 * k + 1] = beta
+                }
+            }
+            else -> wt[0] = 1.0
+        }
+        return Win(p.kinds[si], a0, b0, lo, hi, wt)
     }
 
     /** Сколько кадров кольцо должно держать одновременно — проход по плану всухую. */
-    private fun ringCap(): Int {
+    private fun ringCap(total: Int): Int {
         var pos = 0
         var loadedMax = 0
         var cap = 2
         for (si in a.plan.kinds.indices) {
-            val e = elem(si, pos)
+            val w = windows(si, pos)
             pos += a.plan.counts[si]
-            if (e.kind == 0) {
+            if (w.kind == 0) {
                 // Кадры как есть идут по одному: на кадре i в кольце нужен лишь он сам
-                // (плюс то, что подгрузили наперёд для прошлой склейки).
-                loadedMax = max(loadedMax, e.a + 1)
-                cap = max(cap, loadedMax - e.a)
-                loadedMax = max(loadedMax, e.b + 1)
+                // (плюс то, что подгрузили наперёд для прошлого окна).
+                loadedMax = max(loadedMax, w.a + 1)
+                cap = max(cap, loadedMax - w.a)
+                loadedMax = max(loadedMax, w.b + 1)
                 continue
             }
-            var need = e.b
-            var minLo = Int.MAX_VALUE
-            for (j in e.set) { need = max(need, j); minLo = min(minLo, j) }
-            if (minLo == Int.MAX_VALUE) minLo = e.a
+            var need = w.b
+            var minLo = w.a
+            for (k in 0 until 12) if (w.wt[k] > 0) {
+                need = max(need, min(total - 1, w.hi[k]))
+                minLo = min(minLo, max(0, w.lo[k]))
+            }
             loadedMax = max(loadedMax, need + 1)
             cap = max(cap, loadedMax - minLo)
         }
@@ -89,7 +122,7 @@ internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis)
 
     fun render(fd: FileDescriptor, cancelled: () -> Boolean, progress: (done: Int, total: Int) -> Unit): Result {
         val total = a.plan.totalFrames
-        val cap = ringCap()
+        val cap = ringCap(total)
         val slow = a.slow
 
         val extractor = MediaExtractor()
@@ -221,50 +254,56 @@ internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis)
                 progress(done, total)
             }
 
-            val layers = IntArray(PovGl.MAX_LAYERS)
-            val rings = IntArray(PovGl.MAX_LAYERS)
-            val phases = FloatArray(PovGl.MAX_LAYERS)
+            val loI = IntArray(12)
+            val hiI = IntArray(12)
+            val wtF = FloatArray(12)
             val black = (BLACK_LEVEL + 0.5f) / 255f
-            val refDeg = a.plan.refDeg.toFloat()
             var pos = 0
             planLoop@ for (si in a.plan.kinds.indices) {
                 if (cancelled()) throw InterruptedException()
-                val e = elem(si, pos)
+                val w = windows(si, pos)
                 pos += a.plan.counts[si]
-                if (e.kind == 0) {
+                if (w.kind == 0) {
                     // Кадры как есть — по одному, кольцо не переполняется даже на долгой паузе.
-                    for (i in e.a..e.b) {
+                    for (i in w.a..w.b) {
                         if (!ensure(i)) break@planLoop
-                        layers[0] = i % cap
-                        g.blend(layers, 1, -1f)
+                        loI.fill(0); hiI.fill(0); wtF.fill(0f); wtF[0] = 1f
+                        g.blend(i % cap, 1, loI, hiI, wtF, -1f)
                         emit(i, 1)
                     }
                     continue
                 }
-                var need = e.b
-                for (j in e.set) need = max(need, j)
-                ensure(min(need, decPts.size - 1))
-                if (e.a >= loaded) break
-                val b = min(e.b, loaded - 1)
+                var need = w.b
+                for (k in 0 until 12) if (w.wt[k] > 0) need = max(need, w.hi[k])
+                ensure(min(need, total - 1))
+                if (w.a >= loaded) break
+                val b = min(w.b, loaded - 1)
+                // Окна — в пределах того, что есть в кольце (у краёв ролика окно короче).
                 val first = max(0, loaded - cap)
-                var n = 0
-                var nearK = 0
-                for (k in e.set.indices) {
-                    val j = e.set[k]
-                    if (j !in first until loaded || n >= layers.size) continue
-                    if (j == e.near) nearK = n
-                    layers[n] = j % cap; rings[n] = e.ring[k]; phases[n] = e.phase[k]; n++
+                var jMin = Int.MAX_VALUE
+                var jMax = Int.MIN_VALUE
+                val lo = IntArray(12)
+                val hi = IntArray(12)
+                for (k in 0 until 12) {
+                    lo[k] = max(first, w.lo[k])
+                    hi[k] = min(loaded - 1, w.hi[k])
+                    if (hi[k] < lo[k]) { lo[k] = w.a; hi[k] = b }
+                    if (w.wt[k] > 0) { jMin = min(jMin, lo[k]); jMax = max(jMax, hi[k]) }
                 }
-                if (n == 0) { layers[0] = max(first, e.a) % cap; n = 1 }
-                // часть длинной прорисовки — максимум; прорисовка — свой кадр для каждой точки
-                if (e.kind == 2) g.blend(layers, n, if (n > 1) black else -1f, rings, phases, nearK, refDeg)
-                else g.blend(layers, n, if (n > 1) black else -1f)
+                val n = jMax - jMin + 1
+                for (k in 0 until 12) {
+                    loI[k] = lo[k] - jMin; hiI[k] = hi[k] - jMin; wtF[k] = w.wt[k].toFloat()
+                }
+                // отсечка шума — только когда кадров больше одного: одиночный кадр идёт как есть
+                g.blend(jMin % cap, n, loI, hiI, wtF, if (n > 1) black else -1f)
                 // Склейка уходит одним кадром, который стоит до метки следующего (переменная
-                // частота кадров). Последний элемент плана — ещё и кадр на своём конце, иначе
+                // частота кадров). Прежде она повторялась на каждом исходном кадре прорисовки —
+                // при 240 к/с это ~6 одинаковых кадров, и кодировщик тратил на них битрейт
+                // наравне с живыми. Последний элемент плана — ещё и кадр на своём конце, иначе
                 // ролик обрывался бы раньше на длину прорисовки.
-                emit(e.a, b - e.a + 1)
-                if (si == a.plan.kinds.size - 1 && b > e.a) emit(b, 0)
-                if (b < e.b) break
+                emit(w.a, b - w.a + 1)
+                if (si == a.plan.kinds.size - 1 && b > w.a) emit(b, 0)
+                if (b < w.b) break
             }
 
             enc.signalEndOfInputStream()

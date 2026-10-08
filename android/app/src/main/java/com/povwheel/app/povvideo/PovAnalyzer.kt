@@ -31,31 +31,20 @@ import kotlin.math.sqrt
 class TickTrack(val times: DoubleArray, val real: BooleanArray, val dir: Int = 1)
 
 /**
- * Разметка видео на кадры результата. Элемент i плана занимает [counts] кадров исходника
- * подряд (столько времени он стоит на экране) и бывает трёх видов:
+ * Разметка видео на кадры результата — та же, что была у звуковой синхронизации. Элемент i
+ * плана занимает [counts] кадров исходника подряд (столько времени он стоит на экране):
  *  - kind 0 — эти кадры идут как есть (колесо не рисует или лога на это время нет);
  *  - kind 1 — часть длинной прорисовки (нижний предел частоты кадров): склейка её кадров;
- *  - kind 2 — ровно одна прорисовка (1/6 оборота): склейка набора кадров, подобранного по
- *    фазе ротора так, чтобы их дуги выдержки закрыли все 60° (см. [PovSync.phaseSet]).
- * Набор кадров элемента i — [setIdx] с [setStart][i] до [setStart][i + 1] (номера кадров
- * исходника, по возрастанию); у kind 0 он пуст. Для каждого кадра набора — [setRing]
- * (удаление от середины прорисовки в прорисовках, 0 — своя) и [setPhase] (фаза ротора по
- * модулю 60°, градусы): по ним шейдер выбирает для каждой точки ближайший по времени кадр,
- * который её снимал. [near] — ближайший кадр элемента (для фона), [refDeg] — ширина окна
- * фаз, в котором ищутся кадры, снимавшие точку (см. PovGl.FS_BLEND).
+ *  - kind 2 — окно ровно в одну прорисовку (1/6 оборота): смешивание шести сдвинутых окон с
+ *    дробным началом ([segT0], [segT] — точное начало и длина прорисовки в кадрах).
  */
 class PovPlan(
     val kinds: IntArray,
     val counts: IntArray,
-    val setStart: IntArray,
-    val setIdx: IntArray,
-    val setRing: IntArray,
-    val setPhase: FloatArray,
-    val near: IntArray,
-    val refDeg: Double
+    val segT0: DoubleArray,
+    val segT: DoubleArray
 ) {
     val totalFrames: Int = counts.sum()
-    fun setOf(i: Int): IntArray = setIdx.copyOfRange(setStart[i], setStart[i + 1])
 }
 
 /** Всё, что нужно рендеру, плюс строки сводки для экрана. */
@@ -115,17 +104,18 @@ internal class DecodedAudio(
  * 3. Точный сдвиг и замедление slow motion — по гашениям дисплея в кадре
  *    ([PovAlignCore.LitScorer]): у GoPro и части телефонов частоты съёмки в метаданных нет
  *    вовсе, а у Samsung подсказка есть, но прежде проигрывала гипотезе «×1» по покрытию
- *    логом. Двойников (слайдшоу повторяет файлы по кругу) и ролики без гашений решает
+ *    логом. Сдвиг ищется и далеко от метаданных ([PovSync.FAR_US]): часы GoPro уходили на
+ *    18–22 с. Двойников (слайдшоу повторяет файлы по кругу) и ролики без гашений решает
  *    пульсация общей яркости ([PovAlignCore.Coherence]). Без гашений и без изменения
  *    скорости остаётся привязка по метаданным — сдвиг тогда склейке и не важен.
  * 4. Тики — через весь прогон вращения: короткое гашение слайдшоу (загрузка файла) склейку
  *    не рвёт, прорисовки идут дальше, просто тёмные. Прежде на эти доли секунды шли
  *    исходные кадры с полной частотой, и смена картинок выбивалась из ролика.
- * 5. Склейка прорисовки — набор кадров по фазе ротора ([PovSync.phaseSet]): каждый кадр ловит лишь
- *    дугу выдержки (у GoPro — 10–15° из 60°), и кадров одной прорисовки на круг часто не
- *    хватает. Ближайшие по времени кадры берутся, пока их дуги не закроют круг, — из
- *    соседних прорисовок, если надо. Прежде шесть сдвинутых окон усреднялись: щели между
- *    клиньями становились полупрозрачными радиальными полосами, разными от кадра к кадру.
+ * 5. Склейка — как была у звуковой синхронизации: каждая прорисовка — окно ровно в одну
+ *    прорисовку (шесть сдвинутых окон, см. PovRenderer). Любое такое окно содержит всю
+ *    картинку, с какой бы фазы оно ни начиналось, поэтому от привязки склейке нужны лишь
+ *    замедление и скорость ротора, а не фаза. Отбор кадров по фазе ротора из соседних
+ *    прорисовок (до ±0.3 с) был убран: анимация и движение камеры размазывались в кашу.
  */
 internal object PovAnalyzer {
 
@@ -189,20 +179,23 @@ internal object PovAnalyzer {
             if (videoBps > 0) ", " + num(Math.rint(videoBps / 1e5) / 10) + " Mbit/s" else "")
         if (captureFps > 0 && hint >= 2) rep.add(fmt("  metadata: captured at %s fps — slow motion ×%d?", num2(captureFps), hint))
 
+        // Кандидат — пара «время из метаданных, сессия», если лог покрывает ролик хотя бы
+        // где-то в пределах дальнего поиска: часы камеры бывают неточны на десятки секунд.
+        // cover — покрытие у самих метаданных (по нему выбирается запасной вариант).
         val cands = ArrayList<PovSync.Cand>()
         val srcCache = HashMap<Long, PovSync.Src?>()
         for (slow in slows) {
             val durReal = durationSec * 1e6 / slow
             val anchors = anchorsOf(name, dateStr, ms, durReal)
             if (anchors.isEmpty()) continue
-            val lo = anchors.minOf { it.wallUs } - 60e6
-            val hi = anchors.maxOf { it.wallUs } + durReal + 60e6
+            val lo = anchors.minOf { it.wallUs } - PovSync.FAR_US - 60e6
+            val hi = anchors.maxOf { it.wallUs } + durReal + PovSync.FAR_US + 60e6
             for (s in HallArchive.sessionsAround(lo, hi, 0.0)) {
                 val src = srcCache.getOrPut(s.bootId) { PovSync.srcOf(s) } ?: continue
                 for (a in anchors) {
+                    if (src.covered(a.wallUs - PovSync.FAR_US, a.wallUs + durReal + PovSync.FAR_US) <= 0.5e6) continue
                     val pad = 3 * a.sigmaUs
-                    val cov = src.covered(a.wallUs - pad, a.wallUs + durReal + pad)
-                    if (cov > 0.5e6) cands.add(PovSync.Cand(a, slow, src, cov))
+                    cands.add(PovSync.Cand(a, slow, src, src.covered(a.wallUs - pad, a.wallUs + durReal + pad)))
                 }
             }
         }
@@ -242,7 +235,7 @@ internal object PovAnalyzer {
         step("Matching the video with the log…")
         val al = PovSync.align(stats, fileFps, cands, prefSlow, best0, cancelled)
         step("Planning…")
-        val pl = PovSync.plan(stats, pts, fileFps, durationSec, al)
+        val pl = PovSync.plan(pts, fileFps, durationSec, al)
         val cand = al.cand
         val src = al.src
         val slow = al.slow
@@ -264,16 +257,17 @@ internal object PovAnalyzer {
         }
         val d = (al.anchor - cand.a.wallUs) / 1e3
         when (al.how) {
-            1 -> rep.add(fmt("Matched by %d display switches (slideshow, start/stop): %+.0f ms from the metadata time, ±%s ms",
-                al.events, d, num2(al.sigma / 1e3)))
+            1 -> rep.add(if (abs(d) < 2000)
+                fmt("Matched by %d display switches (slideshow, start/stop): %+.0f ms from the metadata time, ±%s ms",
+                    al.events, d, num2(al.sigma / 1e3))
+            else fmt("Matched by %d display switches (slideshow, start/stop): %+.1f s from the metadata time — the camera's clock is off; ±%s ms",
+                    al.events, d / 1e3, num2(al.sigma / 1e3)))
             2 -> rep.add(fmt("Matched by one display switch: %+.0f ms from the metadata time, ±%s ms", d, num2(al.sigma / 1e3)))
             3 -> rep.add(fmt("Matched by the brightness pulsing with the rotor: %+.0f ms from the metadata time", d))
             else -> rep.add("Video match: no display switch in the video and the speed hardly changed — the metadata time is used. " +
                 "With a steady speed the exact offset does not affect the stitching." +
                 if (hint < 2) " If this is slow motion, its factor could not be found: film a moment when the display switches (a slideshow does it every few seconds)." else "")
         }
-        if (pl.expUs > 0) rep.add(fmt("Camera exposure ≈ 1/%d s: one frame catches ~%d° of the 60° each arm draws",
-            (1e6 / pl.expUs).roundToInt(), (pl.expUs * pl.wMed).roundToInt()))
         pl.tracks.forEachIndexed { i, t ->
             val ts = t.times
             var rMin = Double.MAX_VALUE; var rMax = 0.0
@@ -289,17 +283,11 @@ internal object PovAnalyzer {
             rep.add("  frames kept as recorded (no log or display dark): " + pl.natives.joinToString(", ") { num3(it[0]) + "–" + num3(it[1]) + " s" })
         rep.add(fmt("Blended frames (sweeps): %d", pl.sweeps) +
             if (pl.fpsSplit > 0) fmt(" — %d intervals longer than 1/%s s were split to keep ≥ %s fps", pl.fpsSplit, num(PovSync.MIN_FPS), num(PovSync.MIN_FPS)) else "")
-        if (pl.setSizes.isNotEmpty()) {
-            val sz = pl.setSizes.sorted(); val sp = pl.setSpansUs.sorted()
-            rep.add(fmt("  each sweep is stitched from %d frames picked by rotor phase (median), spanning %d ms",
-                sz[sz.size / 2], (sp[sp.size / 2] / 1e3).roundToInt()))
-            if (pl.openSweeps > pl.setSizes.size / 5) {
-                val fps = PovSync.median(pl.tracks.flatMap { t -> (1 until t.times.size).map { (t.times[it] - t.times[it - 1]) * fileFps } }) ?: 0.0
-                rep.add(fmt("  %d%% of sweeps stay partly open: the camera frame rate is nearly locked to the wheel (%s frames per 1/6 turn), " +
-                    "so some angles were never filmed and show as thin dark gaps. Another frame rate or a slower shutter fixes it.",
-                    (pl.openSweeps * 100.0 / pl.setSizes.size).roundToInt(), num2(fps)))
-            }
-        }
+        // Медленная съёмка: прорисовка короче MIN_WIN_FRAMES кадров — окно склейки шире её.
+        if (pl.framesPerSweep > 0 && pl.framesPerSweep < PovSync.MIN_WIN_FRAMES)
+            rep.add(fmt("  a sweep is only ~%s frames: blend windows widened to %d frames (~%s sweeps) to close the gaps the camera's shutter leaves. Film at 120–240 fps for crisp results.",
+                num(Math.rint(pl.framesPerSweep * 10) / 10), PovSync.MIN_WIN_FRAMES,
+                num(Math.rint(PovSync.MIN_WIN_FRAMES / pl.framesPerSweep * 10) / 10)))
         if (pl.tracks.isNotEmpty())
             rep.add(fmt("Result: %s s at %s fps%s", num2(durationSec / slow), num2(fileFps * slow), if (slow > 1) " (real time)" else ""))
 

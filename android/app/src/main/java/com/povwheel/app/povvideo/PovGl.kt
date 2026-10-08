@@ -68,15 +68,14 @@ internal class PovGl {
     private val uStUV: Int
     private val aPosPresent: Int
     private val aPosBlend: Int
+    private val uCap: Int
+    private val uJ0: Int
     private val uN: Int
     private val uLut: Int
     private val uBlack: Int
-    private val uIdx: Int
-    private val uRing: Int
-    private val uPhase: Int
-    private val uNear: Int
-    private val uOwn: Int
-    private val uRef: Int
+    private val uLo: Int
+    private val uHi: Int
+    private val uW: Int
 
     // ---- текстуры ----
     var w = 0; private set
@@ -118,15 +117,14 @@ internal class PovGl {
         aPosPresent = GLES20.glGetAttribLocation(progPresent, "aPos")
         progBlend = build(VS_300, FS_BLEND)
         aPosBlend = GLES20.glGetAttribLocation(progBlend, "aPos")
+        uCap = GLES20.glGetUniformLocation(progBlend, "uCap")
+        uJ0 = GLES20.glGetUniformLocation(progBlend, "uJ0")
         uN = GLES20.glGetUniformLocation(progBlend, "uN")
         uLut = GLES20.glGetUniformLocation(progBlend, "uLut")
         uBlack = GLES20.glGetUniformLocation(progBlend, "uBlack")
-        uIdx = GLES20.glGetUniformLocation(progBlend, "uIdx")
-        uRing = GLES20.glGetUniformLocation(progBlend, "uRing")
-        uPhase = GLES20.glGetUniformLocation(progBlend, "uPhase")
-        uNear = GLES20.glGetUniformLocation(progBlend, "uNear")
-        uOwn = GLES20.glGetUniformLocation(progBlend, "uOwn")
-        uRef = GLES20.glGetUniformLocation(progBlend, "uRef")
+        uLo = GLES20.glGetUniformLocation(progBlend, "uLo")
+        uHi = GLES20.glGetUniformLocation(progBlend, "uHi")
+        uW = GLES20.glGetUniformLocation(progBlend, "uW")
         GLES20.glUseProgram(progBlend)
         GLES20.glUniform1i(GLES20.glGetUniformLocation(progBlend, "uY"), 0)
         GLES20.glUniform1i(GLES20.glGetUniformLocation(progBlend, "uUV"), 1)
@@ -245,15 +243,13 @@ internal class PovGl {
     }
 
     /**
-     * Склейка набора кадров в текстуру результата: слои кольца [layers] (уже по модулю cap),
-     * [n] штук, не больше [MAX_LAYERS]. [black] — порог отсечки шума (0..1) или < 0 — без
-     * отсечки. [rings] == null — поканальный максимум (lighten) всех кадров; иначе для каждой
-     * точки — ближайший по времени кадр, который её снимал (см. FS_BLEND): [rings] — удаление
-     * кадра от середины прорисовки, [phases] — фаза ротора по модулю 60°, [near] — номер
-     * ближайшего кадра в наборе (фон), [refDeg] — окно фаз.
+     * Склейка окна в текстуру результата. Кадры окна — слои кольца подряд, начиная с
+     * [j0] (уже по модулю cap), [n] штук; окна k = 0..11 — отрезки [lo[k], hi[k]]
+     * (относительно первого кадра) с весами [wt]: у каждого окна поканальный максимум
+     * (lighten) его кадров, результат — среднее окон с весами. [black] — порог отсечки
+     * шума (0..1) или < 0 — без отсечки.
      */
-    fun blend(layers: IntArray, n: Int, black: Float,
-              rings: IntArray? = null, phases: FloatArray? = null, near: Int = 0, refDeg: Float = 6f) {
+    fun blend(j0: Int, n: Int, lo: IntArray, hi: IntArray, wt: FloatArray, black: Float) {
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbo[0])
         GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, resTex, 0)
         GLES20.glViewport(0, 0, w, h)
@@ -263,17 +259,14 @@ internal class PovGl {
         GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
         GLES20.glBindTexture(GLES30.GL_TEXTURE_2D_ARRAY, ringUV)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-        GLES20.glUniform1i(uN, n.coerceIn(1, MAX_LAYERS))
+        GLES20.glUniform1i(uCap, cap)
+        GLES20.glUniform1i(uJ0, j0)
+        GLES20.glUniform1i(uN, n)
         GLES20.glUniform1i(uLut, if (black >= 0) 1 else 0)
         GLES20.glUniform1f(uBlack, if (black >= 0) black else 0f)
-        GLES20.glUniform1iv(uIdx, MAX_LAYERS, layers, 0)
-        GLES20.glUniform1i(uOwn, if (rings != null && phases != null && n > 1) 1 else 0)
-        if (rings != null && phases != null) {
-            GLES20.glUniform1iv(uRing, MAX_LAYERS, rings, 0)
-            GLES20.glUniform1fv(uPhase, MAX_LAYERS, phases, 0)
-        }
-        GLES20.glUniform1i(uNear, near.coerceIn(0, max(0, n - 1)))
-        GLES20.glUniform1f(uRef, refDeg)
+        GLES20.glUniform1iv(uLo, 12, lo, 0)
+        GLES20.glUniform1iv(uHi, 12, hi, 0)
+        GLES20.glUniform1fv(uW, 12, wt, 0)
         drawQuad(aPosBlend)
     }
 
@@ -420,11 +413,9 @@ internal class PovGl {
         if (e != GLES20.GL_NO_ERROR) throw RuntimeException("GL error 0x" + Integer.toHexString(e) + " at " + where)
     }
 
-    companion object {
-        /** Кадров в одной склейке (= размер массива слоёв в шейдере). */
-        const val MAX_LAYERS = PovSync.MAX_SET
-        private const val EGL_RECORDABLE_ANDROID = 0x3142
-        private const val EGL_OPENGL_ES3_BIT = 0x40
+    private companion object {
+        const val EGL_RECORDABLE_ANDROID = 0x3142
+        const val EGL_OPENGL_ES3_BIT = 0x40
 
         // Шейдеры без ведущих пробелов: часть драйверов капризничает к отступу перед #.
         private const val VS_EXT =
@@ -505,20 +496,10 @@ internal class PovGl {
             "  gl_Position = vec4(aPos, 0.0, 1.0);\n" +
             "}\n"
 
-        // Склейка набора кадров. uOwn = 0 — поканальный максимум слоёв (кадры как есть, часть
-        // длинной прорисовки). uOwn = 1 — для каждой точки свой кадр, без геометрии колеса:
-        //  1. Яркость точки во всех кадрах набора: максимум M, минимум m, самый яркий кадр.
-        //  2. Кадры, где точка светится (не тусклее 0.6 размаха) и чья фаза ротора не дальше
-        //     uRef° от фазы самого яркого, — точно её снимали: их фазы задают интервал фаз,
-        //     в котором луч проходит через эту точку. Смена картинки его не сдвигает (свет в
-        //     любой момент — доказательство, что луч там был), дрожь камеры — ограничивает uRef.
-        //  3. Из кадров с фазой в этом интервале (светлых или тёмных — тёмный тоже честный
-        //     снимок картинки) — ближайшее по времени кольцо, внутри него максимум.
-        // Прежде максимум брался по всему набору — до 0.2 с: движущаяся анимация (вращающаяся
-        // спираль) накладывалась сама на себя в кашу, тёмные детали заливались светом соседних
-        // моментов. Точки фона (малый размах или светятся почти во всех кадрах) — из
-        // ближайшего кадра uNear, без максимума: так не копятся шум и сдвиг камеры.
-        // Отсечка шума — до всего: всё, что не выше порога, считается чёрным.
+        // Склейка — то же, что PovRender.Run в скрипте: у каждого из 12 окон поканальный
+        // максимум (lighten) его кадров, результат — среднее окон с весами. Отсечка шума — до
+        // склейки: всё, что не выше порога, считается чёрным, и шуму матрицы нечего копить.
+        // Каждый кадр читается один раз и раздаётся всем окнам, куда попадает.
         private const val FS_BLEND =
             "#version 300 es\n" +
             "precision highp float;\n" +
@@ -526,65 +507,38 @@ internal class PovGl {
             "precision highp sampler2DArray;\n" +
             "uniform sampler2DArray uY;\n" +
             "uniform sampler2DArray uUV;\n" +
+            "uniform int uCap;\n" +
+            "uniform int uJ0;\n" +
             "uniform int uN;\n" +
             "uniform int uLut;\n" +
             "uniform float uBlack;\n" +
-            "uniform int uIdx[32];\n" +
-            "uniform int uOwn;\n" +
-            "uniform int uRing[32];\n" +
-            "uniform float uPhase[32];\n" +
-            "uniform int uNear;\n" +
-            "uniform float uRef;\n" +
+            "uniform int uLo[12];\n" +
+            "uniform int uHi[12];\n" +
+            "uniform float uW[12];\n" +
             "in vec2 vUV;\n" +
             "out vec4 oColor;\n" +
-            "vec3 rgbOf(float yy, float layer) {\n" +
-            "  vec2 cc = texture(uUV, vec3(vUV, layer)).rg - 0.5;\n" +
-            "  return clamp(vec3(yy + 1.5748 * cc.y, yy - 0.1873 * cc.x - 0.4681 * cc.y, yy + 1.8556 * cc.x), 0.0, 1.0);\n" +
-            "}\n" +
-            "vec3 cut(vec3 c) { return uLut == 1 ? c * vec3(greaterThan(c, vec3(uBlack))) : c; }\n" +
-            "float wrap30(float d) { return d - 60.0 * floor((d + 30.0) / 60.0); }\n" +
             "void main() {\n" +
-            "  if (uOwn == 0) {\n" +
-            "    vec3 acc = vec3(0.0);\n" +
-            "    for (int i = 0; i < 32; i++) {\n" +
-            "      if (i >= uN) break;\n" +
-            "      float layer = float(uIdx[i]);\n" +
-            "      acc = max(acc, cut(rgbOf(texture(uY, vec3(vUV, layer)).r, layer)));\n" +
+            "  vec3 acc[12];\n" +
+            "  for (int k = 0; k < 12; k++) acc[k] = vec3(0.0);\n" +
+            "  for (int i = 0; i < uN; i++) {\n" +
+            "    int layer = (uJ0 + i) % uCap;\n" +
+            "    float yy = texture(uY, vec3(vUV, float(layer))).r;\n" +
+            "    vec2 cc = texture(uUV, vec3(vUV, float(layer))).rg - 0.5;\n" +
+            "    vec3 c = clamp(vec3(yy + 1.5748 * cc.y, yy - 0.1873 * cc.x - 0.4681 * cc.y, yy + 1.8556 * cc.x), 0.0, 1.0);\n" +
+            "    if (uLut == 1) c *= vec3(greaterThan(c, vec3(uBlack)));\n" +
+            "    for (int k = 0; k < 12; k++) {\n" +
+            "      if (uW[k] <= 0.0 || i < uLo[k] || i > uHi[k]) continue;\n" +
+            "      acc[k] = max(acc[k], c);\n" +
             "    }\n" +
-            "    oColor = vec4(acc, 1.0);\n" +
-            "    return;\n" +
             "  }\n" +
-            "  float y[32];\n" +
-            "  float mx = -1.0; float mn = 2.0; int ref = 0;\n" +
-            "  for (int i = 0; i < 32; i++) {\n" +
-            "    if (i >= uN) break;\n" +
-            "    float v = texture(uY, vec3(vUV, float(uIdx[i]))).r;\n" +
-            "    y[i] = v;\n" +
-            "    if (v > mx) { mx = v; ref = i; }\n" +
-            "    mn = min(mn, v);\n" +
+            "  vec3 res = vec3(0.0);\n" +
+            "  float ws = 0.0;\n" +
+            "  for (int k = 0; k < 12; k++) {\n" +
+            "    if (uW[k] <= 0.0) continue;\n" +
+            "    res += uW[k] * acc[k];\n" +
+            "    ws += uW[k];\n" +
             "  }\n" +
-            "  float span = max(mx - mn, 1e-4);\n" +
-            "  float cref = uPhase[ref];\n" +
-            "  float lo = 99.0; float hi = -99.0; int lit = 0;\n" +
-            "  for (int i = 0; i < 32; i++) {\n" +
-            "    if (i >= uN) break;\n" +
-            "    if ((y[i] - mn) / span < 0.6) continue;\n" +
-            "    lit++;\n" +
-            "    float d = wrap30(uPhase[i] - cref);\n" +
-            "    if (abs(d) <= uRef) { lo = min(lo, d); hi = max(hi, d); }\n" +
-            "  }\n" +
-            "  int rmin = 100000; vec3 acc = vec3(0.0);\n" +
-            "  for (int i = 0; i < 32; i++) {\n" +
-            "    if (i >= uN) break;\n" +
-            "    float d = wrap30(uPhase[i] - cref);\n" +
-            "    if (d < lo - 0.3 || d > hi + 0.3 || uRing[i] > rmin) continue;\n" +
-            "    vec3 c = cut(rgbOf(y[i], float(uIdx[i])));\n" +
-            "    if (uRing[i] < rmin) { rmin = uRing[i]; acc = c; } else acc = max(acc, c);\n" +
-            "  }\n" +
-            "  vec3 bg = rgbOf(y[uNear], float(uIdx[uNear]));\n" +
-            "  float disc = smoothstep(20.0 / 255.0, 40.0 / 255.0, mx - mn) *\n" +
-            "      (1.0 - smoothstep(0.6, 0.85, float(lit) / float(uN)));\n" +
-            "  oColor = vec4(mix(bg, acc, disc), 1.0);\n" +
+            "  oColor = vec4(res / max(ws, 1e-6), 1.0);\n" +
             "}\n"
     }
 }

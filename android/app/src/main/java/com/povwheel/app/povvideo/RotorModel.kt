@@ -61,17 +61,6 @@ class RotorModel private constructor(
         }
     }
 
-    /** Скорость в момент [x], градусы/мкс (линейно между точками). */
-    fun wAt(x: Double): Double {
-        if (x <= t[0]) return w[0]
-        if (x >= t[t.size - 1]) return w[w.size - 1]
-        var lo = 0
-        var hi = t.size - 1
-        while (hi - lo > 1) { val m = (lo + hi) ushr 1; if (t[m] <= x) lo = m else hi = m }
-        val f = (x - t[lo]) / (t[lo + 1] - t[lo])
-        return w[lo] + (w[lo + 1] - w[lo]) * f
-    }
-
     private fun herm(i: Int, x: Double): Double {
         val h = t[i + 1] - t[i]
         if (h <= 0) return phi[i]

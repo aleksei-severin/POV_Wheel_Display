@@ -3,18 +3,23 @@ package com.povwheel.app.povvideo
 import com.povwheel.app.hall.HallArchive
 import kotlin.math.abs
 import kotlin.math.ceil
-import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Чистая часть анализа ролика — без Android: привязка к логу Холла, оценка выдержки,
- * разметка склейки. Отдельно от [PovAnalyzer] (метаданные, декодер, сводка), чтобы её
- * можно было прогнать на настоящих роликах на компьютере.
+ * Чистая часть анализа ролика — без Android: привязка к логу Холла и разметка склейки.
+ * Отдельно от [PovAnalyzer] (метаданные, декодер, сводка), чтобы её можно было прогнать
+ * на настоящих роликах на компьютере.
  */
 internal object PovSync {
 
     const val MIN_FPS = 10.0
+    /**
+     * Окно склейки не короче стольких кадров (-MinWindowFrames скрипта): на съёмке 60 к/с с
+     * выдержкой короче 1/fps прорисовка в ~2 кадра оставляет провалы между клиньями, а
+     * соседние прорисовки закрывают их кадрами с другой фазой выдержки.
+     */
+    const val MIN_WIN_FRAMES = 4
     /** Замедления, которые проверяются всегда (кроме подсказки метаданных). */
     val SLOWS = doubleArrayOf(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 16.0)
     /** Оценка по гашениям, ниже которой совпадение не считается. */
@@ -22,18 +27,24 @@ internal object PovSync {
     /** Гашение длиннее этого (мкс) — колесо стояло или не набрало обороты: склейку рвём. */
     private const val DARK_SPLIT_US = 1_000_000.0
     /**
-     * Доля оценки выдержки, с которой подбирается набор кадров. Оценка по свету завышена
-     * (размытие, ореол, насыщение): на полном разрешении освещённая дуга точки — около трети
-     * её. Недооценка стоит лишних кадров, но шейдер берёт для точки ближайший по времени
-     * снимавший её кадр, так что лишние дальние кадры не мутят картинку; переоценка — щели.
+     * Дальний поиск сдвига: ±столько (мкс) вокруг каждого кандидата метаданных. Часы камеры,
+     * которую не подводит сеть, уходят на десятки секунд (у GoPro в тестах — на 18–22 с), и
+     * поиск только ±2…5 с вокруг метаданных находил там двойника или чужое замедление:
+     * ×2 вместо ×8, ×6 и ×1 вместо ×4.
      */
-    private const val ARC_SAFETY = 0.35
-    /** Не больше стольких кадров в одной склейке (= размер массива слоёв в шейдере склейки). */
-    const val MAX_SET = 32
-    /** Дальше этого (мкс реального времени) от середины прорисовки кадры не берём. */
-    private const val SET_RADIUS_US = 300_000.0
-    /** Ячеек круга 60° в модели покрытия (по 0.25°). */
-    private const val NB = 240
+    const val FAR_US = 120e6
+    /**
+     * Дальняя гипотеза заменяет ближнюю, только если её оценка выше во столько раз. Двойник
+     * через цикл слайдшоу (тот же рисунок гашений) набирал до 1.12 от верной ближней, а
+     * верная дальняя при уехавших часах — от 1.48 до 2.2 от лучшей ближней.
+     */
+    private const val FAR_GAIN = 1.3
+    /** Дальняя гипотеза должна быть убедительна и сама: не меньше стольких очков и 3 гашений. */
+    private const val FAR_MIN = 40.0
+    /** Шаг грубого перебора сдвига, мкс; точный — 2 мс вокруг лучших. */
+    private const val STEP_US = 20e3
+    /** Сколько лучших пиков дальнего перебора уточнять на каждую сессию и замедление. */
+    private const val FAR_PEAKS = 3
 
     /** Кандидат начала записи: часы телефона (мкс UTC) первого кадра в реальном времени. */
     class Anchor(val wallUs: Double, val sigmaUs: Double, val what: String)
@@ -44,14 +55,6 @@ internal object PovSync {
         /** Гашения [darkA[i], darkB[i]] — от «погасла» до следующей «зажглась». */
         val darkA: DoubleArray, val darkB: DoubleArray
     ) {
-        /** 1 — лента светилась, 0 — нет, NaN — неизвестно (до первой отметки в архиве). */
-        fun litAt(t: Double): Double {
-            if (litT.isEmpty()) return Double.NaN
-            var lo = -1
-            var hi = litT.size
-            while (hi - lo > 1) { val m = (lo + hi) ushr 1; if (litT[m] <= t) lo = m else hi = m }
-            return if (lo < 0) (if (litOn[0]) 0.0 else 1.0) else (if (litOn[lo]) 1.0 else 0.0)
-        }
         /** Сколько мкс отрезка [a, b] покрыто прогонами. */
         fun covered(a: Double, b: Double): Double =
             runs.sumOf { max(0.0, min(b, it.t1) - max(a, it.t0)) }
@@ -67,23 +70,6 @@ internal object PovSync {
                 r.phiAtSorted(tq, tmp)
                 for (j in tq.indices) if (!tmp[j].isNaN()) out[j] = tmp[j]
             }
-        }
-        /**
-         * Номер светлого промежутка, в котором момент [t]: −1 — лента не горела. Кадры для
-         * склейки прорисовки берутся только из её собственного промежутка — иначе в одну
-         * склейку попали бы картинка до смены файла и после неё.
-         */
-        fun litSeg(t: Double): Int {
-            if (litT.isEmpty()) return Int.MAX_VALUE
-            var lo = -1
-            var hi = litT.size
-            while (hi - lo > 1) { val m = (lo + hi) ushr 1; if (litT[m] <= t) lo = m else hi = m }
-            return if (lo < 0) (if (litOn[0]) -1 else Int.MAX_VALUE) else (if (litOn[lo]) lo else -1)
-        }
-        /** Скорость, градусы/мкс; NaN вне прогонов. */
-        fun wAt(t: Double): Double {
-            for (r in runs) if (t >= r.t0 && t <= r.t1) return r.wAt(t)
-            return Double.NaN
         }
     }
 
@@ -126,11 +112,13 @@ internal object PovSync {
     }
 
     /**
-     * Сдвиг и замедление по кадрам [st]. Сначала гашения дисплея ([PovAlignCore.LitScorer])
-     * в окне вокруг каждого кандидата метаданных, для каждого замедления; близкие по оценке
-     * гипотезы (двойник через цикл слайдшоу, соседнее замедление) решает пульсация общей
-     * яркости ([PovAlignCore.Coherence]). Без гашений — она же, если скорость менялась;
-     * иначе — [fallback] по метаданным.
+     * Сдвиг и замедление по кадрам [st]. Гашения дисплея ([PovAlignCore.LitScorer])
+     * перебираются для каждой сессии и замедления дважды: близко (±2…5 с вокруг каждого
+     * кандидата метаданных) и далеко (±[FAR_US]) — на случай, когда у камеры уехали часы.
+     * Дальняя гипотеза побеждает, только если она заметно сильнее ближней ([FAR_GAIN]):
+     * иначе выигрывал бы двойник через цикл слайдшоу. Близкие по оценке гипотезы (двойник,
+     * соседнее замедление) решает пульсация общей яркости ([PovAlignCore.Coherence]). Без
+     * гашений — она же, если скорость менялась; иначе — [fallback] по метаданным.
      */
     fun align(
         st: PovAlignCore.Stats, fileFps: Double, cands: List<Cand>, prefSlow: Double, fallback: Cand,
@@ -147,34 +135,79 @@ internal object PovSync {
             return co.value(phi)
         }
 
-        val hyps = ArrayList<Hyp>()
-        if (lit != null) {
-            val tested = HashSet<String>()
-            for (c in cands) {
-                if (c.src.darkA.isEmpty()) continue
-                val half = searchHalf(c.a.sigmaUs)
-                val key = c.src.s.bootId.toString() + "/" + c.slow + "/" + Math.round(c.a.wallUs / 0.5e6)
-                if (!tested.add(key)) continue
+        val near = ArrayList<Hyp>()
+        val far = ArrayList<Hyp>()
+        if (lit != null && sn >= 2) {
+            val spanFirst = st.ptsUs[0].toDouble()
+            val spanLast = st.ptsUs[sn - 1].toDouble()
+            for ((key, cs) in cands.filter { it.src.darkA.isNotEmpty() }.groupBy { Pair(it.src, it.slow) }) {
                 if (cancelled()) throw InterruptedException()
-                var bestAt = c.a.wallUs; var bestS = Double.NEGATIVE_INFINITY; var bestEv = 0
-                var x = c.a.wallUs - half
-                while (x <= c.a.wallUs + half) {
-                    val s = lit.score(c.src.darkA, c.src.darkB, c.slow, x)
-                    if (s.value > bestS) { bestS = s.value; bestAt = x; bestEv = s.events }
-                    x += 20e3
+                val (src, slow) = key
+                // Где вообще может что-то совпасть: ролик задевает хотя бы одно гашение.
+                val lim0 = src.darkA[0] - spanLast / slow - 1e6
+                val lim1 = src.darkB[src.darkB.size - 1] - spanFirst / slow + 1e6
+                val ivs = cs.map { doubleArrayOf(max(lim0, it.a.wallUs - FAR_US), min(lim1, it.a.wallUs + FAR_US)) }
+                    .filter { it[1] > it[0] }.sortedBy { it[0] }
+                val merged = ArrayList<DoubleArray>()
+                for (iv in ivs) {
+                    val last = merged.lastOrNull()
+                    if (last != null && iv[0] <= last[1]) last[1] = max(last[1], iv[1]) else merged.add(iv.copyOf())
                 }
-                if (bestEv == 0) continue
-                // тонко: ±30 мс по 2 мс
-                val x0 = bestAt
-                for (k in -15..15) {
-                    val xx = x0 + k * 2e3
-                    val s = lit.score(c.src.darkA, c.src.darkB, c.slow, xx)
-                    if (s.value > bestS) { bestS = s.value; bestAt = xx; bestEv = s.events }
+                // грубый перебор: 20 мс
+                var cnt = 0
+                for (iv in merged) cnt += ((iv[1] - iv[0]) / STEP_US).toInt() + 1
+                val xs = DoubleArray(cnt); val sc = DoubleArray(cnt); val ev = IntArray(cnt)
+                var k = 0
+                for (iv in merged) {
+                    if (cancelled()) throw InterruptedException()
+                    val m = ((iv[1] - iv[0]) / STEP_US).toInt() + 1
+                    for (q in 0 until m) {
+                        val x = iv[0] + q * STEP_US
+                        val s = lit.score(src.darkA, src.darkB, slow, x)
+                        xs[k] = x; sc[k] = s.value; ev[k] = s.events; k++
+                    }
                 }
-                hyps.add(Hyp(c, bestAt, bestS, bestEv))
+                fun refine(c: Cand, x0: Double): Hyp {
+                    var bestAt = x0
+                    var best = lit.score(src.darkA, src.darkB, slow, x0)
+                    for (q in -15..15) {
+                        if (q == 0) continue
+                        val s = lit.score(src.darkA, src.darkB, slow, x0 + q * 2e3)
+                        if (s.value > best.value) { best = s; bestAt = x0 + q * 2e3 }
+                    }
+                    return Hyp(c, bestAt, best.value, best.events)
+                }
+                // ближние: лучшее в окне ±2…5 с вокруг каждого кандидата
+                for (c in cs) {
+                    val half = searchHalf(c.a.sigmaUs)
+                    var bi = -1
+                    for (i in 0 until cnt) {
+                        if (abs(xs[i] - c.a.wallUs) > half || ev[i] == 0) continue
+                        if (bi < 0 || sc[i] > sc[bi]) bi = i
+                    }
+                    if (bi >= 0) near.add(refine(c, xs[bi]))
+                }
+                // дальние: несколько лучших локальных максимумов, не ближе 0.5 с друг к другу
+                val peaks = (0 until cnt).filter { i ->
+                    ev[i] > 0 && (i == 0 || xs[i - 1] < xs[i] - 1.5 * STEP_US || sc[i] >= sc[i - 1]) &&
+                        (i == cnt - 1 || xs[i + 1] > xs[i] + 1.5 * STEP_US || sc[i] > sc[i + 1])
+                }.sortedByDescending { sc[it] }
+                val taken = ArrayList<Double>()
+                for (i in peaks) {
+                    if (taken.size >= FAR_PEAKS) break
+                    if (taken.any { abs(it - xs[i]) < 0.5e6 }) continue
+                    taken.add(xs[i])
+                    val c = cs.minBy { abs(it.a.wallUs - xs[i]) }
+                    far.add(refine(c, xs[i]))
+                }
             }
         }
 
+        val nearTop = near.maxByOrNull { it.score }
+        val farTop = far.maxByOrNull { it.score }
+        val useFar = farTop != null && farTop.events >= 3 && farTop.score >= FAR_MIN &&
+            (nearTop == null || nearTop.events < 2 || farTop.score >= FAR_GAIN * max(nearTop.score, LIT_MIN))
+        val hyps = if (useFar) far + near else near
         val top = hyps.maxByOrNull { it.score }
         if (top != null && top.events >= 2 && top.score >= LIT_MIN) {
             val kept = ArrayList<Hyp>()
@@ -196,7 +229,7 @@ internal object PovSync {
             return Alignment(pick.c, pick.at, 1e6 / (fileFps * pick.c.slow) / 2, 1, pick.events)
         }
         // Одно гашение в ролике: сдвиг по нему, замедление — подсказка метаданных или ×1.
-        hyps.filter { it.c.slow == prefSlow && it.score >= LIT_MIN }.maxByOrNull { it.score }?.let { one ->
+        near.filter { it.c.slow == prefSlow && it.score >= LIT_MIN }.maxByOrNull { it.score }?.let { one ->
             return Alignment(one.c, one.at, 1e6 / (fileFps * one.c.slow) / 2, 2, one.events)
         }
         // Гашений нет: пульсация яркости — пик есть, если скорость заметно менялась.
@@ -209,7 +242,7 @@ internal object PovSync {
                 val key = c.src.s.bootId.toString() + "/" + Math.round(c.a.wallUs / 0.5e6)
                 if (!tested.add(key)) continue
                 if (cancelled()) throw InterruptedException()
-                val xs = DoubleArray((2 * half / 20e3).toInt() + 1) { c.a.wallUs - half + it * 20e3 }
+                val xs = DoubleArray((2 * half / STEP_US).toInt() + 1) { c.a.wallUs - half + it * STEP_US }
                 val ys = DoubleArray(xs.size) { cohAt(c, xs[it]) }
                 val pk = PovAlignCore.peakOf(xs, ys)
                 if (pk.excess >= 0.8 && pk.prominence >= 1.4 && (bestPk == null || pk.excess > bestPk.excess)) {
@@ -221,44 +254,8 @@ internal object PovSync {
         return Alignment(fallback, fallback.a.wallUs, fallback.a.sigmaUs, 0, 0)
     }
 
-    /** Полуширина поиска сдвига вокруг кандидата, мкс. */
+    /** Полуширина ближнего поиска сдвига вокруг кандидата, мкс. */
     private fun searchHalf(sigmaUs: Double) = (3 * sigmaUs).coerceIn(2e6, 5e6)
-
-    // ------------------------------------------------------------------ выдержка
-
-    /**
-     * Выдержка в реальном времени, мкс: по окнам [PovAlignCore.WIN] кадров, где лента
-     * светилась, а фазы кадров закрывают круг плотно (щель не шире 6°) — тогда склейка окна
-     * и есть весь диск, и доля света кадра от неё — доля 60°, которую он ловит. 0 — не
-     * удалось оценить.
-     */
-    fun exposureOf(st: PovAlignCore.Stats, src: Src, anchor: Double, slow: Double): Double {
-        val win = PovAlignCore.WIN
-        val tq = DoubleArray(win); val ph = DoubleArray(win); val tmp = DoubleArray(win)
-        val est = ArrayList<Double>()
-        for (s in st.winStart) {
-            if (s + win > st.n) continue
-            var ok = true
-            for (k in 0 until win) {
-                tq[k] = anchor + st.ptsUs[s + k] / slow
-                if (src.litAt(tq[k]) < 0.5) { ok = false; break }
-            }
-            if (!ok) continue
-            src.phiInto(tq, ph, tmp)
-            if (ph.any { it.isNaN() }) continue
-            val m = DoubleArray(win) { ((ph[it] % 60.0) + 60.0) % 60.0 }
-            m.sort()
-            var gap = m[0] + 60.0 - m[win - 1]
-            for (k in 1 until win) gap = max(gap, m[k] - m[k - 1])
-            if (gap > 6.0) continue
-            val r = (0 until win).map { st.winRatio[s + it].toDouble() }.filter { !it.isNaN() }
-            val wm = median((0 until win).map { src.wAt(tq[it]) }.filter { !it.isNaN() }) ?: continue
-            val rm = median(r) ?: continue
-            if (rm <= 0 || wm <= 0) continue
-            est.add(60.0 * rm / wm)
-        }
-        return median(est) ?: 0.0
-    }
 
     fun median(v: List<Double>): Double? {
         if (v.isEmpty()) return null
@@ -277,22 +274,19 @@ internal object PovSync {
         val fpsSplit: Int,
         /** Отрезки (с файла), где кадры идут как есть. */
         val natives: List<DoubleArray>,
-        /** Кадров в склейке каждой прорисовки и их разброс во времени (мкс реального времени). */
-        val setSizes: IntArray,
-        val setSpansUs: DoubleArray,
-        /** Прорисовок, которые и по модели выдержки остались не закрыты (< 90 % круга). */
-        val openSweeps: Int,
-        /** Оценка выдержки (мкс реального времени, 0 — нет) и средняя скорость, °/мкс. */
-        val expUs: Double,
-        val wMed: Double
+        /** Кадров исходника на прорисовку (медиана; 0 — прорисовок нет). */
+        val framesPerSweep: Double
     )
 
     /**
-     * Тики — через весь прогон вращения: короткое гашение слайдшоу склейку не рвёт.
-     * Каждая прорисовка — набор кадров по фазе ([phaseSet]); прорисовка длиннее 1/[MIN_FPS] с
-     * делится на части из своих кадров. [pts] — метки кадров, мкс от первого.
+     * Разметка склейки — та же, что у звуковой синхронизации, только тики (каждые 60°
+     * поворота ротора) берутся из лога, а не из чирпов. Каждая прорисовка — один кадр
+     * результата: окно ровно в одну прорисовку (см. PovRenderer.windows). Тики идут через
+     * весь прогон вращения: короткое гашение слайдшоу склейку не рвёт. Прорисовка длиннее
+     * 1/[MIN_FPS] с делится на части, каждая — склейка своих кадров. [pts] — метки кадров,
+     * мкс от первого.
      */
-    fun plan(st: PovAlignCore.Stats, pts: LongArray, fileFps: Double, durationSec: Double, al: Alignment): Planned {
+    fun plan(pts: LongArray, fileFps: Double, durationSec: Double, al: Alignment): Planned {
         val src = al.src
         val slow = al.slow
         val anchor = al.anchor
@@ -313,17 +307,7 @@ internal object PovSync {
         tracks.sortBy { it.times.first() }
         syncRanges.sortBy { it[0] }
 
-        val expUs = exposureOf(st, src, anchor, slow)
-        val expModel = if (expUs > 0) expUs * ARC_SAFETY else 0.25e6 / (fileFps * slow)
-
-        val fq = DoubleArray(nF) { anchor + pts[it] / slow }
-        val phiAll = DoubleArray(nF)
-        src.phiInto(fq, phiAll, DoubleArray(nF))
-        val wAll = DoubleArray(nF) { src.wAt(fq[it]) }
-        val halfFrameReal = 0.5e6 / (fileFps * slow)
-        val halfFrameFile = 0.5e6 / fileFps
-        val segAll = IntArray(nF) { src.litSeg(fq[it] + halfFrameReal) }
-
+        // Отрисовка (интервалы между тиками) и всё остальное (кадры как есть).
         class Seg(val native: Boolean, val t0: Double, val t1: Double, val wins: Int)
         val segs = ArrayList<Seg>()
         var cursor = 0.0
@@ -337,6 +321,7 @@ internal object PovSync {
                 val dur = ts[k + 1] - ts[k]
                 val wins = max(1, ceil(dur / slow * MIN_FPS - 1e-6).toInt())
                 if (wins > 1) fpsSplit++
+                sweeps += wins
                 segs.add(Seg(false, ts[k], ts[k + 1], wins))
             }
             cursor = ts.last()
@@ -344,140 +329,35 @@ internal object PovSync {
         if (durationSec > cursor) segs.add(Seg(true, cursor, durationSec, 0))
 
         val ptsSec = DoubleArray(nF) { pts[it] / 1e6 }
-        fun frameAt(t: Double): Int = Math.rint(frameIndex(ptsSec, t)).toInt().coerceIn(0, nF)
+        fun frameIdx(t: Double): Double = frameIndex(ptsSec, t)
+        fun frameAt(t: Double): Int = Math.rint(frameIdx(t)).toInt().coerceIn(0, nF)
         val kinds = ArrayList<Int>()
         val counts = ArrayList<Int>()
-        val setStart = ArrayList<Int>().apply { add(0) }
-        val setIdx = ArrayList<Int>()
-        val setRing = ArrayList<Int>()
-        val setPhase = ArrayList<Float>()
-        val near = ArrayList<Int>()
-        val setSizes = ArrayList<Int>()
-        val setSpans = ArrayList<Double>()
-        var openSweeps = 0
+        val segT0 = ArrayList<Double>()
+        val segT = ArrayList<Double>()
         for (sg in segs) {
             if (sg.native) {
-                val nn = frameAt(sg.t1) - frameAt(sg.t0)
-                if (nn > 0) { kinds.add(0); counts.add(nn); setStart.add(setIdx.size); near.add(frameAt(sg.t0)) }
+                val n = frameAt(sg.t1) - frameAt(sg.t0)
+                if (n > 0) { kinds.add(0); counts.add(n); segT0.add(0.0); segT.add(0.0) }
                 continue
             }
             for (w in 0 until sg.wins) {
                 val ta = if (w == 0) sg.t0 else sg.t0 + (sg.t1 - sg.t0) * w / sg.wins
                 val tb = if (w == sg.wins - 1) sg.t1 else sg.t0 + (sg.t1 - sg.t0) * (w + 1) / sg.wins
-                val fa = frameAt(ta)
-                val nn = frameAt(tb) - fa
-                if (nn < 1) continue
-                if (sg.wins == 1) {
-                    val seg = src.litSeg(anchor + 0.5 * (ta + tb) * 1e6 / slow)
-                    val ps = if (seg < 0) PhaseSet(IntArray(0), 0.0)
-                             else phaseSet(pts, phiAll, wAll, segAll, seg, slow, fileFps, ta * 1e6, tb * 1e6, expModel)
-                    val set = if (ps.frames.isNotEmpty()) ps.frames else IntArray(min(nn, MAX_SET)) { fa + it }
-                    kinds.add(2); counts.add(nn)
-                    // кольцо — удаление середины кадра от середины прорисовки, в прорисовках
-                    val tc = 0.5 * (ta + tb) * 1e6
-                    val sweepUs = max(1.0, (tb - ta) * 1e6)
-                    var best = set[0]
-                    for (j in set) {
-                        val dt = abs(pts[j] + halfFrameFile - tc)
-                        setIdx.add(j)
-                        setRing.add(floor(dt / sweepUs + 0.5).toInt())
-                        setPhase.add(phase60(phiAll[j]))
-                        if (dt < abs(pts[best] + halfFrameFile - tc)) best = j
-                    }
-                    near.add(best)
-                    setSizes.add(set.size)
-                    setSpans.add((pts[set.last()] - pts[set.first()]) / slow)
-                    if (seg >= 0 && ps.coverage < 0.9) openSweeps++
-                } else {
-                    // часть длинной прорисовки — её собственные кадры (не больше MAX_SET, равномерно)
-                    kinds.add(1); counts.add(nn)
-                    val m = min(nn, MAX_SET)
-                    for (q in 0 until m) {
-                        val j = fa + (q.toLong() * nn / m).toInt()
-                        setIdx.add(j); setRing.add(0); setPhase.add(phase60(phiAll[min(j, nF - 1)]))
-                    }
-                    near.add(fa + nn / 2)
-                }
-                setStart.add(setIdx.size)
-                sweeps++
+                val n = frameAt(tb) - frameAt(ta)
+                if (n < 1) continue
+                kinds.add(if (sg.wins == 1) 2 else 1); counts.add(n)
+                val fa = frameIdx(ta)
+                segT0.add(fa); segT.add(frameIdx(tb) - fa)
             }
         }
         val natives = segs.filter { it.native && it.t1 - it.t0 > 0.05 }.map { doubleArrayOf(it.t0, it.t1) }
-        val wMed = median(wAll.filter { !it.isNaN() }) ?: 0.0
-        // Окно фаз, в котором шейдер собирает кадры, снимавшие точку: шире освещённой дуги
-        // (≈ треть оценки по свету) с запасом, но не настолько, чтобы дрожь камеры и
-        // размытие собрали кадры, которые точку не видели.
-        val refDeg = if (expUs > 0 && wMed > 0) (0.6 * expUs * wMed).coerceIn(4.0, 12.0) else 6.0
+        val per = median(tracks.flatMap { t -> (1 until t.times.size).map { (t.times[it] - t.times[it - 1]) * fileFps } }) ?: 0.0
         return Planned(
             tracks, syncRanges,
-            PovPlan(kinds.toIntArray(), counts.toIntArray(), setStart.toIntArray(), setIdx.toIntArray(),
-                setRing.toIntArray(), setPhase.toFloatArray(), near.toIntArray(), refDeg),
-            sweeps, fpsSplit, natives, setSizes.toIntArray(), setSpans.toDoubleArray(), openSweeps, expUs, wMed
+            PovPlan(kinds.toIntArray(), counts.toIntArray(), segT0.toDoubleArray(), segT.toDoubleArray()),
+            sweeps, fpsSplit, natives, per
         )
-    }
-
-    /** Фаза ротора по модулю 60°, градусы (NaN — 0: кадр вне лога в набор не попадает). */
-    private fun phase60(p: Double): Float {
-        if (p.isNaN()) return 0f
-        var x = p % 60.0
-        if (x < 0) x += 60.0
-        return x.toFloat()
-    }
-
-    /** Набор кадров одной прорисовки и доля круга, которую закрывают их дуги (по модели выдержки). */
-    class PhaseSet(val frames: IntArray, val coverage: Double)
-
-    /**
-     * Кадры для склейки прорисовки [taUs]…[tbUs] (мкс файла) — только из светлого
-     * промежутка [seg] (номера промежутков кадров — [segOf]). Кадр j ловит дугу
-     * [φ_j, φ_j + ω_j·e] по модулю 60° (e — выдержка в реальном времени). Кандидаты — по
-     * близости к середине прорисовки; кадр берётся, только если закрывает заметную часть ещё
-     * не закрытого круга, и сбор кончается, как только круг закрыт. Так прорисовка с
-     * длинной выдержкой (240 к/с) берёт свои же кадры, а GoPro с дугой в 10° — ближайшие из
-     * соседних прорисовок, чьи фазы ложатся в щели. Сдвиг выдержки относительно метки кадра
-     * и rolling shutter сдвигают все дуги одинаково — покрытие от них не зависит.
-     */
-    fun phaseSet(
-        pts: LongArray, phi: DoubleArray, w: DoubleArray, segOf: IntArray, seg: Int, slow: Double, fileFps: Double,
-        taUs: Double, tbUs: Double, expUs: Double
-    ): PhaseSet {
-        val n = pts.size
-        val tc = 0.5 * (taUs + tbUs)
-        val frameUs = 1e6 / fileFps
-        var jc = java.util.Arrays.binarySearch(pts, tc.toLong())
-        if (jc < 0) jc = -jc - 1
-        // радиус: полпрорисовки и полтора круга по модели выдержки, не дальше SET_RADIUS_US реального времени
-        var ws = 0.0; var wc = 0
-        for (j in max(0, jc - 2)..min(n - 1, jc + 2)) if (!w[j].isNaN()) { ws += w[j]; wc++ }
-        val arcMid = if (wc == 0) 10.0 else ws / wc * expUs
-        val need = 60.0 / max(arcMid, 0.5)
-        val sweepFrames = (tbUs - taUs) / frameUs
-        val maxHalf = max(1, (SET_RADIUS_US * slow / frameUs).toInt())
-        val half = min(maxHalf, ceil(max(sweepFrames / 2 + 1, 1.5 * need)).toInt())
-        val lo = max(0, jc - half - 1)
-        val hi = min(n - 1, jc + half)
-        val cand = (lo..hi).sortedBy { abs(pts[it] + frameUs / 2 - tc) }
-        val cov = BooleanArray(NB)
-        var covN = 0
-        val pick = ArrayList<Int>()
-        for (j in cand) {
-            val p = phi[j]
-            if (p.isNaN() || w[j].isNaN() || segOf[j] != seg) continue
-            val arc = w[j] * expUs
-            var pm = p % 60.0
-            if (pm < 0) pm += 60.0
-            val b0 = floor(pm / 60.0 * NB).toInt()
-            val nb = min(NB, max(1, ceil(arc / 60.0 * NB).toInt()))
-            var fresh = 0
-            for (q in 0 until nb) if (!cov[(b0 + q) % NB]) fresh++
-            if (fresh >= max(1, nb / 6)) {
-                for (q in 0 until nb) { val b = (b0 + q) % NB; if (!cov[b]) { cov[b] = true; covN++ } }
-                pick.add(j)
-            }
-            if (covN == NB || pick.size >= MAX_SET) break
-        }
-        pick.sort()
-        return PhaseSet(pick.toIntArray(), covN.toDouble() / NB)
     }
 
     /**

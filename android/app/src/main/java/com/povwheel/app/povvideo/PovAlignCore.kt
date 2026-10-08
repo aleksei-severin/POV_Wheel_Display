@@ -18,9 +18,10 @@ import kotlin.math.sin
  *    до микросекунды, а на видео он виден как провал энергии межкадровой разности (лучи
  *    перестают бегать по кадру). Рисунок провалов разной длины однозначно задаёт и сдвиг,
  *    и замедление slow motion: при неверном замедлении предсказанные гашения ложатся
- *    мимо, и каждое такое промахнувшееся гашение штрафуется. Проверено на 14 роликах
- *    (Samsung, iPhone, GoPro, Blackmagic; ×1, ×4, ×8): верная гипотеза в 1.1–3.9 раза
- *    выше лучшей неверной, сдвиг — до кадра.
+ *    мимо, и каждое такое промахнувшееся гашение штрафуется. Проверено на 21 ролике
+ *    (Samsung, iPhone, GoPro, Blackmagic; ×1, ×4, ×8): верное замедление в 1.4–3.9 раза
+ *    выше лучшего неверного, сдвиг — до кадра (как искать далеко от метаданных — см.
+ *    PovSync.align).
  *
  * 2. ПУЛЬСАЦИЯ ОБЩЕЙ ЯРКОСТИ. Кадр ловит лучи на дуге выдержки, и сумма света в кадре —
  *    функция фазы ротора по модулю 60°. При верной привязке эта зависимость согласована
@@ -28,31 +29,14 @@ import kotlin.math.sin
  *    периодом цикла — из двух таких двойников верный выбирает эта мера (проверено и на
  *    скоростях 362 против 364 об/мин). Если гашений в ролике нет вовсе, она же уточняет
  *    сдвиг — когда скорость менялась; при ровной скорости сдвиг склейке и не важен.
- *
- * 3. ВЫДЕРЖКА. Окна по [WIN] кадров: свет каждого кадра над фоном окна (поточечный
- *    минимум) против света их общей склейки. Если фазы кадров окна плотно закрывают
- *    круг, отношение — доля 60°, которую ловит один кадр. Размытие и ореол свет не
- *    добавляют, поэтому отношение от них почти не зависит (насыщение белого его чуть
- *    завышает — запас на это закладывает планировщик склейки).
  */
 object PovAlignCore {
 
-    /** Кадров в окне оценки выдержки. */
-    const val WIN = 24
-    /** Отсечка шума (уровни яркости 0..255) при подсчёте света над фоном. */
-    private const val THR = 10
-
-    /**
-     * Сводка кадров отрезка: метки (мкс файла), средняя яркость, средняя |разность| с
-     * предыдущим кадром; для окон выдержки — начало окна и доля света каждого кадра окна
-     * от их общей склейки (NaN — окно без света).
-     */
+    /** Сводка кадров отрезка: метки (мкс файла), средняя яркость, средняя |разность| с предыдущим кадром. */
     class Stats(
         val ptsUs: LongArray,
         val mean: FloatArray,
-        val diff: FloatArray,
-        val winStart: IntArray,
-        val winRatio: FloatArray
+        val diff: FloatArray
     ) {
         val n: Int get() = ptsUs.size
     }
@@ -64,65 +48,29 @@ object PovAlignCore {
         private var mean = FloatArray(4096)
         private var diff = FloatArray(4096)
         private var n = 0
-        private var prev: ByteArray? = null
-        private val win = Array(WIN) { ByteArray(np) }
-        private var inWin = 0
-        private val bg = IntArray(np)
-        private val mx = IntArray(np)
-        private val winStart = ArrayList<Int>()
-        private var ratio = FloatArray(4096)
+        private val prev = ByteArray(np)
 
         fun frame(luma: ByteArray, ptsUs: Long) {
             if (n == pts.size) {
-                pts = pts.copyOf(n * 2); mean = mean.copyOf(n * 2); diff = diff.copyOf(n * 2); ratio = ratio.copyOf(n * 2)
+                pts = pts.copyOf(n * 2); mean = mean.copyOf(n * 2); diff = diff.copyOf(n * 2)
             }
             var s = 0L
             for (i in 0 until np) s += luma[i].toInt() and 0xFF
             mean[n] = (s.toDouble() / np).toFloat()
-            val p = prev
-            if (p != null) {
+            if (n > 0) {
                 var d = 0L
-                for (i in 0 until np) d += abs((luma[i].toInt() and 0xFF) - (p[i].toInt() and 0xFF))
+                for (i in 0 until np) d += abs((luma[i].toInt() and 0xFF) - (prev[i].toInt() and 0xFF))
                 diff[n] = (d.toDouble() / np).toFloat()
             } else diff[n] = Float.NaN
             pts[n] = ptsUs
-            ratio[n] = Float.NaN
-            val slot = win[inWin]
-            System.arraycopy(luma, 0, slot, 0, np)
-            prev = slot
+            System.arraycopy(luma, 0, prev, 0, np)
             n++
-            if (++inWin == WIN) closeWindow()
         }
 
         fun finish(): Stats {
             if (n > 1 && diff[0].isNaN()) diff[0] = diff[1]
             if (n == 1) diff[0] = 0f
-            return Stats(pts.copyOf(n), mean.copyOf(n), diff.copyOf(n), winStart.toIntArray(), ratio.copyOf(n))
-        }
-
-        /** Окно набрано: фон и склейка поточечно, свет каждого кадра против света склейки. */
-        private fun closeWindow() {
-            java.util.Arrays.fill(bg, 255)
-            java.util.Arrays.fill(mx, 0)
-            for (f in win) for (i in 0 until np) {
-                val v = f[i].toInt() and 0xFF
-                if (v < bg[i]) bg[i] = v
-                if (v > mx[i]) mx[i] = v
-            }
-            var u = 0L
-            for (i in 0 until np) u += max(0, mx[i] - bg[i] - THR)
-            val first = n - WIN
-            winStart.add(first)
-            if (u > 0) for (k in 0 until WIN) {
-                val f = win[k]
-                var e = 0L
-                for (i in 0 until np) e += max(0, (f[i].toInt() and 0xFF) - bg[i] - THR)
-                ratio[first + k] = (e.toDouble() / u).toFloat()
-            }
-            // Последний кадр окна — опора разности следующего кадра: копия, слоты сейчас перезапишутся.
-            val keep = win[WIN - 1].copyOf()
-            prev = keep
-            inWin = 0
+            return Stats(pts.copyOf(n), mean.copyOf(n), diff.copyOf(n))
         }
     }
 
@@ -135,17 +83,25 @@ object PovAlignCore {
      * гашения у его краёв, в долях шума. Вклад гашения — отношение правдоподобия
      * mu·c − mu²/2: совпавшее гашение даёт много, гашение, которого на видео нет, — штраф.
      * Длинное гашение (колесо стояло) считается только у краёв, как и короткое.
+     *
+     * Одна оценка — O(гашений в ролике · log кадров): суммы по кадрам — разностью префиксных
+     * сумм, первое гашение ролика — бинарным поиском. Привязка перебирает десятки тысяч
+     * сдвигов (±2 минуты вокруг метаданных на каждое замедление), прямые циклы по кадрам и
+     * по всем гашениям сессии на телефоне заняли бы минуты.
      */
     class LitScorer(st: Stats) {
         private val n = st.n
         private val pts = DoubleArray(n) { st.ptsUs[it].toDouble() }
         private val dtf: DoubleArray
         private val y = DoubleArray(n) { ln(max(0f, st.diff[it]) + 1.0) }
+        /** ys[j] — сумма y[0 until j]. */
+        private val ys = DoubleArray(n + 1)
         private val sig: Double
 
         init {
             val avg = if (n > 1) (pts[n - 1] - pts[0]) / (n - 1) else 33_333.0
             dtf = DoubleArray(n) { if (it + 1 < n) max(1.0, pts[it + 1] - pts[it]) else avg }
+            for (j in 0 until n) ys[j + 1] = ys[j] + y[j]
             val d = DoubleArray(max(0, n - 1)) { abs(y[it + 1] - y[it]) }
             d.sort()
             sig = (if (d.isEmpty()) 0.0 else 1.4826 * d[d.size / 2] / Math.sqrt(2.0)) + 1e-6
@@ -160,42 +116,51 @@ object PovAlignCore {
             val tLast = anchor + (pts[n - 1] + dtf[n - 1]) / slow
             var tot = 0.0
             var cnt = 0
-            for (i in darkA.indices) {
+            // первое гашение, которое кончается не раньше начала ролика (+50 мс)
+            var lo = 0
+            var hi = darkB.size
+            while (lo < hi) { val m = (lo + hi) ushr 1; if (darkB[m] < tFirst + 50_000) lo = m + 1 else hi = m }
+            for (i in lo until darkA.size) {
                 val a = darkA[i]; val b = darkB[i]
-                if (b < tFirst + 50_000 || a > tLast - 50_000) continue
+                if (a > tLast - 50_000) break
                 val prevLitStart = if (i > 0) darkB[i - 1] else Double.NEGATIVE_INFINITY
                 val nextLitEnd = if (i + 1 < darkA.size) darkA[i + 1] else Double.POSITIVE_INFINITY
                 // кадры, пересекающие гашение: t1 > a и t0 < b
                 val j0 = firstEndAfter(a, slow, anchor)
                 val j1 = firstStartAtOrAfter(b, slow, anchor)
                 if (j1 <= j0) continue
+                // Считаются кадры у краёв: конец не позже a + EDGE (начало отрезка [j0, jA))
+                // или начало не раньше b − EDGE (конец [jB, j1)); у короткого гашения — все.
+                val jA = min(j1, firstEndAfter(a + EDGE_US, slow, anchor))
+                val jB = max(j0, firstStartAtOrAfter(b - EDGE_US, slow, anchor))
+                val jl = j1 - 1
                 var m = 0.0; var gmax = 0.0; var yd = 0.0
-                for (j in j0 until j1) {
+                // Доля кадра внутри гашения g: кадры между j0 и jl закрыты целиком (g = 1),
+                // неполными бывают только крайние.
+                fun edge(j: Int) {
                     val t0 = anchor + pts[j] / slow
                     val t1 = t0 + dtf[j] / slow
-                    if (!(t1 <= a + EDGE_US || t0 >= b - EDGE_US)) continue
                     val g = max(0.0, min(t1, b) - max(t0, a)) / (t1 - t0)
-                    m += g; yd += g * y[j]; if (g > gmax) gmax = g
+                    m += g - 1; yd += (g - 1) * y[j]
+                    if (g > gmax) gmax = g
                 }
+                fun take(r0: Int, r1: Int) {
+                    if (r1 <= r0) return
+                    m += (r1 - r0).toDouble(); yd += ys[r1] - ys[r0]
+                    var edges = 0
+                    if (j0 in r0 until r1) { edge(j0); edges++ }
+                    if (jl != j0 && jl in r0 until r1) { edge(jl); edges++ }
+                    if (r1 - r0 > edges) gmax = 1.0
+                }
+                if (jA >= jB) take(j0, j1) else { take(j0, jA); take(jB, j1) }
                 if (m < 0.25) continue
                 yd /= m
-                // светлые соседи: целиком в светлом промежутке у краёв гашения
-                var ls = 0.0; var lc = 0
-                val loA = max(a - EDGE_US, prevLitStart)
-                var j = firstStartAtOrAfter(loA, slow, anchor)
-                while (j < n) {
-                    val t0 = anchor + pts[j] / slow
-                    if (t0 + dtf[j] / slow > a) break
-                    ls += y[j]; lc++; j++
-                }
-                val hiB = min(b + EDGE_US, nextLitEnd)
-                j = firstStartAtOrAfter(b, slow, anchor)
-                while (j < n) {
-                    val t0 = anchor + pts[j] / slow
-                    if (t0 + dtf[j] / slow > hiB) break
-                    ls += y[j]; lc++; j++
-                }
+                // светлые соседи: кадры целиком в светлом промежутке у краёв гашения
+                val ja = firstStartAtOrAfter(max(a - EDGE_US, prevLitStart), slow, anchor)
+                val jb = firstEndAfter(min(b + EDGE_US, nextLitEnd), slow, anchor)
+                val lc = max(0, j0 - ja) + max(0, jb - j1)
                 if (lc < 2) continue
+                val ls = (if (j0 > ja) ys[j0] - ys[ja] else 0.0) + (if (jb > j1) ys[jb] - ys[j1] else 0.0)
                 val c = (ls / lc - yd) / sig
                 val mu = MU * min(1.0, gmax)
                 tot += mu * c - mu * mu / 2
