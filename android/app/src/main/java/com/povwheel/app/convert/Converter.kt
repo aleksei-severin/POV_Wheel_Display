@@ -541,12 +541,7 @@ class Converter(private val context: Context) {
         return disc
     }
 
-    /** Равномерный выбор до [max] индексов из [n]: первый и последний включены. */
-    private fun pickIndices(n: Int, max: Int): IntArray {
-        if (n <= max) return IntArray(n) { it }
-        if (max <= 1) return intArrayOf(0)
-        return IntArray(max) { ((it.toLong() * (n - 1)) / (max - 1)).toInt() }
-    }
+    private fun pickIndices(n: Int, max: Int): IntArray = PreviewClips.pickIndices(n, max)
 
     private fun gifClip(raw: ByteArray, fitMode: Int, size: Int, cap: Int): PreviewClip? {
         val gif = GifDecoder(raw)

@@ -68,6 +68,9 @@ object Proto {
     // Длинный отбор слайдшоу кусками (FEAT_ALBUM_LONG): [u16 first][u16 total]{[u8 len][имя]};
     // запускает показ следующий OP_ALBUM со счётчиком имён 0xFFFF
     const val OP_ALBUM_LIST = 0x25
+    // Любой кадр файла для анимированного превью (FEAT_PREVIEW_AT):
+    // [u16 кадр][имя] ← staged: [u16 кадров][u16 задержка мс][u8 sec][u8 rad] + RGB565
+    const val OP_PREVIEW_AT = 0x26
 
     /**
      * Предел имени — столько же, сколько держит PovHello.name вместе с
@@ -116,6 +119,7 @@ object Proto {
     const val FEAT_TEXT_RGB  = 0x0100   // блоб текста может нести слой цвета эмодзи (convert/TextMask)
     const val FEAT_SLIDE_CLOCK = 0x0200 // OP_ALBUM понимает t0: синхронный показ по абсолютным часам
     const val FEAT_ALBUM_LONG  = 0x0400 // отбор слайдшоу любой длины (OP_ALBUM_LIST)
+    const val FEAT_PREVIEW_AT  = 0x1000 // OP_PREVIEW_AT: клип превью из кадров колеса
 
     const val ST_BUSY = 3
 
@@ -148,6 +152,7 @@ data class Hello(
     val hasTextRgb  get() = features and Proto.FEAT_TEXT_RGB != 0
     val hasSlideClock get() = features and Proto.FEAT_SLIDE_CLOCK != 0
     val hasAlbumLong  get() = features and Proto.FEAT_ALBUM_LONG != 0
+    val hasPreviewAt  get() = features and Proto.FEAT_PREVIEW_AT != 0
 
     companion object {
         const val SIZE = 48

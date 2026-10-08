@@ -509,65 +509,135 @@ static void buildFileList() {
     stage_len = pos;
 }
 
-// Превью: первый кадр, прореженный до PV_SEC × PV_RAD и приведённый к RGB565.
+// Превью: кадр файла, прореженный до PV_SEC × PV_RAD и приведённый к RGB565.
 // Наружу всегда один формат — приложению незачем знать, что лежит на флеше.
 #define PV_SEC  120
 #define PV_RAD   22
 
-static bool buildPreview(const String& name) {
-    stage_len = 0;
-    String path = "/" + name;
-    File f = LittleFS.open(path, "r");
+// Кадр файла для превью, прочитанный с флеша в PSRAM.
+struct PvSrc {
+    uint8_t* buf    = nullptr;   // кадр; освобождает вызывающий
+    bool     pal    = false;     // ANI6: палитра 768 Б + индексы
+    bool     legacy = false;     // RGB888 (ANIM и старые статичные)
+    uint16_t frames = 1;         // из заголовка; у файла без заголовка — один
+    uint16_t delay  = 0;         // мс на кадр, из заголовка
+};
+
+// false — файла нет или в нём нет кадра frame.
+static bool pvRead(const String& name, uint32_t frame, PvSrc& s) {
+    File f = LittleFS.open("/" + name, "r");
     if (!f || f.size() < 8) { if (f) f.close(); return false; }
 
     uint8_t hdr[8];
     f.read(hdr, 8);
     size_t offset = 0;
-    bool   legacy = false, pal = false;
-    if (hdr[0]=='A' && hdr[1]=='N' && hdr[2]=='I' && hdr[3]=='6')      { offset = 8; pal = true; }
-    else if (hdr[0]=='A' && hdr[1]=='N' && hdr[2]=='I' && hdr[3]=='5') { offset = 8; }
-    else if (hdr[0]=='A' && hdr[1]=='N' && hdr[2]=='I' && hdr[3]=='M') { offset = 8; legacy = true; }
-    else { offset = 0; legacy = (f.size() >= FRAME_SIZE_888); }
+    bool   anim = true;
+    if      (memcmp(hdr, "ANI6", 4) == 0) { offset = 8; s.pal = true; }
+    else if (memcmp(hdr, "ANI5", 4) == 0) { offset = 8; }
+    else if (memcmp(hdr, "ANIM", 4) == 0) { offset = 8; s.legacy = true; }
+    else { anim = false; s.legacy = (f.size() >= FRAME_SIZE_888); }
+    if (anim) {
+        // Бит 15 числа кадров — флаг зеркала задней стороны (см. loadFrameFromFile).
+        s.frames = (uint16_t)((hdr[4] | (hdr[5] << 8)) & 0x7FFF);
+        s.delay  = (uint16_t)(hdr[6] | (hdr[7] << 8));
+        if (s.frames == 0) s.frames = 1;
+    }
+    if (frame >= s.frames) { f.close(); return false; }
 
-    size_t srcLen = pal ? FRAME_STRIDE_PAL : (legacy ? FRAME_SIZE_888 : FRAME_SIZE);
-    uint8_t* src = (uint8_t*)ps_malloc(srcLen);
-    if (!src) { f.close(); return false; }
-    memset(src, 0, srcLen);                 // обрезанный файл даст чёрный хвост
-    size_t avail = f.size() - offset;
-    f.seek(offset);
-    f.read(src, avail < srcLen ? avail : srcLen);
+    size_t srcLen = s.pal ? FRAME_STRIDE_PAL : (s.legacy ? FRAME_SIZE_888 : FRAME_SIZE);
+    s.buf = (uint8_t*)ps_malloc(srcLen);
+    if (!s.buf) { f.close(); return false; }
+    memset(s.buf, 0, srcLen);                 // обрезанный файл даст чёрный хвост
+    size_t at = offset + (size_t)frame * srcLen;
+    if (at < f.size()) {
+        size_t avail = f.size() - at;
+        f.seek(at);
+        f.read(s.buf, avail < srcLen ? avail : srcLen);
+    }
     f.close();
+    return true;
+}
 
+static inline void pvRgb(const PvSrc& s, int sec, int led, uint8_t* r, uint8_t* g, uint8_t* b) {
+    uint32_t i = (uint32_t)sec * LEDS_PER_SIDE + led;
+    if (s.pal) {
+        const uint8_t* e = s.buf + s.buf[PAL_BYTES + i] * 3;
+        *r = e[0]; *g = e[1]; *b = e[2];
+    } else if (s.legacy) {
+        const uint8_t* e = s.buf + i * 3;
+        *r = e[0]; *g = e[1]; *b = e[2];
+    } else {
+        uint16_t v = ((const uint16_t*)s.buf)[i];
+        *r = (v >> 8) & 0xF8; *g = (v >> 3) & 0xFC; *b = (v << 3) & 0xF8;
+    }
+}
+
+static inline uint32_t pvPut565(uint32_t pos, uint32_t r, uint32_t g, uint32_t b) {
+    uint16_t v = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+    stage[pos++] = v & 0xFF;
+    stage[pos++] = v >> 8;
+    return pos;
+}
+
+// OP_PREVIEW: первый кадр, по одной точке на клетку.
+static bool buildPreview(const String& name) {
+    stage_len = 0;
+    PvSrc s;
+    if (!pvRead(name, 0, s)) return false;
     stage[0] = PV_SEC;
     stage[1] = PV_RAD;
     uint32_t pos = 2;
-    const uint8_t* palp = src;
-    const uint8_t* idx  = src + PAL_BYTES;
-    for (int s = 0; s < PV_SEC; s++) {
-        int ss = s * (SECTORS / PV_SEC);
+    for (int sc = 0; sc < PV_SEC; sc++) {
+        int ss = sc * (SECTORS / PV_SEC);
         for (int r = 0; r < PV_RAD; r++) {
             // Растягиваем на ВЕСЬ радиус: при шаге LEDS_PER_SIDE/PV_RAD = 2
             // последняя строка попадала бы на диод 42 из 43, и миниатюра
             // выезжала бы наружу на половину диода.
             int rr = r * (LEDS_PER_SIDE - 1) / (PV_RAD - 1);
-            uint16_t v;
-            if (pal) {
-                uint8_t c = idx[ss * LEDS_PER_SIDE + rr];
-                const uint8_t* e = palp + c * 3;
-                v = ((e[0] & 0xF8) << 8) | ((e[1] & 0xFC) << 3) | (e[2] >> 3);
-            } else if (legacy) {
-                const uint8_t* e = src + (ss * LEDS_PER_SIDE + rr) * 3;
-                v = ((e[0] & 0xF8) << 8) | ((e[1] & 0xFC) << 3) | (e[2] >> 3);
-            } else {
-                v = ((const uint16_t*)src)[ss * LEDS_PER_SIDE + rr];
-            }
-            stage[pos++] = v & 0xFF;
-            stage[pos++] = v >> 8;
+            uint8_t R, G, B;
+            pvRgb(s, ss, rr, &R, &G, &B);
+            pos = pvPut565(pos, R, G, B);
         }
     }
-    free(src);
+    free(s.buf);
     stage_len = pos;
     return true;
+}
+
+// OP_PREVIEW_AT: кадр frame для анимированного превью. Клетка — среднее блока
+// 3 сектора × 2 диода, а не одна точка: кадров в клипе много, и рябь выборки по
+// точке на маленьком диске видна сильнее, чем лёгкая мягкость. Возвращает статус.
+static uint8_t buildPreviewAt(const String& name, uint32_t frame) {
+    stage_len = 0;
+    PvSrc s;
+    if (!pvRead(name, frame, s)) {
+        if (s.buf) free(s.buf);
+        return LittleFS.exists("/" + name) ? ST_BAD_ARG : ST_NOT_FOUND;
+    }
+    PovPreviewAt h;
+    h.frames   = s.frames;
+    h.delay_ms = s.delay;
+    h.sec      = PV_SEC;
+    h.rad      = PV_RAD;
+    memcpy(stage, &h, sizeof(h));
+    uint32_t pos = sizeof(h);
+    const int SB = SECTORS / PV_SEC, LB = LEDS_PER_SIDE / PV_RAD, N = SB * LB;
+    for (int sc = 0; sc < PV_SEC; sc++) {
+        for (int r = 0; r < PV_RAD; r++) {
+            uint32_t R = 0, G = 0, B = 0;
+            for (int a = 0; a < SB; a++) {
+                for (int b = 0; b < LB; b++) {
+                    uint8_t r8, g8, b8;
+                    pvRgb(s, sc * SB + a, r * LB + b, &r8, &g8, &b8);
+                    R += r8; G += g8; B += b8;
+                }
+            }
+            pos = pvPut565(pos, (R + N / 2) / N, (G + N / 2) / N, (B + N / 2) / N);
+        }
+    }
+    free(s.buf);
+    stage_len = pos;
+    return ST_OK;
 }
 
 // ---------------------------------------------------------------------
@@ -784,7 +854,8 @@ static void handleCmd(const uint8_t* d, size_t n) {
         h.mtu           = peer_mtu;
         h.features      = POV_FEAT_DEFLATE | POV_FEAT_OTA | POV_FEAT_PREVIEW |
                           POV_FEAT_ALBUM_SEL | POV_FEAT_HALL_LOG2 | POV_FEAT_TEXT | POV_FEAT_FX |
-                          POV_FEAT_TEXT_RGB | POV_FEAT_SLIDE_CLOCK | POV_FEAT_ALBUM_LONG;
+                          POV_FEAT_TEXT_RGB | POV_FEAT_SLIDE_CLOCK | POV_FEAT_ALBUM_LONG |
+                          POV_FEAT_PREVIEW_AT;
         h.uptime_s      = millis() / 1000;
         // Именно видимое имя: приложение подписывает им строку списка, и
         // расходиться с тем, что пришло в рекламе, оно не должно.
@@ -1104,6 +1175,21 @@ static void handleCmd(const uint8_t* d, size_t n) {
         String fname((const char*)pl, pn);
         if (!nameOk(fname))       { sendRsp(op, seq, ST_BAD_ARG);  break; }
         if (!buildPreview(fname)) { sendRsp(op, seq, ST_NOT_FOUND); break; }
+        stageRsp(op, seq);
+        break;
+    }
+
+    case OP_PREVIEW_AT: {
+        if (pn < 3) { sendRsp(op, seq, ST_BAD_ARG); break; }
+        // Чтение кадра с флеша гасит кеш на обоих ядрах — на светящемся ободе это
+        // рывок, а клип — это десятки таких чтений подряд. Подождёт, пока колесо
+        // погаснет: телефон спросит снова.
+        if (power_state == PWR_FULL) { sendRsp(op, seq, ST_BUSY); break; }
+        uint16_t fr; memcpy(&fr, pl, 2);
+        String fname((const char*)pl + 2, pn - 2);
+        if (!nameOk(fname)) { sendRsp(op, seq, ST_BAD_ARG); break; }
+        uint8_t st = buildPreviewAt(fname, fr);
+        if (st != ST_OK) { sendRsp(op, seq, st); break; }
         stageRsp(op, seq);
         break;
     }

@@ -846,6 +846,10 @@ private fun StoredDisc(vm: WheelVm, f: DevFile, online: Boolean) {
     LaunchedEffect(f.name, f.size, pv, online) {
         val c = vm.localClip(f)
         if (c != null) { clip = c; return@LaunchedEffect }
+        // Своего клипа нет (залит с другого телефона) — колесо соберёт его из своих
+        // кадров, фоном; готовый ляжет в кэш, и эффект перезапустится по previewVersion.
+        // До тех пор — статичный первый кадр.
+        if (online) vm.wantDeviceClip(f)
         var pause = 2_000L
         while (thumb == null) {
             val p = vm.thumb(f)

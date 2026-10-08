@@ -404,6 +404,22 @@ on field names buys an extra round trip per exchange. Five characteristics: CMD
 Large replies (file list, preview, log) are staged on the device and pulled by
 offset with `OP_FRAG`, so a lost fragment cannot pass unnoticed.
 
+**Library previews come from three places, best first.** (1) The animated `.pvc`
+clip the phone renders from the *source* at upload (`cachePreview`, full 360×44
+polar resolution). (2) For a file uploaded from another phone or before a
+reinstall there is no source, so `WheelVm.clipWorker` builds the same `.pvc` from
+the wheel's own frames: `OP_PREVIEW_AT` (0x26, `POV_FEAT_PREVIEW_AT`) returns any
+frame as 120×22 RGB565, each cell the mean of a 3-sector × 2-LED block, plus the
+file's frame count and delay; up to `CACHE_FRAMES` frames picked like the upload
+clip (`PreviewClips.pickIndices`), one file at a time, cached forever. It answers
+`ST_BUSY` while `PWR_FULL` — a clip is dozens of flash reads, each a hitch on a lit
+rim — and the worker just waits. (3) Until then the static first frame
+(`OP_PREVIEW`, point-sampled), cached on disk as `.pvf`, retried with backoff and on
+reconnect. Clip and Hall-log transfers are *background* requests in `BleClient`
+(`requestStaged(…, background = true)`): they yield to anything the screen asks for
+(previews, list, Play), or a freshly installed app pulling ~1.5 MB of Hall log would
+put every tap behind a multi-second chunk.
+
 **Upload speed** is why the format is what it is. The phone deflates the file and
 the device inflates it with `tinfl_decompress` **from ROM** (`0x40000828`) — free
 in flash terms, and 3–5× on palette indices, which multiplies the effective rate

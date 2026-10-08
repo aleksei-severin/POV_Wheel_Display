@@ -741,6 +741,28 @@ class BleClient(
         return PreviewFrame(sec, rad, raw.copyOfRange(2, 2 + sec * rad * 2))
     }
 
+    /**
+     * Кадр [frame] файла для анимированного превью (OP_PREVIEW_AT) вместе с числом
+     * кадров и задержкой из заголовка файла. Фоновый запрос — пропускает экран
+     * вперёд, как лог Холла: клип библиотеки — это десятки таких кадров подряд.
+     * Пока лента светится, колесо отвечает ST_BUSY.
+     */
+    suspend fun previewAt(name: String, frame: Int): PreviewAt? {
+        val nm = name.toByteArray(Charsets.US_ASCII)
+        val b = Proto.buf(2 + nm.size)
+        b.putShort(frame.toShort()); b.put(nm)
+        val raw = requestStaged(Proto.OP_PREVIEW_AT, b.array(), background = true)
+        if (raw.size < PreviewAt.HDR) return null
+        val p = Proto.wrap(raw)
+        val frames = p.short.toInt() and 0xFFFF
+        val delay = p.short.toInt() and 0xFFFF
+        val sec = p.get().toInt() and 0xFF
+        val rad = p.get().toInt() and 0xFF
+        val n = sec * rad * 2
+        if (sec == 0 || rad == 0 || raw.size < PreviewAt.HDR + n) return null
+        return PreviewAt(frames, delay, PreviewFrame(sec, rad, raw.copyOfRange(PreviewAt.HDR, PreviewAt.HDR + n)))
+    }
+
     suspend fun logs(since: Long): Pair<Long, List<String>> {
         val b = Proto.buf(4); b.putInt(since.toInt())
         val raw = requestStaged(Proto.OP_LOGS, b.array())
@@ -893,3 +915,8 @@ class BleClient(
 }
 
 data class PreviewFrame(val sectors: Int, val radii: Int, val rgb565: ByteArray)
+
+/** Ответ OP_PREVIEW_AT: кадров в файле, задержка кадра (мс) и сам кадр. */
+data class PreviewAt(val frames: Int, val delayMs: Int, val frame: PreviewFrame) {
+    companion object { const val HDR = 6 }   // PovPreviewAt
+}

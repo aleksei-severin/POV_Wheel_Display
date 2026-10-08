@@ -114,6 +114,12 @@ enum PovOp : uint8_t {
     // first = номер первого имени куска (0 — начать заново), total — сколько
     // всего. Сам показ запускает следующий OP_ALBUM с n = 0xFFFF.
     OP_ALBUM_LIST  = 0x25,  // →  [u16 first][u16 total]{[u8 len][имя]}  ←  ничего
+
+    // Кадр файла для анимированного превью (POV_FEAT_PREVIEW_AT): телефон, у
+    // которого нет своего клипа (файл залит с другого телефона), собирает его из
+    // нескольких кадров колеса. ST_BUSY, пока лента светится — чтение флеша
+    // морозит отрисовку; ST_BAD_ARG — кадра с таким номером нет.
+    OP_PREVIEW_AT  = 0x26,  // →  [u16 кадр][имя]  ←  staged: PovPreviewAt + RGB565 sec×rad
 };
 
 // Предел имени. 19 значащих символов — ровно столько, сколько влезает в
@@ -167,6 +173,7 @@ struct PovHello {
 // записей (HLOG_P4/HLOG_P2), сочло бы их младшие биты паузами и безвозвратно
 // испортило бы время всей сессии в своём архиве. Без бита оно лог просто не видит.
 #define POV_FEAT_HALL_LOG2 0x0800   // OP_TIME / OP_TIME_SET / OP_HALL_LOG / OP_HALL_HIST, лог с упаковкой
+#define POV_FEAT_PREVIEW_AT 0x1000  // OP_PREVIEW_AT: любой кадр файла для анимированного превью
 #define POV_FEAT_TEXT      0x0040   // эффект «Текст»: OP_TEXT_STYLE / OP_TEXT_SET / OP_TEXT_GET
 #define POV_FEAT_FX        0x0080   // OP_FX_GET / OP_FX_SET; эффекты 2 и 5 удалены, часы цифровые
 #define POV_FEAT_TEXT_RGB  0x0100   // блоб OP_TEXT_SET может нести слой цвета эмодзи (до 40 кБ)
@@ -301,6 +308,16 @@ struct PovHallPage {
     int8_t   dir;         // rotation_dir сейчас
     uint16_t _rsvd;
 };
+
+// Заголовок ответа OP_PREVIEW_AT. За ним sec × rad пикселей RGB565, сектор → диод;
+// клетка — среднее блока кадра (SECTORS/sec секторов × LEDS_PER_SIDE/rad диодов).
+struct PovPreviewAt {
+    uint16_t frames;      // кадров в файле
+    uint16_t delay_ms;    // задержка кадра из заголовка файла (0 — статичная картинка)
+    uint8_t  sec;
+    uint8_t  rad;
+};
+static_assert(sizeof(PovPreviewAt) == 6, "PovPreviewAt != PreviewAt.HDR в Proto.kt");
 
 // Заголовок ответа OP_HALL_HIST. За ним n байт файла с позиции off.
 struct PovHallHist {

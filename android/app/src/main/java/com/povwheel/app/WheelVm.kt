@@ -3246,6 +3246,106 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    // ---- Анимированные превью с колеса ----
+    // Файлу, залитому с другого телефона (или до переустановки приложения), здесь
+    // не из чего построить клип: исходник был на том телефоне. Тогда клип
+    // собирается из кадров самого колеса (OP_PREVIEW_AT): до CACHE_FRAMES кадров
+    // равномерно по всей анимации — так же, как при заливке, — и ложится в тот же
+    // кэш .pvc. Дальше плитка крутит его локально и BLE больше не трогает. Один
+    // файл за раз, фоном (запросы экрана идут вперёд, см. BleClient.previewAt).
+    private val clipQueue = LinkedHashMap<String, Pair<String, DevFile>>()  // имя → колесо, файл
+    private val clipSkip = HashSet<String>()     // «имя|размер», клипа не будет (один кадр, нет файла…)
+    private val clipFails = HashMap<String, Int>()
+    private var clipJob: kotlinx.coroutines.Job? = null
+
+    /** Плитка без своего клипа просит собрать его с колеса. */
+    fun wantDeviceClip(f: DevFile) {
+        val addr = current.value ?: return
+        val c = client(addr) ?: return
+        if (c.hello?.hasPreviewAt != true) return
+        synchronized(clipQueue) {
+            if ((f.name + "|" + f.size) in clipSkip || clipQueue.containsKey(f.name)) return
+            clipQueue[f.name] = addr to f
+            if (clipJob?.isActive == true) return
+            clipJob = viewModelScope.launch(Dispatchers.IO) { clipWorker() }
+        }
+    }
+
+    private suspend fun clipWorker() {
+        while (true) {
+            val (addr, f) = synchronized(clipQueue) {
+                clipQueue.values.firstOrNull() ?: run { clipJob = null; return }
+            }
+            val key = f.name + "|" + f.size
+            val c = client(addr)?.takeIf { it.link.value == Link.Ready }
+            if (c == null) {
+                // Колеса нет на связи — очередь подождёт: плитки попросят снова,
+                // когда оно вернётся (online у них в ключах).
+                synchronized(clipQueue) { clipQueue.clear(); clipJob = null }
+                return
+            }
+            if (PreviewClips.fileFor(previewDir, f.name).exists()) {
+                synchronized(clipQueue) { clipQueue.remove(f.name) }
+                continue
+            }
+            val clip = try {
+                buildDeviceClip(c, f)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: BleException) {
+                when (e.status) {
+                    // Лента светится — флеш колеса сейчас не читается; ждём, пока погаснет.
+                    ST_BUSY -> { delay(5_000); continue }
+                    -1 -> {
+                        if (c.link.value != Link.Ready) {           // связь пропала — ждём её
+                            synchronized(clipQueue) { clipQueue.clear(); clipJob = null }
+                            return
+                        }
+                        // Таймаут на живой связи — ещё пару попыток, в конце очереди.
+                        val n = (clipFails[key] ?: 0) + 1
+                        clipFails[key] = n
+                        if (n < 3) {
+                            synchronized(clipQueue) { clipQueue.remove(f.name); clipQueue[f.name] = addr to f }
+                            delay(2_000)
+                            continue
+                        }
+                        null
+                    }
+                    else -> null                                    // нет файла, нет кадра
+                }
+            } catch (e: Exception) { null }
+            if (clip != null) {
+                runCatching { PreviewClips.save(PreviewClips.fileFor(previewDir, f.name), clip) }
+                clip.recycle()   // плитка возьмёт клип с диска
+                synchronized(clipMem) { clipMem.remove(f.name) }
+                previewVersion.value = previewVersion.value + 1
+            } else {
+                synchronized(clipQueue) { clipSkip.add(key) }
+            }
+            synchronized(clipQueue) { clipQueue.remove(f.name) }
+        }
+    }
+
+    /** Клип из кадров колеса; null — файл из одного кадра (хватит статичного превью). */
+    private suspend fun buildDeviceClip(c: BleClient, f: DevFile): PreviewClip? {
+        val first = c.previewAt(f.name, 0) ?: return null
+        if (first.frames <= 1) return null
+        val idx = PreviewClips.pickIndices(first.frames, PreviewClips.CACHE_FRAMES)
+        val frames = ArrayList<Bitmap>(idx.size)
+        try {
+            frames.add(com.povwheel.app.ui.WheelThumb.render(first.frame, PreviewClips.CACHE_PX))
+            for (k in 1 until idx.size) {
+                val p = c.previewAt(f.name, idx[k]) ?: throw BleException("bad preview frame", 2)
+                frames.add(com.povwheel.app.ui.WheelThumb.render(p.frame, PreviewClips.CACHE_PX))
+            }
+        } catch (e: Throwable) {
+            frames.forEach { it.recycle() }
+            throw e
+        }
+        val totalMs = first.frames.toLong() * first.delayMs.coerceAtLeast(1)
+        return PreviewClip(frames, PreviewClips.clipDelay(totalMs, frames.size))
+    }
+
     /** Есть смысл просить кадр у колеса снова: оно на связи и превью умеет. */
     fun canFetchThumb(): Boolean = readyClient()?.let { it.hello?.hasPreview != false } ?: false
 

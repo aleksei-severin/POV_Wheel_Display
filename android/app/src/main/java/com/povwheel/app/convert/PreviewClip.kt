@@ -42,6 +42,17 @@ object PreviewClips {
 
     fun fileFor(dir: File, deviceName: String) = File(dir, deviceName + ".pvc")
 
+    /** Равномерный выбор до [max] индексов из [n]: первый и последний включены. */
+    fun pickIndices(n: Int, max: Int): IntArray {
+        if (n <= max) return IntArray(n) { it }
+        if (max <= 1) return intArrayOf(0)
+        return IntArray(max) { ((it.toLong() * (n - 1)) / (max - 1)).toInt() }
+    }
+
+    /** Задержка кадра клипа: вся петля анимации ([totalMs]) на [frames] кадров, в
+     *  тех же пределах, что у клипов, построенных при заливке. */
+    fun clipDelay(totalMs: Long, frames: Int): Int = (totalMs / frames.coerceAtLeast(1)).toInt().coerceIn(40, 200)
+
     /**
      * Пишет клип одним спрайт-листом: кадры уложены вертикально в столбец.
      * Запись во временный файл с переименованием — оборванная на середине заливка
