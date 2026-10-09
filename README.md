@@ -130,27 +130,6 @@ will — the real speed, the current time, the chosen colours.
 
 ---
 
-## 🗂️ Repository
-
-| Path | What's inside |
-|---|---|
-| [src/](src/) · [include/](include/) | ESP32-S3 firmware: rotor tracking, rendering, power management, BLE, effects, Hall log |
-| [android/](android/) | Android app (Kotlin / Compose): library, conversion, upload, effects, POV video renderer. See [android/README.md](android/README.md) |
-| [tools/](tools/) | Offline helpers |
-
-## 🛠️ Build & flash
-
-```bash
-# Firmware
-pio run -e cable --target upload      # firmware over USB (never run uploadfs: it would wipe the library)
-
-# Android app
-cd android && ./build.sh assembleRelease
-```
-
-After the first USB flash, firmware updates go over Bluetooth from the app
-(*Maintenance → Update*).
-
 ## 📄 License
 
 **Free for personal, non-commercial use** under the
