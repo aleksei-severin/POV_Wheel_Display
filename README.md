@@ -13,7 +13,7 @@ your own text right onto bike wheel! You control it from an Android app over Blu
 ![Android](https://img.shields.io/badge/Android-8.0%2B-3DDC84?logo=android&logoColor=white)
 ![Kotlin](https://img.shields.io/badge/Kotlin-Jetpack_Compose-7F52FF?logo=kotlin&logoColor=white)
 ![Bluetooth LE](https://img.shields.io/badge/Bluetooth-LE-0082FC?logo=bluetooth&logoColor=white)
-![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+![License: PolyForm Noncommercial](https://img.shields.io/badge/License-PolyForm_Noncommercial-orange.svg)
 
 <a href="https://www.instagram.com/reel/DeDYKcECSC1/">
   <img width="320" alt="POV Wheel Display on a mountain bike: watch the reel on Instagram" src="docs/images/instagram_reel.jpg" />
@@ -208,4 +208,15 @@ After the first USB flash, firmware updates go over Bluetooth from the app
 
 ## 📄 License
 
-[MIT](LICENSE) © 2026 Aleksei Severin
+**Free for personal, non-commercial use** under the
+[PolyForm Noncommercial License 1.0.0](LICENSE.md): build a wheel for your own bike, study the
+code, change it and share your changes.
+
+**Commercial use requires a separate license from the author.** That covers, for example, selling
+wheels, kits or pre-flashed boards, or using the firmware, the app or any part of them in a
+commercial product or service. To discuss terms, write to
+[severin.alexey.r@gmail.com](mailto:severin.alexey.r@gmail.com).
+
+Third-party libraries keep their own licenses.
+
+© 2026 Aleksei Severin
