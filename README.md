@@ -93,10 +93,29 @@ and it can drive several displays at once.
 
 ## 🎬 Render POV video from any camera
 
-A spinning POV display looks great in person but flickers and tears on camera. Film your ride with
-a phone, an action cam or a drone, and the app turns the clip into a clean, flicker-free POV video
-right on the phone. The result keeps the original resolution and sound, and slow-motion clips work
-too.
+A spinning POV display looks great in person but terrible on camera. A video frame catches only a
+slice of the image, so the result flickers and tears. The app fixes this **after the fact**, from
+footage shot on **any camera**:
+
+```mermaid
+flowchart LR
+    H["🧲 Wheel logs<br/>its rotation"] -->|BLE, in the background| A["📱 Rotation archive<br/>on the phone"]
+    V["🎥 Clip from any camera<br/>phone · action cam · drone"] --> M["⏱️ Clip lined up<br/>with the rotation"]
+    A --> M
+    M --> S["🧩 Stitched into<br/>clean frames"]
+    S --> O["🎞️ MP4 in your gallery"]
+```
+
+1. **The wheel keeps a diary.** It logs its rotation while you ride, and the app collects the log in
+   the background whenever it's connected. A ride without the phone isn't lost.
+2. **The app finds the clip in the log.** It lines the recording up with the wheel's rotation
+   automatically.
+3. **The app stitches clean frames.** The output keeps the source resolution and the original
+   audio. **Slow-motion clips work too.**
+
+All of this runs on the phone, with no extra hardware and no special camera.
+
+Long-press **Render POV Video** to export the rotation archive or import one from another phone.
 
 ---
 
