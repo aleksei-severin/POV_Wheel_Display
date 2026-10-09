@@ -34,7 +34,7 @@ your own text right onto bike wheel! You control it from an Android app over Blu
 | 🔋 **Up to 6 hours of animation** | One charge covers a whole evening ride. A smart battery gauge shows the real remaining percentage. |
 | 💤 **Up to a year on standby** | It draws about 10 µA asleep and wakes when you **shake the wheel**. Transport mode ignores vibration completely, so it won't wake up in a car or on a bike rack. |
 | 📱 **Android app over BLE** | Connect **several displays at once** and run a synced slideshow across them. |
-| 🎬 **Render POV video from any camera** | Film your ride with a phone, action cam or drone. The app matches the clip to the wheel's rotation log **by its metadata** and stitches it into a clean, flicker-free POV video. |
+| 🎬 **Render POV video from any camera** | Film your ride with a phone, action cam or drone, and the app turns the clip into a clean, flicker-free POV video. |
 | 🖼️ **Photos, GIFs, video, text** | Drop in a picture, GIF, animated WebP or MP4. The phone converts it and shows you a preview of exactly what the wheel will display. |
 | 🎯 **Sharp, stable image** | 1° angular resolution, sub-degree interpolation, anti-aliasing and acceleration-aware rotor tracking. The picture stays put while you speed up or brake hard. |
 
@@ -93,37 +93,10 @@ and it can drive several displays at once.
 
 ## 🎬 Render POV video from any camera
 
-A spinning POV display looks great in person but terrible on camera. A video frame catches only a
-slice of the image, so the result flickers and tears. The app fixes this **after the fact**, from
-footage shot on **any camera**:
-
-```mermaid
-flowchart LR
-    H["🧲 Wheel logs every<br/>60° of rotation"] -->|BLE, in the background| A["📱 Rotation archive<br/>on the phone"]
-    V["🎥 Clip from any camera<br/>phone · action cam · drone"] --> M["⏱️ Match by metadata,<br/>refine from the video itself"]
-    A --> M
-    M --> S["🧩 Stitch each 1/6 turn<br/>into one clean frame"]
-    S --> O["🎞️ MP4 in your gallery"]
-```
-
-1. **The wheel keeps a diary.** Every Hall-sensor event is timestamped with microsecond precision.
-   The log lives in RAM while you ride and goes to flash before sleep, so a ride without the phone
-   isn't lost. The app collects it in the background whenever it's connected.
-2. **The clip is found by its metadata.** The app reads the recording time from the container,
-   the gallery, the file name or the file date, and tries each as start or end, local time or UTC.
-3. **The video itself sets the exact offset.** The disc's brightness pulses in step with the
-   rotor. The app picks the offset where those pulses line up with the logged rotation, accurate to
-   about ±10 ms.
-4. **Each sweep becomes one frame.** Every 1/6 turn is blended into a single clean frame. The
-   output keeps the source resolution (2K → 2K, 4K → 4K), real-time speed and the original audio.
-   **Slow-motion clips work too.**
-
-All of this runs on the phone's GPU, with no extra hardware and no special camera.
-
-Long-press **Render POV Video** to export the rotation archive as a ZIP — a readable `README.txt`
-listing, per display, every session and when its image was on, plus a CSV of every sensor event — or
-to import one. An import merges into the phone's archive and never replaces what is already there,
-so another phone's archive can be rendered here as well.
+A spinning POV display looks great in person but flickers and tears on camera. Film your ride with
+a phone, an action cam or a drone, and the app turns the clip into a clean, flicker-free POV video
+right on the phone. The result keeps the original resolution and sound, and slow-motion clips work
+too.
 
 ---
 
@@ -154,34 +127,6 @@ will — the real speed, the current time, the chosen colours.
   jump when the display turns on or the charger is plugged in.
 - **Protects the cell.** Brightness is capped when the battery is low and the display stops before
   the cell is deeply discharged. Charging works even from a nearly flat battery.
-
----
-
-<details>
-<summary><b>🔬 Under the hood: why the image stays sharp</b></summary>
-
-<br/>
-
-- **Acceleration-aware rotor tracking.** Six Hall sensors give six revolution measurements per
-  turn. A two-stage PLL with an adaptive angular-acceleration estimate keeps the image fixed while
-  you speed up or brake. Without the acceleration term the error would reach tens of degrees under
-  hard braking.
-- **Per-arm calibration.** Each sensor's mounting offset is measured automatically and applied to
-  both timing and rendering, so the six arms line up into one image.
-- **Fixed-phase rendering.** Each frame's angle is computed for the moment its LEDs actually light
-  up, at a fixed point of the SPI cycle. This removes speed-dependent drift and wobble.
-- **Area sampling.** Every LED is averaged over the angle it sweeps while lit. This anti-aliasing
-  turns the staircase on straight lines back into smooth edges.
-- **Sub-degree interpolation and frame blending.** Edges land between whole degrees, and
-  consecutive animation frames are blended so motion doesn't step at the 60° sector borders.
-- **256-colour palette per frame.** Median-cut quantisation gives less error than RGB565 at half
-  the memory, so twice as many frames fit.
-- **Colour pipeline.** Gamma, contrast, saturation, then white balance, then radial brightness
-  compensation, so the hub doesn't look brighter than the rim.
-
-More engineering notes are in [CLAUDE.md](CLAUDE.md).
-
-</details>
 
 ---
 
