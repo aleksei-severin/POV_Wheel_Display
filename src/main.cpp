@@ -161,6 +161,13 @@ static volatile float rotor_alpha = 0.0f;  // град/мкс², знакова�
 // что это точное значение, а не приближение.
 #define SK9822_FRAME_US   ((float)(SK9822_BUF_SIZE * 8) * 1000000.0f / (float)SK9822_SPI_HZ)
 
+// Гашение одного первого луча (см. blankArm1()): старт-фрейм, 88 пустых
+// LED-фреймов и хвост из нулей. Хвост — новый старт-фрейм, по которому SK9822
+// защёлкивают данные: 32 нулевых бита плюс 44 на задержку в полтакта у каждого
+// из 88 диодов луча, с запасом — 16 байт.
+#define ARM1_BLANK_TAIL   16
+#define ARM1_BLANK_BYTES  (4 + LEDS_PER_ARM * 4 + ARM1_BLANK_TAIL)
+
 // RMS за текущий оборот: среднее нормированное потребление тока (0.0–1.0).
 // Считается от нередуцированного bri_level — показывает реальную нагрузку.
 static float rms_accum = 0.0f;
@@ -168,6 +175,7 @@ static float rms_accum = 0.0f;
 static spi_device_handle_t sk9822_spi   = nullptr;
 static uint8_t*            dma_buf[2]   = {nullptr, nullptr}; // Два буфера для ping-pong DMA
 static uint8_t*            dma_tx_buffer = nullptr;           // = dma_buf[0], для служебных заливок
+static uint8_t*            arm1_blank    = nullptr;           // посылка blankArm1(), DMA-память
 static spi_transaction_t   spi_trans[2] = {};                 // Предвыделенные транзакции (не на стеке)
 static SemaphoreHandle_t   hallSemaphore = nullptr;
 static SemaphoreHandle_t   dmaMutex      = nullptr;
@@ -597,10 +605,14 @@ void ledBusPark() {
 
 // Вернуть пады SPI. IO11/IO12 — родные пины SPI2, spi_bus_initialize() вывел
 // их через IO_MUX, так что достаточно вернуть падам функцию FSPI.
-// Звать только когда питание лучей поднято не меньше LED_RAIL_SETTLE_MS.
-static void ledBusAttach() {
+static void ledPinsToSpi() {
     gpio_iomux_out(PIN_LED_DATA, spi_periph_signal[SPI2_HOST].func, false);
     gpio_iomux_out(PIN_LED_CLK,  spi_periph_signal[SPI2_HOST].func, false);
+}
+
+// Шина — рендеру. Звать только когда питание лучей поднято не меньше LED_RAIL_SETTLE_MS.
+static void ledBusAttach() {
+    ledPinsToSpi();
     led_bus_live = true;
 }
 
@@ -629,6 +641,12 @@ void initSK9822_DMA() {
         spi_trans[b].length    = SK9822_BUF_SIZE * 8;
     }
     dma_tx_buffer = dma_buf[0];
+
+    arm1_blank = (uint8_t*)heap_caps_malloc(ARM1_BLANK_BYTES, MALLOC_CAP_DMA);
+    assert(arm1_blank != nullptr);
+    memset(arm1_blank, 0x00, ARM1_BLANK_BYTES);
+    for (int i = 0; i < LEDS_PER_ARM; i++) arm1_blank[4 + i * 4] = 0xE0;   // 111bbbbb, ток 0
+
     dmaMutex = xSemaphoreCreateMutex();
 }
 
@@ -639,7 +657,7 @@ static uint8_t buf_bri_cache[2] = {0, 0};
 // Гасит все 528 диодов — ток=0, цвет=0.
 // Используется при остановке рендеринга и перед снятием питания с лучей.
 // Пока шина прижата к земле, слать некуда (и незачем: лучи либо обесточены,
-// либо с момента включения не получили ни одной посылки).
+// либо это PWR_SPINUP, где первый луч уже погасил blankArm1()).
 void blankAllLEDs_DMA() {
     if (!dma_tx_buffer || !sk9822_spi || !dmaMutex || !led_bus_live) return;
     xSemaphoreTake(dmaMutex, portMAX_DELAY);
@@ -658,6 +676,36 @@ void blankAllLEDs_DMA() {
     spi_device_transmit(sk9822_spi, &t);
     spi_device_transmit(sk9822_spi, &t);
     buf_bri_cache[0] = 0xE0;   // dma_tx_buffer == dma_buf[0]
+    xSemaphoreGive(dmaMutex);
+}
+
+// Гасит первый луч, пока лучи 2–6 обесточены, — при включении DCDC №1 (PWR_SPINUP).
+// SK9822 не обязаны включаться погашенными: на отдельном луче с лабораторным
+// питанием этого не случалось ни разу, а в колесе после пробуждения от тряски
+// первый луч иногда загорался случайными диодами — и горел все секунды PWR_SPINUP,
+// пока не начнётся отрисовка: до неё в шину не уходило ни одной посылки.
+// Звать не раньше LED_RAIL_SETTLE_MS после EN — посылка в чипы на ещё
+// поднимающемся питании как раз и даёт вспышку.
+//
+// Посылка — только на свои 88 диодов (ARM1_BLANK_BYTES), а не весь кадр: последний
+// диод первого луча передаёт дальше всё, что после его фрейма, а там одни нули, так
+// что на DATA обесточенного второго луча не приходит ни единицы, а такт идёт
+// ~0.3 мс. Через защитный диод за это время натекает ничтожно мало — сброс по
+// питанию портила долгая единица на входе. После посылки шина снова на земле,
+// led_bus_live не трогаем: в PWR_SPINUP больше слать некому.
+static void blankArm1() {
+    if (!arm1_blank || !sk9822_spi || !dmaMutex) return;
+    xSemaphoreTake(dmaMutex, portMAX_DELAY);
+    ledPinsToSpi();
+    spi_transaction_t t = {};
+    t.length    = ARM1_BLANK_BYTES * 8;
+    t.tx_buffer = arm1_blank;
+    // Дважды, как и в blankAllLEDs_DMA: хвост первой посылки уже защёлкивает
+    // гашение, вторая — страховка для диода, который из случайного состояния не
+    // опознал первый старт-фрейм.
+    spi_device_transmit(sk9822_spi, &t);
+    spi_device_transmit(sk9822_spi, &t);
+    ledPinsToGround();
     xSemaphoreGive(dmaMutex);
 }
 
@@ -2025,13 +2073,12 @@ static void setHallMask(uint8_t mask) {
 }
 
 // Подаёт питание на лучи и ждёт, пока TPS631000 выйдет на режим. DATA/CLK всё
-// это время на земле (шину к SPI подключает только переход в PWR_FULL).
+// это время на земле.
 //
-// Гасить диоды сразу после включения больше не пытаемся: SK9822-A сами по
-// себе при подаче питания не светятся (проверено на отдельном луче, много
-// циклов). Вспышку случайными диодами давали как раз попытки гашения — посылки
-// в чипы на ещё поднимающемся питании и высокий уровень на линиях обесточенного
-// луча (см. led_bus_live).
+// Гасить диоды сразу после EN нельзя: посылки в чипы на ещё поднимающемся
+// питании и высокий уровень на линиях обесточенного луча давали вспышку
+// случайными диодами (см. led_bus_live). После выдержки — можно и нужно: первый
+// луч в PWR_SPINUP гасит blankArm1(), остальные — первый же кадр отрисовки.
 static void powerRailUp(uint8_t en_pin) {
     digitalWrite(en_pin, HIGH);
     delay(LED_RAIL_SETTLE_MS);
@@ -2086,8 +2133,8 @@ static void applyPowerState(PowerState target) {
         case PWR_SPINUP:
             setCpuFreqForPower(PWR_SPINUP);
             if (power_state == PWR_FULL) {
-                // Обороты упали — гасим лучи 2–6, первый оставляем под питанием.
-                // В PWR_SPINUP в шину ничего не шлём, так что она тоже на землю.
+                // Обороты упали — гасим лучи 2–6, первый оставляем под питанием
+                // (погашенным). В PWR_SPINUP в шину больше не шлём — на землю.
                 power_state = PWR_SPINUP;
                 setHallMask(0x01);
                 delay(3);
@@ -2097,13 +2144,16 @@ static void applyPowerState(PowerState target) {
                 webLog("[PWR] RPM low, arms 2-6 off");
             } else {
                 // Просыпаемся: включаем только первый луч и его датчик Холла.
-                // Шина остаётся на земле: в PWR_SPINUP лента не светится, и
-                // слать в неё нечего. Маску Холла — после выхода питания на
-                // режим, чтобы не поймать фронт на подъёме.
+                // Луч сразу после выхода питания на режим гасим одной короткой
+                // посылкой (blankArm1): SK9822 могут включиться со случайными
+                // диодами, и до отрисовки они так и горели бы. Дальше шина на
+                // земле. Маску Холла — после выхода питания на режим, чтобы не
+                // поймать фронт на подъёме.
                 last_dcdc_on_time = millis();  // до пауз — иначе now_ms < last_dcdc_on_time
                 peripherals_active = true;
                 power_state = PWR_SPINUP;
                 powerRailUp(PIN_EN_DCDC_ARM1);
+                blankArm1();
                 setHallMask(0x01);
                 webLog("[PWR] Arm 1 on, measuring RPM");
             }
@@ -2377,7 +2427,7 @@ static void transportShowWave(bool outward) {
     gpio_hold_dis((gpio_num_t)PIN_EN_DCDC_ARM1);
     gpio_hold_dis((gpio_num_t)PIN_EN_DCDC_REST);
     // Если лучи уже под питанием (уход в сон во время отрисовки), выдержка
-    // просто лишние 60 мс; шина к SPI — только после неё.
+    // просто лишние 2 × LED_RAIL_SETTLE_MS; шина к SPI — только после неё.
     powerRailUp(PIN_EN_DCDC_ARM1);
     powerRailUp(PIN_EN_DCDC_REST);
     ledBusAttach();
