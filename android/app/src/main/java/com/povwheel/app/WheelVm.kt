@@ -2656,11 +2656,31 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             return
         }
         val un = withContext(Dispatchers.Default) { TextMask.unpack(blob) }
+        // Текст без слоя цвета на колесе, которое слой уже умеет: его отправили, пока
+        // прошивка слоя не знала, и эмодзи свёрнуты в маску — красятся, как буквы. Так
+        // оставался и текст по умолчанию, долитый на старую прошивку: перепрошивка
+        // хранилище в хвосте флеша не трогает, а долив — только на пустое колесо, и
+        // эмодзи меняли цвет лишь после первой правки. Строка лежит в блобе — рисуем её
+        // заново со слоем и отправляем; не дошло — попробуем при следующем подключении.
+        // Нет в ней эмодзи — нет и слоя: запоминаем колесо, чтобы не рисовать зря.
+        if (un != null && un.second.rgb == null && un.first.isNotEmpty() &&
+            c.hello?.hasTextRgb == true && addr !in textNoLayer
+        ) {
+            val (img, nb) = withContext(Dispatchers.Default) { TextMask.build(un.first, true) }
+            if (img.rgb == null) textNoLayer.add(addr)
+            else if (runCatching { c.textSet(nb) }.isSuccess) {
+                adoptTextFx(addr, TextFx(un.first, st, img.mask, nb, img.rgb))
+                return
+            }
+        }
         adoptTextFx(addr, TextFx(un?.first ?: "", st, un?.second?.mask, blob.takeIf { un != null }, un?.second?.rgb))
     }
 
     /** Колёса, которым в этом запуске уже отправляли текст по умолчанию. */
     private val textProvisioned = HashSet<String>()
+
+    /** Колёса, чей текст без слоя цвета так и должен быть: эмодзи в нём нет. */
+    private val textNoLayer = HashSet<String>()
 
     /**
      * Текст на колесе ни разу не задавали (блоб пустой) — ставим [DEFAULT_TEXT]
