@@ -3,10 +3,13 @@ package com.povwheel.app.convert
 import android.content.Context
 import android.graphics.Bitmap
 import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaCodecList
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.os.Build
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -43,6 +46,89 @@ internal object VideoFrames {
                                         // эталон (MMR, софт) и кадр (MediaCodec + GL)
                                         // декодируются по-разному, структура должна
                                         // перебивать пиксельный шум их разницы
+
+    /** MIME-типы, для которых на телефоне есть декодер. */
+    private val decodable: Set<String> by lazy {
+        MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
+            .filter { !it.isEncoder }
+            .flatMap { ci -> ci.supportedTypes.map { it.lowercase() } }
+            .toSet()
+    }
+
+    private fun canDecode(mime: String) = mime.lowercase() in decodable
+
+    /**
+     * Видеодорожка, которую этот телефон может декодировать: номер и формат для configure().
+     * Все, кто читает ролик (привязка, рендер POV-видео, заливка на колесо), берут дорожку
+     * здесь — и, значит, одну и ту же, с одними метками кадров.
+     *
+     * HDR-ролики iPhone — Dolby Vision профиля 8.4: базовый слой — обычный HEVC Main 10
+     * (HLG), поверх него метаданные Dolby. Декодера video/dolby-vision у большинства
+     * телефонов нет (Samsung, Pixel: «Failed to initialize video/dolby-vision,
+     * NAME_NOT_FOUND»), а базовый слой читает любой HEVC-декодер, пропуская служебные NAL
+     * Dolby. Экстрактор Android для профилей 4/7 и совместимых 8–10 сам кладёт сразу за
+     * дорожкой DV вторую — тот же поток как video/hevc (avc, av01); её и берём, даже если
+     * декодер DV есть. Нет её (экстрактор производителя) — у дорожки DV подменяется MIME
+     * на кодек базового слоя, как делает ExoPlayer.
+     *
+     * HDR (HLG, PQ) на API 31+ декодер просят свести к SDR: кадр дальше идёт в GL и в
+     * H.264 как обычное видео, и без этого цвета блёклые. Декодер, который так не умеет,
+     * просьбу пропускает.
+     */
+    fun videoTrack(ex: MediaExtractor): Pair<Int, MediaFormat>? {
+        var first: Pair<Int, MediaFormat>? = null
+        var dv: Pair<Int, MediaFormat>? = null
+        for (i in 0 until ex.trackCount) {
+            val f = ex.getTrackFormat(i)
+            val mime = f.getString(MediaFormat.KEY_MIME) ?: continue
+            if (!mime.startsWith("video/")) continue
+            if (first == null) first = Pair(i, f)
+            if (mime.equals(MediaFormat.MIMETYPE_VIDEO_DOLBY_VISION, ignoreCase = true)) {
+                if (dv == null) dv = Pair(i, f)
+            } else if (canDecode(mime)) return Pair(i, toSdr(f))
+        }
+        dv?.let { (i, f) ->
+            if (canDecode(MediaFormat.MIMETYPE_VIDEO_DOLBY_VISION)) return Pair(i, toSdr(f))
+            baseLayer(f)?.let { b -> return Pair(i, toSdr(b)) }
+        }
+        return first?.let { Pair(it.first, toSdr(it.second)) }   // декодера нет — ошибка будет у configure, как прежде
+    }
+
+    /**
+     * Формат дорожки Dolby Vision как поток её базового слоя — или null, если слой не
+     * совместим с обычным кодеком (профиль 5) или декодера для него нет. Профиль — из
+     * записи dvcC (csd-2, старшие 7 бит байта 2) или из KEY_PROFILE (DolbyVisionProfile… =
+     * 1 shl профиль). Профиль и уровень Dolby кодеку базового слоя ни к чему: профиль
+     * заменяется на его собственный, уровень убирается (до API 29 убрать ключ нечем).
+     */
+    private fun baseLayer(f: MediaFormat): MediaFormat? {
+        var profile = -1
+        runCatching { f.getByteBuffer("csd-2") }.getOrNull()?.let { b ->
+            if (b.remaining() >= 5) profile = (b.get(b.position() + 2).toInt() and 0xFF) shr 1
+        }
+        if (profile < 0 && f.containsKey(MediaFormat.KEY_PROFILE))
+            profile = Integer.numberOfTrailingZeros(f.getInteger(MediaFormat.KEY_PROFILE))
+        val (mime, baseProfile) = when (profile) {
+            4, 7, 8 -> Pair(MediaFormat.MIMETYPE_VIDEO_HEVC, MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10)
+            9 -> Pair(MediaFormat.MIMETYPE_VIDEO_AVC, MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
+            10 -> Pair(MediaFormat.MIMETYPE_VIDEO_AV1, MediaCodecInfo.CodecProfileLevel.AV1ProfileMain10)
+            else -> return null
+        }
+        if (!canDecode(mime)) return null
+        f.setString(MediaFormat.KEY_MIME, mime)
+        f.setInteger(MediaFormat.KEY_PROFILE, baseProfile)
+        if (Build.VERSION.SDK_INT >= 29) f.removeKey(MediaFormat.KEY_LEVEL)
+        return f
+    }
+
+    private fun toSdr(f: MediaFormat): MediaFormat {
+        if (Build.VERSION.SDK_INT >= 31 && f.containsKey(MediaFormat.KEY_COLOR_TRANSFER)) {
+            val tr = f.getInteger(MediaFormat.KEY_COLOR_TRANSFER)
+            if (tr == MediaFormat.COLOR_TRANSFER_HLG || tr == MediaFormat.COLOR_TRANSFER_ST2084)
+                f.setInteger(MediaFormat.KEY_COLOR_TRANSFER_REQUEST, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
+        }
+        return f
+    }
 
     /** Грейскейл-миниатюра С СОХРАНЕНИЕМ пропорций (длинная сторона THUMB_LONG). */
     class OThumb(val w: Int, val h: Int, val px: IntArray)
@@ -178,19 +264,12 @@ internal object VideoFrames {
             throw SetupError("cannot open video", e)
         }
 
-        var trackIdx = -1
-        var trackFmt: MediaFormat? = null
-        for (i in 0 until extractor.trackCount) {
-            val f = extractor.getTrackFormat(i)
-            if ((f.getString(MediaFormat.KEY_MIME) ?: "").startsWith("video/")) {
-                trackIdx = i; trackFmt = f; break
-            }
-        }
-        val format = trackFmt
-        if (trackIdx < 0 || format == null) {
+        val track = videoTrack(extractor)
+        if (track == null) {
             extractor.release()
             throw SetupError("no video track")
         }
+        val (trackIdx, format) = track
         extractor.selectTrack(trackIdx)
 
         val mime = format.getString(MediaFormat.KEY_MIME)!!

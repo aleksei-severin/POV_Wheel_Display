@@ -24,6 +24,23 @@ internal object PovSync {
     val SLOWS = doubleArrayOf(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 16.0)
     /** Оценка по гашениям, ниже которой совпадение не считается. */
     private const val LIT_MIN = 10.0
+    /**
+     * Совпадение по гашениям засчитывается, только если оно выделяется над фоном — над тем,
+     * что то же замедление набирает при посторонних сдвигах: (оценка − медиана) / MAD по
+     * всему перебору сдвигов не меньше этого. Днём на улице, с движущейся камеры и с мелким
+     * в кадре колесом гашений в межкадровой разности не видно вовсе, а её колыхания от
+     * движения камеры при каком-нибудь сдвиге и замедлении набирают десятки очков: прежде
+     * этого хватало, и ролик S25+ ×4 уходил в ×12, iPhone ×1 — в ×6. На 23 роликах с
+     * проверенной привязкой у верных совпадений 6.3…16, у шума — не выше 4.9.
+     */
+    private const val Z_MIN = 6.0
+    /**
+     * Замедление из метаданных (частота съёмки против частоты файла — у Samsung есть)
+     * уступает другому, только если совпадение с тем сильнее лучшего совпадения с
+     * подсказкой во столько раз: на проверенных роликах неверное замедление набирало не
+     * больше половины верного.
+     */
+    private const val HINT_GAIN = 2.0
     /** Гашение длиннее этого (мкс) — колесо стояло или не набрало обороты: склейку рвём. */
     private const val DARK_SPLIT_US = 1_000_000.0
     /**
@@ -75,9 +92,14 @@ internal object PovSync {
 
     class Cand(val a: Anchor, val slow: Double, val src: Src, val cover: Double)
 
-    /** Гипотеза привязки: кандидат, точное начало (мкс часов телефона), её оценка. */
-    private class Hyp(val c: Cand, val at: Double, val score: Double, val events: Int) {
+    /**
+     * Гипотеза привязки: кандидат, точное начало (мкс часов телефона), её оценка и [z] —
+     * насколько оценка выше фона своего перебора (см. [Z_MIN]).
+     */
+    private class Hyp(val c: Cand, val at: Double, val score: Double, val events: Int, val z: Double) {
         var coh = Double.NaN
+        /** Совпадение настоящее, а не колыхание межкадровой разности. */
+        val real: Boolean get() = score >= LIT_MIN && z >= Z_MIN
     }
 
     fun srcOf(s: HallArchive.Session): Src? {
@@ -105,7 +127,7 @@ internal object PovSync {
 
     // ------------------------------------------------------------------ привязка
 
-    /** Как привязано: 1 — по гашениям, 2 — по одному гашению, 3 — по пульсации яркости, 0 — по метаданным. */
+    /** Как привязано: 1 — по гашениям, 2 — по одному гашению, 0 — по метаданным. */
     class Alignment(val cand: Cand, val anchor: Double, val sigma: Double, val how: Int, val events: Int) {
         val slow: Double get() = cand.slow
         val src: Src get() = cand.src
@@ -117,8 +139,11 @@ internal object PovSync {
      * кандидата метаданных) и далеко (±[FAR_US]) — на случай, когда у камеры уехали часы.
      * Дальняя гипотеза побеждает, только если она заметно сильнее ближней ([FAR_GAIN]):
      * иначе выигрывал бы двойник через цикл слайдшоу. Близкие по оценке гипотезы (двойник,
-     * соседнее замедление) решает пульсация общей яркости ([PovAlignCore.Coherence]). Без
-     * гашений — она же, если скорость менялась; иначе — [fallback] по метаданным.
+     * соседнее замедление) решает пульсация общей яркости ([PovAlignCore.Coherence]).
+     * Гашения засчитываются, только если совпадение выделяется над фоном перебора
+     * ([Z_MIN]), а замедление [prefSlow] из метаданных уступает только вдвое более
+     * сильному совпадению ([HINT_GAIN]): если гашений в кадре не видно, ролик остаётся при
+     * замедлении и времени из метаданных ([fallback]), а не при случайном пике шума.
      */
     fun align(
         st: PovAlignCore.Stats, fileFps: Double, cands: List<Cand>, prefSlow: Double, fallback: Cand,
@@ -167,6 +192,21 @@ internal object PovSync {
                         xs[k] = x; sc[k] = s.value; ev[k] = s.events; k++
                     }
                 }
+                // Фон — оценки при посторонних сдвигах (их в переборе подавляющее большинство):
+                // медиана и MAD там, где ролик задевает гашения. На коротком переборе фон не
+                // оценить, и совпадение проходит без этой проверки, как прежде.
+                val bg = DoubleArray(cnt)
+                var nb = 0
+                for (i in 0 until cnt) if (ev[i] > 0) bg[nb++] = sc[i]
+                var bgMed = Double.NEGATIVE_INFINITY
+                var bgMad = 1.0
+                if (nb >= 50) {
+                    bg.sort(0, nb)
+                    bgMed = bg[nb / 2]
+                    for (i in 0 until nb) bg[i] = abs(bg[i] - bgMed)
+                    bg.sort(0, nb)
+                    bgMad = max(1.0, 1.4826 * bg[nb / 2])
+                }
                 fun refine(c: Cand, x0: Double): Hyp {
                     var bestAt = x0
                     var best = lit.score(src.darkA, src.darkB, slow, x0)
@@ -175,7 +215,7 @@ internal object PovSync {
                         val s = lit.score(src.darkA, src.darkB, slow, x0 + q * 2e3)
                         if (s.value > best.value) { best = s; bestAt = x0 + q * 2e3 }
                     }
-                    return Hyp(c, bestAt, best.value, best.events)
+                    return Hyp(c, bestAt, best.value, best.events, (best.value - bgMed) / bgMad)
                 }
                 // ближние: лучшее в окне ±2…5 с вокруг каждого кандидата
                 for (c in cs) {
@@ -203,13 +243,19 @@ internal object PovSync {
             }
         }
 
-        val nearTop = near.maxByOrNull { it.score }
-        val farTop = far.maxByOrNull { it.score }
+        // В счёт идут только настоящие совпадения (Hyp.real), а другое замедление вместо
+        // подсказки метаданных — лишь при вдвое более сильном совпадении, чем лучшее с ней.
+        val hintBest = if (prefSlow > 1) (near + far).filter { it.c.slow == prefSlow }.maxOfOrNull { it.score } ?: 0.0 else 0.0
+        fun ok(h: Hyp) = h.real && (prefSlow <= 1 || h.c.slow == prefSlow || h.score >= HINT_GAIN * max(hintBest, LIT_MIN))
+        val nearOk = near.filter(::ok)
+        val farOk = far.filter(::ok)
+        val nearTop = nearOk.maxByOrNull { it.score }
+        val farTop = farOk.maxByOrNull { it.score }
         val useFar = farTop != null && farTop.events >= 3 && farTop.score >= FAR_MIN &&
             (nearTop == null || nearTop.events < 2 || farTop.score >= FAR_GAIN * max(nearTop.score, LIT_MIN))
-        val hyps = if (useFar) far + near else near
+        val hyps = if (useFar) farOk + nearOk else nearOk
         val top = hyps.maxByOrNull { it.score }
-        if (top != null && top.events >= 2 && top.score >= LIT_MIN) {
+        if (top != null && top.events >= 2) {
             val kept = ArrayList<Hyp>()
             for (h in hyps.sortedByDescending { it.score }) {
                 if (h.score < 0.6 * top.score) break
@@ -229,28 +275,14 @@ internal object PovSync {
             return Alignment(pick.c, pick.at, 1e6 / (fileFps * pick.c.slow) / 2, 1, pick.events)
         }
         // Одно гашение в ролике: сдвиг по нему, замедление — подсказка метаданных или ×1.
-        near.filter { it.c.slow == prefSlow && it.score >= LIT_MIN }.maxByOrNull { it.score }?.let { one ->
+        nearOk.filter { it.c.slow == prefSlow }.maxByOrNull { it.score }?.let { one ->
             return Alignment(one.c, one.at, 1e6 / (fileFps * one.c.slow) / 2, 2, one.events)
         }
-        // Гашений нет: пульсация яркости — пик есть, если скорость заметно менялась.
-        if (coh != null) {
-            var bestC: Cand? = null
-            var bestPk: PovAlignCore.Peak? = null
-            val tested = HashSet<String>()
-            for (c in cands.filter { it.slow == prefSlow }.sortedByDescending { it.cover }) {
-                val half = searchHalf(c.a.sigmaUs)
-                val key = c.src.s.bootId.toString() + "/" + Math.round(c.a.wallUs / 0.5e6)
-                if (!tested.add(key)) continue
-                if (cancelled()) throw InterruptedException()
-                val xs = DoubleArray((2 * half / STEP_US).toInt() + 1) { c.a.wallUs - half + it * STEP_US }
-                val ys = DoubleArray(xs.size) { cohAt(c, xs[it]) }
-                val pk = PovAlignCore.peakOf(xs, ys)
-                if (pk.excess >= 0.8 && pk.prominence >= 1.4 && (bestPk == null || pk.excess > bestPk.excess)) {
-                    bestC = c; bestPk = pk
-                }
-            }
-            if (bestC != null && bestPk != null) return Alignment(bestC, bestPk.at, 10e3, 3, 0)
-        }
+        // Гашений не нашлось — время из метаданных. Пульсацию яркости здесь больше не
+        // спрашиваем: на уличных роликах её пики шума (excess до 13, prominence ~2.2)
+        // неотличимы от настоящих (1.4…7.4 и 1.9…3.4 на проверенных роликах), и она
+        // уверенно ставила сдвиг на секунды мимо. Склейке нужна скорость ротора, а она
+        // за секунду ошибки метаданных почти не меняется.
         return Alignment(fallback, fallback.a.wallUs, fallback.a.sigmaUs, 0, 0)
     }
 

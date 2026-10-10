@@ -133,13 +133,7 @@ internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis)
         var drain: Drain? = null
         try {
             extractor.setDataSource(ctx, a.uri, null)
-            var vTrack = -1
-            var vFmt: MediaFormat? = null
-            for (i in 0 until extractor.trackCount) {
-                val f = extractor.getTrackFormat(i)
-                if ((f.getString(MediaFormat.KEY_MIME) ?: "").startsWith("video/")) { vTrack = i; vFmt = f; break }
-            }
-            if (vTrack < 0 || vFmt == null) throw IllegalStateException("no video track")
+            val (vTrack, vFmt) = VideoFrames.videoTrack(extractor) ?: throw IllegalStateException("no video track")
             extractor.selectTrack(vTrack)
             vFmt.setInteger(MediaFormat.KEY_ROTATION, 0)   // крутит контейнер, не декодер
 

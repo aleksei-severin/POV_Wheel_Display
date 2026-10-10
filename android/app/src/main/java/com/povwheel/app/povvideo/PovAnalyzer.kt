@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import com.povwheel.app.convert.VideoFrames
 import com.povwheel.app.hall.HallArchive
 import java.nio.ByteOrder
 import java.text.SimpleDateFormat
@@ -105,9 +106,13 @@ internal class DecodedAudio(
  *    ([PovAlignCore.LitScorer]): у GoPro и части телефонов частоты съёмки в метаданных нет
  *    вовсе, а у Samsung подсказка есть, но прежде проигрывала гипотезе «×1» по покрытию
  *    логом. Сдвиг ищется и далеко от метаданных ([PovSync.FAR_US]): часы GoPro уходили на
- *    18–22 с. Двойников (слайдшоу повторяет файлы по кругу) и ролики без гашений решает
- *    пульсация общей яркости ([PovAlignCore.Coherence]). Без гашений и без изменения
- *    скорости остаётся привязка по метаданным — сдвиг тогда склейке и не важен.
+ *    18–22 с. Двойников (слайдшоу повторяет файлы по кругу) решает пульсация общей
+ *    яркости ([PovAlignCore.Coherence]). Совпадение засчитывается, только если выделяется
+ *    над фоном перебора: днём на улице с движущейся камеры гашений не видно, и шум выбирал
+ *    случайное замедление (S25+ ×4 → ×12, iPhone ×1 → ×6). Замедление из метаданных
+ *    уступает лишь вдвое более сильному совпадению. Без совпадения остаются замедление и
+ *    время из метаданных — склейке нужна скорость ротора, а не фаза, и секунда ошибки ей
+ *    почти не вредит.
  * 4. Тики — через весь прогон вращения: короткое гашение слайдшоу (загрузка файла) склейку
  *    не рвёт, прорисовки идут дальше, просто тёмные. Прежде на эти доли секунды шли
  *    исходные кадры с полной частотой, и смена картинок выбивалась из ролика.
@@ -263,9 +268,9 @@ internal object PovAnalyzer {
             else fmt("Matched by %d display switches (slideshow, start/stop): %+.1f s from the metadata time — the camera's clock is off; ±%s ms",
                     al.events, d / 1e3, num2(al.sigma / 1e3)))
             2 -> rep.add(fmt("Matched by one display switch: %+.0f ms from the metadata time, ±%s ms", d, num2(al.sigma / 1e3)))
-            3 -> rep.add(fmt("Matched by the brightness pulsing with the rotor: %+.0f ms from the metadata time", d))
-            else -> rep.add("Video match: no display switch in the video and the speed hardly changed — the metadata time is used. " +
-                "With a steady speed the exact offset does not affect the stitching." +
+            else -> rep.add("Video match: no display switching could be matched in the video (none filmed, or not visible: " +
+                "a small or distant wheel, daylight, a moving camera) — the metadata time is used. " +
+                "Stitching needs only the rotor speed, which changes slowly, so a second or so of offset does not matter." +
                 if (hint < 2) " If this is slow motion, its factor could not be found: film a moment when the display switches (a slideshow does it every few seconds)." else "")
         }
         pl.tracks.forEachIndexed { i, t ->
@@ -398,13 +403,8 @@ internal object PovAnalyzer {
         val ex = MediaExtractor()
         try {
             ex.setDataSource(ctx, uri, null)
-            var track = -1
-            var mime = ""
-            for (i in 0 until ex.trackCount) {
-                val m = ex.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: ""
-                if (m.startsWith("video/")) { track = i; mime = m; break }
-            }
-            if (track < 0) throw IllegalStateException("no video track")
+            val (track, fmt) = VideoFrames.videoTrack(ex) ?: throw IllegalStateException("no video track")
+            val mime = fmt.getString(MediaFormat.KEY_MIME) ?: ""
             ex.selectTrack(track)
             var arr = LongArray(4096)
             var n = 0

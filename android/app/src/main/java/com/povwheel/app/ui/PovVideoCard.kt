@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -272,7 +273,7 @@ private fun EntryView(
                 // отрезки ролика пошли в склейку, — результат под ней.
                 Spacer(Modifier.height(2.dp))
                 Text("Saved to the gallery:", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
-                Text(s.path, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
+                SelectionContainer { Text(s.path, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace) }
                 e.summary?.let { a ->
                     // Размеры — как видит зритель (с поворотом из метаданных); меньше исходника
                     // результат бывает, только если кодировщик или память видеокарты не тянут.
@@ -302,7 +303,8 @@ private fun EntryView(
             }
 
             is Status.Failed -> {
-                Text(s.message, style = MaterialTheme.typography.bodySmall, color = cs.error)
+                // Ошибку выделяют долгим нажатием и копируют — чтобы прислать как есть.
+                SelectionContainer { Text(s.message, style = MaterialTheme.typography.bodySmall, color = cs.error) }
                 // Без доступа — сначала разрешение. Иначе просто ещё раз: лог мог
                 // дойти с колеса уже после анализа.
                 if (s.retry) Button(onClick = hapticClick(onAllowAccess)) { Text("Allow access") }
@@ -373,9 +375,9 @@ private fun HallArchiveDialog(ctrl: PovVideoController, onDismiss: () -> Unit) {
                         Text(o.step, style = MaterialTheme.typography.bodySmall)
                     }
                     is PovVideoController.ArchiveOp.Done ->
-                        Text(o.message, style = MaterialTheme.typography.bodySmall, color = Ok)
+                        SelectionContainer { Text(o.message, style = MaterialTheme.typography.bodySmall, color = Ok) }
                     is PovVideoController.ArchiveOp.Failed ->
-                        Text(o.message, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                        SelectionContainer { Text(o.message, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error) }
                     PovVideoController.ArchiveOp.Idle -> {}
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -402,17 +404,26 @@ private fun dateSpan(firstUs: Double, lastUs: Double): String {
     return if (a == b) a else "$a … $b"
 }
 
-/** Сводка о файле — те же строки, что скрипт выводит в консоль (имя файла — над ней). */
+/**
+ * Сводка о файле — те же строки, что скрипт выводит в консоль (имя файла — над ней).
+ * Выделяется долгим нажатием и копируется, как обычный текст: без SelectionContainer
+ * Text в Compose не выделяется вообще. Он раскладывает детей друг на друга, как Box,
+ * поэтому шкала и строки — в своём Column с тем же шагом, что у карточки.
+ */
 @Composable
 private fun Report(a: Summary) {
-    SyncBar(a)
-    Text(
-        a.report.joinToString("\n"),
-        fontFamily = FontFamily.Monospace,
-        fontSize = 11.sp,
-        lineHeight = 14.sp,
-        color = MaterialTheme.colorScheme.onSurfaceVariant
-    )
+    SelectionContainer {
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            SyncBar(a)
+            Text(
+                a.report.joinToString("\n"),
+                fontFamily = FontFamily.Monospace,
+                fontSize = 11.sp,
+                lineHeight = 14.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
 }
 
 /**

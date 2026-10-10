@@ -6,6 +6,7 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.net.Uri
 import com.povwheel.app.convert.GlVideoScaler
+import com.povwheel.app.convert.VideoFrames
 
 /**
  * Проход декодера для привязки ролика к логу Холла: каждый кадр отрезка уменьшается на
@@ -31,13 +32,7 @@ internal object PovVisDecoder {
         var scaler: GlVideoScaler? = null
         try {
             ex.setDataSource(ctx, uri, null)
-            var track = -1
-            var fmt: MediaFormat? = null
-            for (i in 0 until ex.trackCount) {
-                val f = ex.getTrackFormat(i)
-                if ((f.getString(MediaFormat.KEY_MIME) ?: "").startsWith("video/")) { track = i; fmt = f; break }
-            }
-            if (track < 0 || fmt == null) throw IllegalStateException("no video track")
+            val (track, fmt) = VideoFrames.videoTrack(ex) ?: throw IllegalStateException("no video track")
             ex.selectTrack(track)
             val codedW = fmt.getInteger(MediaFormat.KEY_WIDTH)
             val codedH = fmt.getInteger(MediaFormat.KEY_HEIGHT)
