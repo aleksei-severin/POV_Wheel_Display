@@ -30,8 +30,8 @@ import kotlin.math.sqrt
  * Вне отрисовки кадры исходника идут как есть, а каждая прорисовка становится одним кадром —
  * склейкой (6 окон длиной в прорисовку со сдвигом 0..5/6 и дробным началом, см. [windows]),
  * который стоит на экране до следующего: частота кадров результата переменная. Метки
- * времени — настоящие, делённые на замедление, так что slow motion выходит в реальном
- * времени.
+ * времени — реальные ([PovAnalysis.map]: замедление постоянное или только в середине, как
+ * у slo-mo с iPhone), так что slow motion выходит в реальном времени.
  *
  * Разрешение результата — как у исходника. Кольцо держит в памяти видеокарты десятки
  * кадров, поэтому хранит их в YUV 4:2:0 (1.5 байта на пиксель вместо 4 у RGBA): кадр 4K —
@@ -49,6 +49,7 @@ internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis)
         const val BLACK_LEVEL = 16            // отсечка шума, как -BlackLevel по умолчанию
         const val SPREAD = 1.0                // разнос шести окон (CheckerSpread)
         const val SHORT_FRAC = 0.15           // см. Windows в скрипте
+        const val OUT_RATE = 48000            // частота звука замедленного ролика в результате
     }
 
     /** Окна одного элемента плана: 12 отрезков кадров (абсолютные номера) и веса. */
@@ -124,6 +125,7 @@ internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis)
         val total = a.plan.totalFrames
         val cap = ringCap(total)
         val slow = a.slow
+        val map = a.map
 
         val extractor = MediaExtractor()
         var decoder: MediaCodec? = null
@@ -239,7 +241,8 @@ internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis)
             // Кадр результата с меткой исходного кадра i; covers — сколько исходных кадров
             // он собой заменяет (для прогресса).
             fun emit(i: Int, covers: Int) {
-                var ns = ((decPts[i] - decPts[0]) * 1000.0 / slow).roundToLong()
+                val t = map.real((decPts[i] - a.videoStartUs).toDouble()) - map.real((decPts[0] - a.videoStartUs).toDouble())
+                var ns = (t * 1000.0).roundToLong()
                 if (ns <= lastNs) ns = lastNs + 1000
                 lastNs = ns
                 g.present(encW, encH, ns)
@@ -447,23 +450,16 @@ internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis)
 
     /**
      * Звук результата. Обычная съёмка — дорожка как есть (без перекодирования).
-     * Замедленная — сэмплы объявляются идущими в slow раз чаще (тон и голоса снова на своей
-     * высоте, как asetrate в скрипте) и перекодируются в AAC.
+     * Замедленная — сэмплы растягиваются обратно в реальное время ([retimeAudio]).
      */
     private fun prepareAudio(cancelled: () -> Boolean): AudioOut? =
-        if (a.slow <= 1.0) copyAudio() else speedUpAudio(cancelled)
+        if (a.slow <= 1.0) copyAudio() else retimeAudio(cancelled)
 
     private fun copyAudio(): AudioOut? {
         val ex = MediaExtractor()
         try {
             ex.setDataSource(ctx, a.uri, null)
-            var track = -1
-            var fmt: MediaFormat? = null
-            for (i in 0 until ex.trackCount) {
-                val f = ex.getTrackFormat(i)
-                if ((f.getString(MediaFormat.KEY_MIME) ?: "").startsWith("audio/")) { track = i; fmt = f; break }
-            }
-            if (track < 0 || fmt == null) return null
+            val (track, fmt) = VideoFrames.audioTrack(ex) ?: return null
             ex.selectTrack(track)
             val cap = if (fmt.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) max(1 shl 14, fmt.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE)) else 1 shl 18
             val buf = ByteBuffer.allocateDirect(cap)
@@ -489,9 +485,16 @@ internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis)
         } finally { runCatching { ex.release() } }
     }
 
-    private fun speedUpAudio(cancelled: () -> Boolean): AudioOut? {
-        val au = PovAnalyzer.decodeAudio(ctx, a.uri, wantDet = false, wantPcm = true, cancelled = cancelled) ?: return null
-        var pcm = au.pcm ?: return null
+    /**
+     * Звук замедленного ролика в реальном времени: выходной сэмпл в момент τ берётся из
+     * момента файла map.file(τ) — замедленный участок звучит в slow раз быстрее, остальное
+     * как есть. Тон и голоса снова на своей высоте (как asetrate в скрипте): замедляют звук
+     * тем же растяжением (Samsung объявляет у дорожки частоту в k раз ниже, iOS
+     * пересчитывает), так что ×k возвращает ему и высокие частоты. Результат — 48 кГц AAC.
+     */
+    private fun retimeAudio(cancelled: () -> Boolean): AudioOut? {
+        val au = PovAnalyzer.decodePcm(ctx, a.uri, cancelled) ?: return null
+        var pcm = au.pcm
         var ch = au.channels
         if (ch > 2) {   // AAC здесь — моно или стерео
             val frames = pcm.size / ch
@@ -503,10 +506,27 @@ internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis)
             }
             pcm = st; ch = 2
         }
-        var rate = (au.sampleRate * a.slow).roundToInt()
-        val std = intArrayOf(8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000)
-        if (rate !in std) { pcm = resample(pcm, ch, rate, 48000); rate = 48000 }
-        val offUs = ((au.startUs - a.videoStartUs) / a.slow).roundToLong()
+        val map = a.map
+        val rate = OUT_RATE
+        val inF = pcm.size / ch
+        if (inF < 2) return null
+        val a0 = (au.startUs - a.videoStartUs).toDouble()      // момент файла первого сэмпла
+        val outStart = max(0.0, map.real(a0))                    // звук до первого кадра не нужен
+        val outF = ((map.real(a0 + inF * 1e6 / au.sampleRate) - outStart) * rate / 1e6).toInt()
+        if (outF < 1) return null
+        val src = pcm
+        pcm = ShortArray(outF * ch)
+        for (m in 0 until outF) {
+            val x = (map.file(outStart + m * 1e6 / rate) - a0) * au.sampleRate / 1e6
+            val i0 = floor(x).toInt().coerceIn(0, inF - 1)
+            val i1 = min(inF - 1, i0 + 1)
+            val fr = (x - i0).coerceIn(0.0, 1.0)
+            for (k in 0 until ch) {
+                val v = src[i0 * ch + k] * (1 - fr) + src[i1 * ch + k] * fr
+                pcm[m * ch + k] = v.roundToInt().coerceIn(-32768, 32767).toShort()
+            }
+        }
+        val offUs = outStart.roundToLong()
 
         val c = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
         try {
@@ -564,25 +584,6 @@ internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis)
             runCatching { c.stop() }
             runCatching { c.release() }
         }
-    }
-
-    /** Линейный пересчёт частоты дискретизации (чередующиеся каналы). */
-    private fun resample(src: ShortArray, ch: Int, from: Int, to: Int): ShortArray {
-        val inF = src.size / ch
-        val outF = (inF.toLong() * to / from).toInt()
-        val out = ShortArray(outF * ch)
-        val step = from.toDouble() / to
-        for (f in 0 until outF) {
-            val x = f * step
-            val i0 = min(inF - 1, x.toInt())
-            val i1 = min(inF - 1, i0 + 1)
-            val fr = x - i0
-            for (k in 0 until ch) {
-                val v = src[i0 * ch + k] * (1 - fr) + src[i1 * ch + k] * fr
-                out[f * ch + k] = v.roundToInt().coerceIn(-32768, 32767).toShort()
-            }
-        }
-        return out
     }
 
     // ------------------------------------------------------------------ выход кодировщика

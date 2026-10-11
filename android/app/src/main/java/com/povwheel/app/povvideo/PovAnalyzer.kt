@@ -19,6 +19,7 @@ import java.util.Locale
 import java.util.TimeZone
 import kotlin.math.abs
 import kotlin.math.floor
+import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -63,8 +64,8 @@ class PovAnalysis(
     val videoBps: Double,
     /** Кодек исходника (MIME). */
     val videoMime: String,
-    /** Во сколько раз файл медленнее реального времени (1 — обычная съёмка). */
-    val slow: Double,
+    /** Время файла → реальное время: замедление, постоянное или только в середине (slo-mo с iPhone). */
+    val map: TimeMap,
     val tracks: List<TickTrack>,
     /** Метки времени кадров, мкс от первого кадра, по возрастанию. */
     val ptsUs: LongArray,
@@ -78,6 +79,10 @@ class PovAnalysis(
 ) {
     val renderable: Boolean get() = tracks.isNotEmpty() && plan.totalFrames > 0
     val outName: String get() = displayName.substringBeforeLast('.') + "_sync_" + sweeps + "sweeps.mp4"
+    /** Самое сильное замедление (1 — обычная съёмка). */
+    val slow: Double get() = map.slow
+    /** Длина ролика в реальном времени, с — столько же идёт результат. */
+    val realDurationSec: Double get() = map.real(durationSec * 1e6) / 1e6
 }
 
 /** Звук ролика, декодированный в PCM. */
@@ -86,11 +91,8 @@ internal class DecodedAudio(
     val channels: Int,
     /** Время первого сэмпла, мкс по шкале контейнера. */
     val startUs: Long,
-    /** −1..1, [detChannels] каналов вперемешку (не больше двух). */
-    val det: FloatArray?,
-    val detChannels: Int,
     /** Чередующиеся каналы, 16 бит — для звука результата. */
-    val pcm: ShortArray?,
+    val pcm: ShortArray,
     val frames: Int
 )
 
@@ -113,6 +115,10 @@ internal class DecodedAudio(
  *    уступает лишь вдвое более сильному совпадению. Без совпадения остаются замедление и
  *    время из метаданных — склейке нужна скорость ротора, а не фаза, и секунда ошибки ей
  *    почти не вредит.
+ *    Замедление бывает не на весь ролик ([TimeMap]): slo-mo, отданное с iPhone, идёт первые
+ *    и последние секунды в реальном времени, а середину — ×4 или ×8. Где середина, видно по
+ *    звуку ([SlowMoAudio]: замедленный звук без высоких частот), во сколько раз — снова по
+ *    гашениям: такие формы перебираются наравне с постоянными.
  * 4. Тики — через весь прогон вращения: короткое гашение слайдшоу (загрузка файла) склейку
  *    не рвёт, прорисовки идут дальше, просто тёмные. Прежде на эти доли секунды шли
  *    исходные кадры с полной частотой, и смена картинок выбивалась из ролика.
@@ -171,8 +177,23 @@ internal object PovAnalyzer {
         // но проверяются все: у GoPro её нет вовсе. Метки кадров замедленного файла —
         // настоящие, умноженные на целое (проверено: ровно 4.000 и 8.000, не 4.03).
         val hint = if (captureFps > 0 && fileFps > 0) (captureFps / fileFps).roundToInt() else 0
-        val slows = LinkedHashSet<Double>().apply { if (hint >= 2) add(hint.toDouble()); for (s in PovSync.SLOWS) add(s) }.toList()
-        val prefSlow = if (hint >= 2) hint.toDouble() else 1.0
+        // Slo-mo, замедленное лишь в середине (так iPhone отдаёт его через «поделиться»):
+        // где середина — по звуку, замедление перебирается по гашениям, как и постоянное,
+        // но не больше, чем допускает край спектра замедленного звука.
+        step("Listening to the sound…")
+        val cue = runCatching { slowMoCue(ctx, uri, videoStartUs, durationSec * 1e6, cancelled) }
+            .getOrElse { if (it is InterruptedException) throw it; null }
+        if (cancelled()) throw InterruptedException()
+        val cueSlow = cue?.let { audioSlow(it.edgeHz) }
+        val maps = slowMaps(hint, cue)
+        val prefSlow = when {
+            hint >= 2 -> hint.toDouble()
+            cueSlow != null -> cueSlow
+            else -> 1.0
+        }
+        // Предпочтение — постоянному из метаданных, а при подсказке звука — его форме.
+        val prefMap = maps.firstOrNull { it.slow == prefSlow && it.constant == (hint >= 2 || cue == null) }
+            ?: maps.first { it.constant && it.slow == prefSlow }
 
         // ---- когда снято ----
         step("Looking up the Hall log…")
@@ -183,14 +204,16 @@ internal object PovAnalyzer {
         rep.add(fmt("Video: %d×%d, %s fps, %s s", dispW, dispH, num2(fileFps), num2(durationSec)) +
             if (videoBps > 0) ", " + num(Math.rint(videoBps / 1e5) / 10) + " Mbit/s" else "")
         if (captureFps > 0 && hint >= 2) rep.add(fmt("  metadata: captured at %s fps — slow motion ×%d?", num2(captureFps), hint))
+        if (cue != null) rep.add(fmt("  sound: slowed %s, nothing above %s kHz there — slow motion with real-time start/end (as an iPhone shares it)%s?",
+            rangeOf(cue.fromUs, cue.toUs, durationSec), num(cue.edgeHz / 1000), if (cueSlow != null) ", ×" + num(cueSlow) else ""))
 
         // Кандидат — пара «время из метаданных, сессия», если лог покрывает ролик хотя бы
         // где-то в пределах дальнего поиска: часы камеры бывают неточны на десятки секунд.
         // cover — покрытие у самих метаданных (по нему выбирается запасной вариант).
         val cands = ArrayList<PovSync.Cand>()
         val srcCache = HashMap<Long, PovSync.Src?>()
-        for (slow in slows) {
-            val durReal = durationSec * 1e6 / slow
+        for (map in maps) {
+            val durReal = map.real(durationSec * 1e6)
             val anchors = anchorsOf(name, dateStr, ms, durReal)
             if (anchors.isEmpty()) continue
             val lo = anchors.minOf { it.wallUs } - PovSync.FAR_US - 60e6
@@ -200,7 +223,7 @@ internal object PovAnalyzer {
                 for (a in anchors) {
                     if (src.covered(a.wallUs - PovSync.FAR_US, a.wallUs + durReal + PovSync.FAR_US) <= 0.5e6) continue
                     val pad = 3 * a.sigmaUs
-                    cands.add(PovSync.Cand(a, slow, src, src.covered(a.wallUs - pad, a.wallUs + durReal + pad)))
+                    cands.add(PovSync.Cand(a, map, src, src.covered(a.wallUs - pad, a.wallUs + durReal + pad)))
                 }
             }
         }
@@ -214,7 +237,7 @@ internal object PovAnalyzer {
         if (cancelled()) throw InterruptedException()
 
         // ---- кадры для привязки: весь ролик, а у очень длинного — окно с наибольшим числом гашений ----
-        val best0 = cands.filter { it.slow == prefSlow }.ifEmpty { cands }.maxBy { it.cover / sqrt(it.a.sigmaUs) }
+        val best0 = cands.filter { it.map === prefMap }.ifEmpty { cands }.maxBy { it.cover / sqrt(it.a.sigmaUs) }
         var fromI = 0
         var toI = nF - 1
         if (nF > MAX_ALIGN_FRAMES) {
@@ -222,8 +245,8 @@ internal object PovAnalyzer {
             var st = 0
             val stepI = max(1, MAX_ALIGN_FRAMES / 20)
             while (st + MAX_ALIGN_FRAMES <= nF) {
-                val a = best0.a.wallUs + pts[st] / best0.slow
-                val b = best0.a.wallUs + pts[st + MAX_ALIGN_FRAMES - 1] / best0.slow
+                val a = best0.a.wallUs + best0.map.real(pts[st].toDouble())
+                val b = best0.a.wallUs + best0.map.real(pts[st + MAX_ALIGN_FRAMES - 1].toDouble())
                 val k = best0.src.darksIn(a, b) * 1000 + (best0.src.covered(a, b) / (b - a + 1) * 999).toInt()
                 if (k > bestK) { bestK = k; fromI = st }
                 st += stepI
@@ -243,12 +266,24 @@ internal object PovAnalyzer {
         val pl = PovSync.plan(pts, fileFps, durationSec, al)
         val cand = al.cand
         val src = al.src
-        val slow = al.slow
+        val map = al.map
+        val slow = map.slow
+        val realDur = map.real(durationSec * 1e6) / 1e6
 
         // ---- сводка ----
-        if (slow > 1) rep.add(fmt("Slow motion ×%s%s: rpm below are real; segment times are in the file's own time; the result plays in real time.",
-            num(slow), when { al.how == 1 -> " (found from the display switching on/off)"; slow.roundToInt() == hint -> " (from the metadata)"; else -> "" }))
+        val how = when {
+            !map.constant && al.how == 1 -> " (where: from the sound and the display switching; the factor: from the display switching on/off)"
+            !map.constant -> " (from the sound: the display switching could not be matched)"
+            al.how == 1 -> " (found from the display switching on/off)"
+            slow.roundToInt() == hint -> " (from the metadata)"
+            else -> ""
+        }
+        if (!map.constant) rep.add(fmt("Slow motion ×%s only %s, real time before and after%s: rpm below are real; segment times are in the file's own time; the result plays in real time.",
+            num(slow), rangeOf(map.slowFrom, map.slowTo, durationSec), how))
+        else if (slow > 1) rep.add(fmt("Slow motion ×%s%s: rpm below are real; segment times are in the file's own time; the result plays in real time.", num(slow), how))
         else if (hint >= 2 && al.how == 1) rep.add(fmt("  the display switching says real time, not ×%d — the metadata hint is ignored", hint))
+        if (cue != null && map.constant && al.how == 1)
+            rep.add("  the display switching does not confirm the slowed sound — the whole video is taken at one speed")
         rep.add("Recorded (" + cand.a.what + "): " + fmtWall(cand.a.wallUs) + fmt(" ±%s s", num2(cand.a.sigmaUs / 1e6)))
         rep.add(fmt("Hall log: %s, session %08x, clock from %s (±%s ms)",
             src.s.wheelName, src.s.bootId, src.s.map.how, num2(src.s.map.sigmaUs / 1e3)))
@@ -271,13 +306,13 @@ internal object PovAnalyzer {
             else -> rep.add("Video match: no display switching could be matched in the video (none filmed, or not visible: " +
                 "a small or distant wheel, daylight, a moving camera) — the metadata time is used. " +
                 "Stitching needs only the rotor speed, which changes slowly, so a second or so of offset does not matter." +
-                if (hint < 2) " If this is slow motion, its factor could not be found: film a moment when the display switches (a slideshow does it every few seconds)." else "")
+                if (hint < 2 && cueSlow == null) " If this is slow motion, its factor could not be found: film a moment when the display switches (a slideshow does it every few seconds)." else "")
         }
         pl.tracks.forEachIndexed { i, t ->
             val ts = t.times
             var rMin = Double.MAX_VALUE; var rMax = 0.0
             for (k in 0 until ts.size - 1) {
-                val rpm = 60.0 / ((ts[k + 1] - ts[k]) / slow * ARMS)
+                val rpm = 60.0 / ((map.real(ts[k + 1] * 1e6) - map.real(ts[k] * 1e6)) / 1e6 * ARMS)
                 rMin = min(rMin, rpm); rMax = max(rMax, rpm)
             }
             rep.add(fmt("  segment %d: %s–%s s, %d sweeps, %d..%d rpm, %s", i + 1, num3(ts.first()), num3(ts.last()),
@@ -294,12 +329,46 @@ internal object PovAnalyzer {
                 num(Math.rint(pl.framesPerSweep * 10) / 10), PovSync.MIN_WIN_FRAMES,
                 num(Math.rint(PovSync.MIN_WIN_FRAMES / pl.framesPerSweep * 10) / 10)))
         if (pl.tracks.isNotEmpty())
-            rep.add(fmt("Result: %s s at %s fps%s", num2(durationSec / slow), num2(fileFps * slow), if (slow > 1) " (real time)" else ""))
+            rep.add(if (map.constant) fmt("Result: %s s at %s fps%s", num2(realDur), num2(fileFps * slow), if (slow > 1) " (real time)" else "")
+                    else fmt("Result: %s s (real time)", num2(realDur)))
 
         return PovAnalysis(
-            uri, name, relPath, codedW, codedH, rotation, fileFps, durationSec, videoBps, vi.mime, slow,
+            uri, name, relPath, codedW, codedH, rotation, fileFps, durationSec, videoBps, vi.mime, map,
             pl.tracks, pts, videoStartUs, pl.plan, pl.sweeps, syncRanges, rep
         )
+    }
+
+    /**
+     * Формы замедления для перебора: постоянные (подсказка метаданных первой) и, если звук
+     * показал замедленную середину, ×1 → ×k → ×1 с её границами (раздвинутыми на
+     * [SlowMoAudio.LAG_US]) — k не больше, чем допускает край спектра замедленного звука.
+     */
+    fun slowMaps(hint: Int, cue: SlowMoAudio.Found?): List<TimeMap> {
+        val maps = ArrayList<TimeMap>()
+        if (hint >= 2) maps.add(TimeMap.constant(hint.toDouble()))
+        for (s in PovSync.SLOWS) if (hint < 2 || s != hint.toDouble()) maps.add(TimeMap.constant(s))
+        if (cue != null) {
+            // видео замедлено чуть шире звука (SlowMoAudio.LAG_US)
+            val from = cue.fromUs?.let { it - SlowMoAudio.LAG_US }
+            val to = cue.toUs?.let { it + SlowMoAudio.LAG_US }
+            for (s in PovSync.SLOWS) if (s >= 2 && s <= cue.maxSlow) maps.add(TimeMap.ramp(from, to, s))
+        }
+        return maps
+    }
+
+    /** «from 2.49 to 41.87 s of the file»; null — с начала / до конца. */
+    private fun rangeOf(fromUs: Double?, toUs: Double?, durationSec: Double): String =
+        "from " + num2((fromUs ?: 0.0) / 1e6) + " to " + num2((toUs ?: (durationSec * 1e6)) / 1e6) + " s of the file"
+
+    /**
+     * Замедление по краю спектра замедленного звука: iPhone пишет звук до ~20 кГц, ×k
+     * сдвигает край к 20/k. Засчитывается, только если выходит близко к степени двойки
+     * (×2, ×4 — 120 к/с, ×8 — 240 к/с, ×16): край меряется полосами по 500 Гц.
+     */
+    fun audioSlow(edgeHz: Double): Double? {
+        val k = 20000.0 / edgeHz
+        for (p in doubleArrayOf(2.0, 4.0, 8.0, 16.0)) if (abs(ln(k / p)) < 0.25) return p
+        return null
     }
 
     // ---- время записи по метаданным ----
@@ -425,26 +494,19 @@ internal object PovAnalyzer {
     }
 
     /**
-     * Декодирует звуковую дорожку целиком: для детектора — float, не больше двух каналов
-     * вперемешку (стерео не сводится в моно: два микрофона телефона на 15–20 кГц бывают в
-     * противофазе, и сумма гасила бы чирп — детектор складывает их по энергиям); и/или
-     * 16-битный PCM всех каналов.
+     * Декодирует звуковую дорожку кусками: [onPcm] получает частоту, число каналов, момент
+     * первого сэмпла дорожки (мкс шкалы контейнера) и очередной кусок −1..1 вперемешку по
+     * каналам. false — звуковой дорожки, которую телефон может декодировать, нет.
      */
-    fun decodeAudio(
-        ctx: Context, uri: Uri, wantDet: Boolean, wantPcm: Boolean,
-        cancelled: () -> Boolean
-    ): DecodedAudio? {
+    private fun decodeAudioChunks(
+        ctx: Context, uri: Uri, cancelled: () -> Boolean,
+        onPcm: (sr: Int, ch: Int, startUs: Long, pcm: FloatArray, frames: Int) -> Unit
+    ): Boolean {
         val ex = MediaExtractor()
         var codec: MediaCodec? = null
         try {
             ex.setDataSource(ctx, uri, null)
-            var track = -1
-            var fmt: MediaFormat? = null
-            for (i in 0 until ex.trackCount) {
-                val f = ex.getTrackFormat(i)
-                if ((f.getString(MediaFormat.KEY_MIME) ?: "").startsWith("audio/")) { track = i; fmt = f; break }
-            }
-            if (track < 0 || fmt == null) return null
+            val (track, fmt) = VideoFrames.audioTrack(ex) ?: return false
             ex.selectTrack(track)
             val startUs = max(0L, ex.sampleTime)
             var sr = fmt.getInteger(MediaFormat.KEY_SAMPLE_RATE)
@@ -454,11 +516,7 @@ internal object PovAnalyzer {
             c.configure(fmt, null, null, 0)
             c.start()
             var isFloat = false
-            var det = FloatArray(if (wantDet) 1 shl 20 else 0)
-            var pcm = ShortArray(if (wantPcm) 1 shl 20 else 0)
-            var nDet = 0
-            var detCh = 0
-            var nPcm = 0
+            var buf = FloatArray(1 shl 14)
             val info = MediaCodec.BufferInfo()
             var inEos = false
             var outEos = false
@@ -468,8 +526,8 @@ internal object PovAnalyzer {
                 if (!inEos) {
                     val ii = c.dequeueInputBuffer(10_000)
                     if (ii >= 0) {
-                        val buf = c.getInputBuffer(ii)!!
-                        val size = ex.readSampleData(buf, 0)
+                        val ib = c.getInputBuffer(ii)!!
+                        val size = ex.readSampleData(ib, 0)
                         if (size < 0) {
                             c.queueInputBuffer(ii, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM); inEos = true
                         } else {
@@ -492,48 +550,52 @@ internal object PovAnalyzer {
                     val ob = c.getOutputBuffer(oi)!!.order(ByteOrder.nativeOrder())
                     ob.position(info.offset); ob.limit(info.offset + info.size)
                     val chn = max(1, ch)
-                    val dch = min(chn, 2)                 // детектору — первые два канала
-                    if (wantDet && detCh == 0) detCh = dch
-                    if (isFloat) {
-                        val fb = ob.asFloatBuffer()
-                        val frames = fb.remaining() / chn
-                        if (wantDet && nDet + frames * dch > det.size) det = det.copyOf(max(det.size * 2, nDet + frames * dch))
-                        if (wantPcm && nPcm + frames * chn > pcm.size) pcm = pcm.copyOf(max(pcm.size * 2, nPcm + frames * chn))
-                        for (f in 0 until frames) {
-                            for (k in 0 until chn) {
-                                val v = fb.get()
-                                if (wantPcm) pcm[nPcm++] = (v.coerceIn(-1f, 1f) * 32767f).toInt().toShort()
-                                if (wantDet && k < dch) det[nDet++] = v
-                            }
-                        }
-                    } else {
-                        val sb = ob.asShortBuffer()
-                        val frames = sb.remaining() / chn
-                        if (wantDet && nDet + frames * dch > det.size) det = det.copyOf(max(det.size * 2, nDet + frames * dch))
-                        if (wantPcm && nPcm + frames * chn > pcm.size) pcm = pcm.copyOf(max(pcm.size * 2, nPcm + frames * chn))
-                        for (f in 0 until frames) {
-                            for (k in 0 until chn) {
-                                val v = sb.get()
-                                if (wantPcm) pcm[nPcm++] = v
-                                if (wantDet && k < dch) det[nDet++] = v / 32768f
-                            }
-                        }
-                    }
+                    val frames = (if (isFloat) info.size / 4 else info.size / 2) / chn
+                    val m = frames * chn
+                    if (buf.size < m) buf = FloatArray(m)
+                    if (isFloat) ob.asFloatBuffer().get(buf, 0, m)
+                    else { val sb = ob.asShortBuffer(); for (i in 0 until m) buf[i] = sb.get() / 32768f }
+                    if (frames > 0) onPcm(sr, chn, startUs, buf, frames)
                 }
                 c.releaseOutputBuffer(oi, false)
             }
-            val frames = if (wantDet) nDet / max(1, detCh) else nPcm / max(1, ch)
-            return DecodedAudio(
-                sr, max(1, ch), startUs,
-                if (wantDet) det.copyOf(nDet) else null, max(1, detCh),
-                if (wantPcm) pcm.copyOf(nPcm) else null,
-                frames
-            )
+            return true
         } finally {
             runCatching { codec?.stop() }
             runCatching { codec?.release() }
             runCatching { ex.release() }
         }
+    }
+
+    /** Звук целиком, 16-битный PCM всех каналов — для звука результата. */
+    fun decodePcm(ctx: Context, uri: Uri, cancelled: () -> Boolean): DecodedAudio? {
+        var pcm = ShortArray(1 shl 20)
+        var n = 0
+        var sr = 0
+        var chn = 1
+        var startUs = 0L
+        val ok = decodeAudioChunks(ctx, uri, cancelled) { r, c, st, buf, frames ->
+            sr = r; chn = c; startUs = st
+            val m = frames * c
+            if (n + m > pcm.size) pcm = pcm.copyOf(max(pcm.size * 2, n + m))
+            for (i in 0 until m) pcm[n++] = (buf[i] * 32768f).roundToInt().coerceIn(-32768, 32767).toShort()
+        }
+        if (!ok || n == 0 || sr <= 0) return null
+        return DecodedAudio(sr, chn, startUs, pcm.copyOf(n), n / chn)
+    }
+
+    /**
+     * Подсказка звука о замедленной середине ролика ([SlowMoAudio]); null — её нет или звука
+     * нет. Звук идёт в детектор кусками, целиком в памяти не держится.
+     */
+    private fun slowMoCue(ctx: Context, uri: Uri, videoStartUs: Long, durUs: Double, cancelled: () -> Boolean): SlowMoAudio.Found? {
+        var det: SlowMoAudio? = null
+        var startUs = 0L
+        decodeAudioChunks(ctx, uri, cancelled) { sr, ch, st, buf, frames ->
+            val d = det ?: SlowMoAudio(sr).also { det = it; startUs = st }
+            d.feed(buf, frames, ch)
+        }
+        return det?.finish((startUs - videoStartUs).toDouble(), durUs)
     }
 
     private fun fmt(f: String, vararg a: Any?) = String.format(Locale.US, f, *a)

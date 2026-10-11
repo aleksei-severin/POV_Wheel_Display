@@ -45,14 +45,15 @@ class PovVideoController(private val app: Application, private val scope: Corout
     class Summary(
         val displayName: String,
         val durationSec: Double,
-        val slow: Double,
+        /** Длина в реальном времени (у slow motion короче файла) — столько идёт результат. */
+        val realDurationSec: Double,
         val rotation: Int,
         val codedW: Int,
         val codedH: Int,
         val syncRanges: List<DoubleArray>,
         val report: List<String>
     ) {
-        constructor(a: PovAnalysis) : this(a.displayName, a.durationSec, a.slow, a.rotation,
+        constructor(a: PovAnalysis) : this(a.displayName, a.durationSec, a.realDurationSec, a.rotation,
             a.codedW, a.codedH, a.syncRanges, a.report)
     }
 

@@ -24,6 +24,11 @@ import kotlin.math.sin
  *    PovSync.align). Днём на улице, с движущейся камеры и с мелким в кадре колесом
  *    провалов не видно: межкадровую разность задаёт фон. Такое совпадение не выделяется
  *    над фоном перебора, и PovSync.align его не засчитывает.
+ *    Разность считается только по крупным переменам пикселя (сверх [DIFF_FLOOR]): лучи
+ *    меняют пиксель на десятки и сотни уровней, а мерцание комнатного света (100 Гц,
+ *    в slo-mo — период в несколько кадров) и шум — на единицы. Со средней |разностью|
+ *    мелкое колесо в светлой комнате тонуло в мерцании (IMG_5297: контраст гашений
+ *    0.3–1.2 σ против 12–40 σ теперь).
  *
  * 2. ПУЛЬСАЦИЯ ОБЩЕЙ ЯРКОСТИ. Кадр ловит лучи на дуге выдержки, и сумма света в кадре —
  *    функция фазы ротора по модулю 60°. При верной привязке эта зависимость согласована
@@ -34,7 +39,13 @@ import kotlin.math.sin
  */
 object PovAlignCore {
 
-    /** Сводка кадров отрезка: метки (мкс файла), средняя яркость, средняя |разность| с предыдущим кадром. */
+    /** Перемена пикселя меньше этого (уровней из 255) — мерцание света и шум, а не лучи. */
+    const val DIFF_FLOOR = 20
+
+    /**
+     * Сводка кадров отрезка: метки (мкс файла), средняя яркость и разность с предыдущим
+     * кадром — среднее по пикселям превышения |разности| над [DIFF_FLOOR].
+     */
     class Stats(
         val ptsUs: LongArray,
         val mean: FloatArray,
@@ -61,7 +72,10 @@ object PovAlignCore {
             mean[n] = (s.toDouble() / np).toFloat()
             if (n > 0) {
                 var d = 0L
-                for (i in 0 until np) d += abs((luma[i].toInt() and 0xFF) - (prev[i].toInt() and 0xFF))
+                for (i in 0 until np) {
+                    val v = abs((luma[i].toInt() and 0xFF) - (prev[i].toInt() and 0xFF))
+                    if (v > DIFF_FLOOR) d += v - DIFF_FLOOR
+                }
                 diff[n] = (d.toDouble() / np).toFloat()
             } else diff[n] = Float.NaN
             pts[n] = ptsUs
@@ -79,17 +93,19 @@ object PovAlignCore {
     // ------------------------------------------------------------------ гашения
 
     /**
-     * Оценка гипотезы «кадр j снят в момент anchor + pts_j/slow (мкс часов телефона)» по
-     * гашениям ленты из лога. У каждого гашения [a, b] — контраст лог-энергии межкадровой
-     * разности: светлые соседи (до [EDGE_US] с каждой стороны) против кадров внутри
-     * гашения у его краёв, в долях шума. Вклад гашения — отношение правдоподобия
-     * mu·c − mu²/2: совпавшее гашение даёт много, гашение, которого на видео нет, — штраф.
-     * Длинное гашение (колесо стояло) считается только у краёв, как и короткое.
+     * Оценка гипотезы «кадр j снят в момент anchor + map.real(pts_j) (мкс часов телефона)»
+     * по гашениям ленты из лога; [TimeMap] — замедление, постоянное или по участкам. У
+     * каждого гашения [a, b] — контраст лог-энергии межкадровой разности: светлые соседи
+     * (до [EDGE_US] с каждой стороны) против кадров внутри гашения у его краёв, в долях
+     * шума. Вклад гашения — отношение правдоподобия mu·c − mu²/2: совпавшее гашение даёт
+     * много, гашение, которого на видео нет, — штраф. Длинное гашение (колесо стояло)
+     * считается только у краёв, как и короткое.
      *
      * Одна оценка — O(гашений в ролике · log кадров): суммы по кадрам — разностью префиксных
      * сумм, первое гашение ролика — бинарным поиском. Привязка перебирает десятки тысяч
      * сдвигов (±2 минуты вокруг метаданных на каждое замедление), прямые циклы по кадрам и
-     * по всем гашениям сессии на телефоне заняли бы минуты.
+     * по всем гашениям сессии на телефоне заняли бы минуты. Моменты кадров на реальной шкале
+     * при данной [TimeMap] считаются один раз ([timed]) — сдвиг их только переносит.
      */
     class LitScorer(st: Stats) {
         private val n = st.n
@@ -111,11 +127,19 @@ object PovAlignCore {
 
         class Score(val value: Double, val events: Int)
 
+        /** Начало и конец каждого кадра на реальной шкале, мкс от первого кадра ролика. */
+        class Timed(val map: TimeMap, val t0: DoubleArray, val t1: DoubleArray)
+
+        fun timed(map: TimeMap): Timed =
+            Timed(map, DoubleArray(n) { map.real(pts[it]) }, DoubleArray(n) { map.real(pts[it] + dtf[it]) })
+
         /** [darkA]/[darkB] — начала и концы гашений, мкс часов телефона, по возрастанию. */
-        fun score(darkA: DoubleArray, darkB: DoubleArray, slow: Double, anchor: Double): Score {
+        fun score(darkA: DoubleArray, darkB: DoubleArray, tm: Timed, anchor: Double): Score {
             if (n < 2) return Score(0.0, 0)
-            val tFirst = anchor + pts[0] / slow
-            val tLast = anchor + (pts[n - 1] + dtf[n - 1]) / slow
+            val fs = tm.t0
+            val fe = tm.t1
+            val tFirst = anchor + fs[0]
+            val tLast = anchor + fe[n - 1]
             var tot = 0.0
             var cnt = 0
             // первое гашение, которое кончается не раньше начала ролика (+50 мс)
@@ -128,20 +152,20 @@ object PovAlignCore {
                 val prevLitStart = if (i > 0) darkB[i - 1] else Double.NEGATIVE_INFINITY
                 val nextLitEnd = if (i + 1 < darkA.size) darkA[i + 1] else Double.POSITIVE_INFINITY
                 // кадры, пересекающие гашение: t1 > a и t0 < b
-                val j0 = firstEndAfter(a, slow, anchor)
-                val j1 = firstStartAtOrAfter(b, slow, anchor)
+                val j0 = firstEndAfter(fe, a - anchor)
+                val j1 = firstStartAtOrAfter(fs, b - anchor)
                 if (j1 <= j0) continue
                 // Считаются кадры у краёв: конец не позже a + EDGE (начало отрезка [j0, jA))
                 // или начало не раньше b − EDGE (конец [jB, j1)); у короткого гашения — все.
-                val jA = min(j1, firstEndAfter(a + EDGE_US, slow, anchor))
-                val jB = max(j0, firstStartAtOrAfter(b - EDGE_US, slow, anchor))
+                val jA = min(j1, firstEndAfter(fe, a + EDGE_US - anchor))
+                val jB = max(j0, firstStartAtOrAfter(fs, b - EDGE_US - anchor))
                 val jl = j1 - 1
                 var m = 0.0; var gmax = 0.0; var yd = 0.0
                 // Доля кадра внутри гашения g: кадры между j0 и jl закрыты целиком (g = 1),
                 // неполными бывают только крайние.
                 fun edge(j: Int) {
-                    val t0 = anchor + pts[j] / slow
-                    val t1 = t0 + dtf[j] / slow
+                    val t0 = anchor + fs[j]
+                    val t1 = anchor + fe[j]
                     val g = max(0.0, min(t1, b) - max(t0, a)) / (t1 - t0)
                     m += g - 1; yd += (g - 1) * y[j]
                     if (g > gmax) gmax = g
@@ -158,8 +182,8 @@ object PovAlignCore {
                 if (m < 0.25) continue
                 yd /= m
                 // светлые соседи: кадры целиком в светлом промежутке у краёв гашения
-                val ja = firstStartAtOrAfter(max(a - EDGE_US, prevLitStart), slow, anchor)
-                val jb = firstEndAfter(min(b + EDGE_US, nextLitEnd), slow, anchor)
+                val ja = firstStartAtOrAfter(fs, max(a - EDGE_US, prevLitStart) - anchor)
+                val jb = firstEndAfter(fe, min(b + EDGE_US, nextLitEnd) - anchor)
                 val lc = max(0, j0 - ja) + max(0, jb - j1)
                 if (lc < 2) continue
                 val ls = (if (j0 > ja) ys[j0] - ys[ja] else 0.0) + (if (jb > j1) ys[jb] - ys[j1] else 0.0)
@@ -171,22 +195,22 @@ object PovAlignCore {
             return Score(tot, cnt)
         }
 
-        /** Первый кадр, чей конец позже [t]. */
-        private fun firstEndAfter(t: Double, slow: Double, anchor: Double): Int {
+        /** Первый кадр, чей конец ([fe], реальная шкала) позже [t]. */
+        private fun firstEndAfter(fe: DoubleArray, t: Double): Int {
             var lo = 0; var hi = n
             while (lo < hi) {
                 val m = (lo + hi) ushr 1
-                if (anchor + (pts[m] + dtf[m]) / slow > t) hi = m else lo = m + 1
+                if (fe[m] > t) hi = m else lo = m + 1
             }
             return lo
         }
 
-        /** Первый кадр, чьё начало не раньше [t]. */
-        private fun firstStartAtOrAfter(t: Double, slow: Double, anchor: Double): Int {
+        /** Первый кадр, чьё начало ([fs]) не раньше [t]. */
+        private fun firstStartAtOrAfter(fs: DoubleArray, t: Double): Int {
             var lo = 0; var hi = n
             while (lo < hi) {
                 val m = (lo + hi) ushr 1
-                if (anchor + pts[m] / slow >= t) hi = m else lo = m + 1
+                if (fs[m] >= t) hi = m else lo = m + 1
             }
             return lo
         }

@@ -58,6 +58,19 @@ internal object VideoFrames {
     private fun canDecode(mime: String) = mime.lowercase() in decodable
 
     /**
+     * Первая звуковая дорожка, которую этот телефон может декодировать. У iPhone 16e и
+     * новее рядом с AAC лежит пространственный звук (APAC), декодера которого у Android нет.
+     */
+    fun audioTrack(ex: MediaExtractor): Pair<Int, MediaFormat>? {
+        for (i in 0 until ex.trackCount) {
+            val f = ex.getTrackFormat(i)
+            val mime = f.getString(MediaFormat.KEY_MIME) ?: continue
+            if (mime.startsWith("audio/") && canDecode(mime)) return Pair(i, f)
+        }
+        return null
+    }
+
+    /**
      * Видеодорожка, которую этот телефон может декодировать: номер и формат для configure().
      * Все, кто читает ролик (привязка, рендер POV-видео, заливка на колесо), берут дорожку
      * здесь — и, значит, одну и ту же, с одними метками кадров.

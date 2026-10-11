@@ -282,7 +282,7 @@ private fun EntryView(
                     val iw = if (rot90) a.codedH else a.codedW; val ih = if (rot90) a.codedW else a.codedH
                     val reduced = s.w.toLong() * s.h < a.codedW.toLong() * a.codedH * 0.98
                     Text(
-                        ow.toString() + "×" + oh + " · " + String.format(Locale.US, "%.1f", a.durationSec / a.slow) +
+                        ow.toString() + "×" + oh + " · " + String.format(Locale.US, "%.1f", a.realDurationSec) +
                             " s · rendered in " + mmss(s.seconds),
                         style = MaterialTheme.typography.bodySmall,
                         color = cs.onSurfaceVariant

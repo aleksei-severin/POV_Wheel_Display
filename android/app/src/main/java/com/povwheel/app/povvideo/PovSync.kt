@@ -30,10 +30,12 @@ internal object PovSync {
      * всему перебору сдвигов не меньше этого. Днём на улице, с движущейся камеры и с мелким
      * в кадре колесом гашений в межкадровой разности не видно вовсе, а её колыхания от
      * движения камеры при каком-нибудь сдвиге и замедлении набирают десятки очков: прежде
-     * этого хватало, и ролик S25+ ×4 уходил в ×12, iPhone ×1 — в ×6. На 23 роликах с
-     * проверенной привязкой у верных совпадений 6.3…16, у шума — не выше 4.9.
+     * этого хватало, и ролик S25+ ×4 уходил в ×12, iPhone ×1 — в ×6. С разностью только по
+     * крупным переменам пикселя (PovAlignCore.DIFF_FLOOR) на 26 роликах с проверенной
+     * привязкой у верных совпадений 8.0…18, у шума уличного ролика — до 6.5 (со средней
+     * |разностью| было 6.3…16 против 4.9, порог стоял на 6).
      */
-    private const val Z_MIN = 6.0
+    private const val Z_MIN = 7.5
     /**
      * Замедление из метаданных (частота съёмки против частоты файла — у Samsung есть)
      * уступает другому, только если совпадение с тем сильнее лучшего совпадения с
@@ -62,6 +64,8 @@ internal object PovSync {
     private const val STEP_US = 20e3
     /** Сколько лучших пиков дальнего перебора уточнять на каждую сессию и замедление. */
     private const val FAR_PEAKS = 3
+    /** Граница замедленного участка уточняется по гашениям в пределах ±столько (мкс файла). */
+    private const val EDGE_SEARCH_US = 400e3
 
     /** Кандидат начала записи: часы телефона (мкс UTC) первого кадра в реальном времени. */
     class Anchor(val wallUs: Double, val sigmaUs: Double, val what: String)
@@ -90,7 +94,10 @@ internal object PovSync {
         }
     }
 
-    class Cand(val a: Anchor, val slow: Double, val src: Src, val cover: Double)
+    /** Кандидат: начало по метаданным, замедление (постоянное или по участкам), сессия, покрытие логом. */
+    class Cand(val a: Anchor, val map: TimeMap, val src: Src, val cover: Double) {
+        val slow: Double get() = map.slow
+    }
 
     /**
      * Гипотеза привязки: кандидат, точное начало (мкс часов телефона), её оценка и [z] —
@@ -127,8 +134,12 @@ internal object PovSync {
 
     // ------------------------------------------------------------------ привязка
 
-    /** Как привязано: 1 — по гашениям, 2 — по одному гашению, 0 — по метаданным. */
+    /**
+     * Как привязано: 1 — по гашениям, 2 — по одному гашению, 0 — по метаданным. [anchor] —
+     * момент первого кадра (мкс часов телефона); кадр файла t снят в anchor + map.real(t).
+     */
     class Alignment(val cand: Cand, val anchor: Double, val sigma: Double, val how: Int, val events: Int) {
+        val map: TimeMap get() = cand.map
         val slow: Double get() = cand.slow
         val src: Src get() = cand.src
     }
@@ -155,7 +166,7 @@ internal object PovSync {
         val tq = DoubleArray(sn); val phi = DoubleArray(sn); val tmp = DoubleArray(sn)
         fun cohAt(c: Cand, at: Double): Double {
             val co = coh ?: return 0.0
-            for (j in 0 until sn) tq[j] = at + st.ptsUs[j] / c.slow
+            for (j in 0 until sn) tq[j] = at + c.map.real(st.ptsUs[j].toDouble())
             c.src.phiInto(tq, phi, tmp)
             return co.value(phi)
         }
@@ -165,12 +176,13 @@ internal object PovSync {
         if (lit != null && sn >= 2) {
             val spanFirst = st.ptsUs[0].toDouble()
             val spanLast = st.ptsUs[sn - 1].toDouble()
-            for ((key, cs) in cands.filter { it.src.darkA.isNotEmpty() }.groupBy { Pair(it.src, it.slow) }) {
+            for ((key, cs) in cands.filter { it.src.darkA.isNotEmpty() }.groupBy { Pair(it.src, it.map) }) {
                 if (cancelled()) throw InterruptedException()
-                val (src, slow) = key
+                val (src, map) = key
+                val tm = lit.timed(map)
                 // Где вообще может что-то совпасть: ролик задевает хотя бы одно гашение.
-                val lim0 = src.darkA[0] - spanLast / slow - 1e6
-                val lim1 = src.darkB[src.darkB.size - 1] - spanFirst / slow + 1e6
+                val lim0 = src.darkA[0] - map.real(spanLast) - 1e6
+                val lim1 = src.darkB[src.darkB.size - 1] - map.real(spanFirst) + 1e6
                 val ivs = cs.map { doubleArrayOf(max(lim0, it.a.wallUs - FAR_US), min(lim1, it.a.wallUs + FAR_US)) }
                     .filter { it[1] > it[0] }.sortedBy { it[0] }
                 val merged = ArrayList<DoubleArray>()
@@ -188,7 +200,7 @@ internal object PovSync {
                     val m = ((iv[1] - iv[0]) / STEP_US).toInt() + 1
                     for (q in 0 until m) {
                         val x = iv[0] + q * STEP_US
-                        val s = lit.score(src.darkA, src.darkB, slow, x)
+                        val s = lit.score(src.darkA, src.darkB, tm, x)
                         xs[k] = x; sc[k] = s.value; ev[k] = s.events; k++
                     }
                 }
@@ -209,10 +221,10 @@ internal object PovSync {
                 }
                 fun refine(c: Cand, x0: Double): Hyp {
                     var bestAt = x0
-                    var best = lit.score(src.darkA, src.darkB, slow, x0)
+                    var best = lit.score(src.darkA, src.darkB, tm, x0)
                     for (q in -15..15) {
                         if (q == 0) continue
-                        val s = lit.score(src.darkA, src.darkB, slow, x0 + q * 2e3)
+                        val s = lit.score(src.darkA, src.darkB, tm, x0 + q * 2e3)
                         if (s.value > best.value) { best = s; bestAt = x0 + q * 2e3 }
                     }
                     return Hyp(c, bestAt, best.value, best.events, (best.value - bgMed) / bgMad)
@@ -259,7 +271,7 @@ internal object PovSync {
             val kept = ArrayList<Hyp>()
             for (h in hyps.sortedByDescending { it.score }) {
                 if (h.score < 0.6 * top.score) break
-                if (kept.any { it.c.src === h.c.src && it.c.slow == h.c.slow && abs(it.at - h.at) < 150e3 }) continue
+                if (kept.any { it.c.src === h.c.src && it.c.map === h.c.map && abs(it.at - h.at) < 150e3 }) continue
                 kept.add(h)
             }
             var pick = kept[0]
@@ -272,7 +284,8 @@ internal object PovSync {
                 val bc = kept.maxBy { it.coh }
                 if (bc.coh > kept[0].coh * 1.03) pick = bc
             }
-            return Alignment(pick.c, pick.at, 1e6 / (fileFps * pick.c.slow) / 2, 1, pick.events)
+            val al = Alignment(pick.c, pick.at, 1e6 / (fileFps * pick.c.slow) / 2, 1, pick.events)
+            return if (lit != null && !pick.c.map.constant) refineEdges(lit, st, al) else al
         }
         // Одно гашение в ролике: сдвиг по нему, замедление — подсказка метаданных или ×1.
         nearOk.filter { it.c.slow == prefSlow }.maxByOrNull { it.score }?.let { one ->
@@ -284,6 +297,50 @@ internal object PovSync {
         // уверенно ставила сдвиг на секунды мимо. Склейке нужна скорость ротора, а она
         // за секунду ошибки метаданных почти не меняется.
         return Alignment(fallback, fallback.a.wallUs, fallback.a.sigmaUs, 0, 0)
+    }
+
+    /**
+     * Границы замедленного участка ×1 → ×k → ×1 — точнее по гашениям. Звук их показывает с
+     * разбросом в десятые доли секунды ([SlowMoAudio.LAG_US]), а гашение в обычной части
+     * сдвигается в 1 − 1/k раза быстрее границы: 0.2 с ошибки — 150 мс мимо, и короткие
+     * гашения слайдшоу (70–170 мс) уже не совпадают. Каждая граница двигается в пределах
+     * ±[EDGE_SEARCH_US], середина остаётся на месте — её привязали гашения внутри. Ровная
+     * оценка (у края нет гашений) границу не трогает; из равных лучших берётся средняя.
+     */
+    private fun refineEdges(lit: PovAlignCore.LitScorer, st: PovAlignCore.Stats, al: Alignment): Alignment {
+        val map0 = al.map
+        val src = al.src
+        val k = map0.slow
+        var from = map0.slowFrom
+        var to = map0.slowTo
+        val last = st.ptsUs[st.n - 1].toDouble()
+        // точка середины, которую держим на месте при любых границах из перебора
+        val mid = ((from ?: 0.0) + EDGE_SEARCH_US + ((to ?: last) - EDGE_SEARCH_US)) / 2
+        fun anchorOf(m: TimeMap) = al.anchor + map0.real(mid) - m.real(mid)
+        fun scoreOf(m: TimeMap) = lit.score(src.darkA, src.darkB, lit.timed(m), anchorOf(m)).value
+        fun best(cur: Double, make: (Double) -> TimeMap): Double {
+            val base = scoreOf(make(cur))
+            val xs = ArrayList<Double>()
+            val vs = ArrayList<Double>()
+            var q = -EDGE_SEARCH_US
+            while (q <= EDGE_SEARCH_US + 1) { xs.add(cur + q); vs.add(scoreOf(make(cur + q))); q += 10e3 }
+            val im = vs.indices.maxBy { vs[it] }
+            if (vs[im] < base + LIT_MIN) return cur
+            // середина плато вокруг максимума: гашение совпадает целыми кадрами, и оценка
+            // стоит ровно на отрезке сдвигов
+            var lo = im
+            var hi = im
+            while (lo > 0 && vs[lo - 1] >= vs[im] - 0.5) lo--
+            while (hi < vs.size - 1 && vs[hi + 1] >= vs[im] - 0.5) hi++
+            return (xs[lo] + xs[hi]) / 2
+        }
+        from?.let { f -> from = best(f) { TimeMap.ramp(it, to, k) } }
+        to?.let { t -> to = best(t) { TimeMap.ramp(from, it, k) } }
+        if (from == map0.slowFrom && to == map0.slowTo) return al
+        val m = TimeMap.ramp(from, to, k)
+        val c = al.cand
+        val s = lit.score(src.darkA, src.darkB, lit.timed(m), anchorOf(m))
+        return Alignment(Cand(c.a, m, c.src, c.cover), anchorOf(m), al.sigma, al.how, s.events)
     }
 
     /** Полуширина ближнего поиска сдвига вокруг кандидата, мкс. */
@@ -315,15 +372,17 @@ internal object PovSync {
      * поворота ротора) берутся из лога, а не из чирпов. Каждая прорисовка — один кадр
      * результата: окно ровно в одну прорисовку (см. PovRenderer.windows). Тики идут через
      * весь прогон вращения: короткое гашение слайдшоу склейку не рвёт. Прорисовка длиннее
-     * 1/[MIN_FPS] с делится на части, каждая — склейка своих кадров. [pts] — метки кадров,
-     * мкс от первого.
+     * 1/[MIN_FPS] с (реального времени) делится на части, каждая — склейка своих кадров.
+     * [pts] — метки кадров, мкс от первого. Тики переводятся во время файла через
+     * [Alignment.map]: у slo-mo, замедленного лишь в середине, прорисовка в начале и в конце
+     * занимает в разы меньше кадров, чем в середине.
      */
     fun plan(pts: LongArray, fileFps: Double, durationSec: Double, al: Alignment): Planned {
         val src = al.src
-        val slow = al.slow
+        val map = al.map
         val anchor = al.anchor
         val nF = pts.size
-        val durReal = durationSec * 1e6 / slow
+        val durReal = map.real(durationSec * 1e6)
 
         val tracks = ArrayList<TickTrack>()
         val syncRanges = ArrayList<DoubleArray>()
@@ -331,7 +390,7 @@ internal object PovSync {
             for (iv in stitchIntervals(src, max(r.t0, anchor), min(r.t1, anchor + durReal))) {
                 val tk = r.ticks(iv[0], iv[1])
                 if (tk.size < 2) continue
-                val times = DoubleArray(tk.size) { (tk[it] - anchor) * slow / 1e6 }
+                val times = DoubleArray(tk.size) { map.file(tk[it] - anchor) / 1e6 }
                 tracks.add(TickTrack(times, BooleanArray(tk.size) { true }, r.dir))
                 syncRanges.add(doubleArrayOf(times.first(), times.last()))
             }
@@ -350,8 +409,8 @@ internal object PovSync {
             if (ts[0] < cursor) continue
             if (ts[0] > cursor) segs.add(Seg(true, cursor, ts[0], 0))
             for (k in 0 until ts.size - 1) {
-                val dur = ts[k + 1] - ts[k]
-                val wins = max(1, ceil(dur / slow * MIN_FPS - 1e-6).toInt())
+                val dur = (map.real(ts[k + 1] * 1e6) - map.real(ts[k] * 1e6)) / 1e6
+                val wins = max(1, ceil(dur * MIN_FPS - 1e-6).toInt())
                 if (wins > 1) fpsSplit++
                 sweeps += wins
                 segs.add(Seg(false, ts[k], ts[k + 1], wins))
