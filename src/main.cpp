@@ -66,7 +66,6 @@ volatile uint32_t last_dcdc_on_time  = 0;      // Момент включени�
 // тот же жест, что признан таковым при пробуждении из глубокого сна.
 static uint32_t last_motion_ms = 0;
 volatile uint32_t last_web_activity_time = 0;  // Отслеживание активности в Web UI
-volatile bool     wakeup_event       = false;  // Импульс с вибродатчика
 volatile bool     request_play_flag  = false;
 
 // Подряд идущие импульсы вибродатчика в скользящем окне VIB_WAKE_WINDOW_MS —
@@ -80,6 +79,17 @@ volatile bool     request_play_flag  = false;
 volatile uint8_t  vib_burst_hits    = 0;
 volatile uint32_t vib_burst_last_us = 0;
 volatile bool     vib_burst_event   = false;
+
+// Частота толчков вибродатчика — по ней автомат питания узнаёт, что колесо
+// крутится, и только тогда поднимает DCDC №1 (см. VIB_SPIN_SECONDS в config.h).
+// Нарастающий итог с момента загрузки — ISR его только увеличивает, посекундный
+// счёт считает vibSecondTick() разностью. «Толчок» — спад после тишины не короче
+// VIB_TAP_GAP_US: дребезг контакта одного касания идёт одной пачкой и считается
+// один раз — сами спады на торможении дребезжат до сотен в секунду.
+static const uint32_t VIB_TAP_GAP_US = 10000;
+volatile uint32_t vib_taps_total = 0;
+// Сколько секунд подряд набрано не меньше VIB_SPIN_TAPS_PER_S толчков.
+static uint8_t vib_spin_run = 0;
 
 volatile float last_lux_value = 0.0f;          // Последнее усреднённое показание ALS-PT19 (лк)
 
@@ -161,7 +171,7 @@ static volatile float rotor_alpha = 0.0f;  // град/мкс², знакова�
 // что это точное значение, а не приближение.
 #define SK9822_FRAME_US   ((float)(SK9822_BUF_SIZE * 8) * 1000000.0f / (float)SK9822_SPI_HZ)
 
-// Гашение одного первого луча (см. blankArm1()): старт-фрейм, 88 пустых
+// Гашение одного первого луча (см. arm1RailUpBlanked()): старт-фрейм, 88 пустых
 // LED-фреймов и хвост из нулей. Хвост — новый старт-фрейм, по которому SK9822
 // защёлкивают данные: 32 нулевых бита плюс 44 на задержку в полтакта у каждого
 // из 88 диодов луча, с запасом — 16 байт.
@@ -175,7 +185,7 @@ static float rms_accum = 0.0f;
 static spi_device_handle_t sk9822_spi   = nullptr;
 static uint8_t*            dma_buf[2]   = {nullptr, nullptr}; // Два буфера для ping-pong DMA
 static uint8_t*            dma_tx_buffer = nullptr;           // = dma_buf[0], для служебных заливок
-static uint8_t*            arm1_blank    = nullptr;           // посылка blankArm1(), DMA-память
+static uint8_t*            arm1_blank    = nullptr;           // посылка arm1RailUpBlanked(), DMA-память
 static spi_transaction_t   spi_trans[2] = {};                 // Предвыделенные транзакции (не на стеке)
 static SemaphoreHandle_t   hallSemaphore = nullptr;
 static SemaphoreHandle_t   dmaMutex      = nullptr;
@@ -393,19 +403,18 @@ static PowerCache pwr_cache;
 // =====================================================================
 
 // Вибродатчик HX 0805-C2: подтянут к неотключаемой 3V3, при тряске даёт импульсы LOW.
-// Реагируем только когда питание снято — это сигнал «пора просыпаться».
+// Сам по себе импульс питание больше не поднимает — вращение по их частоте
+// распознаёт vibSecondTick().
 void IRAM_ATTR vibrationInterruptHandler() {
-    if (power_state == PWR_OFF) {
-        wakeup_event = true;
-    }
-
     // Серия толчков за VIB_WAKE_WINDOW_MS — см. комментарий у vib_burst_hits
     // выше. FALLING, а не CHANGE (как раньше): считаем ровно по одному разу на
     // физический толчок, тем же способом, что и порог при пробуждении из
     // глубокого сна, а не по два раза на каждый (LOW и обратно в HIGH).
     // Пауза длиннее окна обнуляет счёт — это уже не та же тряска, а новая.
     uint32_t now = micros();
-    if ((uint32_t)(now - vib_burst_last_us) > (uint32_t)VIB_WAKE_WINDOW_MS * 1000UL) {
+    uint32_t gap = now - vib_burst_last_us;
+    if (gap >= VIB_TAP_GAP_US) vib_taps_total++;   // см. vibSecondTick()
+    if (gap > (uint32_t)VIB_WAKE_WINDOW_MS * 1000UL) {
         vib_burst_hits = 0;
     }
     vib_burst_last_us = now;
@@ -657,7 +666,7 @@ static uint8_t buf_bri_cache[2] = {0, 0};
 // Гасит все 528 диодов — ток=0, цвет=0.
 // Используется при остановке рендеринга и перед снятием питания с лучей.
 // Пока шина прижата к земле, слать некуда (и незачем: лучи либо обесточены,
-// либо это PWR_SPINUP, где первый луч уже погасил blankArm1()).
+// либо это PWR_SPINUP, где первый луч уже погасил arm1RailUpBlanked()).
 void blankAllLEDs_DMA() {
     if (!dma_tx_buffer || !sk9822_spi || !dmaMutex || !led_bus_live) return;
     xSemaphoreTake(dmaMutex, portMAX_DELAY);
@@ -679,30 +688,45 @@ void blankAllLEDs_DMA() {
     xSemaphoreGive(dmaMutex);
 }
 
-// Гасит первый луч, пока лучи 2–6 обесточены, — при включении DCDC №1 (PWR_SPINUP).
-// SK9822 не обязаны включаться погашенными: на отдельном луче с лабораторным
-// питанием этого не случалось ни разу, а в колесе после пробуждения от тряски
-// первый луч иногда загорался случайными диодами — и горел все секунды PWR_SPINUP,
-// пока не начнётся отрисовка: до неё в шину не уходило ни одной посылки.
-// Звать не раньше LED_RAIL_SETTLE_MS после EN — посылка в чипы на ещё
-// поднимающемся питании как раз и даёт вспышку.
+// Поднимает питание первого луча (DCDC №1, PWR_SPINUP) и гасит его, пока лучи
+// 2–6 обесточены. SK9822 не обязаны включаться погашенными: на отдельном луче с
+// лабораторным питанием этого не случалось ни разу, а в колесе после пробуждения
+// от тряски первый луч иногда загорался случайными диодами.
+//
+// Гасим не после выдержки, а всё время подъёма питания: короткая посылка примерно
+// раз в миллисекунду ARM1_BLANK_STREAM_MS подряд. С выдержкой в тишине
+// (LED_RAIL_SETTLE_MS) случайные диоды горели до её конца; так чип, ожив, гаснет
+// на ближайшей посылке. Посылка в ещё не ожившие чипы бесполезна, но и вреда не
+// несёт: одиночное гашение через 2 мс после EN не помогало именно потому, что
+// было одно, а вспышки тогда же давала и долгая единица на MOSI обесточенных
+// лучей (см. led_bus_live) — её больше нет. Последняя пара — уже на
+// установившемся питании: что бы ни поймали чипы на подъёме, оно перезаписано.
 //
 // Посылка — только на свои 88 диодов (ARM1_BLANK_BYTES), а не весь кадр: последний
 // диод первого луча передаёт дальше всё, что после его фрейма, а там одни нули, так
-// что на DATA обесточенного второго луча не приходит ни единицы, а такт идёт
-// ~0.3 мс. Через защитный диод за это время натекает ничтожно мало — сброс по
-// питанию портила долгая единица на входе. После посылки шина снова на земле,
-// led_bus_live не трогаем: в PWR_SPINUP больше слать некому.
-static void blankArm1() {
-    if (!arm1_blank || !sk9822_spi || !dmaMutex) return;
-    xSemaphoreTake(dmaMutex, portMAX_DELAY);
-    ledPinsToSpi();
+// что на DATA обесточенного второго луча не приходит ни единицы. Такт идёт ~150 мкс
+// на посылку, между посылками линии на земле — на CLK второго луча единица
+// держится меньше 10 % времени подъёма, через защитный диод натекает ничтожно мало (сброс
+// по питанию портила долгая единица на входе). led_bus_live не трогаем: в
+// PWR_SPINUP больше слать некому.
+static void arm1RailUpBlanked() {
+    digitalWrite(PIN_EN_DCDC_ARM1, HIGH);
+    if (!arm1_blank || !sk9822_spi || !dmaMutex) { delay(LED_RAIL_SETTLE_MS); return; }
     spi_transaction_t t = {};
     t.length    = ARM1_BLANK_BYTES * 8;
     t.tx_buffer = arm1_blank;
+    xSemaphoreTake(dmaMutex, portMAX_DELAY);
+    uint32_t t0 = millis();
+    do {
+        ledPinsToSpi();
+        spi_device_transmit(sk9822_spi, &t);
+        ledPinsToGround();
+        delay(1);
+    } while (millis() - t0 < ARM1_BLANK_STREAM_MS);
     // Дважды, как и в blankAllLEDs_DMA: хвост первой посылки уже защёлкивает
     // гашение, вторая — страховка для диода, который из случайного состояния не
     // опознал первый старт-фрейм.
+    ledPinsToSpi();
     spi_device_transmit(sk9822_spi, &t);
     spi_device_transmit(sk9822_spi, &t);
     ledPinsToGround();
@@ -2073,12 +2097,9 @@ static void setHallMask(uint8_t mask) {
 }
 
 // Подаёт питание на лучи и ждёт, пока TPS631000 выйдет на режим. DATA/CLK всё
-// это время на земле.
-//
-// Гасить диоды сразу после EN нельзя: посылки в чипы на ещё поднимающемся
-// питании и высокий уровень на линиях обесточенного луча давали вспышку
-// случайными диодами (см. led_bus_live). После выдержки — можно и нужно: первый
-// луч в PWR_SPINUP гасит blankArm1(), остальные — первый же кадр отрисовки.
+// это время на земле. Высокий уровень на линиях обесточенного луча давал вспышку
+// случайными диодами (см. led_bus_live). Лучи 2–6 гасит первый же кадр
+// отрисовки; первый луч поднимается не здесь, а в arm1RailUpBlanked().
 static void powerRailUp(uint8_t en_pin) {
     digitalWrite(en_pin, HIGH);
     delay(LED_RAIL_SETTLE_MS);
@@ -2143,17 +2164,16 @@ static void applyPowerState(PowerState target) {
                 digitalWrite(PIN_EN_DCDC_REST, LOW);
                 webLog("[PWR] RPM low, arms 2-6 off");
             } else {
-                // Просыпаемся: включаем только первый луч и его датчик Холла.
-                // Луч сразу после выхода питания на режим гасим одной короткой
-                // посылкой (blankArm1): SK9822 могут включиться со случайными
+                // Колесо крутится: включаем только первый луч и его датчик Холла.
+                // Пока питание луча поднимается, гасим его короткими посылками
+                // (arm1RailUpBlanked): SK9822 могут включиться со случайными
                 // диодами, и до отрисовки они так и горели бы. Дальше шина на
                 // земле. Маску Холла — после выхода питания на режим, чтобы не
                 // поймать фронт на подъёме.
                 last_dcdc_on_time = millis();  // до пауз — иначе now_ms < last_dcdc_on_time
                 peripherals_active = true;
                 power_state = PWR_SPINUP;
-                powerRailUp(PIN_EN_DCDC_ARM1);
-                blankArm1();
+                arm1RailUpBlanked();
                 setHallMask(0x01);
                 webLog("[PWR] Arm 1 on, measuring RPM");
             }
@@ -3166,12 +3186,8 @@ void setup() {
         uint8_t want = effect_id;
         effect_id = EFF_NONE;               // effectsStart сам выставит и проверит PSRAM
         if (effectsStart(want)) {
+            // request_play_flag не ставим, как и для файла ниже: см. там.
             webLogf("[EFF] Autostart: %s", effectName(want));
-            // Питание первого луча поднимаем и для эффекта тоже. Раньше это
-            // делалось только для файла, и после сна колесо с живым эффектом
-            // стояло тёмным до первой тряски: обороты никто не мерил, а значит
-            // и порог розжига не проверялся.
-            if (!force_stop_display) request_play_flag = true;
         } else {
             webLog("[EFF] Autostart failed, no PSRAM");
         }
@@ -3182,10 +3198,10 @@ void setup() {
             webLogf("[DISP] Autoplay: %s", last_file.c_str());
         }
         loadFrameFromFile("/" + last_file);
-        // Только если показ вообще разрешён: после Stop флаг переживает сон
-        // в RTC-памяти, и поднимать ради него лучи значило бы жечь их вхолостую
-        // все три секунды до возврата в PWR_OFF.
-        if (!force_stop_display) request_play_flag = true;
+        // request_play_flag (Play) здесь не ставим: он поднимает первый луч сразу,
+        // а колесо будит любая тряска — на неподвижном колесе луч включался бы
+        // зря. Питание поднимет вибродатчик, когда колесо поедет (vib_spin_run);
+        // окно простоя и так отсчитывается от загрузки.
     } else if (slideshowActive) {
         webLog("[DISP] Slideshow resume: waiting for first file load");
     }
@@ -3234,6 +3250,24 @@ void setup() {
     // этому моменту (пробуждение по тряске на ходу), первый же проход loop()
     // сам поднимет частоту обратно через applyPowerState(PWR_FULL).
     setCpuFreqForPower(PWR_OFF);
+}
+
+// Раз в секунду: толчки за прошедшую секунду — секунда «вращения» или нет
+// (vib_spin_run, см. VIB_SPIN_SECONDS в config.h). Толчки, разбудившие чип из
+// глубокого сна, сюда не попадают — ISR подключается в setup() уже после них.
+static void vibSecondTick(uint32_t now_ms) {
+    static uint32_t next_ms = 0, taps_prev = 0;
+    if ((int32_t)(now_ms - next_ms) < 0) return;
+    next_ms = now_ms + 1000;
+
+    uint32_t t = vib_taps_total;
+    uint32_t t1 = t - taps_prev;
+    taps_prev = t;
+    if (t1 >= VIB_SPIN_TAPS_PER_S) {
+        if (vib_spin_run < 0xFF) vib_spin_run++;
+    } else {
+        vib_spin_run = 0;
+    }
 }
 
 // =====================================================================
@@ -3296,9 +3330,12 @@ void loop() {
     // молчания, поэтому RPM падает плавно, а не держится на старом значении.
     float rpm = rpmEstimate(rev_period, hall_age_us);
 
-    // --- Обработка запроса Play из Web UI ---
-    // Датчики Холла обесточены, поэтому вращения ждать нельзя — питание
-    // первого луча поднимаем сами, дальше решает автомат по оборотам.
+    // --- Обработка запроса Play из приложения ---
+    // Человек нажал Play — питание первого луча поднимаем сразу, не дожидаясь
+    // вибродатчика: после Stop на ходу картинка иначе вернулась бы только через
+    // VIB_SPIN_SECONDS. Автозапуск после пробуждения этот флаг не ставит — его
+    // ведёт вибродатчик (vib_spin_run), иначе любая тряска, разбудившая колесо,
+    // поднимала бы луч.
     static bool play_pending = false;
     if (request_play_flag) {
         request_play_flag = false;
@@ -3335,13 +3372,6 @@ void loop() {
         }
     }
 
-    // --- Пробуждение по вибродатчику ---
-    bool vibration = false;
-    if (wakeup_event) {
-        wakeup_event = false;
-        vibration = true;
-    }
-
     // --- Нарочитая серия толчков продлевает окно ожидания перед сном ---
     // До сих пор тряска в этом окне (60 с простоя / 5 мин с подключённым BLE
     // до enterDeepSleep() ниже) никак его не продлевала: last_motion_ms
@@ -3356,9 +3386,10 @@ void loop() {
         last_motion_ms  = now_ms;
         webLog("[SYS] Vibration burst detected, sleep timer reset");
     }
+    vibSecondTick(now_ms);
 
     // =================== АВТОМАТ ПИТАНИЯ ===================
-    // PWR_OFF → PWR_SPINUP : вибрация или запрос Play (есть что показывать)
+    // PWR_OFF → PWR_SPINUP : вибродатчик показал вращение или Play (есть что показывать)
     // PWR_SPINUP → PWR_FULL: обороты достигли RPM_RENDER_ON
     // PWR_FULL → PWR_SPINUP: обороты упали ниже RPM_RENDER_OFF (гистерезис 20 RPM)
     // любое → PWR_OFF      : нет вращения дольше 3 с либо Stop из приложения
@@ -3395,7 +3426,13 @@ void loop() {
         switch (power_state) {
             case PWR_OFF:
                 spindown_ms = 0;                    // блокировка розжига больше не нужна
-                if (vibration || play_pending) applyPowerState(PWR_SPINUP);
+                if (play_pending) {
+                    applyPowerState(PWR_SPINUP);
+                } else if (vib_spin_run >= VIB_SPIN_SECONDS) {
+                    webLogf("[VIB] Rotation detected: %u s of >= %u taps/s",
+                            (unsigned)vib_spin_run, (unsigned)VIB_SPIN_TAPS_PER_S);
+                    applyPowerState(PWR_SPINUP);
+                }
                 break;
 
             case PWR_SPINUP:
@@ -3419,6 +3456,10 @@ void loop() {
                            (now_ms - last_play_ms)      > 10000 &&
                            (now_ms - last_dcdc_on_time) > 2000) {
                     webLog("[PWR] No rotation >3s");
+                    // Вибродатчик ошибся (тряска без вращения, багажник машины) —
+                    // следующую попытку только после нового полного счёта, а не
+                    // на том, что набралось, пока луч стоял под питанием.
+                    vib_spin_run = 0;
                     applyPowerState(PWR_OFF);
                 }
                 break;
