@@ -68,8 +68,10 @@ internal class GlVideoScaler(outW: Int, outH: Int) {
 
     private val progExt: Int
     private val prog2d: Int
+    private val prog2dFlip: Int
     private val aPosExt: Int
     private val aPos2d: Int
+    private val aPos2dFlip: Int
     private val uStExt: Int
 
     // 2 текстуры/FBO под пинг-понг деления вдвое + 1 под финальный кадр (чтение).
@@ -96,9 +98,11 @@ internal class GlVideoScaler(outW: Int, outH: Int) {
 
         progExt = buildProgram(VERT_EXT, FRAG_EXT)
         prog2d = buildProgram(VERT_2D, FRAG_2D)
+        prog2dFlip = buildProgram(VERT_2D_FLIP, FRAG_2D)
         aPosExt = GLES20.glGetAttribLocation(progExt, "aPos")
         uStExt = GLES20.glGetUniformLocation(progExt, "uSt")
         aPos2d = GLES20.glGetAttribLocation(prog2d, "aPos")
+        aPos2dFlip = GLES20.glGetAttribLocation(prog2dFlip, "aPos")
 
         GLES20.glGenFramebuffers(3, fbo, 0)
         GLES20.glGenTextures(3, tex, 0)
@@ -149,10 +153,16 @@ internal class GlVideoScaler(outW: Int, outH: Int) {
 
     private fun renderToPixBuf(decW: Int, decH: Int) {
         // --- пасс 1: OES → tex[0] в масштабе кадра (с кэпом), матрица SurfaceTexture ---
-        // stMatrix несёт вертикальный флип видеокадра, поэтому дальше по
-        // конвейеру переворотов Y нет: glReadPixels + copyPixelsFromBuffer дают
-        // Bitmap правильной ориентации (тот же путь, что в Grafika). Размер
-        // tex[0] — ровно decW×decH из формата декодера; повороты решает CPU выше.
+        // Матрица SurfaceTexture по контракту ставит кадр прямо в координатах GL,
+        // где начало — ЛЕВЫЙ НИЖНИЙ угол: низ кадра ложится в нижнюю строку FBO.
+        // glReadPixels отдаёт строки тоже снизу вверх, а Bitmap ждёт сверху
+        // вниз — поэтому последний пасс отражает V (VERT_2D_FLIP), иначе кадр
+        // выходит зеркальным сверху вниз. Так было до 2026-10-16: отражение — не
+        // поворот, и сверка в VideoFrames.matchRotation выбирала между 0°
+        // (вверх ногами) и 180° (зеркально слева направо) — что сюжету ближе.
+        // Grafika (ExtractMpegFramesTest) по той же причине рисует с invert.
+        // Размер tex[0] — ровно decW×decH из формата декодера; повороты решает
+        // CPU выше.
         val cap = 2048
         var w = maxOf(1, decW)
         var h = maxOf(1, decH)
@@ -186,12 +196,12 @@ internal class GlVideoScaler(outW: Int, outH: Int) {
             ch /= 2
         }
 
-        // --- пасс 3: последний шаг в tex[2] (outW×outH) + чтение ---
+        // --- пасс 3: последний шаг в tex[2] (outW×outH) с отражением V + чтение ---
         ensureTex(2, outW, outH)
         bindFbo(2, outW, outH)
         GLES20.glClearColor(0f, 0f, 0f, 0f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-        blit2d(tex[src])
+        blit2d(tex[src], flipV = true)
 
         pixBuf.rewind()
         GLES20.glReadPixels(0, 0, outW, outH, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, pixBuf)
@@ -205,6 +215,7 @@ internal class GlVideoScaler(outW: Int, outH: Int) {
         runCatching { GLES20.glDeleteTextures(1, intArrayOf(oesTex), 0) }
         runCatching { GLES20.glDeleteProgram(progExt) }
         runCatching { GLES20.glDeleteProgram(prog2d) }
+        runCatching { GLES20.glDeleteProgram(prog2dFlip) }
         runCatching { surface.release() }
         runCatching { surfaceTexture.release() }
         if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
@@ -300,12 +311,12 @@ internal class GlVideoScaler(outW: Int, outH: Int) {
         GLES20.glViewport(0, 0, w, h)
     }
 
-    private fun blit2d(srcTex: Int) {
-        GLES20.glUseProgram(prog2d)
+    private fun blit2d(srcTex: Int, flipV: Boolean = false) {
+        GLES20.glUseProgram(if (flipV) prog2dFlip else prog2d)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, srcTex)
         texParams(GLES20.GL_TEXTURE_2D)
-        drawQuad(aPos2d)
+        drawQuad(if (flipV) aPos2dFlip else aPos2d)
     }
 
     private fun drawQuad(aPos: Int) {
@@ -383,6 +394,15 @@ internal class GlVideoScaler(outW: Int, outH: Int) {
             "varying vec2 vUV;\n" +
             "void main() {\n" +
             "  vUV = aPos * 0.5 + 0.5;\n" +
+            "  gl_Position = vec4(aPos, 0.0, 1.0);\n" +
+            "}\n"
+
+        // Тот же блит с отражённой V: последний пасс перед glReadPixels.
+        const val VERT_2D_FLIP =
+            "attribute vec2 aPos;\n" +
+            "varying vec2 vUV;\n" +
+            "void main() {\n" +
+            "  vUV = vec2(aPos.x * 0.5 + 0.5, 0.5 - aPos.y * 0.5);\n" +
             "  gl_Position = vec4(aPos, 0.0, 1.0);\n" +
             "}\n"
 
