@@ -266,7 +266,7 @@ class WheelConnectivityService : Service() {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("POV Wheel Display")
             .setContentText("Watching for your wheels in the background")
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .rainbowIcon()
             .setContentIntent(openIntent)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_MIN)

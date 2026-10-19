@@ -250,7 +250,7 @@ class SyncSlideshowService : Service() {
             return NotificationCompat.Builder(ctx, CHANNEL_ID)
                 .setContentTitle("Sync slideshow running")
                 .setContentText(names.joinToString(" ↔ "))
-                .setSmallIcon(R.mipmap.ic_launcher)
+                .rainbowIcon()
                 .setContentIntent(openIntent)
                 .addAction(0, "Stop", stopIntent)
                 .setOngoing(true)

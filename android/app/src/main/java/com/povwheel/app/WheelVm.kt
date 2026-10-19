@@ -380,10 +380,10 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      */
     val slideIntervalMs = MutableStateFlow<Map<String, Int>>(emptyMap())
 
-    data class PendingSyncDelete(val names: List<String>, val partners: List<Pair<String, String>>)
-    /** Удаление на синхронизированном колесе задело общий файл — ждём ответа,
-     *  удалять ли его и у остальных участников группы тоже. */
-    val pendingSyncDelete = MutableStateFlow<PendingSyncDelete?>(null)
+    /** Удаление на синхронизированном колесе задевает общие файлы [names] —
+     *  кого спросить, удалить ли их и там: [partners] — участники группы на
+     *  связи (адрес → имя). См. [syncDeleteInfo]. */
+    data class SyncDeleteInfo(val names: List<String>, val partners: List<Pair<String, String>>)
 
     /** Имена файлов, совпадающих у [addr] и КАЖДОГО из [others] по имени И
      *  размеру — ровно то, что безопасно проигрывать в одной
@@ -3224,18 +3224,33 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
 
     fun delete(name: String) = deleteMany(listOf(name))
 
+    /**
+     * Текущее колесо в синхронной группе, и среди [names] есть файлы из её
+     * общего списка — об этом окно удаления спрашивает ДО удаления: удалить ли
+     * их и у остальных участников (тех, что на связи). null — спрашивать не о чем.
+     */
+    fun syncDeleteInfo(names: Collection<String>): SyncDeleteInfo? {
+        val addr = current.value ?: return null
+        val group = syncGroups[addr] ?: return null
+        val shared = names.filter { it in group.files }
+        if (shared.isEmpty()) return null
+        val partners = group.members
+            .filter { it != addr && clients[it]?.link?.value == Link.Ready }
+            .map { it to wheelName(it) }
+        return if (partners.isEmpty()) null else SyncDeleteInfo(shared, partners)
+    }
+
     /** Удаляет несколько файлов с ТЕКУЩЕГО колеса, заодно чистит их локальные
-     *  превью. Обычно НЕ зеркалит на другие колёса — у них разные библиотеки —
-     *  но если текущее колесо синхронизировано ([syncGroups]) и среди
-     *  удалённых есть файлы из общего списка, спрашивает через
-     *  [pendingSyncDelete], удалить ли их и у остальных участников группы:
-     *  иначе синхронный показ наткнётся на файл, которого больше нет у кого-то
-     *  из них. */
-    fun deleteMany(names: List<String>) {
+     *  превью. На другие колёса — только если колесо синхронизировано и человек
+     *  в окне удаления согласился ([alsoOnPartners]): тогда общие из этих файлов
+     *  ([syncDeleteInfo]) удаляются и у остальных участников группы. Синхронный
+     *  показ в любом случае идёт дальше без удалённых файлов. */
+    fun deleteMany(names: List<String>, alsoOnPartners: Boolean = false) {
         if (names.isEmpty()) return
         val addr = current.value
         val c = currentClient() ?: return
         val group = addr?.let { syncGroups[it] }
+        val there = if (alsoOnPartners) syncDeleteInfo(names) else null
         viewModelScope.launch {
             var ok = 0
             for (n in names) {
@@ -3248,11 +3263,25 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             }
             runCatching { files.value = c.list() }
             runCatching { fsInfo.value = c.fsInfo() }
-            if (ok == 1) say("Deleted " + names.first())
-            else if (ok > 1) say("Deleted " + ok + " files")
+            // Те же файлы у остальных участников — раньше, чем группа получит
+            // новое расписание: так ни одно колесо не успеет взяться за файл,
+            // который вот-вот исчезнет.
+            val doneThere = ArrayList<String>()
+            if (there != null) for ((p, pName) in there.partners) {
+                val pc = clients[p]?.takeIf { it.link.value == Link.Ready } ?: continue
+                var gone = 0
+                for (n in there.names) if (runCatching { pc.delete(n) }.isSuccess) gone++
+                runCatching { pc.list() }.getOrNull()?.let {
+                    filesByAddr[p] = it
+                    if (current.value == p) files.value = it
+                }
+                runCatching { pc.fsInfo() }.getOrNull()?.let { fsInfoByAddr[p] = it }
+                if (gone > 0) doneThere.add(pName)
+            }
+            val what = if (ok == 1) names.first() else ok.toString() + " files"
+            if (ok > 0) say("Deleted " + what + (if (doneThere.isEmpty()) "" else " here and on " + doneThere.joinToString(", ")))
 
             if (group != null) {
-                val shared = names.filter { it in group.files }
                 group.files = group.files - names.toSet()
                 if (group.files.isEmpty()) {
                     // Гасим всю группу своими соединениями — раньше это молча
@@ -3270,33 +3299,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                     persistSyncGroup(group)
                     armSyncGroup(group)
                 }
-                if (shared.isNotEmpty()) {
-                    val partners = group.members.filter { it != addr }.map { p ->
-                        p to (wheels.value.firstOrNull { w -> w.address == p }?.name ?: "the other wheel")
-                    }
-                    if (partners.isNotEmpty()) pendingSyncDelete.value = PendingSyncDelete(shared, partners)
-                }
             }
-        }
-    }
-
-    /** Ответ на диалог [pendingSyncDelete]: удалить те же файлы у остальных
-     *  участников группы тоже. */
-    fun confirmSyncDelete(doIt: Boolean) {
-        val pend = pendingSyncDelete.value ?: return
-        pendingSyncDelete.value = null
-        if (!doIt) return
-        viewModelScope.launch {
-            for ((addr, _) in pend.partners) {
-                val c = clients[addr] ?: continue
-                for (n in pend.names) runCatching { c.delete(n) }
-                val list = runCatching { c.list() }.getOrNull()
-                if (list != null) {
-                    filesByAddr[addr] = list
-                    if (current.value == addr) files.value = list
-                }
-            }
-            say("Deleted on " + pend.partners.joinToString(", ") { it.second } + " too")
         }
     }
 

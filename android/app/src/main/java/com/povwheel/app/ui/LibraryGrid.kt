@@ -9,6 +9,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.*
@@ -128,7 +129,6 @@ internal fun LibraryTab(
     val wheels by vm.wheels.collectAsState()
     val syncPartnersMap by vm.syncPartners.collectAsState()
     val slideIntervalMap by vm.slideIntervalMs.collectAsState()
-    val pendingSyncDelete by vm.pendingSyncDelete.collectAsState()
     val uploadBusyAddrs by vm.uploadBusyAddrs.collectAsState()
     val textFx by vm.textFx.collectAsState()
     val fxParams by vm.fxParams.collectAsState()
@@ -391,17 +391,45 @@ internal fun LibraryTab(
         }
     }
 
-    if (confirmDelete) AlertDialog(
-        onDismissRequest = { confirmDelete = false },
-        title = { Text("Delete " + checks.size + (if (checks.size == 1) " animation?" else " animations?")) },
-        confirmButton = {
-            TextButton(onClick = hapticClick {
-                vm.deleteMany(checks.filterNot { vm.isSlideEffect(it) })   // эффекты не удаляются
-                confirmDelete = false; mode = LibMode.NORMAL; checks = emptySet()
-            }) { Text("Delete", color = Danger) }
-        },
-        dismissButton = { TextButton(onClick = hapticClick { confirmDelete = false }) { Text("Cancel") } }
-    )
+    if (confirmDelete) {
+        val toDelete = checks.filterNot { vm.isSlideEffect(it) }   // эффекты не удаляются
+        // Колесо в синхронном показе, и удаляются общие файлы — удалить ли их и у
+        // остальных участников, спрашиваем здесь же, ДО удаления.
+        val sync = remember(toDelete) { vm.syncDeleteInfo(toDelete) }
+        var alsoThere by remember { mutableStateOf(true) }
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = { Text("Delete " + toDelete.size + (if (toDelete.size == 1) " animation?" else " animations?")) },
+            text = if (sync == null) null else ({
+                val where = sync.partners.joinToString(", ") { it.second }
+                Column {
+                    Text(
+                        when {
+                            toDelete.size == 1 -> "It's in the synced slideshow with $where."
+                            sync.names.size == toDelete.size -> "They're in the synced slideshow with $where."
+                            else -> "${sync.names.size} of them are in the synced slideshow with $where."
+                        }
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Row(
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
+                            .clickable { alsoThere = !alsoThere },
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Checkbox(checked = alsoThere, onCheckedChange = { alsoThere = it })
+                        Text("Delete " + (if (sync.names.size == 1) "it" else "them") + " on $where too")
+                    }
+                }
+            }),
+            confirmButton = {
+                TextButton(onClick = hapticClick {
+                    vm.deleteMany(toDelete, alsoOnPartners = sync != null && alsoThere)
+                    confirmDelete = false; mode = LibMode.NORMAL; checks = emptySet()
+                }) { Text("Delete", color = Danger) }
+            },
+            dismissButton = { TextButton(onClick = hapticClick { confirmDelete = false }) { Text("Cancel") } }
+        )
+    }
 
     when (fxDialog) {
         TEXT_EFFECT_ID -> TextEffectDialog(vm) { fxDialog = 0 }
@@ -416,25 +444,6 @@ internal fun LibraryTab(
         initial = slideSecs, unit = "s", min = 1, max = 300,
         onDismiss = { intervalDialog = false },
         onSave = { vm.setSlideInterval(it); intervalDialog = false }
-    )
-
-    val pending = pendingSyncDelete
-    if (pending != null) AlertDialog(
-        onDismissRequest = { vm.confirmSyncDelete(false) },
-        title = { Text("Delete for " + pending.partners.joinToString(", ") { it.second } + " too?") },
-        text = {
-            Text(
-                (if (pending.names.size == 1) pending.names.first() else pending.names.size.toString() + " files") +
-                    " — part of the synced slideshow with " + pending.partners.joinToString(", ") { it.second } +
-                    ". Leaving it there will break the sync unless it's removed too."
-            )
-        },
-        confirmButton = {
-            TextButton(onClick = hapticClick { vm.confirmSyncDelete(true) }) {
-                Text("Delete there too", color = Danger)
-            }
-        },
-        dismissButton = { TextButton(onClick = hapticClick { vm.confirmSyncDelete(false) }) { Text("Keep it there") } }
     )
 }
 
