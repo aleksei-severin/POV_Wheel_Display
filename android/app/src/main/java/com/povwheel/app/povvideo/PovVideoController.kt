@@ -66,9 +66,19 @@ class PovVideoController(private val app: Application, private val scope: Corout
             val elapsedSec: Int,
             /** null — пока не набралось данных для оценки. */
             val etaSec: Int?,
-            val step: String
+            val step: String,
+            /** Рендер с ночной обработкой (как её решили для этого ролика). */
+            val night: Boolean = false
         ) : Status
-        data class Done(val path: String, val uri: Uri?, val seconds: Int, val w: Int, val h: Int) : Status
+        /**
+         * [night] — ночная обработка была; [nightUnsupported] — её просили, но видеокарта
+         * телефона её не умеет (16-битные float-текстуры, мипмапы к ним, шейдеры), и ролик
+         * вышел без неё.
+         */
+        data class Done(
+            val path: String, val uri: Uri?, val seconds: Int, val w: Int, val h: Int,
+            val night: Boolean = false, val nightUnsupported: Boolean = false
+        ) : Status
         /** [retry] — ролик не дали прочитать: после разрешения на видео можно поставить его снова. */
         data class Failed(val message: String, val retry: Boolean = false) : Status
         /** Остановлен кнопкой (Skip / Stop) — можно поставить в очередь заново. */
@@ -78,6 +88,24 @@ class PovVideoController(private val app: Application, private val scope: Corout
     /** Ролик в очереди. [name] — null, пока не узнали имя файла. */
     data class Entry(val id: Long, val uri: Uri, val name: String?, val summary: Summary?, val status: Status) {
         val finished: Boolean get() = status is Status.Done || status is Status.Failed || status is Status.Stopped
+    }
+
+    /**
+     * Ночная обработка ([PovRenderer], PovGl): поднять тёмное вокруг колеса, не пересветив
+     * дисплей. Auto — по яркости ролика ([PovAnalysis.dark]). Действует на ролики, чей
+     * рендер начнётся после выбора; хранится в настройках приложения.
+     */
+    enum class NightMode { AUTO, ON, OFF }
+
+    private val prefs = app.getSharedPreferences("pov", Context.MODE_PRIVATE)
+    private val _night = MutableStateFlow(
+        runCatching { NightMode.valueOf(prefs.getString(KEY_NIGHT, null) ?: "AUTO") }.getOrDefault(NightMode.AUTO)
+    )
+    val night: StateFlow<NightMode> = _night
+
+    fun setNight(m: NightMode) {
+        _night.value = m
+        prefs.edit().putString(KEY_NIGHT, m.name).apply()
     }
 
     private val _entries = MutableStateFlow<List<Entry>>(emptyList())
@@ -244,7 +272,12 @@ class PovVideoController(private val app: Application, private val scope: Corout
         if (!a.renderable) { setStatus(id, Status.Failed("Nothing to render: the Hall log does not cover this video.")); return }
         if (cancelled()) { setStatus(id, Status.Stopped); return }
 
-        setStatus(id, Status.Rendering(0, a.plan.totalFrames, 0, null, "Preparing…"))
+        val wantNight = when (_night.value) {
+            NightMode.ON -> true
+            NightMode.OFF -> false
+            NightMode.AUTO -> a.dark
+        }
+        setStatus(id, Status.Rendering(0, a.plan.totalFrames, 0, null, "Preparing…", wantNight))
         val t0 = System.nanoTime()
         var target: Saver.Target? = null
         try {
@@ -253,7 +286,7 @@ class PovVideoController(private val app: Application, private val scope: Corout
             var lastUi = 0L
             var etaSmooth = -1.0
             // Рендер — прямо в потоке очереди: GL-контекст привязан к потоку.
-            val res = PovRenderer(app, a).render(
+            val res = PovRenderer(app, a, wantNight).render(
                 tgt.pfd.fileDescriptor,
                 cancelled = cancelled,
                 progress = { done, total ->
@@ -269,13 +302,14 @@ class PovVideoController(private val app: Application, private val scope: Corout
                             etaSmooth = if (etaSmooth < 0) raw else 0.8 * etaSmooth + 0.2 * raw
                             eta = etaSmooth.toInt()
                         }
-                        setStatus(id, Status.Rendering(done, total, el.toInt(), eta, "Rendering…"))
+                        setStatus(id, Status.Rendering(done, total, el.toInt(), eta, "Rendering…", wantNight))
                     }
                 }
             )
             val path = Saver.publish(app, tgt)
             target = null
-            setStatus(id, Status.Done(path.first, path.second, ((System.nanoTime() - t0) / 1e9).toInt(), res.width, res.height))
+            setStatus(id, Status.Done(path.first, path.second, ((System.nanoTime() - t0) / 1e9).toInt(), res.width, res.height,
+                night = res.night, nightUnsupported = wantNight && !res.night))
         } catch (c: CancellationException) {
             throw c
         } catch (_: InterruptedException) {
@@ -373,6 +407,10 @@ class PovVideoController(private val app: Application, private val scope: Corout
     }
 
     private fun plural(n: Int, word: String) = n.toString() + " " + word + (if (n == 1) "" else "s")
+
+    private companion object {
+        const val KEY_NIGHT = "povvideo_night"
+    }
 
     /** Для onCleared ViewModel: остановить рендер, файл-заготовка удалится сам. */
     fun shutdown() { stopAll(); worker?.cancel() }

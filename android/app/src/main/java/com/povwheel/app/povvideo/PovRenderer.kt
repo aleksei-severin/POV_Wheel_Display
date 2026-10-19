@@ -38,15 +38,19 @@ import kotlin.math.sqrt
  * 12 МБ, а не 33. Результат кодируется в тот же 4:2:0, так что это ничего не стоит.
  * Меньше исходника — только если кодировщик телефона такого размера не умеет или кольцо
  * не помещается в память; тогда [Result] это показывает.
+ *
+ * [wantNight] — ночная обработка (см. PovGl): тёмное вокруг колеса поднимается, дисплей
+ * не пересвечивается. Стоит лишь мипмапа и пары крошечных проходов на кадр результата;
+ * видеокарта, не рисующая в 16-битные float-текстуры, рендерит без неё ([Result.night]).
  */
-internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis) {
+internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis, private val wantNight: Boolean) {
 
-    class Result(val frames: Int, val width: Int, val height: Int)
+    /** [night] — ночная обработка в самом деле была (запрошена и видеокарта её умеет). */
+    class Result(val frames: Int, val width: Int, val height: Int, val night: Boolean)
 
     private companion object {
         const val RING_BUDGET = 512L shl 20   // байт на кольцо кадров в памяти видеокарты
         const val MAX_BPS = 120e6             // потолок битрейта (и не выше, чем умеет кодировщик)
-        const val BLACK_LEVEL = 16            // отсечка шума, как -BlackLevel по умолчанию
         const val SPREAD = 1.0                // разнос шести окон (CheckerSpread)
         const val SHORT_FRAC = 0.15           // см. Windows в скрипте
         const val OUT_RATE = 48000            // частота звука замедленного ролика в результате
@@ -152,14 +156,15 @@ internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis)
                 while (scale > 0.2 && !caps.isSizeSupported(even(cw * scale), even(ch * scale))) scale *= 0.95
             }
             scale = min(scale, g.maxTextureSize().toDouble() / max(cw, ch))
-            // кольцо: Y на каждый пиксель + Cb/Cr на четверть — 1.5 байта; плюс результат RGBA
-            val bytes = cw * scale * ch * scale * (1.5 * cap + 4.0)
+            // кольцо: Y на каждый пиксель + Cb/Cr на четверть — 1.5 байта; плюс результат:
+            // RGBA8 — 4 байта, с ночной обработкой RGBA16F с мипмапами — 8 · 4/3
+            val bytes = cw * scale * ch * scale * (1.5 * cap + if (wantNight) 32.0 / 3 else 4.0)
             if (bytes > RING_BUDGET) scale *= sqrt(RING_BUDGET / bytes)
             var ok = false
             for (attempt in 0 until 6) {
                 val w = even(cw * scale)
                 val h = even(ch * scale)
-                if (g.allocate(w, h, cap)) { ok = true; break }
+                if (g.allocate(w, h, cap, wantNight)) { ok = true; break }
                 scale *= 0.8
             }
             if (!ok) throw IllegalStateException("not enough GPU memory")
@@ -254,7 +259,6 @@ internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis)
             val loI = IntArray(12)
             val hiI = IntArray(12)
             val wtF = FloatArray(12)
-            val black = (BLACK_LEVEL + 0.5f) / 255f
             var pos = 0
             planLoop@ for (si in a.plan.kinds.indices) {
                 if (cancelled()) throw InterruptedException()
@@ -265,7 +269,7 @@ internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis)
                     for (i in w.a..w.b) {
                         if (!ensure(i)) break@planLoop
                         loI.fill(0); hiI.fill(0); wtF.fill(0f); wtF[0] = 1f
-                        g.blend(i % cap, 1, loI, hiI, wtF, -1f)
+                        g.blend(i % cap, 1, loI, hiI, wtF)
                         emit(i, 1)
                     }
                     continue
@@ -291,8 +295,7 @@ internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis)
                 for (k in 0 until 12) {
                     loI[k] = lo[k] - jMin; hiI[k] = hi[k] - jMin; wtF[k] = w.wt[k].toFloat()
                 }
-                // отсечка шума — только когда кадров больше одного: одиночный кадр идёт как есть
-                g.blend(jMin % cap, n, loI, hiI, wtF, if (n > 1) black else -1f)
+                g.blend(jMin % cap, n, loI, hiI, wtF)
                 // Склейка уходит одним кадром, который стоит до метки следующего (переменная
                 // частота кадров). Прежде она повторялась на каждом исходном кадре прорисовки —
                 // при 240 к/с это ~6 одинаковых кадров, и кодировщик тратил на них битрейт
@@ -308,7 +311,7 @@ internal class PovRenderer(private val ctx: Context, private val a: PovAnalysis)
             dr.error?.let { throw it }
             if (!dr.started) throw IllegalStateException("the encoder produced no video")
             runCatching { mux.stop() }.onFailure { throw IllegalStateException("could not finish the MP4 file", it) }
-            return Result(written, encW, encH)
+            return Result(written, encW, encH, g.night)
         } finally {
             drain?.let { d -> d.abort(); runCatching { d.join(3000) } }
             runCatching { encoder?.stop() }

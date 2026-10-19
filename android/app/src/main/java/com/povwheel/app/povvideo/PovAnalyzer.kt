@@ -75,9 +75,16 @@ class PovAnalysis(
     val sweeps: Int,
     /** Отрезки ролика (с файла), где есть синхронизация по логу Холла. */
     val syncRanges: List<DoubleArray>,
+    /**
+     * Яркость сцены: медиана средней яркости кадра (0..255) по кадрам, прочитанным для
+     * привязки; NaN — кадров не было. По ней ночная обработка в режиме Auto ([dark]).
+     */
+    val sceneLuma: Double,
     val report: List<String>
 ) {
     val renderable: Boolean get() = tracks.isNotEmpty() && plan.totalFrames > 0
+    /** Тёмный ролик: ночная обработка в режиме Auto включается. */
+    val dark: Boolean get() = sceneLuma < PovAnalyzer.NIGHT_LUMA
     val outName: String get() = displayName.substringBeforeLast('.') + "_sync_" + sweeps + "sweeps.mp4"
     /** Самое сильное замедление (1 — обычная съёмка). */
     val slow: Double get() = map.slow
@@ -133,6 +140,14 @@ internal object PovAnalyzer {
     private const val ARMS = 6
     /** Не больше стольких кадров читаем ради привязки (4K60 — полторы минуты). */
     private const val MAX_ALIGN_FRAMES = 6000
+
+    /**
+     * Порог ночной обработки в режиме Auto: медиана средней яркости кадра ниже этого (из
+     * 255). Замер по 47 тестовым роликам: ночная улица — 5–6, комнаты, где светит лишь
+     * колесо, — 6–19 (подъём там помогает), полутёмные комнаты, где всё и так видно, —
+     * 22–45 (подъём делает их плоскими), освещённые — 46–105, день на улице — 120–150.
+     */
+    const val NIGHT_LUMA = 20.0
 
     class NoLog(message: String) : Exception(message)
 
@@ -331,10 +346,14 @@ internal object PovAnalyzer {
         if (pl.tracks.isNotEmpty())
             rep.add(if (map.constant) fmt("Result: %s s at %s fps%s", num2(realDur), num2(fileFps * slow), if (slow > 1) " (real time)" else "")
                     else fmt("Result: %s s (real time)", num2(realDur)))
+        val sceneLuma = if (stats.n > 0) stats.mean.sorted()[stats.n / 2].toDouble() else Double.NaN
+        if (!sceneLuma.isNaN())
+            rep.add(fmt("Scene brightness: %d of 255 (median frame) — %s", sceneLuma.roundToInt(),
+                if (sceneLuma < NIGHT_LUMA) "dark: Auto turns night processing on" else "lit: Auto leaves night processing off"))
 
         return PovAnalysis(
             uri, name, relPath, codedW, codedH, rotation, fileFps, durationSec, videoBps, vi.mime, map,
-            pl.tracks, pts, videoStartUs, pl.plan, pl.sweeps, syncRanges, rep
+            pl.tracks, pts, videoStartUs, pl.plan, pl.sweeps, syncRanges, sceneLuma, rep
         )
     }
 

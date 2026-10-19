@@ -1076,13 +1076,14 @@ private fun UploadArrowIcon() {
     }
 }
 
-// ---- Пилюли настроек заливки (раньше жили в UploadPanel.kt) ----
+// ---- Пилюли настроек заливки (раньше жили в UploadPanel.kt; ими же выбирается ночная
+// обработка в PovVideoCard) ----
 
 private val PILL_HEIGHT = 34.dp
 private val PILL_SHAPE = RoundedCornerShape(50)
 
 @Composable
-private fun Pill(
+internal fun Pill(
     text: String,
     width: Dp,
     selected: Boolean = false,

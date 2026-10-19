@@ -56,6 +56,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.povwheel.app.povvideo.PovVideoController
+import com.povwheel.app.povvideo.PovVideoController.NightMode
 import com.povwheel.app.povvideo.PovVideoController.Status
 import com.povwheel.app.povvideo.PovVideoController.Summary
 import java.util.Locale
@@ -151,6 +152,8 @@ fun PovVideoCard(ctrl: PovVideoController) {
         }
         if (archiveOpen) HallArchiveDialog(ctrl) { archiveOpen = false }
 
+        NightChoice(ctrl)
+
         if (entries.size > 1) {
             val done = entries.count { it.status is Status.Done }
             val failed = entries.count { it.status is Status.Failed }
@@ -194,6 +197,32 @@ fun PovVideoCard(ctrl: PovVideoController) {
                 Text(if (busy || entries.any { !it.finished }) "Close finished" else "Close")
             }
         }
+    }
+}
+
+/**
+ * Ночная обработка: Auto / On / Off. Действует на ролики, чей рендер ещё не начался, —
+ * переключить можно и посреди очереди.
+ */
+@Composable
+private fun NightChoice(ctrl: PovVideoController) {
+    val night by ctrl.night.collectAsState()
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("Night processing", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+            for ((m, label) in listOf(NightMode.AUTO to "Auto", NightMode.ON to "On", NightMode.OFF to "Off")) {
+                Pill(text = label, width = 56.dp, selected = night == m, onClick = { ctrl.setNight(m) })
+            }
+        }
+        Text(
+            when (night) {
+                NightMode.AUTO -> "Dark videos: brighten the surroundings, keep the display from blowing out."
+                NightMode.ON -> "Always brighten the dark surroundings; the display stays as bright as filmed."
+                NightMode.OFF -> "Render as filmed."
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
     }
 }
 
@@ -261,7 +290,8 @@ private fun EntryView(
                         style = MaterialTheme.typography.bodySmall,
                         fontWeight = FontWeight.SemiBold
                     )
-                    Text("Elapsed " + mmss(s.elapsedSec) + ". Keep the app open — the screen stays on.",
+                    Text("Elapsed " + mmss(s.elapsedSec) + (if (s.night) ". Night processing on" else "") +
+                            ". Keep the app open — the screen stays on.",
                         style = MaterialTheme.typography.bodySmall,
                         color = cs.onSurfaceVariant)
                 }
@@ -283,9 +313,14 @@ private fun EntryView(
                     val reduced = s.w.toLong() * s.h < a.codedW.toLong() * a.codedH * 0.98
                     Text(
                         ow.toString() + "×" + oh + " · " + String.format(Locale.US, "%.1f", a.realDurationSec) +
-                            " s · rendered in " + mmss(s.seconds),
+                            " s · rendered in " + mmss(s.seconds) + (if (s.night) " · night processing" else ""),
                         style = MaterialTheme.typography.bodySmall,
                         color = cs.onSurfaceVariant
+                    )
+                    if (s.nightUnsupported) Text(
+                        "Rendered without night processing: this phone's GPU doesn't support it (16-bit float render targets).",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = cs.error
                     )
                     if (reduced) Text(
                         "Smaller than the original " + iw + "×" + ih + ": this phone's video encoder or GPU memory can't handle the full size.",
