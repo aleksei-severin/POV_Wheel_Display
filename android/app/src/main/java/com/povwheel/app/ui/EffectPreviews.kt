@@ -190,13 +190,13 @@ internal fun ClockDisc(style: TextStyle, px: Int, modifier: Modifier = Modifier)
 }
 
 /**
- * Rainbow: спектр со спиралью, скоростью и резкостью полос колеса — та же таблица
+ * Rainbow: семь полос со скоростью и закруткой спирали колеса — та же таблица
  * цвета и та же раскладка по секторам и диодам, что в effects.cpp.
  */
 @Composable
 internal fun RainbowDisc(fx: FxParams, px: Int, modifier: Modifier = Modifier) {
     val disc = remember(px) { FxMask.RainbowDisc(px) }
-    val lut = remember(fx.rbSharp) { FxMask.rainbowLut(fx.rbSharp) }
+    val lut = FxMask.rainbowLut
     // Фаза в долях круга (1024 на оборот), копится по кадрам — смена скорости
     // ползунком не дёргает картину, как и на колесе.
     var phase by remember { mutableStateOf(0.0) }
@@ -213,7 +213,7 @@ internal fun RainbowDisc(fx: FxParams, px: Int, modifier: Modifier = Modifier) {
         }
     }
     Canvas(modifier) {
-        val img = disc.draw(lut, phase.toInt()).asImageBitmap()
+        val img = disc.draw(lut, phase.toInt(), fx.rbTwist).asImageBitmap()
         drawImage(img, dstSize = IntSize(size.width.roundToInt(), size.height.roundToInt()),
             filterQuality = FilterQuality.Low)
     }

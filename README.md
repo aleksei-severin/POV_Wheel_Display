@@ -126,7 +126,7 @@ Long-press **Render POV Video** to export the rotation archive or import one fro
 | 🏎️ **Speed** | Live speedometer in big digits that shift from green to red as you speed up (red point set in the app) |
 | 🕐 **Clock** | Time `hh:mm:ss` with blinking colons around the top of the rim, the date `yyyy.mm.dd` around the bottom, solid or rainbow |
 | ✍️ **Text** | Your text around the rim, solid or rainbow |
-| 🌈 **Rainbow** | A colour spiral flowing across the disc — speed and band sharpness set in the app |
+| 🌈 **Rainbow** | Seven colour bands curled into a spiral that pours toward the hub or out to the rim — speed and twist set in the app |
 
 Long-press an effect in the app to set it up; the library thumbnail shows it exactly as the rim
 will — the real speed, the current time, the chosen colours.

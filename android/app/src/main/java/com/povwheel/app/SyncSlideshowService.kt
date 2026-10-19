@@ -87,6 +87,7 @@ class SyncSlideshowService : Service() {
 
         private const val ACTION_TAKE_OVER = "com.povwheel.app.sync.TAKE_OVER"
         private const val ACTION_RELEASE = "com.povwheel.app.sync.RELEASE"
+        private const val ACTION_RELEASE_STOP = "com.povwheel.app.sync.RELEASE_STOP"
         private const val ACTION_STOP = "com.povwheel.app.sync.STOP"
 
         /** Пауза между попытками подтянуть участника, который всё ещё не Ready —
@@ -158,11 +159,46 @@ class SyncSlideshowService : Service() {
             ctx.startService(Intent(ctx, SyncSlideshowService::class.java).apply { action = ACTION_RELEASE })
         }
 
-        /** Остановить показ на всех участниках группы и погасить уведомление.
-         *  Безопасно звать даже если служба не запущена. */
-        fun stop(ctx: Context) {
-            ctx.startService(Intent(ctx, SyncSlideshowService::class.java).apply { action = ACTION_STOP })
+        /**
+         * ViewModel сняла группу (Stop всей группы, или из неё ушли все, кроме
+         * одного колеса) — забыть её СРАЗУ, прямо в вызове, и спрятать
+         * уведомление. Колёсам отсюда ничего не шлём: на связи с ними сама
+         * ViewModel, и Stop, если он нужен, она рассылает по своим соединениям
+         * (WheelVm.stopWholeSync / stopSyncedSlideshow).
+         *
+         * Раньше на этом месте был stop(): ACTION_STOP, и служба, не держа
+         * соединений, подключалась к участникам С НУЛЯ — параллельно соединениям
+         * ViewModel к тем же адресам, вопреки правилу в описании класса, — и слала
+         * им OP_STOP. Доходил он через секунду-другую, а то и позже (подключение
+         * ждёт до 20 с), и гасил то, что успели запустить после: файл или эффект
+         * по тапу, синхронный показ, запущенный заново сразу после Stop, — при
+         * этом экран считал, что показ идёт. А группу служба брала из [tracked] при
+         * ДОСТАВКЕ Intent, а не при вызове, и запомненную между ними (старт нового
+         * показа) тут же стирала — вместе с копией в SharedPreferences.
+         *
+         * Если группу прямо сейчас держит сама служба (экран только что открыли и
+         * она ещё не отпустила соединения), она отпускает их — своими же
+         * соединениями, со Stop на колёса, если [stopWheels], — новых не открывая.
+         */
+        fun forget(ctx: Context, stopWheels: Boolean) {
+            tracked = null
+            setLiveVisible(ctx, null)
+            if (drivingMembers.isNotEmpty()) {
+                ctx.startService(Intent(ctx, SyncSlideshowService::class.java).apply {
+                    action = if (stopWheels) ACTION_RELEASE_STOP else ACTION_RELEASE
+                })
+            }
         }
+
+        /**
+         * Stop из уведомления, пока жива ViewModel (экран открыт или свёрнут —
+         * уведомление тогда показывает она сама, см. [setLiveVisible]): гасит
+         * группу ViewModel — своими соединениями и вместе со своим состоянием,
+         * иначе экран так и показывал бы идущий синхронный показ, а служба
+         * подключалась бы к уже занятым ею адресам. false — синхронных групп у
+         * ViewModel нет. Ставит ViewModel при создании, снимает в onCleared().
+         */
+        @Volatile var stopHandler: (() -> Boolean)? = null
 
         /**
          * Показать (или спрятать) живое уведомление синхронного показа —
@@ -235,6 +271,7 @@ class SyncSlideshowService : Service() {
         when (intent?.action) {
             ACTION_TAKE_OVER -> startDriving()
             ACTION_RELEASE -> stopDriving(sendStop = false)
+            ACTION_RELEASE_STOP -> stopDriving(sendStop = true)
             ACTION_STOP -> doStop()
         }
         return START_NOT_STICKY
@@ -367,12 +404,19 @@ class SyncSlideshowService : Service() {
         }
     }
 
-    /** Stop насовсем: гасит показ у всех участников группы — через уже
-     *  открытые соединения, если служба сейчас сама держит группу, иначе
-     *  подключается с нуля только на время самой команды (обычный случай —
-     *  Stop из уведомления, когда экран приложения и так закрыт). */
+    /** Stop насовсем (кнопка в уведомлении): гасит показ у всех участников
+     *  группы — через уже открытые соединения, если служба сейчас сама держит
+     *  группу; если группу держит живая ViewModel — её руками ([stopHandler]);
+     *  иначе подключается с нуля только на время самой команды (обычный
+     *  случай — экран приложения и так закрыт). */
     @SuppressLint("MissingPermission")
     private fun doStop() {
+        // К колёсам ViewModel уже подключена: второе соединение к тем же адресам —
+        // ровно то, чего служба не делает никогда (см. описание класса).
+        if (drivingMembers.isEmpty() && stopHandler?.invoke() == true) {
+            if (driveJob?.isActive != true) stopSelf()   // поднята только ради этой кнопки
+            return
+        }
         val group = tracked
         tracked = null
         val wasDriving = drivingMembers.isNotEmpty()

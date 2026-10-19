@@ -466,32 +466,40 @@ data class TextStyle(val rainbow: Boolean = false, val rgb: Int = 0xFFFFFF, val 
 /**
  * Параметры эффектов (PovFxParams, 16 байт): [speedRed] — км/ч, при которых цифры
  * Speed красные; радуга — скорость [rbSpeed] (0…100, 100 — два оборота спектра в
- * секунду) и резкость [rbSharp] (0 — плавный спектр, 100 — семь чистых полос);
- * [clock] — цвет часов, устроен как у «Текста».
+ * секунду) и закрутка [rbTwist] (−100…100 — ±2 оборота спирали от ступицы до
+ * обода, 0 — прямые лучи; вращаясь, спираль течёт к ступице при > 0, к ободу при
+ * < 0); [clock] — цвет часов, устроен как у «Текста».
  */
 data class FxParams(
     val speedRed: Int = 45,
     val rbSpeed: Int = 10,
-    val rbSharp: Int = 100,
+    val rbTwist: Int = RB_TWIST_DEFAULT,
     val clock: TextStyle = TextStyle()
 ) {
     fun pack(): ByteArray {
         val b = Proto.buf(SIZE)
         b.putShort(speedRed.coerceIn(5, 200).toShort())
         b.put(rbSpeed.coerceIn(0, 100).toByte())
-        b.put(rbSharp.coerceIn(0, 100).toByte())
+        // Бывшая резкость полос: прошивка до закрутки рисует по ней — 100, чистые полосы.
+        b.put(100.toByte())
         b.put(clock.pack())
+        // Закрутка + 128: 0 прошивка читает как «поля нет» (приложение старше).
+        b.put((rbTwist.coerceIn(-100, 100) + 128).toByte())
         return b.array()
     }
     companion object {
         const val SIZE = 16
+        /** ≈ пол-оборота: постоянная спираль радуги до того, как закрутку сделали настройкой. */
+        const val RB_TWIST_DEFAULT = 25
         fun parse(a: ByteArray): FxParams {
             if (a.size < SIZE) return FxParams()
             val p = Proto.wrap(a)
             val red = p.short.toInt() and 0xFFFF
             val sp = p.get().toInt() and 0xFF
-            val sh = p.get().toInt() and 0xFF
-            return FxParams(red, sp, sh, TextStyle.parse(a, 4))
+            // 0 — прошивка до закрутки: у неё постоянная спираль ≈ RB_TWIST_DEFAULT.
+            val tw = a[12].toInt() and 0xFF
+            val twist = if (tw == 0) RB_TWIST_DEFAULT else (tw - 128).coerceIn(-100, 100)
+            return FxParams(red, sp, twist, TextStyle.parse(a, 4))
         }
     }
 }

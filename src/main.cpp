@@ -2553,6 +2553,19 @@ void updateFileList() {
     }
 }
 
+// Файлы обычного показа в его порядке (только те, что есть на флеше; сам
+// порядок — см. advanceSlideshow() ниже). Общая часть advanceSlideshow() и
+// slideIndexOnRim(): номер пункта обязан значить у них одно и то же.
+static std::vector<String> slideFileSequence() {
+    std::vector<String> out;
+    if (slideListInclude && !slideList.empty()) {
+        for (const String& f : slideList) if (LittleFS.exists("/" + f)) out.push_back(f);
+    } else {
+        for (const String& f : savedFiles) if (slideInSlideshow(f)) out.push_back(f);
+    }
+    return out;
+}
+
 // Выбирает и запрашивает следующий пункт слайдшоу (файл или эффект) из
 // виртуальной последовательности, затем отмеченные эффекты 1..6. Порядок
 // файлов: если отбор — "играть только эти" (slideListInclude), это порядок
@@ -2574,35 +2587,15 @@ void updateFileList() {
 // slideInterval незачем, показывать всё равно больше нечего. Возвращает
 // false, если сейчас показывать нечего — слайдшоу пора остановить.
 static bool advanceSlideshow() {
-    bool explicitOrder = slideListInclude && !slideList.empty();
-
-    int fileCount = 0;
-    if (explicitOrder) {
-        for (const String& f : slideList) if (LittleFS.exists("/" + f)) fileCount++;
-    } else {
-        for (const String& f : savedFiles) if (slideInSlideshow(f)) fileCount++;
-    }
+    std::vector<String> files = slideFileSequence();
+    int fileCount = (int)files.size();
     int total = fileCount + __builtin_popcount(slideEffectMask);
     if (total == 0) return false;
     int pos = ((slideCurrentIndex < 0 ? -1 : slideCurrentIndex) + 1) % total;
     slideCurrentIndex = pos;
 
     if (pos < fileCount) {
-        String nextFile;
-        int seen = 0;
-        if (explicitOrder) {
-            for (const String& f : slideList) {
-                if (!LittleFS.exists("/" + f)) continue;
-                if (seen == pos) { nextFile = f; break; }
-                seen++;
-            }
-        } else {
-            for (int i = 0; i < (int)savedFiles.size(); i++) {
-                if (!slideInSlideshow(savedFiles[i])) continue;
-                if (seen == pos) { nextFile = savedFiles[i]; break; }
-                seen++;
-            }
-        }
+        String nextFile = files[pos];
         // Единственный файл в отборе (total==1) выбирает сам себя каждый раз:
         // loadFrameFromFile() гасит ленту на всё время чтения, и перечитывать
         // то, что и так уже лежит в PSRAM неизменным, значит гасить картинку
@@ -2642,6 +2635,27 @@ static bool advanceSlideshow() {
     return true;
 }
 
+// Где в последовательности обычного показа (сначала файлы, потом эффекты —
+// см. advanceSlideshow()) стоит то, что сейчас на ободе. -1 — на ободе не пункт
+// показа: тогда показ начнётся с первого.
+static int slideIndexOnRim() {
+    std::vector<String> files = slideFileSequence();
+    uint8_t eff = effect_id;
+    if (eff == EFF_NONE) {
+        String cur = currentDisplayFile;          // копия: имя пишет загрузчик на другом ядре
+        if (cur.startsWith("/")) cur.remove(0, 1);
+        for (int i = 0; i < (int)files.size(); i++) if (files[i] == cur) return i;
+        return -1;
+    }
+    int ord = 0;
+    for (int e = 1; e < EFF_COUNT; e++) {
+        if (!(slideEffectMask & (1 << (e - 1)))) continue;
+        if (e == eff) return (int)files.size() + ord;
+        ord++;
+    }
+    return -1;
+}
+
 // =====================================================================
 //  Слайдшоу по абсолютным часам (синхронная группа колёс)
 //
@@ -2671,12 +2685,19 @@ static bool advanceSlideshow() {
 //  не действие человека (см. «never sleeps» в Slideshow, CLAUDE.md).
 // =====================================================================
 int64_t slideClockT0 = 0;          // UTC, мс; 0 — обычный показ по таймеру loop()
+// Идущий показ по часам только что стал обычным — loop() продолжит его с того,
+// что на ободе (см. slideClockSet()).
+static volatile bool slide_resume_local = false;
 
 #define SLIDE_CLOCK_POLL_MS 250    // перепроверка: питание, переставленные телефоном часы
 
 bool slideClockSet(int64_t t0Ms) {
     if (t0Ms < 0) t0Ms = 0;
     if (t0Ms == slideClockT0) return false;
+    // Тот же отбор без t0 идущему показу по часам: из синхронной группы ушли
+    // все, кроме этого колеса, и оно дальше крутит тот же список само. Обычный
+    // показ должен подхватить его с текущего пункта, а не с первого.
+    if (t0Ms == 0 && slideClockT0 > 0 && slideshowActive) slide_resume_local = true;
     slideClockT0     = t0Ms;
     slide_list_dirty = true;
     settings_dirty   = true;
@@ -2711,9 +2732,11 @@ static uint32_t slideClockStep() {
     // Пункт этого слота уже не загрузился (не хватило PSRAM, файл битый) —
     // до следующего слота не пробуем. Без этого шаг повторялся бы каждую
     // миллисекунду: лента гасла и зажигалась без остановки, флеш читался
-    // непрерывно, и BLE отваливался.
-    static int64_t failed_slot = -1;
-    if (slot == failed_slot) return wait;
+    // непрерывно, и BLE отваливался. Номер слота считается от t0, поэтому
+    // запоминаем и t0: у перезапущенного показа нумерация начинается заново, и
+    // сбой слота N прежнего расписания не должен пропустить слот N нового.
+    static int64_t failed_slot = -1, failed_t0 = 0;
+    if (slot == failed_slot && slideClockT0 == failed_t0) return wait;
 
     // Пункт — по ПОЛНОМУ присланному списку, а не по тому, что нашлось на
     // этом колесе: иначе при недостающем файле у колёс разошлась бы длина
@@ -2743,6 +2766,7 @@ static uint32_t slideClockStep() {
         webLogf("[DISP] Clock slideshow: starting effect %s", effectName(eid));
         if (!effectsStart((uint8_t)eid)) {
             failed_slot = slot;
+            failed_t0   = slideClockT0;
             return wait;
         }
         return 1;                           // запуск занял время — пересчитать ожидание
@@ -2765,6 +2789,7 @@ static uint32_t slideClockStep() {
     loadFrameFromFile(path, origin);
     if (currentDisplayFile != path) {
         failed_slot = slot;
+        failed_t0   = slideClockT0;
         webLogf("[DISP] Clock slideshow: %s did not load, skipping this slot", name.c_str());
         return wait;
     }
@@ -3362,6 +3387,21 @@ void loop() {
     // держал мьютекс времени newlib почти постоянно, и webLog() на другом ядре
     // натыкался на него и ронял колесо (см. webLog в storage.cpp). Часы ещё не
     // выставлены — показ по часам просто ждёт телефона.
+    //
+    // Показ по часам только что стал обычным (из синхронной группы ушли все,
+    // кроме этого колеса): продолжаем с того, что сейчас на ободе, а следующий
+    // пункт — через интервал. Номер пункта по часам здесь не вёлся: остался бы
+    // от старта показа (-1, то есть с первого пункта) или вовсе от давнего
+    // обычного показа (он в RTC) — колесо перескочило бы на другой пункт.
+    if (slide_resume_local) {
+        slide_resume_local = false;
+        slideCurrentIndex  = slideIndexOnRim();
+        slideLastSwitch    = now_ms;
+        if (slideCurrentIndex >= 0)
+            webLogf("[DISP] Slideshow continues on its own from item %d", slideCurrentIndex + 1);
+        else
+            webLog("[DISP] Slideshow continues on its own from the first item");
+    }
     if (slideshowActive && slideClockT0 <= 0) {
         bool due = (slideCurrentIndex < 0) || (now_ms - slideLastSwitch) >= slideInterval;
         if (!rendering_active && slideCurrentIndex >= 0) {

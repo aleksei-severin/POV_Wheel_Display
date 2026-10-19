@@ -737,8 +737,8 @@ static void fillTele(PovTele* t) {
     t->file_ver   = pov_file_version;
     time_t nowt = time(nullptr);
     t->epoch      = (nowt > 1672531200) ? (uint32_t)nowt : 0;   // до 2023 — «не задано»
-    // Идёт эффект — на ободе не файл. В слайдшоу currentDisplayFile держит имя
-    // последнего файла и не сбрасывается сам, поэтому гасим его здесь по effect_id.
+    // Идёт эффект — на ободе не файл. Имя effectsStart() сбрасывает и сам, но
+    // effect_id он выставляет раньше, чем имя, — проверка закрывает этот зазор.
     const char* cf = (effect_id != EFF_NONE) ? "" : currentDisplayFile.c_str();
     if (*cf == '/') cf++;
     strncpy(t->file, cf, sizeof(t->file) - 1);
@@ -981,12 +981,11 @@ static void handleCmd(const uint8_t* d, size_t n) {
         if (id != EFF_NONE && !effectValid(id)) { sendRsp(op, seq, ST_BAD_ARG); break; }
         slideshowActive = false;
         pendingFilePath = "";
-        if (id == EFF_NONE) {
-            force_stop_display = true;
-        } else {
-            force_stop_display = false;
-            currentDisplayFile = "";
-        }
+        // Имя файла на ободе сбрасывает сам effectsStart() — в задаче загрузчика,
+        // единственной, что его пишет: String, переписанный отсюда (задача хоста
+        // NimBLE) посреди загрузки файла, портил бы кучу. До запуска эффекта на
+        // ободе и правда ещё прежний файл.
+        force_stop_display = (id == EFF_NONE);
         pending_effect_play = (id != EFF_NONE);   // до pending_effect: см. effects.h
         pending_effect = (int8_t)id;
         xSemaphoreGive(fileLoaderSemaphore);
@@ -1046,7 +1045,8 @@ static void handleCmd(const uint8_t* d, size_t n) {
         PovFxParams p; memset(&p, 0, sizeof(p));
         p.speed_red = f.speed_red;
         p.rb_speed  = f.rb_speed;
-        p.rb_sharp  = f.rb_sharp;
+        p.rb_sharp_rsv = 100;
+        p.rb_twist  = (uint8_t)(f.rb_twist + 128);
         p.clock.mode = f.clk_mode;
         p.clock.r = f.clk_r; p.clock.g = f.clk_g; p.clock.b = f.clk_b;
         p.clock.speed = f.clk_speed;
@@ -1058,9 +1058,10 @@ static void handleCmd(const uint8_t* d, size_t n) {
         if (pn < sizeof(PovFxParams)) { sendRsp(op, seq, ST_BAD_ARG); break; }
         PovFxParams p; memcpy(&p, pl, sizeof(p));
         FxParams f;
+        effectsFxGet(f);            // закрутку прежнее приложение не шлёт (0) — остаётся текущая
         f.speed_red = p.speed_red;
         f.rb_speed  = p.rb_speed;
-        f.rb_sharp  = p.rb_sharp;
+        if (p.rb_twist) f.rb_twist = (int8_t)constrain((int)p.rb_twist - 128, -100, 100);
         f.clk_mode  = p.clock.mode;
         f.clk_r = p.clock.r; f.clk_g = p.clock.g; f.clk_b = p.clock.b;
         f.clk_speed = p.clock.speed;
@@ -1135,6 +1136,15 @@ static void handleCmd(const uint8_t* d, size_t n) {
             slideshowActive    = true;
             slideCurrentIndex  = -1;
             slideLastSwitch    = 0;
+            // Запуск показа — то же «человек попросил», что и Play: первый луч
+            // поднимаем сразу. Иначе после Stop на ходу (или на колесе, которое
+            // крутят на подставке и почти не трясут) лента ждала бы вибродатчика
+            // (VIB_SPIN_SECONDS) и могла не загореться вовсе. Обычный показ это и
+            // так получал — от первой смены в advanceSlideshow(); показу по часам
+            // смены флаг не ставят, поэтому — здесь, один раз. Присылка расписания
+            // уже идущему показу (телефон переподключился) ловится выше, на
+            // «уже идёт», и луч не трогает.
+            request_play_flag  = true;
             settings_dirty     = true;
             pov_state_version++;
             webLogf("[BLE] Slideshow start, interval %lus%s", (unsigned long)(slideInterval / 1000),

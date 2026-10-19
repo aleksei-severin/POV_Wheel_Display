@@ -256,25 +256,19 @@ object FxMask {
 
     // ---- Радуга ----
 
-    /** Семь цветов радуги, тон в градусах; последний замыкает круг (effects.cpp, RB_ANCHORS). */
-    private val ANCHORS = floatArrayOf(0f, 30f, 60f, 120f, 190f, 240f, 280f, 360f)
+    /** Семь цветов радуги, тон в градусах; круг — семь равных полос (effects.cpp, RB_ANCHORS). */
+    private val ANCHORS = floatArrayOf(0f, 30f, 60f, 120f, 190f, 240f, 280f)
     const val RB_LUT = 1024
 
-    private fun rainbowHue(f: Float, p: Float): Float {
-        val x = f * 7f
-        val k = x.toInt().coerceAtMost(6)
-        val t = x - k
-        val g = if (p >= 0.999f) (if (t < 0.5f) 0f else 1f)
-                else ((t - p * 0.5f) / (1f - p)).coerceIn(0f, 1f)
-        val band = ANCHORS[k] + g * (ANCHORS[k + 1] - ANCHORS[k])
-        return (1f - p) * f * 360f + p * band
-    }
+    /** Сдвиг по кругу (положений таблицы) диода [led] при закрутке [twist] — целочисленно,
+     *  с усечением к нулю, ровно как effRainbow() в effects.cpp. */
+    fun twistOffset(twist: Int, led: Int): Int =
+        twist.coerceIn(-100, 100) * led * RB_LUT / (50 * (Geom.LEDS_PER_SIDE - 1))
 
-    /** Таблица радуги для резкости [sharp] (0…100): положение на круге (10 бит) → ARGB. */
-    fun rainbowLut(sharp: Int): IntArray {
-        val p = sharp.coerceIn(0, 100) / 100f
-        return IntArray(RB_LUT) { u ->
-            val h = rainbowHue(u.toFloat() / RB_LUT, p) % 360f
+    /** Таблица радуги: положение на круге (10 бит) → ARGB, семь чистых полос. */
+    val rainbowLut: IntArray by lazy {
+        IntArray(RB_LUT) { u ->
+            val h = ANCHORS[u * 7 / RB_LUT]
             val hh = h / 60f
             val sec = hh.toInt()
             val up = (255f * (hh - sec)).roundToInt()
@@ -294,13 +288,16 @@ object FxMask {
 
     /**
      * Круглая картинка радуги [size] × [size] — как на ободе: положение на круге —
-     * сектор плюс сдвиг во времени плюс 12 на диод (спираль). Геометрия — та же,
-     * что у [TextMask.disc]; таблица точек считается один раз, кадр — одно
-     * чтение таблицы цвета на пиксель.
+     * сектор плюс сдвиг во времени плюс сдвиг диода по закрутке (спираль).
+     * Геометрия — та же, что у [TextMask.disc]; таблица точек считается один раз,
+     * кадр — одно чтение таблицы цвета на пиксель.
      */
     class RainbowDisc(val size: Int) {
-        private val base = IntArray(size * size) { -1 }
+        private val base = IntArray(size * size) { -1 }   // положение по сектору, −1 — вне диска
+        private val ledOf = ByteArray(size * size)          // номер диода точки
         private val px = IntArray(size * size)
+        private val twistOff = IntArray(Geom.LEDS_PER_SIDE)
+        private var twistBuilt = Int.MIN_VALUE
         val bitmap: Bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
 
         init {
@@ -317,15 +314,20 @@ object FxMask {
                 if (ang < 0) ang += 2 * PI
                 val sec = (ang / (2 * PI) * Geom.SECTORS).toInt().coerceIn(0, Geom.SECTORS - 1)
                 val led = ((rad - minR) / dR).roundToInt().coerceIn(0, Geom.LEDS_PER_SIDE - 1)
-                base[y * size + x] = sec * RB_LUT / Geom.SECTORS + led * 12
+                base[y * size + x] = sec * RB_LUT / Geom.SECTORS
+                ledOf[y * size + x] = led.toByte()
             }
         }
 
-        /** [phase] — сдвиг во времени, 0…1023 на полный круг. */
-        fun draw(lut: IntArray, phase: Int): Bitmap {
+        /** [phase] — сдвиг во времени, 0…1023 на полный круг; [twist] — закрутка, −100…100. */
+        fun draw(lut: IntArray, phase: Int, twist: Int): Bitmap {
+            if (twist != twistBuilt) {
+                for (l in twistOff.indices) twistOff[l] = twistOffset(twist, l)
+                twistBuilt = twist
+            }
             for (i in base.indices) {
                 val b = base[i]
-                px[i] = if (b < 0) 0 else lut[(b + phase) and (RB_LUT - 1)]
+                px[i] = if (b < 0) 0 else lut[(b + twistOff[ledOf[i].toInt()] + phase) and (RB_LUT - 1)]
             }
             bitmap.setPixels(px, 0, size, 0, 0, size, size)
             return bitmap

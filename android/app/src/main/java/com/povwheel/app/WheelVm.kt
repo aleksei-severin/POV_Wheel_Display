@@ -275,7 +275,8 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     // Группа — два и больше колёс: у велосипеда бывает и третье (запасное,
     // прицеп) — список, а не пара, ничего не усложняет.
 
-    private class SyncGroup(val members: List<String>, var files: List<String>, var intervalMs: Int, var t0Ms: Long) {
+    // members — var: колесо может выйти из группы, а остальные продолжить (см. leaveSync).
+    private class SyncGroup(var members: List<String>, var files: List<String>, var intervalMs: Int, var t0Ms: Long) {
         // Общие для группы поля — пороги оборотов, диапазон авто-яркости и
         // весь Color Correction (гамма/насыщенность/контраст/баланс RGB) —
         // общий «источник правды», по которому решаем, действительно ли
@@ -294,6 +295,25 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      *  SyncSlideshowService в этом запуске ViewModel (см. restoreSyncStateIfNeeded) —
      *  once per address, дальше состояние уже ведёт сама реактивная логика. */
     private val restoredSyncFor = HashSet<String>()
+
+    /** Stop из уведомления синхронного показа, пока экран жив, — сюда, на
+     *  соединения этой ViewModel (см. SyncSlideshowService.stopHandler). Это
+     *  Stop всей группы разом, в отличие от Stop на экране одного колеса. */
+    private val notifStop: () -> Boolean = {
+        var any = false
+        while (true) {
+            val a = syncGroups.keys.firstOrNull() ?: break
+            stopWholeSync(a)
+            any = true
+        }
+        any
+    }
+
+    /** Колёса, оставшиеся от группы в одиночку, пока были не на связи: обычным
+     *  показом их сделает первое же подключение (см. [continueAlone]). */
+    private val aloneOnReconnect = HashMap<String, SyncGroup>()
+
+    init { SyncSlideshowService.stopHandler = notifStop }
 
     // ---- Состав группы синхронного показа, переживающий убийство процесса ----
     //
@@ -388,18 +408,75 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     }
 
     /** Прекратить синхронизацию, в которой участвует [addr] (если есть) —
-     *  снимает всю группу, не только этот адрес, отпускает службу (см.
-     *  SyncSlideshowService.stop) и гасит уведомление. Показ на колёсах
-     *  остаётся как есть — его останавливает вызывающий, если нужно. */
-    private fun endSync(addr: String?) {
+     *  снимает всю группу, не только этот адрес, и велит службе её забыть (см.
+     *  SyncSlideshowService.forget — там же, почему служба при этом больше не
+     *  шлёт колёсам Stop сама). Показ на колёсах остаётся как есть — его
+     *  останавливает вызывающий своими соединениями, если нужно; [stopWheels] —
+     *  только для случая, когда группу сейчас держит служба. */
+    private fun endSync(addr: String?, stopWheels: Boolean = false) {
         val group = addr?.let { syncGroups[it] } ?: return
         for (m in group.members) syncGroups.remove(m)
         syncPartners.value = syncPartners.value - group.members.toSet()
         // slideIntervalMs НЕ трогаем — см. комментарий у него: это последнее
         // использованное значение, оно должно пережить остановку показа.
-        SyncSlideshowService.stop(ctx)
+        SyncSlideshowService.forget(ctx, stopWheels)
         clearPersistedSyncGroup()
     }
+
+    /**
+     * Колёса [addrs] выходят из своих синхронных групп, остальные участники
+     * продолжают показ без них: двое и больше — синхронно между собой (расписание
+     * то же, колёсам слать нечего — приложение лишь перестаёт числить ушедших в
+     * группе); один — тот же показ в том же порядке, но уже сам по себе
+     * ([continueAlone]); никого — группы больше нет. Самим [addrs] не шлёт
+     * ничего: что с ними делать (Stop, Play, эффект, новый показ), решает
+     * вызывающий.
+     */
+    private fun leaveSync(addrs: Collection<String>) {
+        val leaving = addrs.toSet()
+        for (group in leaving.mapNotNull { syncGroups[it] }.distinct()) {
+            val rest = group.members.filter { it !in leaving }
+            if (rest.size >= 2) {
+                for (m in group.members) if (m in leaving) syncGroups.remove(m)
+                group.members = rest
+                syncPartners.value = syncPartners.value - leaving + rest.associateWith { m -> rest - m }
+                SyncSlideshowService.track(rest, rest.map { wheelName(it) }, group.files, group.intervalMs, group.t0Ms)
+                persistSyncGroup(group)
+                updateSyncNotification(rest.first())
+            } else {
+                endSync(group.members.first())
+                rest.firstOrNull()?.let { continueAlone(it, group) }
+            }
+        }
+    }
+
+    private fun leaveSync(addr: String?) {
+        if (addr != null) leaveSync(listOf(addr))
+    }
+
+    /**
+     * Из синхронной группы ушли все, кроме [addr]: синхронизироваться не с кем,
+     * и колесо дальше крутит тот же отбор в том же порядке как обычный показ —
+     * тот же OP_ALBUM, только без t0. Прошивка (slideClockSet) подхватывает его
+     * с того пункта, что сейчас на ободе, — без скачка на первый. Колесо не на
+     * связи — сделаем это при подключении ([aloneOnReconnect]), а до тех пор
+     * оно идёт по тому же расписанию на своих часах: порядок тот же.
+     */
+    private fun continueAlone(addr: String, group: SyncGroup) {
+        // Отбор обычного показа этого колеса — тот же, что был у группы: экран
+        // в режиме выбора покажет ровно то, что сейчас крутится.
+        prefs.edit().putString(slideSelKey(addr), group.files.joinToString(",")).apply()
+        val c = clients[addr]?.takeIf { it.link.value == Link.Ready }
+        if (c == null) { aloneOnReconnect[addr] = group; return }
+        aloneOnReconnect.remove(addr)
+        val (names, mask) = SyncSlideshowService.schedulePayload(group.files)
+        viewModelScope.launch {
+            runCatching { c.album(true, group.intervalMs, 1, names, mask) }
+        }
+    }
+
+    private fun wheelName(addr: String): String =
+        wheels.value.firstOrNull { it.address == addr }?.name ?: addr
 
     /**
      * Видимость уведомления синхронного показа — только пока эта ViewModel
@@ -485,7 +562,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      * В обоих случаях подключаемся заодно к остальным участникам группы,
      * которых сама эта ViewModel ещё не открывала. Однократно на адрес за
      * время жизни ViewModel — дальше состоянием заведуют сами
-     * [startSyncedSlideshow]/[endSync].
+     * [startSyncedSlideshow]/[leaveSync]/[endSync].
      */
     private fun restoreSyncStateIfNeeded(addr: String) {
         if (!restoredSyncFor.add(addr)) return
@@ -612,21 +689,18 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         val fileNames = if (longList) wanted else fitNamesToOneWrite(wanted, payload)
         val list = fileNames + checked.filter { isSlideEffect(it) }
         if (list.isEmpty()) { say("Tick at least one shared animation"); return }
-        endSync(addr); others.forEach { endSync(it) }
+        // Участники могли быть в других группах — забираем их оттуда, остальные
+        // там продолжают без них (см. leaveSync).
+        leaveSync(members)
+        members.forEach { aloneOnReconnect.remove(it) }
         val ms = (delaySecs * 1000).coerceIn(1000, 300000)
         val group = SyncGroup(members, list, ms, newSyncT0())
         for (m in members) syncGroups[m] = group
         syncPartners.value = syncPartners.value + members.associateWith { m -> members - m }
         slideIntervalMs.value = slideIntervalMs.value + members.associateWith { ms }
         if (settingsLoaded.value) applyGroupSyncedFields(group, settings.value)
-        // Настройки выбранных в показ эффектов (кроме «Текста») — с этого колеса
-        // на все остальные: один и тот же эффект должен выглядеть одинаково.
-        viewModelScope.launch {
-            val c = clients[addr]?.takeIf { it.hello?.hasFx == true } ?: return@launch
-            val src = runCatching { c.fxGet() }.getOrNull()?.also { adoptFx(addr, it) }
-                ?: fxByAddr[addr] ?: return@launch
-            syncFxToGroup(addr, src, freshBase = true)
-        }
+        // Настройки эффектов НЕ копируем: у каждого колеса свои (свой текст, свой
+        // цвет часов…) — см. «параметры эффектов» ниже.
         armSyncGroup(group)
         val names = members.map { m -> wheels.value.firstOrNull { it.address == m }?.name ?: m }
         SyncSlideshowService.track(members, names, list, ms, group.t0Ms)
@@ -636,16 +710,34 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
             else "Synced slideshow started")
     }
 
-    /** Остановить синхронное слайдшоу И погасить ленту на ВСЕХ колёсах группы —
-     *  нажатие Stop не должно требовать повторного нажатия на каждом.
-     *  [endSync] уже отпускает группу и просит [SyncSlideshowService]
-     *  разослать стоп; следующий цикл дублирует
-     *  `stop()` через соединения этой ViewModel как подстраховку — повторный
-     *  `stop()` на уже остановленном колесе безвреден. */
+    /**
+     * Stop на экране колеса [addr] — останавливает показ только на нём:
+     * остальные участники продолжают без него (двое и больше — синхронно между
+     * собой, один — тем же слайдшоу сам по себе, см. [leaveSync]). Погасить
+     * всю группу разом — Stop в уведомлении синхронного показа ([stopWholeSync]).
+     */
     fun stopSyncedSlideshow(addr: String) {
         val group = syncGroups[addr] ?: return
+        val rest = group.members - addr
+        leaveSync(addr)
+        clients[addr]?.takeIf { it.link.value == Link.Ready }?.let { c ->
+            viewModelScope.launch { runCatching { c.stop() } }
+        }
+        say(when {
+            rest.size >= 2 -> "Stopped here — " + rest.joinToString(", ") { wheelName(it) } + " keep playing in sync"
+            rest.size == 1 -> "Stopped here — " + wheelName(rest.first()) + " keeps playing the same slideshow"
+            else -> "Synced slideshow stopped"
+        })
+    }
+
+    /** Остановить синхронный показ на ВСЕХ колёсах группы [addr] разом — Stop в
+     *  уведомлении и «не осталось общих файлов». Стоп рассылаем сами, по
+     *  соединениям этой ViewModel: служба колёсам, к которым подключены мы,
+     *  ничего не шлёт (см. SyncSlideshowService.forget). */
+    private fun stopWholeSync(addr: String) {
+        val group = syncGroups[addr] ?: return
         val members = group.members
-        endSync(addr)
+        endSync(addr, stopWheels = true)
         viewModelScope.launch {
             for (m in members) {
                 clients[m]?.takeIf { it.link.value == Link.Ready }?.let { c ->
@@ -1209,6 +1301,10 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                     if (addr == current.value) magnetLocked.value = true   // новое подключение — замок закрыт
                     prefetchWheel(addr); restoreSyncStateIfNeeded(addr)
                     syncGroups[addr]?.let { armSyncMember(it, addr) }
+                    // Остался от группы один, пока был не на связи (см. continueAlone).
+                    aloneOnReconnect.remove(addr)?.let { g ->
+                        if (!syncGroups.containsKey(addr)) continueAlone(addr, g)
+                    }
                 }
                 else prefetched.remove(addr)
                 updateSyncNotification(addr)
@@ -1395,7 +1491,8 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     }
 
     fun disconnect(addr: String) {
-        endSync(addr)
+        leaveSync(addr)            // остальные участники показа продолжают без него
+        aloneOnReconnect.remove(addr)
         wantConnected.remove(addr)
         reconnectJobs.remove(addr)?.cancel()
         watchJobs.remove(addr)?.cancel()
@@ -2609,7 +2706,10 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     }
 
     fun play(name: String) {
-        endSync(current.value)   // ручной выбор файла рвёт синхронизацию — иначе следующий тик перебьёт его обратно
+        // Ручной выбор файла выводит это колесо из синхронного показа (иначе
+        // расписание перебило бы выбор на следующей границе слота); остальные
+        // участники продолжают без него — см. leaveSync.
+        leaveSync(current.value)
         onTargets { it.play(name) }
         // «Playing …» с человекочитаемым именем и размером файла — по одному
         // взгляду видно, сколько какой ролик весит.
@@ -2620,8 +2720,8 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         }
         say("Playing " + (f?.pretty ?: name) + (if (size != null) "  ·  " + size else ""))
     }
-    fun stopDisplay() { endSync(current.value); onTargets { it.stop() }; say("Display stopped") }
-    fun effect(id: Int) { endSync(current.value); onTargets { it.effect(id) } }
+    fun stopDisplay() { leaveSync(current.value); onTargets { it.stop() }; say("Display stopped") }
+    fun effect(id: Int) { leaveSync(current.value); onTargets { it.effect(id) } }
 
     // ------------------------------------------------------------ эффект «Текст»
     //
@@ -2751,14 +2851,15 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     }
 
     /** Первая правка в редакторе включает эффект на колесе — набранное сразу
-     *  видно на ободе. */
+     *  видно на ободе. Кроме идущего слайдшоу (обычного или синхронного), как и
+     *  у остальных эффектов ([ensureFxPlaying]): правка не должна его рвать —
+     *  строка и цвет применяются на колесе сразу, и «Текст» покажется в свою
+     *  очередь уже новым (а если он сейчас на ободе — меняется прямо на нём). */
     private suspend fun ensureTextPlaying(addr: String, c: BleClient) {
         if (textStartedFor == addr) return
         textStartedFor = addr
-        if (c.tele.value.effect != TEXT_EFFECT_ID) {
-            endSync(addr)
-            c.effect(TEXT_EFFECT_ID)
-        }
+        if (syncGroups.containsKey(addr) || c.tele.value.slideshow) return
+        if (c.tele.value.effect != TEXT_EFFECT_ID) c.effect(TEXT_EFFECT_ID)
     }
 
     fun beginTextEdit() { textEditing = true; textStartedFor = null }
@@ -2784,12 +2885,13 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
 
     // ------------------------------------------------------ параметры эффектов
     //
-    // Красная точка Speed, скорость и резкость Rainbow, цвет Clock (OP_FX_GET /
+    // Красная точка Speed, скорость и закрутка Rainbow, цвет Clock (OP_FX_GET /
     // OP_FX_SET). Правки из диалогов уходят на колесо сразу, как у «Текста», —
-    // последним значением, промежуточные StateFlow пропускает сам. В синхронной
-    // группе правка тех эффектов, что выбраны в показ, расходится и по остальным
-    // колёсам (см. [syncFxToGroup]); «Текст» не синхронизируется никогда — у
-    // каждого колеса своя строка и свой цвет.
+    // последним значением, промежуточные StateFlow пропускает сам. Настройки
+    // эффектов — у каждого колеса свои, и в синхронной группе тоже: правка на
+    // одном колесе на другие не переносится (раньше переносилась — и при старте
+    // группы, и при каждой правке), так что в одном показе одно колесо может
+    // писать один текст, а другое — другой, часы — разными цветами.
 
     private fun adoptFx(addr: String, p: FxParams) {
         fxByAddr[addr] = p
@@ -2822,7 +2924,6 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 } catch (ex: Exception) {
                     say((c.hello?.name ?: e.addr) + ": " + (ex.message ?: "effect settings not sent"))
                 }
-                syncFxToGroup(e.addr, e.p)
             }
         }
     }
@@ -2852,47 +2953,8 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     /** Колесо открытого экрана умеет настройки эффектов (OP_FX_*). */
     fun hasFxSettings(): Boolean = currentClient()?.hello?.hasFx == true
 
-    /**
-     * Из [src] — только поля эффектов, выбранных в показ ([tokens] — `@eN`):
-     * у партнёра остаются его собственные настройки эффектов, которых в
-     * синхронном показе нет.
-     */
-    private fun mergeFx(base: FxParams, src: FxParams, tokens: Collection<String>): FxParams {
-        var r = base
-        if ("@e1" in tokens) r = r.copy(speedRed = src.speedRed)
-        if ("@e3" in tokens) r = r.copy(rbSpeed = src.rbSpeed, rbSharp = src.rbSharp)
-        if ("@e6" in tokens) r = r.copy(clock = src.clock)
-        return r
-    }
-
-    /**
-     * Колесо [addr] в синхронной группе и в её показе есть Speed/Rainbow/Clock —
-     * их настройки с [src] расходятся по остальным участникам. Все сразу, а не по
-     * очереди: слабая связь с одним колесом не должна задерживать остальные.
-     */
-    private suspend fun syncFxToGroup(addr: String, src: FxParams, freshBase: Boolean = false) {
-        val group = syncGroups[addr] ?: return
-        val tokens = group.files.filter { isSlideEffect(it) }
-        if (tokens.none { it == "@e1" || it == "@e3" || it == "@e6" }) return
-        coroutineScope {
-            for (m in group.members) {
-                if (m == addr) continue
-                val c = clients[m]?.takeIf { it.link.value == Link.Ready && it.hello?.hasFx == true } ?: continue
-                launch {
-                    // Во время перетаскивания ползунка — по кэшу (лишний круг по
-                    // радио на каждое значение ни к чему), на старте показа — с колеса.
-                    val cached = if (freshBase) null else fxByAddr[m]
-                    val base = cached ?: runCatching { c.fxGet() }.getOrNull() ?: fxByAddr[m] ?: return@launch
-                    val merged = mergeFx(base, src, tokens)
-                    if (merged == base) return@launch
-                    if (runCatching { c.fxSet(merged) }.isSuccess) adoptFx(m, merged)
-                }
-            }
-        }
-    }
-
     fun album(start: Boolean, ms: Int) {
-        if (start) endSync(current.value)
+        if (start) leaveSync(current.value)
         onTargets { it.album(start, ms) }
     }
 
@@ -2969,7 +3031,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     /** Запустить слайдшоу с отмеченным [checked] (имена файлов + токены эффектов). */
     fun startSlideshow(delaySecs: Int, checked: Set<String>, fileNames: List<String>) {
         if (checked.isEmpty()) { say("Tick at least one item"); return }
-        endSync(current.value)   // это НЕ синхронное слайдшоу — снимаем прежнее, если было
+        leaveSync(current.value)   // это НЕ синхронное слайдшоу — колесо уходит из группы, если было в ней
         current.value?.let {
             prefs.edit().putString(slideSelKey(it), checked.joinToString(",")).apply()
         }
@@ -3193,7 +3255,9 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 val shared = names.filter { it in group.files }
                 group.files = group.files - names.toSet()
                 if (group.files.isEmpty()) {
-                    endSync(addr)
+                    // Гасим всю группу своими соединениями — раньше это молча
+                    // делала служба, подключаясь к колёсам второй раз.
+                    if (addr != null) stopWholeSync(addr)
                     say("Synced slideshow stopped — no shared files left")
                 } else {
                     // Группа продолжает идти без удалённых файлов — с новым
@@ -3446,6 +3510,8 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     }
 
     override fun onCleared() {
+        // Дальше группу держит служба — Stop из уведомления она выполнит сама.
+        if (SyncSlideshowService.stopHandler === notifStop) SyncSlideshowService.stopHandler = null
         povVideo.shutdown()
         btStateReceiver?.let { try { ctx.unregisterReceiver(it) } catch (_: Exception) {} }
         btStateReceiver = null

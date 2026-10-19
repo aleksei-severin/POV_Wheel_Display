@@ -1,5 +1,6 @@
 #include "config.h"
 #include "effects.h"
+#include "storage.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
@@ -35,7 +36,7 @@ static float   led_r_norm[LEDS_PER_SIDE];  // радиус диода в дол�
 // --- параметры эффектов (OP_FX_GET / OP_FX_SET), живут в /fx.cfg ---
 #define FX_FILE "/fx.cfg"
 static volatile uint8_t fx_rb_speed  = 10;   // ≈ прежний оборот спектра за ~5 с
-static volatile uint8_t fx_rb_sharp  = 100;  // по умолчанию — семь чистых полос
+static volatile int8_t  fx_rb_twist  = RB_TWIST_DEFAULT;
 static volatile uint8_t fx_clk_mode  = 0;
 static volatile uint8_t fx_clk_r = 255, fx_clk_g = 255, fx_clk_b = 255;
 static volatile uint8_t fx_clk_speed = 30;
@@ -139,46 +140,28 @@ static void colorizeMask(uint16_t* out, const uint8_t* alpha, bool rainbow,
     }
 }
 
-// --- Радуга: тон по углу и по радиусу ---
-// Чистое кольцо одного цвета на вращающемся колесе читается как мигание всей
-// плоскости, поэтому тон меняется ещё и вдоль луча — получается спираль,
-// которая честно выглядит движущейся.
-//
-// Положение на круге (10 бит: сектор, сдвиг во времени, +12 на диод) → цвет
-// через таблицу: резкость меняет только её, и кадр стоит одно чтение на диод.
+// --- Радуга: семь чистых полос, закрученных в спираль ---
+// Тон зависит от угла и от радиуса: положение на круге (10 бит) — сектор,
+// сдвиг во времени и сдвиг диода по закрутке → цвет через таблицу; кадр стоит
+// одно чтение таблицы на диод. Закрутка 0 — полосы идут прямыми лучами, ±100 —
+// два оборота спирали от ступицы до обода. Со скоростью спираль вращается, и
+// глаз видит, как полосы текут вдоль неё: при закрутке > 0 — к ступице, < 0 — к
+// ободу. Прежде закрутка была постоянной (+12 положений на диод, ≈ 25), а
+// настраивалась резкость переходов между цветами; теперь переходы всегда чистые.
 #define RB_LUT 1024
 static uint16_t rb_lut[RB_LUT];
-static int      rb_lut_sharp = -1;            // для какой резкости построена
+static bool     rb_lut_ok      = false;
+static int32_t  rb_twist_off[LEDS_PER_SIDE];  // сдвиг по кругу для каждого диода
+static int      rb_twist_built = 1000;        // для какой закрутки посчитан (вне −100…100 — ещё ни для какой)
 
 // Семь цветов радуги — тон в градусах: красный, оранжевый, жёлтый, зелёный,
-// голубой, синий, фиолетовый. Последний — снова красный, замыкает круг.
-// Те же числа — в приложении (ui/EffectPreviews.kt, RAINBOW_ANCHORS).
-static const float RB_ANCHORS[8] = {0, 30, 60, 120, 190, 240, 280, 360};
+// голубой, синий, фиолетовый. Круг делится на семь равных полос, каждая целиком
+// своего цвета. Те же числа — в приложении (convert/FxMask.kt, ANCHORS).
+static const float RB_ANCHORS[7] = {0, 30, 60, 120, 190, 240, 280};
 
-// Тон для положения f (0…1) на круге при резкости p (0…1). Круг делится на
-// семь равных полос, у каждой «плато» её цвета шириной p и линейный переход к
-// соседней на остаток. Чистые полосы (p = 1) неравномерно распределённым тонам
-// ничем не обязаны, а при p = 0 тон обязан быть ровно прежним равномерным
-// спектром — поэтому итог плавно смешивает оба: (1 − p)·равномерный + p·полосы.
-// Смесь двух неубывающих функций сама неубывающая — спектр не идёт вспять.
-static float rainbowHue(float f, float p) {
-    float x = f * 7.0f;
-    int   k = (int)x;
-    if (k > 6) k = 6;
-    float t = x - k, g;
-    if (p >= 0.999f)      g = (t < 0.5f) ? 0.0f : 1.0f;
-    else {
-        g = (t - p * 0.5f) / (1.0f - p);
-        if (g < 0) g = 0; else if (g > 1) g = 1;
-    }
-    float band = RB_ANCHORS[k] + g * (RB_ANCHORS[k + 1] - RB_ANCHORS[k]);
-    return (1.0f - p) * f * 360.0f + p * band;
-}
-
-static void buildRainbowLut(int sharp) {
-    float p = sharp / 100.0f;
+static void buildRainbowLut() {
     for (int u = 0; u < RB_LUT; u++) {
-        float h = fmodf(rainbowHue((float)u / RB_LUT, p), 360.0f);
+        float h = RB_ANCHORS[u * 7 / RB_LUT];
         // HSV при полной насыщенности и яркости, тон в градусах.
         float hh = h / 60.0f;
         int   sec = (int)hh;
@@ -195,18 +178,26 @@ static void buildRainbowLut(int sharp) {
         }
         rb_lut[u] = pack565(r, g, b);
     }
-    rb_lut_sharp = sharp;
+    rb_lut_ok = true;
 }
 
 static void effRainbow(uint16_t* out, uint32_t t) {
     advanceHue(fx_rb_speed, t);
-    int sharp = fx_rb_sharp;
-    if (sharp != rb_lut_sharp) buildRainbowLut(sharp);
+    if (!rb_lut_ok) buildRainbowLut();
+    int tw = fx_rb_twist;
+    if (tw != rb_twist_built) {
+        // Целочисленно и с усечением к нулю — так же считает приложение
+        // (FxMask.twistOffset), миниатюра обязана совпасть с ободом.
+        for (int i = 0; i < LEDS_PER_SIDE; i++)
+            rb_twist_off[i] = tw * i * RB_LUT / (50 * (LEDS_PER_SIDE - 1));
+        rb_twist_built = tw;
+    }
     uint32_t phase = fx_hue_acc >> 22;          // 10 бит
     for (int s = 0; s < SECTORS; s++) {
         uint32_t base = (uint32_t)(s * RB_LUT / SECTORS) + phase;
         uint16_t* row = out + s * LEDS_PER_SIDE;
-        for (int i = 0; i < LEDS_PER_SIDE; i++) row[i] = rb_lut[(base + i * 12) & (RB_LUT - 1)];
+        for (int i = 0; i < LEDS_PER_SIDE; i++)
+            row[i] = rb_lut[(base + (uint32_t)rb_twist_off[i]) & (RB_LUT - 1)];
     }
 }
 
@@ -629,9 +620,11 @@ struct __attribute__((packed)) FxStoreHdr {
     uint16_t rsv0;
     uint32_t crc;          // CRC32 всего после этого поля: остаток заголовка и блоб
     uint8_t  text_mode, text_r, text_g, text_b, text_speed;
-    uint8_t  rb_speed, rb_sharp;
+    uint8_t  rb_speed;
+    uint8_t  rb_sharp_rsv;   // бывшая резкость полос радуги: пишем 100 — прошивке до закрутки это её чистые полосы
     uint8_t  clk_mode, clk_r, clk_g, clk_b, clk_speed;
-    uint8_t  rsv[4];
+    uint8_t  rb_twist_b;     // закрутка радуги + 128; 0 — запись старше этой настройки (по умолчанию)
+    uint8_t  rsv[3];
 };
 static_assert(sizeof(FxStoreHdr) + TEXT_COMP_MAX <= FXSTORE_SIZE, "хранилище эффектов не вмещает блоб");
 
@@ -677,7 +670,8 @@ static bool fxStoreWrite() {
     h.magic = FXSTORE_MAGIC;
     h.text_mode = text_mode; h.text_r = text_r; h.text_g = text_g; h.text_b = text_b;
     h.text_speed = text_speed;
-    h.rb_speed = fx_rb_speed; h.rb_sharp = fx_rb_sharp;
+    h.rb_speed = fx_rb_speed; h.rb_sharp_rsv = 100;
+    h.rb_twist_b = (uint8_t)(fx_rb_twist + 128);
     h.clk_mode = fx_clk_mode; h.clk_r = fx_clk_r; h.clk_g = fx_clk_g; h.clk_b = fx_clk_b;
     h.clk_speed = fx_clk_speed;
     uint16_t n = text_comp ? text_comp_len : 0;
@@ -712,7 +706,7 @@ static bool fxStoreLoad() {
     text_r = h.text_r; text_g = h.text_g; text_b = h.text_b;
     text_speed = h.text_speed > 100 ? 100 : h.text_speed;
     fx_rb_speed  = h.rb_speed > 100 ? 100 : h.rb_speed;
-    fx_rb_sharp  = h.rb_sharp > 100 ? 100 : h.rb_sharp;
+    fx_rb_twist  = h.rb_twist_b ? (int8_t)constrain((int)h.rb_twist_b - 128, -100, 100) : RB_TWIST_DEFAULT;
     fx_clk_mode  = h.clk_mode ? 1 : 0;
     fx_clk_r = h.clk_r; fx_clk_g = h.clk_g; fx_clk_b = h.clk_b;
     fx_clk_speed = h.clk_speed > 100 ? 100 : h.clk_speed;
@@ -736,12 +730,13 @@ static void textFileWrite() {
     f.close();
 }
 
-// /fx.cfg: "FXP1", rb_speed, rb_sharp, clk_mode, clk_r, clk_g, clk_b, clk_speed, rsv.
+// /fx.cfg: "FXP1", rb_speed, бывшая резкость (100), clk_mode, clk_r, clk_g, clk_b,
+// clk_speed, закрутка радуги + 128 (0 в старых файлах — по умолчанию).
 static void fxFileWrite() {
     File f = LittleFS.open(FX_FILE, "w");
     if (!f) { webLog("[EFF] Effect settings save failed"); return; }
-    uint8_t h[12] = {'F', 'X', 'P', '1', fx_rb_speed, fx_rb_sharp, fx_clk_mode,
-                     fx_clk_r, fx_clk_g, fx_clk_b, fx_clk_speed, 0};
+    uint8_t h[12] = {'F', 'X', 'P', '1', fx_rb_speed, 100, fx_clk_mode,
+                     fx_clk_r, fx_clk_g, fx_clk_b, fx_clk_speed, (uint8_t)(fx_rb_twist + 128)};
     f.write(h, sizeof(h));
     f.close();
 }
@@ -791,7 +786,7 @@ static bool textLoad() {
 void effectsFxGet(FxParams& p) {
     p.speed_red = effect_speed_red;
     p.rb_speed  = fx_rb_speed;
-    p.rb_sharp  = fx_rb_sharp;
+    p.rb_twist  = fx_rb_twist;
     p.clk_mode  = fx_clk_mode;
     p.clk_r = fx_clk_r; p.clk_g = fx_clk_g; p.clk_b = fx_clk_b;
     p.clk_speed = fx_clk_speed;
@@ -805,7 +800,7 @@ void effectsFxSet(const FxParams& p) {
         settings_dirty = true;
     }
     fx_rb_speed  = p.rb_speed  > 100 ? 100 : p.rb_speed;
-    fx_rb_sharp  = p.rb_sharp  > 100 ? 100 : p.rb_sharp;
+    fx_rb_twist  = (int8_t)constrain((int)p.rb_twist, -100, 100);
     fx_clk_mode  = p.clk_mode ? 1 : 0;
     fx_clk_r = p.clk_r; fx_clk_g = p.clk_g; fx_clk_b = p.clk_b;
     fx_clk_speed = p.clk_speed > 100 ? 100 : p.clk_speed;
@@ -821,10 +816,10 @@ static bool fxLoad() {
     if (f.read(h, sizeof(h)) == sizeof(h) && memcmp(h, "FXP1", 4) == 0) {
         found = true;
         fx_rb_speed  = h[4] > 100 ? 100 : h[4];
-        fx_rb_sharp  = h[5] > 100 ? 100 : h[5];
         fx_clk_mode  = h[6] ? 1 : 0;
         fx_clk_r = h[7]; fx_clk_g = h[8]; fx_clk_b = h[9];
         fx_clk_speed = h[10] > 100 ? 100 : h[10];
+        fx_rb_twist  = h[11] ? (int8_t)constrain((int)h[11] - 128, -100, 100) : RB_TWIST_DEFAULT;
     }
     f.close();
     return found;
@@ -969,6 +964,16 @@ bool effectsStart(uint8_t id) {
     if (oldBuf) free(oldBuf);
     xSemaphoreGive(eff_mutex);
 
+    // На ободе больше не файл, а его буфер только что освобождён — имени в
+    // currentDisplayFile не место. Раньше оно оставалось, и после остановки
+    // эффекта без загрузки файла (Stop, OP_EFFECT 0) колесо считало этот файл
+    // загруженным при frameBuffer == nullptr: показ по часам, дойдя до него,
+    // лишь подправлял фазу (лента чёрная весь слот, а приложение по телеметрии
+    // видит «играет»), обычный показ с одним файлом после эффекта не перечитывал
+    // его вовсе, а удаление этого файла гасило идущий эффект. Сбрасываем здесь:
+    // эта задача (загрузчик, либо setup()) — единственная, что пишет имя.
+    currentDisplayFile   = "";
+    currentPhaseOriginMs = 0;
     lastFrameSwitchTime = millis();
     newFrameReady      = true;
     force_stop_display = false;

@@ -16,12 +16,15 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.povwheel.app.WheelVm
 import com.povwheel.app.ble.TextStyle
 import com.povwheel.app.convert.FxMask
+import kotlin.math.abs
+import kotlin.math.roundToInt
 
 // Готовые цвета палитры (0xRRGGBB). Чёрного нет: на колесе он — пустота.
 private val SWATCHES = listOf(
@@ -197,7 +200,11 @@ internal fun SpeedEffectDialog(vm: WheelVm, kmh: Float, onDismiss: () -> Unit) {
     }
 }
 
-/** Rainbow (длинный тап по плитке): скорость вращения и резкость переходов цветов. */
+/**
+ * Rainbow (длинный тап по плитке): скорость вращения и закрутка спирали. Полосы
+ * всегда чистые; закрутка — от прямых лучей до двух оборотов спирали в любую
+ * сторону, и, вращаясь, спираль течёт к ступице (вправо) или к ободу (влево).
+ */
 @Composable
 internal fun RainbowEffectDialog(vm: WheelVm, onDismiss: () -> Unit) {
     val fx by vm.fxParams.collectAsState()
@@ -212,20 +219,35 @@ internal fun RainbowEffectDialog(vm: WheelVm, onDismiss: () -> Unit) {
             dotColor = cs.primary
         )
         Spacer(Modifier.height(4.dp))
-        SettingLabel(
-            "Colour bands",
-            when (fx.rbSharp) { 0 -> "smooth"; 100 -> "sharp"; else -> fx.rbSharp.toString() + "%" }
-        )
+        SettingLabel("Twist", twistText(fx.rbTwist))
+        // Ноль посередине: жёлоб подсвечен к краям — чем дальше от центра, тем туже спираль.
+        val edge = cs.primary.copy(alpha = 0.45f)
         EmbossedSlider(
-            value = fx.rbSharp.toFloat(), range = 0f..100f, divisions = 20,
-            onChange = { vm.editFx(EFF_RAINBOW, vm.fxParams.value.copy(rbSharp = it.toInt())) },
+            value = fx.rbTwist.toFloat(), range = -100f..100f, divisions = 40,
+            onChange = { vm.editFx(EFF_RAINBOW, vm.fxParams.value.copy(rbTwist = it.roundToInt())) },
             onFinished = {},
+            fill = Brush.horizontalGradient(listOf(edge, Color.Transparent, edge)),
             dotColor = cs.primary
         )
         Row {
-            Text("Smooth blend", style = MaterialTheme.typography.labelSmall, color = cs.onSurfaceVariant,
+            Text("Flows out", style = MaterialTheme.typography.labelSmall, color = cs.onSurfaceVariant,
                 modifier = Modifier.weight(1f))
-            Text("Red · orange · yellow · …", style = MaterialTheme.typography.labelSmall, color = cs.onSurfaceVariant)
+            Text("Rays", style = MaterialTheme.typography.labelSmall, color = cs.onSurfaceVariant)
+            Text("Flows in", style = MaterialTheme.typography.labelSmall, color = cs.onSurfaceVariant,
+                textAlign = TextAlign.End, modifier = Modifier.weight(1f))
         }
+        Text(
+            "The seven bands curl into a spiral; with speed above zero the colours pour along it toward the hub or out to the rim.",
+            style = MaterialTheme.typography.bodySmall,
+            color = cs.onSurfaceVariant
+        )
     }
+}
+
+/** Закрутка словами: сколько оборотов делает спираль от ступицы до обода и куда течёт. */
+private fun twistText(t: Int): String {
+    if (t == 0) return "straight rays"
+    val turns = abs(t) / 50.0
+    val n = if (turns == Math.floor(turns)) turns.toInt().toString() else String.format("%.1f", turns)
+    return n + (if (turns <= 1.0) " turn" else " turns") + (if (t > 0) " · in" else " · out")
 }
