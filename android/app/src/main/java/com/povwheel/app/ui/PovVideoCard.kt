@@ -210,7 +210,9 @@ private fun NightChoice(ctrl: PovVideoController) {
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
         Text("Night processing", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
         for ((m, label) in listOf(NightMode.AUTO to "Auto", NightMode.ON to "On", NightMode.OFF to "Off")) {
-            Pill(text = label, width = 56.dp, selected = night == m, onClick = { ctrl.setNight(m) })
+            // Высота — как у кнопок Maintenance, а не у пилюль заливки.
+            Pill(text = label, width = 56.dp, selected = night == m, height = SETTING_ROW_H,
+                onClick = { ctrl.setNight(m) })
         }
     }
 }

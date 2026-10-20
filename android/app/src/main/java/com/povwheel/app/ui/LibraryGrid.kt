@@ -1099,6 +1099,7 @@ internal fun Pill(
     enabled: Boolean = true,
     // Доля обычного кегля — когда ряд пилюль сжат, чтобы влезть в одну строку.
     textScale: Float = 1f,
+    height: Dp = PILL_HEIGHT,
     onClick: () -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
@@ -1114,7 +1115,7 @@ internal fun Pill(
         shape = PILL_SHAPE,
         color = if (selected) cs.primary.copy(alpha = 0.12f) else Color.Transparent,
         border = BorderStroke(1.dp, if (enabled) border else border.copy(alpha = 0.38f)),
-        modifier = Modifier.width(width).height(PILL_HEIGHT)
+        modifier = Modifier.width(width).height(height)
     ) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             val st = MaterialTheme.typography.labelMedium

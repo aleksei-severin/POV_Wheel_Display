@@ -701,8 +701,9 @@ private fun SettingCard(
 private val COMPACT_PAD_V = 8.dp
 
 /** Высота однострочного заголовка карточки: компактный спиннер «Magnet
- *  Position» и строка свёрнутого «Color Correction» — одинаковые. */
-private val SETTING_ROW_H = 32.dp
+ *  Position», строка свёрнутого «Color Correction», кнопки Maintenance и
+ *  пилюли Night processing (PovVideoCard) — одинаковые. */
+internal val SETTING_ROW_H = 32.dp
 
 /** Насколько гасить то, что без связи с колесом недоступно. */
 internal const val DIM_ALPHA = 0.4f
