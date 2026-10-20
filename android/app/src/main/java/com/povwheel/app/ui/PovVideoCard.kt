@@ -207,22 +207,11 @@ fun PovVideoCard(ctrl: PovVideoController) {
 @Composable
 private fun NightChoice(ctrl: PovVideoController) {
     val night by ctrl.night.collectAsState()
-    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text("Night processing", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
-            for ((m, label) in listOf(NightMode.AUTO to "Auto", NightMode.ON to "On", NightMode.OFF to "Off")) {
-                Pill(text = label, width = 56.dp, selected = night == m, onClick = { ctrl.setNight(m) })
-            }
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text("Night processing", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+        for ((m, label) in listOf(NightMode.AUTO to "Auto", NightMode.ON to "On", NightMode.OFF to "Off")) {
+            Pill(text = label, width = 56.dp, selected = night == m, onClick = { ctrl.setNight(m) })
         }
-        Text(
-            when (night) {
-                NightMode.AUTO -> "Dark videos: brighten the surroundings, keep the display from blowing out."
-                NightMode.ON -> "Always brighten the dark surroundings; the display stays as bright as filmed."
-                NightMode.OFF -> "Render as filmed."
-            },
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
     }
 }
 
