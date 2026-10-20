@@ -1,8 +1,8 @@
 <div align="center">
 
-# 🚲 POV Wheel Display
+# 🚲 POV Wheel Bike Display
 
-### Turn your 29" MTB wheel into a full-colour video screen
+### Turn your bike wheel into a full-colour video screen
 
 A double-sided **Persistence-Of-Vision Display** that lives inside a mountain-bike wheel:
 528 LEDs on six spinning arms paint photos, animations, video, a live speedometer, a clock and
@@ -21,6 +21,10 @@ your own text right onto bike wheel! You control it from an Android app over Blu
 
 ▶️ **[Watch it in action on Instagram](https://www.instagram.com/reel/DeDYKcECSC1/)**
 
+## 🛒 [povwheel.com](https://povwheel.com/)
+
+**Want one? [Join the waitlist](https://povwheel.com/) to be among the first to buy it.**
+
 </div>
 
 ---
@@ -29,34 +33,32 @@ your own text right onto bike wheel! You control it from an Android app over Blu
 
 | | |
 |---|---|
-| 🚵 **Built for a 29" MTB wheel** | Designed from scratch to fit between the spokes of a 29-inch mountain-bike wheel. Works on the **front and the rear wheel**. The wheel detects which way it spins and keeps the image the right way round on both. |
-| 💧 **Water-resistant enclosure** | Sealed housing made for real rides: rain, mud and puddles. |
+| 🚵 **Compatible with 26″, 27.5″, 29″** | Designed from scratch to fit between the spokes of a mountain-bike wheel. Works on the **front and the rear wheel**. The wheel detects which way it spins and keeps the image the right way round on both. |
+| 💧 **Water-resistant** | Sealed housing made for real rides: rain, mud and puddles. |
 | 🔋 **Up to 6 hours of animation** | One charge covers a whole evening ride. A smart battery gauge shows the real remaining percentage. |
 | 💤 **Up to a year on standby** | It draws about 10 µA asleep and wakes when you **shake the wheel**. Transport mode ignores vibration completely, so it won't wake up in a car or on a bike rack. |
-| 📱 **Android app over BLE** | Connect **several displays at once** and run a synced slideshow across them. |
+| 📱 **App over BLE** | Connect **several displays at once** and run a synced slideshow across them. |
 | 🎬 **Render POV video from any camera** | Film your ride with a phone, action cam or drone, and the app turns the clip into a clean, flicker-free POV video. |
 | 🖼️ **Photos, GIFs, video, text** | Drop in a picture, GIF, animated WebP or MP4. The phone converts it and shows you a preview of exactly what the wheel will display. |
 | 🎯 **Sharp, stable image** | 1° angular resolution, sub-degree interpolation, anti-aliasing and acceleration-aware rotor tracking. The picture stays put while you speed up or brake hard. |
 
 ---
 
-## 🚵 Made for a 29" mountain bike
-
-The geometry and every engineering trade-off target one use case: a 29" MTB wheel on real trails.
+## 🚵 Compatible with 26″, 27.5″, 29″
 
 | | |
 |---|---|
-| **Display** | 6 arms × 88 LEDs = **528 SK9822-A** (27 kHz PWM, 20 MHz clock), double-sided, 44 LEDs per face |
-| **Image size** | **~55 cm disc** (LED radius 49–273 mm), fits inside a 29" rim |
+| **Display** | **360 × 44 RGB LEDs** (27 kHz PWM, 20 MHz clock) × 6 arms, double-sided |
+| **Image size** | **~55 cm disc** (LED radius 49–273 mm), fits inside a 26″, 27.5″ or 29″ rim |
 | **Resolution** | 360 × 44 polar pixels per frame, **256 colours per frame** (own palette for every frame) |
 | **Refresh** | Six arms draw the full image every **1/6 of a turn**: 20 Hz at ~28 km/h |
-| **Turns on** | from **~15 km/h** (110 rpm, adjustable in the app) |
-| **Animation length** | up to **~48 s at 10 fps** in RAM, **13 MB** library on flash |
+| **Turns on** | from **~10 km/h** (adjustable in the app) |
+| **Memory** | up to **~48 s at 10 fps** in RAM, **13 MB** library on flash |
 | **Brains** | ESP32-S3, 16 MB flash, 8 MB PSRAM |
 | **Sync** | **6 Hall sensors** (one per arm) + one magnet on the fork or frame |
 | **Sensors** | Ambient light (auto-brightness), vibration (wake by shake) |
-| **Power** | 1S6P Li-Po pack — six 1000 mAh cells in parallel, **6000 mAh** total — with USB charging, **up to 6 h** display time, **up to 1 year** standby |
-| **Enclosure** | Water-resistant |
+| **Battery** | 1S6P Li-Po pack **6000 mAh** — with USB Type-C charging, **up to 6 h** display time, **up to 1 year** standby |
+| **Enclosure** | Water-resistant, IP54 (dust and splash protected) |
 
 **Both sides are readable.** Text, the clock and the speedometer are mirrored on the far face, so
 riders on either side of the bike read them correctly. Logos and pictures can do the same: tick
@@ -75,7 +77,7 @@ and it can drive several displays at once.
   matches what the rim shows. Tap to play.
 - ➕ **Add anything.** Photos, GIFs, animated WebP and **video** (MP4 / WebM / MOV) with crop or
   fit, fps, start time and length. The phone does the polar transform and the palette
-  quantisation. The preview shows the disc exactly as the wheel will, with the hub hole.
+  quantisation. The preview shows the disc exactly as the wheel will.
 - ⚡ **Fast upload.** The phone deflate-compresses the file and the wheel unpacks it with the
   decompressor in its ROM. With LE 2M PHY and a credit window instead of per-packet acks, the
   effective speed is 3–5× the raw ~110 kB/s. A CRC32 check means a damaged file is never kept.
@@ -110,8 +112,7 @@ flowchart LR
    the background whenever it's connected. A ride without the phone isn't lost.
 2. **The app finds the clip in the log.** It lines the recording up with the wheel's rotation
    automatically.
-3. **The app stitches clean frames.** The output keeps the source resolution and the original
-   audio. **Slow-motion clips work too.**
+3. **The app stitches clean frames,** keeping resolution and sound. **Slow-mo works too.**
 
 All of this runs on the phone, with no extra hardware and no special camera.
 
@@ -123,10 +124,10 @@ Long-press **Render POV Video** to export the rotation archive or import one fro
 
 | Effect | What it does |
 |---|---|
-| 🏎️ **Speed** | Live speedometer in big digits that shift from green to red as you speed up (red point set in the app) |
-| 🕐 **Clock** | Time `hh:mm:ss` with blinking colons around the top of the rim, the date `yyyy.mm.dd` around the bottom, solid or rainbow |
-| ✍️ **Text** | Your text around the rim, solid or rainbow |
-| 🌈 **Rainbow** | Seven colour bands curled into a spiral that pours toward the hub or out to the rim — speed and twist set in the app |
+| 🏎️&nbsp;**Speed** | Live speedometer in big digits that shift from green to red as you speed up |
+| 🕐&nbsp;**Clock** | Time along the top of the rim, date along the bottom, solid or rainbow |
+| ✍️&nbsp;**Text** | Your text around the rim, solid or rainbow |
+| 🌈&nbsp;**Rainbow** | Seven colour bands in a flowing spiral, speed and twist set in the app |
 
 Long-press an effect in the app to set it up; the library thumbnail shows it exactly as the rim
 will — the real speed, the current time, the chosen colours.
@@ -135,17 +136,12 @@ will — the real speed, the current time, the chosen colours.
 
 ## 🔋 Power that lasts
 
-- **Up to 6 hours of animation** on one charge. The CPU drops to 80 MHz whenever the display is
-  off and goes to full speed only while drawing.
-- **Up to a year on standby** at about 10 µA in deep sleep. The wheel sleeps on its own after a
-  minute of inactivity.
-- **👋 Shake to wake.** A deliberate shake wakes it. Single bumps in a bag or on a rack don't.
-- **🧳 Transport mode.** Hold the button for 1.5 s, or tap *Power off* in the app. Vibration is
-  ignored completely and one click wakes the wheel.
-- **Honest battery gauge.** It reconstructs the open-circuit voltage, so the percentage doesn't
-  jump when the display turns on or the charger is plugged in.
-- **Protects the cell.** Brightness is capped when the battery is low and the display stops before
-  the cell is deeply discharged. Charging works even from a nearly flat battery.
+- ⏳ **Up to 6 hours of animation** on one charge.
+- 💤 **Up to a year on standby** at ~10 µA, sleeps by itself after a minute idle.
+- 👋 **Shake to wake.** Single bumps in a bag or on a rack are ignored.
+- 🧳 **Transport mode.** Hold the button 1.5 s or tap *Power off*; one click wakes it.
+- 📊 **Honest battery gauge.** No jumps when the display or the charger turns on.
+- 🛡️ **Protects the cell.** Dims when low, stops before a deep discharge.
 
 ---
 
