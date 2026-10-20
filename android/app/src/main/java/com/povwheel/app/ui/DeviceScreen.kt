@@ -55,6 +55,8 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
@@ -205,10 +207,10 @@ private fun MainContent(vm: WheelVm, tele: Tele, online: Boolean) {
         }
     ) {
         item(key = "brightness", span = { GridItemSpan(maxLineSpan) }) {
-            SettingCard(dim = !online) { AutoBrightnessRange(vm, s, tele, online) }
+            SettingCard(dim = !online, padV = COMPACT_PAD_V) { AutoBrightnessRange(vm, s, tele, online) }
         }
         item(key = "magnet", span = { GridItemSpan(maxLineSpan) }) {
-            SettingCard(dim = !online) {
+            SettingCard(dim = !online, padV = COMPACT_PAD_V) {
                 // Заголовок и компактный спиннер в одну строку — блок по высоте
                 // совпадает со свёрнутым «Colour». Спиннер, а не ползунок: на 360
                 // положениях один пиксель дорожки стоит больше градуса, а
@@ -250,12 +252,15 @@ private fun MainContent(vm: WheelVm, tele: Tele, online: Boolean) {
         }
         item(key = "colour", span = { GridItemSpan(maxLineSpan) }) {
             // Полдюжины ползунков незачем держать перед глазами — прячем под тап.
-            SettingCard(dim = !online) {
+            SettingCard(dim = !online, padV = COMPACT_PAD_V) {
+                // Высота строки задана явно, а не полями вокруг текста: «▾» берётся
+                // из запасного шрифта со своими метриками, и при крупном шрифте
+                // системы свёрнутая карточка выходила выше «Magnet Position».
                 Row(
                     Modifier.fillMaxWidth()
+                        .height(SETTING_ROW_H)
                         .clip(RoundedCornerShape(6.dp))
-                        .tapClickable(enabled = online) { colourOpen = !colourOpen }
-                        .padding(vertical = 4.dp),
+                        .tapClickable(enabled = online) { colourOpen = !colourOpen },
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text("Color Correction", style = MaterialTheme.typography.titleMedium,
@@ -273,7 +278,15 @@ private fun MainContent(vm: WheelVm, tele: Tele, online: Boolean) {
                 // Без связи ползунки не показываем: двигать их всё равно некуда.
                 if (colourOpen && online) {
                     Spacer(Modifier.height(4.dp))
-                    ColourControls(vm)
+                    // Раскрытое меню — на подложке блеклее карточки (ближе к фону
+                    // страницы): видно, что это выпавшая часть, а не новый блок.
+                    val card = CardDefaults.cardColors().containerColor
+                    Box(
+                        Modifier.fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(lerp(card, MaterialTheme.colorScheme.background, 0.4f))
+                            .padding(horizontal = 10.dp, vertical = 6.dp)
+                    ) { ColourControls(vm) }
                 }
             }
         }
@@ -282,7 +295,7 @@ private fun MainContent(vm: WheelVm, tele: Tele, online: Boolean) {
             SettingCard { PovVideoCard(vm.povVideo) }
         }
         item(key = "maint", span = { GridItemSpan(maxLineSpan) }) {
-            SettingCard(dim = !online) {
+            SettingCard(dim = !online, padV = COMPACT_PAD_V) {
                 // Только кнопки, без заголовка — карточка по высоте как «Magnet
                 // Position». «OFF» — уход в транспортный режим: колесо гаснет и
                 // до удержания кнопки не проснётся ни по тряске, ни по BLE.
@@ -670,13 +683,26 @@ private fun Hero(vm: WheelVm, tele: Tele, online: Boolean) {
 /** Блок настроек в своей карточке. Отступы между карточками задаёт сетка
  *  (`verticalArrangement`), поэтому своего нижнего поля у карточки нет. */
 @Composable
-private fun SettingCard(dim: Boolean = false, content: @Composable ColumnScope.() -> Unit) {
+private fun SettingCard(
+    dim: Boolean = false,
+    padV: Dp = 12.dp,
+    content: @Composable ColumnScope.() -> Unit
+) {
     // dim — колесо без связи: блок виден (последние значения), но серый, а
     // управление в нём выключено самими элементами (enabled).
     Card(Modifier.fillMaxWidth().then(if (dim) Modifier.alpha(DIM_ALPHA) else Modifier)) {
-        Column(Modifier.padding(12.dp), content = content)
+        Column(Modifier.padding(horizontal = 12.dp, vertical = padV), content = content)
     }
 }
+
+/** Вертикальные поля карточек Auto Brightness / Magnet Position / Color
+ *  Correction / Maintenance — уже обычных 12 dp, чтобы на S25+ при трёх рядах плитки экран
+ *  целиком, до кнопок Maintenance, помещался без прокрутки. */
+private val COMPACT_PAD_V = 8.dp
+
+/** Высота однострочного заголовка карточки: компактный спиннер «Magnet
+ *  Position» и строка свёрнутого «Color Correction» — одинаковые. */
+private val SETTING_ROW_H = 32.dp
 
 /** Насколько гасить то, что без связи с колесом недоступно. */
 internal const val DIM_ALPHA = 0.4f
@@ -785,7 +811,7 @@ private fun RowScope.MaintBtn(
     OutlinedButton(
         onClick = hapticClick(onClick),
         enabled = enabled,
-        modifier = Modifier.weight(1f).height(32.dp),   // как компактный спиннер «Magnet Position»
+        modifier = Modifier.weight(1f).height(SETTING_ROW_H),   // как компактный спиннер «Magnet Position»
         contentPadding = PaddingValues(horizontal = 2.dp),
         colors = if (danger)
             ButtonDefaults.outlinedButtonColors(contentColor = Danger)
@@ -1078,7 +1104,7 @@ private fun NumberSpinner(
     LaunchedEffect(enabled) { if (!enabled) editing = false }
 
     // Компактный режим: всё в одну строку рядом с заголовком карточки.
-    val btnSize = if (dense) 32.dp else 44.dp
+    val btnSize = if (dense) SETTING_ROW_H else 44.dp
     val signSize = if (dense) 16.sp else 20.sp
     val valueStyle = if (dense) MaterialTheme.typography.titleMedium
                      else MaterialTheme.typography.headlineSmall
