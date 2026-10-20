@@ -15,15 +15,10 @@ your own text right onto bike wheel! You control it from an Android app over Blu
 ![Bluetooth LE](https://img.shields.io/badge/Bluetooth-LE-0082FC?logo=bluetooth&logoColor=white)
 ![License: PolyForm Noncommercial](https://img.shields.io/badge/License-PolyForm_Noncommercial-orange.svg)
 
-<a href="https://www.instagram.com/reel/DeDYKcECSC1/">
-  <img width="320" alt="POV Wheel Display on a mountain bike: watch the reel on Instagram" src="docs/images/instagram_reel.jpg" />
-</a>
+<a href="https://www.instagram.com/reel/DeP-MAYCSIa/"><img width="49%" alt="POV Wheel Bike Display: More memes on my bike, Instagram reel" src="docs/images/reel_memes.webp" /></a>
+<a href="https://www.instagram.com/reel/DeDYKcECSC1/"><img width="49%" alt="POV Wheel Bike Display: I've made it!, Instagram reel" src="docs/images/reel_made_it.webp" /></a>
 
-▶️ **[Watch it in action on Instagram](https://www.instagram.com/reel/DeDYKcECSC1/)**
-
-## 🛒 [povwheel.com](https://povwheel.com/)
-
-**Want one? [Join the waitlist](https://povwheel.com/) to be among the first to buy it.**
+### 🛒 [povwheel.com](https://povwheel.com/) — Want one? [Join the waitlist](https://povwheel.com/) to be among the first to buy it.
 
 </div>
 
