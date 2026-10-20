@@ -639,8 +639,9 @@ private fun Hero(vm: WheelVm, tele: Tele, online: Boolean) {
         NumberDialog(
             title = "Wheel circumference",
             body = "Used only to turn rpm into km/h. Roll the wheel one full turn and " +
-                   "measure, or take it from the tyre: 700x35C is about 2168 mm, " +
-                   "28 inch about 2200 mm, 29 inch MTB about 2300 mm.",
+                   "measure, or take it from the tyre: 26 inch MTB is about 2070 mm, " +
+                   "27.5 inch about 2150 mm, 29 inch MTB about 2300 mm, " +
+                   "700x35C about 2168 mm, 28 inch about 2200 mm.",
             initial = settings.circ, unit = "mm", min = 2000, max = 2500,
             onDismiss = { showCirc = false },
             onSave = { v ->

@@ -48,7 +48,7 @@ your own text right onto bike wheel! You control it from an Android app over Blu
 
 | | |
 |---|---|
-| **Display** | **360 × 44 RGB LEDs** (27 kHz PWM, 20 MHz clock) × 6 arms, double-sided |
+| **Display** | **528 RGB LEDs** on 6 arms (27 kHz PWM, 20 MHz clock), double-sided |
 | **Image size** | **~55 cm disc** (LED radius 49–273 mm), fits inside a 26″, 27.5″ or 29″ rim |
 | **Resolution** | 360 × 44 polar pixels per frame, **256 colours per frame** (own palette for every frame) |
 | **Refresh** | Six arms draw the full image every **1/6 of a turn**: 20 Hz at ~28 km/h |
