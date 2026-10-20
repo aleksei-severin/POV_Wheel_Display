@@ -16,10 +16,11 @@ import com.povwheel.app.WheelVm
 import com.povwheel.app.convert.TextMask
 
 /**
- * Редактор эффекта «Текст» (длинный тап по его плитке). Всё применяется сразу,
- * без кнопки «сохранить»: каждая правка строки — новая маска на колесо, каждый
- * цвет — новый цвет; первая же правка включает эффект на ободе. Превью сверху —
- * та же маска, которую получит колесо, тем же цветом.
+ * Редактор эффекта «Текст» (длинный тап по его плитке). Правки применяются сразу:
+ * каждая правка строки — новая маска на колесо, каждый цвет — новый цвет; первая
+ * же правка включает эффект на ободе. Done их оставляет, Cancel и «Назад»
+ * возвращают строку, цвет и то, что шло на ободе. Превью сверху — та же маска,
+ * которую получит колесо, тем же цветом.
  */
 @Composable
 internal fun TextEffectDialog(vm: WheelVm, onDismiss: () -> Unit) {
@@ -36,7 +37,7 @@ internal fun TextEffectDialog(vm: WheelVm, onDismiss: () -> Unit) {
         onDispose { vm.endTextEdit() }
     }
 
-    EffectDialogFrame("Text", onDismiss, preview = { TextDisc(fx, 480, Modifier.fillMaxSize()) }) {
+    EffectDialogFrame("Text", onDismiss, { vm.cancelTextEdit(); onDismiss() }, preview = { TextDisc(fx, 480, Modifier.fillMaxSize()) }) {
         OutlinedTextField(
             value = tf,
             onValueChange = { v ->

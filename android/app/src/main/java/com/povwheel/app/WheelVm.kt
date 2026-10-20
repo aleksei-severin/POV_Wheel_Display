@@ -2805,12 +2805,37 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     // Правки — последним значением: StateFlow сам пропускает промежуточные,
     // пока уходит предыдущее, и отправка не отстаёт от набора. Счётчик — чтобы
     // одинаковая строка, набранная снова, всё равно ушла.
-    private data class TextEdit(val addr: String, val text: String, val n: Long)
-    private data class StyleEdit(val addr: String, val style: TextStyle, val n: Long)
+    private data class TextEdit(val addr: String, val text: String, val n: Long, val s: EditSession?)
+    private data class StyleEdit(val addr: String, val style: TextStyle, val n: Long, val s: EditSession?)
     private val textEdits = MutableStateFlow<TextEdit?>(null)
     private val styleEdits = MutableStateFlow<StyleEdit?>(null)
     private var editSeq = 0L
     @Volatile private var textEditing = false
+
+    /** Что играло на колесе до того, как первая правка в окне включила эффект. */
+    private data class PrevPlay(val effect: Int, val file: String, val play: Boolean)
+
+    /**
+     * Сеанс окна настроек эффекта — ради Cancel (и «Назад», который то же самое):
+     * снимок настроек на открытие, что успели поменять и что играло до правки.
+     * Правки в очереди несут свой сеанс, поэтому быстро открытое заново окно
+     * не путает, чьё что откатывать.
+     */
+    private class EditSession(val addr: String, val fx: FxParams, val text: TextFx) {
+        var textDirty = false
+        var styleDirty = false
+        var fxDirty = false
+        var prevPlay: PrevPlay? = null
+    }
+
+    // Один замок на все правки эффектов по BLE: откат по Cancel встаёт строго
+    // после правки, которая уже ушла, а не дошедшие до колеса — номером
+    // не больше *CancelledUpTo — пропускаются.
+    private val fxLock = Mutex()
+    @Volatile private var textCancelledUpTo = 0L
+    @Volatile private var fxCancelledUpTo = 0L
+    private var textSession: EditSession? = null
+    private var fxSession: EditSession? = null
     // На каком колесе в этом сеансе редактора эффект уже запущен — второй раз
     // OP_EFFECT не шлём: колесо гасит ленту на время перезапуска эффекта.
     private var textStartedFor: String? = null
@@ -2823,28 +2848,34 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 // прежняя прошивка красит их выбранным цветом, как буквы.
                 val colour = client(e.addr)?.hello?.hasTextRgb ?: true
                 val (img, blob) = withContext(Dispatchers.Default) { TextMask.build(e.text, colour) }
-                adoptTextFx(e.addr, (textFxByAddr[e.addr] ?: TextFx())
-                    .copy(text = e.text, mask = img.mask, blob = blob, rgb = img.rgb))
-                val c = client(e.addr)?.takeIf { it.link.value == Link.Ready && it.hello?.hasText == true }
-                    ?: return@collect
-                try {
-                    c.textSet(blob)
-                    ensureTextPlaying(e.addr, c)
-                } catch (ex: Exception) {
-                    say((c.hello?.name ?: e.addr) + ": " + (ex.message ?: "text not sent"))
+                fxLock.withLock {
+                    if (e.n <= textCancelledUpTo) return@withLock
+                    adoptTextFx(e.addr, (textFxByAddr[e.addr] ?: TextFx())
+                        .copy(text = e.text, mask = img.mask, blob = blob, rgb = img.rgb))
+                    val c = client(e.addr)?.takeIf { it.link.value == Link.Ready && it.hello?.hasText == true }
+                        ?: return@withLock
+                    try {
+                        c.textSet(blob)
+                        ensureTextPlaying(e.addr, c, e.s)
+                    } catch (ex: Exception) {
+                        say((c.hello?.name ?: e.addr) + ": " + (ex.message ?: "text not sent"))
+                    }
                 }
             }
         }
         viewModelScope.launch {
             styleEdits.collect { e ->
                 if (e == null) return@collect
-                val c = client(e.addr)?.takeIf { it.link.value == Link.Ready && it.hello?.hasText == true }
-                    ?: return@collect
-                try {
-                    c.textStyle(e.style)
-                    ensureTextPlaying(e.addr, c)
-                } catch (ex: Exception) {
-                    say((c.hello?.name ?: e.addr) + ": " + (ex.message ?: "colour not sent"))
+                fxLock.withLock {
+                    if (e.n <= textCancelledUpTo) return@withLock
+                    val c = client(e.addr)?.takeIf { it.link.value == Link.Ready && it.hello?.hasText == true }
+                        ?: return@withLock
+                    try {
+                        c.textStyle(e.style)
+                        ensureTextPlaying(e.addr, c, e.s)
+                    } catch (ex: Exception) {
+                        say((c.hello?.name ?: e.addr) + ": " + (ex.message ?: "colour not sent"))
+                    }
                 }
             }
         }
@@ -2855,28 +2886,82 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      *  у остальных эффектов ([ensureFxPlaying]): правка не должна его рвать —
      *  строка и цвет применяются на колесе сразу, и «Текст» покажется в свою
      *  очередь уже новым (а если он сейчас на ободе — меняется прямо на нём). */
-    private suspend fun ensureTextPlaying(addr: String, c: BleClient) {
+    private suspend fun ensureTextPlaying(addr: String, c: BleClient, s: EditSession?) {
         if (textStartedFor == addr) return
         textStartedFor = addr
         if (syncGroups.containsKey(addr) || c.tele.value.slideshow) return
-        if (c.tele.value.effect != TEXT_EFFECT_ID) c.effect(TEXT_EFFECT_ID)
+        val t = c.tele.value
+        if (t.effect != TEXT_EFFECT_ID) {
+            s?.prevPlay = PrevPlay(t.effect, t.file, t.play)
+            c.effect(TEXT_EFFECT_ID)
+        }
     }
 
-    fun beginTextEdit() { textEditing = true; textStartedFor = null }
-    fun endTextEdit() { textEditing = false }
+    fun beginTextEdit() {
+        textEditing = true; textStartedFor = null
+        textSession = current.value?.let { EditSession(it, fxParams.value, textFxByAddr[it] ?: textFx.value) }
+    }
+    fun endTextEdit() { textEditing = false; textSession = null }
+
+    /**
+     * Cancel (или «Назад») в редакторе «Текста»: строка и цвет — как были при
+     * открытии, на колесе тоже; если первая правка включила эффект — на ободе
+     * снова то, что шло до неё.
+     */
+    fun cancelTextEdit() {
+        val s = textSession ?: return
+        textSession = null
+        textEditing = false
+        if (!s.textDirty && !s.styleDirty) return
+        textCancelledUpTo = editSeq
+        adoptTextFx(s.addr, s.text)
+        viewModelScope.launch {
+            fxLock.withLock {
+                val c = client(s.addr)?.takeIf { it.link.value == Link.Ready && it.hello?.hasText == true }
+                    ?: return@withLock
+                try {
+                    if (s.textDirty) {
+                        // Блоб снимка — ровно то, что лежало на колесе; без него
+                        // (текст не читался) рисуем строку заново.
+                        val blob = s.text.blob ?: s.text.text.takeIf { it.isNotEmpty() }?.let { t ->
+                            withContext(Dispatchers.Default) { TextMask.build(t, c.hello?.hasTextRgb == true) }.second
+                        }
+                        if (blob != null) c.textSet(blob)
+                    }
+                    if (s.styleDirty) c.textStyle(s.text.style)
+                    s.prevPlay?.let { restorePlay(c, it) }
+                } catch (ex: Exception) {
+                    say((c.hello?.name ?: s.addr) + ": " + (ex.message ?: "text not restored"))
+                }
+            }
+        }
+    }
+
+    /** Вернуть на обод то, что шло до правки в окне эффекта. */
+    private suspend fun restorePlay(c: BleClient, p: PrevPlay) {
+        when {
+            p.effect != 0 -> c.effect(p.effect)
+            p.play && p.file.isNotEmpty() -> c.play(p.file)
+            else -> c.stop()
+        }
+    }
 
     fun editText(text: String) {
         val addr = current.value ?: return
         val t = TextMask.clip(text)
         // Строка в состоянии — сразу (подпись), маска догонит после отрисовки.
         adoptTextFx(addr, (textFxByAddr[addr] ?: TextFx()).copy(text = t))
-        textEdits.value = TextEdit(addr, t, ++editSeq)
+        val s = textSession?.takeIf { it.addr == addr }
+        s?.textDirty = true
+        textEdits.value = TextEdit(addr, t, ++editSeq, s)
     }
 
     fun editTextStyle(st: TextStyle) {
         val addr = current.value ?: return
         adoptTextFx(addr, (textFxByAddr[addr] ?: TextFx()).copy(style = st))
-        styleEdits.value = StyleEdit(addr, st, ++editSeq)
+        val s = textSession?.takeIf { it.addr == addr }
+        s?.styleDirty = true
+        styleEdits.value = StyleEdit(addr, st, ++editSeq, s)
     }
 
     /** Колесо открытого экрана умеет эффект «Текст» (или он уже знаком из кэша). */
@@ -2906,7 +2991,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         adoptFx(addr, p)
     }
 
-    private data class FxEdit(val addr: String, val p: FxParams, val effectId: Int, val n: Long)
+    private data class FxEdit(val addr: String, val p: FxParams, val effectId: Int, val n: Long, val s: EditSession?)
     private val fxEdits = MutableStateFlow<FxEdit?>(null)
     @Volatile private var fxEditing = false
     // На каком колесе в этом сеансе диалога эффект уже запущен (как у «Текста»).
@@ -2916,13 +3001,16 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             fxEdits.collect { e ->
                 if (e == null) return@collect
-                val c = client(e.addr)?.takeIf { it.link.value == Link.Ready && it.hello?.hasFx == true }
-                    ?: return@collect
-                try {
-                    c.fxSet(e.p)
-                    ensureFxPlaying(e.addr, c, e.effectId)
-                } catch (ex: Exception) {
-                    say((c.hello?.name ?: e.addr) + ": " + (ex.message ?: "effect settings not sent"))
+                fxLock.withLock {
+                    if (e.n <= fxCancelledUpTo) return@withLock
+                    val c = client(e.addr)?.takeIf { it.link.value == Link.Ready && it.hello?.hasFx == true }
+                        ?: return@withLock
+                    try {
+                        c.fxSet(e.p)
+                        ensureFxPlaying(e.addr, c, e.effectId, e.s)
+                    } catch (ex: Exception) {
+                        say((c.hello?.name ?: e.addr) + ": " + (ex.message ?: "effect settings not sent"))
+                    }
                 }
             }
         }
@@ -2933,22 +3021,56 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      * ободе. Кроме идущего слайдшоу (обычного или синхронного): правка настроек
      * не должна его рвать — эффект покажется в свою очередь уже новым.
      */
-    private suspend fun ensureFxPlaying(addr: String, c: BleClient, effectId: Int) {
+    private suspend fun ensureFxPlaying(addr: String, c: BleClient, effectId: Int, s: EditSession?) {
         if (fxStartedFor == addr) return
         fxStartedFor = addr
         if (syncGroups.containsKey(addr) || c.tele.value.slideshow) return
-        if (c.tele.value.effect != effectId) c.effect(effectId)
+        val t = c.tele.value
+        if (t.effect != effectId) {
+            s?.prevPlay = PrevPlay(t.effect, t.file, t.play)
+            c.effect(effectId)
+        }
     }
 
-    fun beginFxEdit() { fxEditing = true; fxStartedFor = null }
-    fun endFxEdit() { fxEditing = false }
+    fun beginFxEdit() {
+        fxEditing = true; fxStartedFor = null
+        fxSession = current.value?.let { EditSession(it, fxParams.value, textFxByAddr[it] ?: textFx.value) }
+    }
+    fun endFxEdit() { fxEditing = false; fxSession = null }
+
+    /** Cancel (или «Назад») в окне Speed / Rainbow / Clock — как [cancelTextEdit]. */
+    fun cancelFxEdit() {
+        val s = fxSession ?: return
+        fxSession = null
+        fxEditing = false
+        if (!s.fxDirty) return
+        fxCancelledUpTo = editSeq
+        adoptFx(s.addr, s.fx)
+        viewModelScope.launch {
+            fxLock.withLock {
+                val c = client(s.addr)?.takeIf { it.link.value == Link.Ready && it.hello?.hasFx == true }
+                    ?: return@withLock
+                try {
+                    c.fxSet(s.fx)
+                    s.prevPlay?.let { restorePlay(c, it) }
+                } catch (ex: Exception) {
+                    say((c.hello?.name ?: s.addr) + ": " + (ex.message ?: "effect settings not restored"))
+                }
+            }
+        }
+    }
 
     /** Правка из диалога эффекта [effectId] (Speed, Rainbow или Clock). */
     fun editFx(effectId: Int, p: FxParams) {
         val addr = current.value ?: return
         adoptFx(addr, p)
-        fxEdits.value = FxEdit(addr, p, effectId, ++editSeq)
+        val s = fxSession?.takeIf { it.addr == addr }
+        s?.fxDirty = true
+        fxEdits.value = FxEdit(addr, p, effectId, ++editSeq, s)
     }
+
+    /** Колесо открытого экрана крутит радугу в обе стороны (FEAT_RB_DIR). */
+    fun hasRbDir(): Boolean = currentClient()?.hello?.hasRbDir == true
 
     /** Колесо открытого экрана умеет настройки эффектов (OP_FX_*). */
     fun hasFxSettings(): Boolean = currentClient()?.hello?.hasFx == true

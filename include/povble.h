@@ -174,6 +174,7 @@ struct PovHello {
 // испортило бы время всей сессии в своём архиве. Без бита оно лог просто не видит.
 #define POV_FEAT_HALL_LOG2 0x0800   // OP_TIME / OP_TIME_SET / OP_HALL_LOG / OP_HALL_HIST, лог с упаковкой
 #define POV_FEAT_PREVIEW_AT 0x1000  // OP_PREVIEW_AT: любой кадр файла для анимированного превью
+#define POV_FEAT_RB_DIR    0x2000   // PovFxParams.rb_dir: радуга крутится в обе стороны
 #define POV_FEAT_TEXT      0x0040   // эффект «Текст»: OP_TEXT_STYLE / OP_TEXT_SET / OP_TEXT_GET
 #define POV_FEAT_FX        0x0080   // OP_FX_GET / OP_FX_SET; эффекты 2 и 5 удалены, часы цифровые
 #define POV_FEAT_TEXT_RGB  0x0100   // блоб OP_TEXT_SET может нести слой цвета эмодзи (до 40 кБ)
@@ -196,7 +197,10 @@ struct PovFxParams {
     PovTextStyle clock;      // Clock: цвет
     uint8_t  rb_twist;       // Rainbow: закрутка + 128 (−100…100 — ±2 оборота спирали от ступицы
                              // до обода, 0 — прямые лучи); 0 — поля нет (приложение старше), не трогаем
-    uint8_t  rsv[3];
+    uint8_t  rb_dir;         // Rainbow: 1 — фаза тона растёт (прежнее направление, против часовой
+                             // на стороне первого диода), 2 — убывает (по часовой); 0 — поля нет
+                             // (приложение старше), направление не трогаем
+    uint8_t  rsv[2];
 };
 
 // Настройки, симметричные на чтение и запись. Всё, что имеет побочные эффекты

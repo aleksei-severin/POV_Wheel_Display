@@ -3,6 +3,7 @@ package com.povwheel.app.ble
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.UUID
+import kotlin.math.abs
 
 /**
  * Протокол обмена с колесом. Файл — зеркало заголовка прошивки include/povble.h:
@@ -120,6 +121,7 @@ object Proto {
     const val FEAT_SLIDE_CLOCK = 0x0200 // OP_ALBUM понимает t0: синхронный показ по абсолютным часам
     const val FEAT_ALBUM_LONG  = 0x0400 // отбор слайдшоу любой длины (OP_ALBUM_LIST)
     const val FEAT_PREVIEW_AT  = 0x1000 // OP_PREVIEW_AT: клип превью из кадров колеса
+    const val FEAT_RB_DIR      = 0x2000 // радуга крутится в обе стороны (FxParams, байт 13)
 
     const val ST_BUSY = 3
 
@@ -153,6 +155,7 @@ data class Hello(
     val hasSlideClock get() = features and Proto.FEAT_SLIDE_CLOCK != 0
     val hasAlbumLong  get() = features and Proto.FEAT_ALBUM_LONG != 0
     val hasPreviewAt  get() = features and Proto.FEAT_PREVIEW_AT != 0
+    val hasRbDir      get() = features and Proto.FEAT_RB_DIR != 0
 
     companion object {
         const val SIZE = 48
@@ -465,9 +468,10 @@ data class TextStyle(val rainbow: Boolean = false, val rgb: Int = 0xFFFFFF, val 
 
 /**
  * Параметры эффектов (PovFxParams, 16 байт): [speedRed] — км/ч, при которых цифры
- * Speed красные; радуга — скорость [rbSpeed] (0…100, 100 — два оборота спектра в
- * секунду) и закрутка [rbTwist] (−100…100 — ±2 оборота спирали от ступицы до
- * обода, 0 — прямые лучи; вращаясь, спираль течёт к ступице при > 0, к ободу при
+ * Speed красные; радуга — скорость [rbSpeed] (−100…100, 100 — два оборота спектра в
+ * секунду; знак — направление: > 0 — фаза тона растёт, как было всегда, спектр идёт
+ * против часовой; < 0 — по часовой, только прошивка с FEAT_RB_DIR) и закрутка [rbTwist] (−100…100 — ±2 оборота спирали от ступицы до
+ * обода, 0 — прямые лучи; вращаясь в прежнем направлении, спираль течёт к ступице при > 0, к ободу при
  * < 0); [clock] — цвет часов, устроен как у «Текста».
  */
 data class FxParams(
@@ -479,12 +483,14 @@ data class FxParams(
     fun pack(): ByteArray {
         val b = Proto.buf(SIZE)
         b.putShort(speedRed.coerceIn(5, 200).toShort())
-        b.put(rbSpeed.coerceIn(0, 100).toByte())
+        b.put(abs(rbSpeed).coerceIn(0, 100).toByte())
         // Бывшая резкость полос: прошивка до закрутки рисует по ней — 100, чистые полосы.
         b.put(100.toByte())
         b.put(clock.pack())
         // Закрутка + 128: 0 прошивка читает как «поля нет» (приложение старше).
         b.put((rbTwist.coerceIn(-100, 100) + 128).toByte())
+        // Направление радуги: 1 — прежнее, 2 — обратное; 0 прошивка читает как «поля нет».
+        b.put((if (rbSpeed < 0) 2 else 1).toByte())
         return b.array()
     }
     companion object {
@@ -499,7 +505,9 @@ data class FxParams(
             // 0 — прошивка до закрутки: у неё постоянная спираль ≈ RB_TWIST_DEFAULT.
             val tw = a[12].toInt() and 0xFF
             val twist = if (tw == 0) RB_TWIST_DEFAULT else (tw - 128).coerceIn(-100, 100)
-            return FxParams(red, sp, twist, TextStyle.parse(a, 4))
+            // 2 — обратное направление; 0 (прошивка без FEAT_RB_DIR) и 1 — прежнее.
+            val rev = a[13].toInt() == 2
+            return FxParams(red, if (rev) -sp else sp, twist, TextStyle.parse(a, 4))
         }
     }
 }

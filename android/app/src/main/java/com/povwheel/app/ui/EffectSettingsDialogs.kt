@@ -34,17 +34,24 @@ private val SWATCHES = listOf(
 
 /**
  * Окно настроек эффекта: заголовок, круглое превью таким, каким эффект будет на
- * ободе, под ним — регуляторы. Всё применяется сразу, без кнопки «сохранить».
+ * ободе, под ним — регуляторы. Правки применяются сразу, на колесе тоже; Done
+ * их оставляет, Cancel и «Назад» возвращают всё, как было при открытии. Тап
+ * мимо окна его не закрывает: по нему не угадать, сохранить или откатить, а над
+ * клавиатурой «Текста» мимо окна попасть легко.
  */
 @Composable
 internal fun EffectDialogFrame(
     title: String,
-    onDismiss: () -> Unit,
+    onDone: () -> Unit,
+    onCancel: () -> Unit,
     preview: @Composable BoxScope.() -> Unit,
     content: @Composable ColumnScope.() -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
-    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+    Dialog(
+        onDismissRequest = onCancel,
+        properties = DialogProperties(usePlatformDefaultWidth = false, dismissOnClickOutside = false)
+    ) {
         Surface(
             Modifier.fillMaxWidth().padding(horizontal = 16.dp),
             shape = RoundedCornerShape(20.dp)
@@ -63,7 +70,8 @@ internal fun EffectDialogFrame(
                 content()
                 Spacer(Modifier.height(8.dp))
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                    TextButton(onClick = hapticClick(onDismiss)) { Text("Done") }
+                    TextButton(onClick = hapticClick(onCancel)) { Text("Cancel") }
+                    TextButton(onClick = hapticClick(onDone)) { Text("Done") }
                 }
             }
         }
@@ -165,7 +173,7 @@ private fun FxEditSession(vm: WheelVm) {
 internal fun ClockEffectDialog(vm: WheelVm, onDismiss: () -> Unit) {
     val fx by vm.fxParams.collectAsState()
     FxEditSession(vm)
-    EffectDialogFrame("Clock", onDismiss, preview = { ClockDisc(fx.clock, 480, Modifier.fillMaxSize()) }) {
+    EffectDialogFrame("Clock", onDismiss, { vm.cancelFxEdit(); onDismiss() }, preview = { ClockDisc(fx.clock, 480, Modifier.fillMaxSize()) }) {
         ColourStylePicker(fx.clock, latest = { vm.fxParams.value.clock }) { st ->
             vm.editFx(EFF_CLOCK, vm.fxParams.value.copy(clock = st))
         }
@@ -183,7 +191,7 @@ internal fun SpeedEffectDialog(vm: WheelVm, kmh: Float, onDismiss: () -> Unit) {
     val green = Color(0xFF000000.toInt() or FxMask.speedColor(0, 100))
     val yellow = Color(0xFF000000.toInt() or FxMask.speedColor(50, 100))
     val red = Color(0xFF000000.toInt() or FxMask.speedColor(100, 100))
-    EffectDialogFrame("Speed", onDismiss, preview = { SpeedDisc(kmh, fx.speedRed, 480, Modifier.fillMaxSize()) }) {
+    EffectDialogFrame("Speed", onDismiss, { vm.cancelFxEdit(); onDismiss() }, preview = { SpeedDisc(kmh, fx.speedRed, 480, Modifier.fillMaxSize()) }) {
         SettingLabel("Red at", fx.speedRed.toString() + " km/h")
         EmbossedSlider(
             value = fx.speedRed.toFloat(), range = 5f..200f, divisions = 39,
@@ -200,28 +208,60 @@ internal fun SpeedEffectDialog(vm: WheelVm, kmh: Float, onDismiss: () -> Unit) {
     }
 }
 
+/** Предел скорости радуги в окне: 50 — оборот спектра в секунду; быстрее рябит. */
+private const val RB_SPEED_MAX = 50
+
 /**
  * Rainbow (длинный тап по плитке): скорость вращения и закрутка спирали. Полосы
- * всегда чистые; закрутка — от прямых лучей до двух оборотов спирали в любую
- * сторону, и, вращаясь, спираль течёт к ступице (вправо) или к ободу (влево).
+ * всегда чистые. Скорость — от ↺ 50 до ↻ 50, посередине стоит; закрутка — от
+ * прямых лучей до двух оборотов спирали в любую сторону, и, вращаясь, спираль
+ * течёт к ступице (вправо) или к ободу (влево).
  */
 @Composable
 internal fun RainbowEffectDialog(vm: WheelVm, onDismiss: () -> Unit) {
     val fx by vm.fxParams.collectAsState()
     FxEditSession(vm)
     val cs = MaterialTheme.colorScheme
-    EffectDialogFrame("Rainbow", onDismiss, preview = { RainbowDisc(fx, 300, Modifier.fillMaxSize()) }) {
-        SettingLabel("Speed", if (fx.rbSpeed == 0) "still" else fx.rbSpeed.toString() + "%")
+    // На ползунке вправо — по часовой. У колеса знак наоборот: rbSpeed > 0 —
+    // прежнее направление, против часовой (см. FxParams). Прошивка без
+    // FEAT_RB_DIR крутит только против часовой — ползунок тогда до середины.
+    val both = vm.hasRbDir()
+    val cw = (-fx.rbSpeed).coerceIn(-RB_SPEED_MAX, if (both) RB_SPEED_MAX else 0)
+    EffectDialogFrame("Rainbow", onDismiss, { vm.cancelFxEdit(); onDismiss() },
+        preview = { RainbowDisc(fx, 300, Modifier.fillMaxSize()) }) {
+        SettingLabel("Speed", when {
+            cw == 0 -> "still"
+            cw > 0 -> "↻ " + cw
+            else -> "↺ " + (-cw)
+        })
+        // Ноль посередине — как у закрутки: жёлоб подсвечен к краям.
+        val edge = cs.primary.copy(alpha = 0.45f)
         EmbossedSlider(
-            value = fx.rbSpeed.toFloat(), range = 0f..100f, divisions = 20,
-            onChange = { vm.editFx(EFF_RAINBOW, vm.fxParams.value.copy(rbSpeed = it.toInt())) },
+            value = cw.toFloat(),
+            range = -RB_SPEED_MAX.toFloat()..(if (both) RB_SPEED_MAX.toFloat() else 0f),
+            divisions = if (both) 20 else 10,
+            onChange = { vm.editFx(EFF_RAINBOW, vm.fxParams.value.copy(rbSpeed = -it.roundToInt())) },
             onFinished = {},
+            fill = Brush.horizontalGradient(
+                if (both) listOf(edge, Color.Transparent, edge) else listOf(edge, Color.Transparent)
+            ),
             dotColor = cs.primary
         )
+        Row {
+            Text("↺ " + RB_SPEED_MAX, style = MaterialTheme.typography.labelSmall, color = cs.onSurfaceVariant,
+                modifier = Modifier.weight(1f))
+            Text("still", style = MaterialTheme.typography.labelSmall, color = cs.onSurfaceVariant)
+            if (both) {
+                Text("↻ " + RB_SPEED_MAX, style = MaterialTheme.typography.labelSmall, color = cs.onSurfaceVariant,
+                    textAlign = TextAlign.End, modifier = Modifier.weight(1f))
+            }
+        }
         Spacer(Modifier.height(4.dp))
-        SettingLabel("Twist", twistText(fx.rbTwist))
+        // Куда течёт спираль, решают оба знака: закрутка > 0 при прежнем направлении
+        // (против часовой) течёт к ступице, по часовой — та же спираль течёт к ободу.
+        val inward = cw <= 0
+        SettingLabel("Twist", twistText(fx.rbTwist, inward))
         // Ноль посередине: жёлоб подсвечен к краям — чем дальше от центра, тем туже спираль.
-        val edge = cs.primary.copy(alpha = 0.45f)
         EmbossedSlider(
             value = fx.rbTwist.toFloat(), range = -100f..100f, divisions = 40,
             onChange = { vm.editFx(EFF_RAINBOW, vm.fxParams.value.copy(rbTwist = it.roundToInt())) },
@@ -230,24 +270,20 @@ internal fun RainbowEffectDialog(vm: WheelVm, onDismiss: () -> Unit) {
             dotColor = cs.primary
         )
         Row {
-            Text("Flows out", style = MaterialTheme.typography.labelSmall, color = cs.onSurfaceVariant,
-                modifier = Modifier.weight(1f))
+            Text(if (inward) "Flows out" else "Flows in", style = MaterialTheme.typography.labelSmall,
+                color = cs.onSurfaceVariant, modifier = Modifier.weight(1f))
             Text("Rays", style = MaterialTheme.typography.labelSmall, color = cs.onSurfaceVariant)
-            Text("Flows in", style = MaterialTheme.typography.labelSmall, color = cs.onSurfaceVariant,
-                textAlign = TextAlign.End, modifier = Modifier.weight(1f))
+            Text(if (inward) "Flows in" else "Flows out", style = MaterialTheme.typography.labelSmall,
+                color = cs.onSurfaceVariant, textAlign = TextAlign.End, modifier = Modifier.weight(1f))
         }
-        Text(
-            "The seven bands curl into a spiral; with speed above zero the colours pour along it toward the hub or out to the rim.",
-            style = MaterialTheme.typography.bodySmall,
-            color = cs.onSurfaceVariant
-        )
     }
 }
 
-/** Закрутка словами: сколько оборотов делает спираль от ступицы до обода и куда течёт. */
-private fun twistText(t: Int): String {
+/** Закрутка словами: сколько оборотов делает спираль от ступицы до обода и куда течёт
+ *  ([inward] — закрутка > 0 течёт к ступице, то есть радуга идёт против часовой). */
+private fun twistText(t: Int, inward: Boolean): String {
     if (t == 0) return "straight rays"
     val turns = abs(t) / 50.0
     val n = if (turns == Math.floor(turns)) turns.toInt().toString() else String.format("%.1f", turns)
-    return n + (if (turns <= 1.0) " turn" else " turns") + (if (t > 0) " · in" else " · out")
+    return n + (if (turns <= 1.0) " turn" else " turns") + (if ((t > 0) == inward) " · in" else " · out")
 }

@@ -37,6 +37,7 @@ static float   led_r_norm[LEDS_PER_SIDE];  // радиус диода в дол�
 #define FX_FILE "/fx.cfg"
 static volatile uint8_t fx_rb_speed  = 10;   // ≈ прежний оборот спектра за ~5 с
 static volatile int8_t  fx_rb_twist  = RB_TWIST_DEFAULT;
+static volatile bool    fx_rb_rev    = false;  // радуга крутится по часовой (фаза тона убывает)
 static volatile uint8_t fx_clk_mode  = 0;
 static volatile uint8_t fx_clk_r = 255, fx_clk_g = 255, fx_clk_b = 255;
 static volatile uint8_t fx_clk_speed = 30;
@@ -100,11 +101,14 @@ float currentSpeedKmh() {
 
 // Сдвиг тона за прошедшее с прошлого кадра время. speed 100 — два оборота
 // цветового круга в секунду: 2^32 · 2 / (100 · 1000) ≈ 85899 на мс и единицу.
-static void advanceHue(uint8_t speed, uint32_t t) {
+// rev — фаза убывает (радуга по часовой); счётчик по модулю 2^32, вычитание
+// заворачивается само.
+static void advanceHue(uint8_t speed, uint32_t t, bool rev = false) {
     uint32_t dt = fx_last_ms ? (uint32_t)(t - fx_last_ms) : 0;
     if (dt > 500) dt = 500;               // после паузы (лента гасла) — без скачка
     fx_last_ms = t;
-    fx_hue_acc += (uint32_t)((uint64_t)dt * speed * 85899u);
+    uint32_t d = (uint32_t)((uint64_t)dt * speed * 85899u);
+    fx_hue_acc += rev ? (uint32_t)(0u - d) : d;
 }
 
 // =====================================================================
@@ -182,7 +186,7 @@ static void buildRainbowLut() {
 }
 
 static void effRainbow(uint16_t* out, uint32_t t) {
-    advanceHue(fx_rb_speed, t);
+    advanceHue(fx_rb_speed, t, fx_rb_rev);
     if (!rb_lut_ok) buildRainbowLut();
     int tw = fx_rb_twist;
     if (tw != rb_twist_built) {
@@ -624,7 +628,8 @@ struct __attribute__((packed)) FxStoreHdr {
     uint8_t  rb_sharp_rsv;   // бывшая резкость полос радуги: пишем 100 — прошивке до закрутки это её чистые полосы
     uint8_t  clk_mode, clk_r, clk_g, clk_b, clk_speed;
     uint8_t  rb_twist_b;     // закрутка радуги + 128; 0 — запись старше этой настройки (по умолчанию)
-    uint8_t  rsv[3];
+    uint8_t  rb_dir;         // направление радуги: 2 — по часовой; 0 (старая запись) и 1 — прежнее
+    uint8_t  rsv[2];
 };
 static_assert(sizeof(FxStoreHdr) + TEXT_COMP_MAX <= FXSTORE_SIZE, "хранилище эффектов не вмещает блоб");
 
@@ -672,6 +677,7 @@ static bool fxStoreWrite() {
     h.text_speed = text_speed;
     h.rb_speed = fx_rb_speed; h.rb_sharp_rsv = 100;
     h.rb_twist_b = (uint8_t)(fx_rb_twist + 128);
+    h.rb_dir = fx_rb_rev ? 2 : 1;
     h.clk_mode = fx_clk_mode; h.clk_r = fx_clk_r; h.clk_g = fx_clk_g; h.clk_b = fx_clk_b;
     h.clk_speed = fx_clk_speed;
     uint16_t n = text_comp ? text_comp_len : 0;
@@ -707,6 +713,7 @@ static bool fxStoreLoad() {
     text_speed = h.text_speed > 100 ? 100 : h.text_speed;
     fx_rb_speed  = h.rb_speed > 100 ? 100 : h.rb_speed;
     fx_rb_twist  = h.rb_twist_b ? (int8_t)constrain((int)h.rb_twist_b - 128, -100, 100) : RB_TWIST_DEFAULT;
+    fx_rb_rev    = h.rb_dir == 2;
     fx_clk_mode  = h.clk_mode ? 1 : 0;
     fx_clk_r = h.clk_r; fx_clk_g = h.clk_g; fx_clk_b = h.clk_b;
     fx_clk_speed = h.clk_speed > 100 ? 100 : h.clk_speed;
@@ -787,6 +794,7 @@ void effectsFxGet(FxParams& p) {
     p.speed_red = effect_speed_red;
     p.rb_speed  = fx_rb_speed;
     p.rb_twist  = fx_rb_twist;
+    p.rb_rev    = fx_rb_rev;
     p.clk_mode  = fx_clk_mode;
     p.clk_r = fx_clk_r; p.clk_g = fx_clk_g; p.clk_b = fx_clk_b;
     p.clk_speed = fx_clk_speed;
@@ -801,6 +809,7 @@ void effectsFxSet(const FxParams& p) {
     }
     fx_rb_speed  = p.rb_speed  > 100 ? 100 : p.rb_speed;
     fx_rb_twist  = (int8_t)constrain((int)p.rb_twist, -100, 100);
+    fx_rb_rev    = p.rb_rev;
     fx_clk_mode  = p.clk_mode ? 1 : 0;
     fx_clk_r = p.clk_r; fx_clk_g = p.clk_g; fx_clk_b = p.clk_b;
     fx_clk_speed = p.clk_speed > 100 ? 100 : p.clk_speed;

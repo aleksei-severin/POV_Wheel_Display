@@ -855,7 +855,7 @@ static void handleCmd(const uint8_t* d, size_t n) {
         h.features      = POV_FEAT_DEFLATE | POV_FEAT_OTA | POV_FEAT_PREVIEW |
                           POV_FEAT_ALBUM_SEL | POV_FEAT_HALL_LOG2 | POV_FEAT_TEXT | POV_FEAT_FX |
                           POV_FEAT_TEXT_RGB | POV_FEAT_SLIDE_CLOCK | POV_FEAT_ALBUM_LONG |
-                          POV_FEAT_PREVIEW_AT;
+                          POV_FEAT_PREVIEW_AT | POV_FEAT_RB_DIR;
         h.uptime_s      = millis() / 1000;
         // Именно видимое имя: приложение подписывает им строку списка, и
         // расходиться с тем, что пришло в рекламе, оно не должно.
@@ -1047,6 +1047,7 @@ static void handleCmd(const uint8_t* d, size_t n) {
         p.rb_speed  = f.rb_speed;
         p.rb_sharp_rsv = 100;
         p.rb_twist  = (uint8_t)(f.rb_twist + 128);
+        p.rb_dir    = f.rb_rev ? 2 : 1;
         p.clock.mode = f.clk_mode;
         p.clock.r = f.clk_r; p.clock.g = f.clk_g; p.clock.b = f.clk_b;
         p.clock.speed = f.clk_speed;
@@ -1058,10 +1059,11 @@ static void handleCmd(const uint8_t* d, size_t n) {
         if (pn < sizeof(PovFxParams)) { sendRsp(op, seq, ST_BAD_ARG); break; }
         PovFxParams p; memcpy(&p, pl, sizeof(p));
         FxParams f;
-        effectsFxGet(f);            // закрутку прежнее приложение не шлёт (0) — остаётся текущая
+        effectsFxGet(f);            // закрутку и направление прежнее приложение не шлёт (0) — остаются текущие
         f.speed_red = p.speed_red;
         f.rb_speed  = p.rb_speed;
         if (p.rb_twist) f.rb_twist = (int8_t)constrain((int)p.rb_twist - 128, -100, 100);
+        if (p.rb_dir)   f.rb_rev   = p.rb_dir == 2;
         f.clk_mode  = p.clock.mode;
         f.clk_r = p.clock.r; f.clk_g = p.clock.g; f.clk_b = p.clock.b;
         f.clk_speed = p.clock.speed;
