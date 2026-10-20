@@ -63,7 +63,7 @@ riders on either side of the bike read them correctly. Logos and pictures can do
 
 ## 📱 The app
 
-<img src="docs/images/app.gif" align="right" width="260" alt="POV Wheel Android app: library with animated previews, battery and settings" />
+<img src="docs/images/app.webp" align="right" width="260" alt="POV Wheel Android app: library with animated previews, battery and settings" />
 
 Everything runs from a handy Android app (Kotlin + Jetpack Compose, Android 8.0+) over Bluetooth LE,
 and it can drive several displays at once.
