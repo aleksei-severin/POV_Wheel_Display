@@ -53,7 +53,7 @@ your own text right onto bike wheel! You control it from an Android app over Blu
 | **Resolution** | 360 × 44 polar pixels per frame, **256 colours per frame** (own palette for every frame) |
 | **Refresh** | Six arms draw the full image every **1/6 of a turn**: 20 Hz at ~28 km/h |
 | **Turns on** | from **~10 km/h** (adjustable in the app) |
-| **Memory** | up to **~48 s at 10 fps** in RAM, **13 MB** library on flash |
+| **Memory** | up to **~48 s at 10 fps** in RAM, **13 MB** library on flash (up to **800 frames**) |
 | **Brains** | ESP32-S3, 16 MB flash, 8 MB PSRAM |
 | **Sync** | **6 Hall sensors** (one per arm) + one magnet on the fork or frame |
 | **Sensors** | Ambient light (auto-brightness), vibration (wake by shake) |
@@ -122,12 +122,15 @@ Long-press **Render POV Video** to export the rotation archive or import one fro
 
 ## 🎨 Built-in effects
 
-| Effect | What it does |
-|---|---|
-| 🏎️&nbsp;**Speed** | Live speedometer in big digits that shift from green to red as you speed up |
-| 🕐&nbsp;**Clock** | Time along the top of the rim, date along the bottom, solid or rainbow |
-| ✍️&nbsp;**Text** | Your text around the rim, solid or rainbow |
-| 🌈&nbsp;**Rainbow** | Seven colour bands in a flowing spiral, speed and twist set in the app |
+<table>
+<thead><tr><th>Effect</th><th width="100%">What it does</th></tr></thead>
+<tbody>
+<tr><td>🏎️&nbsp;<b>Speed</b></td><td>Live speedometer in big digits that shift from green to red as you speed up</td></tr>
+<tr><td>🕐&nbsp;<b>Clock</b></td><td>Time along the top of the rim, date along the bottom, solid or rainbow</td></tr>
+<tr><td>✍️&nbsp;<b>Text</b></td><td>Your text around the rim, solid or rainbow</td></tr>
+<tr><td>🌈&nbsp;<b>Rainbow</b></td><td>Seven colour bands in a flowing spiral, speed and twist set in the app</td></tr>
+</tbody>
+</table>
 
 Long-press an effect in the app to set it up; the library thumbnail shows it exactly as the rim
 will — the real speed, the current time, the chosen colours.
