@@ -807,6 +807,66 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
      *  по этому ключу перечитывает клип. */
     val previewVersion = MutableStateFlow(0)
 
+    // ---- Длительность анимаций ----
+    /** Кадров в файле и задержка кадра (мс) — из заголовка ANI6. Петля на ободе
+     *  длится ровно [loopMs]: колесо крутит кадры с этой задержкой без округлений. */
+    data class AnimInfo(val frames: Int, val delayMs: Int) {
+        val loopMs: Long get() = frames.toLong() * delayMs
+    }
+    /** Ключ — «имя|размер», как у кадров превью: перезалитый файл другого размера —
+     *  уже другая запись. Источники: заливка с этого телефона (заголовок готового
+     *  файла) и колесо (OP_PREVIEW_AT, им же собирается клип превью). Клип .pvc
+     *  длительности не хранит — его задержка прорежена под 16 кадров. */
+    val animInfo = MutableStateFlow<Map<String, AnimInfo>>(emptyMap())
+    private val animInfoFile by lazy { File(previewDir, "anim.json") }
+    private val animInfoLock = Any()
+    private var animInfoLoaded = false
+
+    private fun animKey(name: String, size: Long) = "$name|$size"
+
+    fun animInfoOf(f: DevFile): AnimInfo? = animInfo.value[animKey(f.name, f.size)]
+
+    /** Поднять сохранённое с диска — один раз, с IO-потока. Всё, что записали
+     *  раньше, остаётся поверх прочитанного. */
+    private fun loadAnimInfo() {
+        synchronized(animInfoLock) {
+            if (animInfoLoaded) return
+            animInfoLoaded = true
+            if (!animInfoFile.exists()) return
+            val m = runCatching {
+                val o = JSONObject(animInfoFile.readText())
+                o.keys().asSequence().associateWith { k ->
+                    o.getJSONArray(k).let { AnimInfo(it.getInt(0), it.getInt(1)) }
+                }
+            }.getOrNull() ?: return
+            animInfo.value = m + animInfo.value
+        }
+    }
+
+    /** Под [animInfoLock]. Через временный файл — оборванная запись не съест старую. */
+    private fun saveAnimInfoLocked() {
+        runCatching {
+            val o = JSONObject()
+            animInfo.value.forEach { (k, v) -> o.put(k, JSONArray().put(v.frames).put(v.delayMs)) }
+            val tmp = File(animInfoFile.path + ".tmp")
+            tmp.writeText(o.toString())
+            if (!tmp.renameTo(animInfoFile)) { tmp.copyTo(animInfoFile, overwrite = true); tmp.delete() }
+        }
+    }
+
+    /** Запомнить кадры и задержку файла; на диск — только если что-то изменилось.
+     *  С IO-потока. */
+    private fun putAnimInfo(name: String, size: Long, frames: Int, delayMs: Int) {
+        val key = animKey(name, size)
+        val v = AnimInfo(frames, delayMs)
+        synchronized(animInfoLock) {
+            loadAnimInfo()
+            if (animInfo.value[key] == v) return
+            animInfo.value = animInfo.value + (key to v)
+            saveAnimInfoLocked()
+        }
+    }
+
     private var logTotal = 0L
     private var pollJob: kotlinx.coroutines.Job? = null
     private var scanStopJob: kotlinx.coroutines.Job? = null
@@ -830,6 +890,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             while (true) { delay(3000); runCatching { saveCaches() } }
         }
+        viewModelScope.launch(Dispatchers.IO) { loadAnimInfo() }
         found.value = knownDevices()
         rebuildWheels()
         registerBtStateReceiver()
@@ -2542,7 +2603,10 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                     runCatching { cl.fsInfo() }.getOrNull()?.let { fsInfoByAddr[addr] = it }
                 }
                 if (current.value == addr) { files.value = fl; fsInfo.value = fsInfoByAddr[addr]!! }
-                withContext(Dispatchers.IO) { dropThumb(res.fileName) }
+                withContext(Dispatchers.IO) {
+                    dropThumb(res.fileName)
+                    putAnimInfo(res.fileName, res.data.size.toLong(), Ani6.framesOf(res.data), Ani6.delayOf(res.data))
+                }
                 // Рендерим и кладём в кэш компактное превью, пока доступ к
                 // исходнику ещё жив — один раз на файл, не на каждую цель.
                 if (cachedPreviews.add(item.uri)) cachePreview(item, res.fileName)
@@ -2643,6 +2707,12 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                     total += pf.length()
                     if (total > CLIP_DISK_MAX) pf.delete()
                 }
+            }
+            // Длительности удалённых файлов — по тому же правилу.
+            if (strict) synchronized(animInfoLock) {
+                loadAnimInfo()
+                val kept = animInfo.value.filterKeys { it.substringBeforeLast('|') in keep }
+                if (kept.size != animInfo.value.size) { animInfo.value = kept; saveAnimInfoLocked() }
             }
         }
     }
@@ -3464,6 +3534,13 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     private val clipFails = HashMap<String, Int>()
     private var clipJob: kotlinx.coroutines.Job? = null
 
+    /** Плитка со своим клипом, но без длительности (залит до того, как её стали
+     *  запоминать, или с другого телефона) — просит у колеса только её: той же
+     *  очередью, заголовком первого кадра. */
+    fun wantAnimInfo(f: DevFile) {
+        if (animInfoOf(f) == null) wantDeviceClip(f)
+    }
+
     /** Плитка без своего клипа просит собрать его с колеса. */
     fun wantDeviceClip(f: DevFile) {
         val addr = current.value ?: return
@@ -3478,6 +3555,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun clipWorker() {
+        loadAnimInfo()
         while (true) {
             val (addr, f) = synchronized(clipQueue) {
                 clipQueue.values.firstOrNull() ?: run { clipJob = null; return }
@@ -3490,12 +3568,15 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 synchronized(clipQueue) { clipQueue.clear(); clipJob = null }
                 return
             }
-            if (PreviewClips.fileFor(previewDir, f.name).exists()) {
+            // Клип уже есть — с колеса нужна разве что длительность.
+            val needClip = !PreviewClips.fileFor(previewDir, f.name).exists()
+            if (!needClip && animInfoOf(f) != null) {
                 synchronized(clipQueue) { clipQueue.remove(f.name) }
                 continue
             }
             val clip = try {
-                buildDeviceClip(c, f)
+                if (needClip) buildDeviceClip(c, f)
+                else { c.previewAt(f.name, 0)?.let { putAnimInfo(f.name, f.size, it.frames, it.delayMs) }; null }
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: BleException) {
@@ -3525,7 +3606,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
                 clip.recycle()   // плитка возьмёт клип с диска
                 synchronized(clipMem) { clipMem.remove(f.name) }
                 previewVersion.value = previewVersion.value + 1
-            } else {
+            } else if (needClip || animInfoOf(f) == null) {
                 synchronized(clipQueue) { clipSkip.add(key) }
             }
             synchronized(clipQueue) { clipQueue.remove(f.name) }
@@ -3535,6 +3616,7 @@ class WheelVm(app: Application) : AndroidViewModel(app) {
     /** Клип из кадров колеса; null — файл из одного кадра (хватит статичного превью). */
     private suspend fun buildDeviceClip(c: BleClient, f: DevFile): PreviewClip? {
         val first = c.previewAt(f.name, 0) ?: return null
+        putAnimInfo(f.name, f.size, first.frames, first.delayMs)
         if (first.frames <= 1) return null
         val idx = PreviewClips.pickIndices(first.frames, PreviewClips.CACHE_FRAMES)
         val frames = ArrayList<Bitmap>(idx.size)

@@ -132,6 +132,7 @@ internal fun LibraryTab(
     val uploadBusyAddrs by vm.uploadBusyAddrs.collectAsState()
     val textFx by vm.textFx.collectAsState()
     val fxParams by vm.fxParams.collectAsState()
+    val animInfo by vm.animInfo.collectAsState()
 
     val hasSel = vm.currentClient()?.hello?.hasAlbumSel == true
     val allNames = files.map { it.name }
@@ -330,6 +331,11 @@ internal fun LibraryTab(
                     pendingClip = (cell as? Cell.Pending)?.let { upClips[it.item.uri] },
                     // Сколько займёт на колесе — пересчитывается на лету при смене fps/длины.
                     pendingBytes = (cell as? Cell.Pending)?.let { vm.upEstimatedBytes(it.item) },
+                    // Длительность петли — только у анимаций: у картинки её нет
+                    // (с нулевой задержкой колесо кадры тоже не листает).
+                    loopMs = (cell as? Cell.Stored)?.file
+                        ?.let { animInfo[it.name + "|" + it.size] }
+                        ?.takeIf { it.frames > 1 && it.delayMs > 0 }?.loopMs,
                     noRoom = (cell as? Cell.Pending)?.item?.uri in wontFit,
                     onWheel = (cell as? Cell.Pending)?.item?.uri in plan.onWheel,
                     uploading = upCurUri != null && (cell as? Cell.Pending)?.item?.uri == upCurUri,
@@ -635,6 +641,9 @@ private fun LibraryCell(
     selectedPending: Boolean,
     pendingClip: PreviewClip?,
     pendingBytes: Long?,
+    // Сколько длится петля анимации файла с колеса, мс; null — картинка или пока
+    // неизвестно.
+    loopMs: Long?,
     // Места на колесе на этот файл не хватит — красный ободок и размер.
     noRoom: Boolean,
     // Точно такой файл уже на колесе — серый ободок, приглушённый диск и
@@ -775,18 +784,21 @@ private fun LibraryCell(
         }
         if (showCheck) CheckDot(checked, Modifier.align(Alignment.BottomEnd))
 
-        // Размер в левом нижнем углу: у файла с колеса — в режиме выбора, у
-        // ждущего заливки — всегда (сколько он займёт на колесе после неё). У
-        // уже залитого места он не займёт — вместо размера отметка.
-        val sizeLabel = when {
-            cell is Cell.Stored && mode != LibMode.NORMAL -> fmtBytes(cell.file.size)
+        // Левый нижний угол. У файла с колеса — длительность петли анимации
+        // (интервал слайдшоу удобно брать кратным ей), в режиме удаления — размер
+        // (сколько места освободится). У ждущего заливки — всегда размер (сколько
+        // он займёт на колесе после неё); у уже залитого места он не займёт —
+        // вместо размера отметка.
+        val cornerLabel = when {
+            cell is Cell.Stored && mode == LibMode.DELETE -> fmtBytes(cell.file.size)
+            cell is Cell.Stored -> loopMs?.let { fmtLoop(it) }
             cell is Cell.Pending && onWheel -> "✓ on wheel"
             cell is Cell.Pending -> pendingBytes?.let { fmtBytes(it) }
             else -> null
         }
-        if (sizeLabel != null) {
+        if (cornerLabel != null) {
             Text(
-                sizeLabel,
+                cornerLabel,
                 fontSize = 9.sp,
                 fontWeight = FontWeight.Medium,
                 color = when { noRoom -> Danger; onWheel -> Ok; else -> Color.White },
@@ -819,6 +831,13 @@ private fun fmtBytes(b: Long): String = when {
     b >= 1024      -> (b / 1024).toString() + " kB"
     else           -> b.toString() + " B"
 }
+
+/** Длительность петли: до 10 с — с сотыми, дальше — с десятыми, без хвостовых
+ *  нулей («2s», «2.4s», «1.68s», «12.5s»). Сотые не лишние: интервал слайдшоу
+ *  целый, и 2.96 с, округлённые до «3s», сбивали бы подбор кратного. */
+private fun fmtLoop(ms: Long): String =
+    String.format(Locale.US, if (ms < 10_000) "%.2f" else "%.1f", ms / 1000.0)
+        .trimEnd('0').trimEnd('.') + "s"
 
 /** Кружок в углу превью в режиме выбора. */
 @Composable
@@ -854,7 +873,12 @@ private fun StoredDisc(vm: WheelVm, f: DevFile, online: Boolean) {
     // забитом канале) оставляла плитку серой до перезапуска приложения.
     LaunchedEffect(f.name, f.size, pv, online) {
         val c = vm.localClip(f)
-        if (c != null) { clip = c; return@LaunchedEffect }
+        if (c != null) {
+            clip = c
+            // Клип свой, а длительности петли он не знает — её спросим у колеса.
+            if (online) vm.wantAnimInfo(f)
+            return@LaunchedEffect
+        }
         // Своего клипа нет (залит с другого телефона) — колесо соберёт его из своих
         // кадров, фоном; готовый ляжет в кэш, и эффект перезапустится по previewVersion.
         // До тех пор — статичный первый кадр.

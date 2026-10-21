@@ -37,6 +37,12 @@ object Ani6 {
 
     fun frameOffset(i: Int) = HEADER + i * Geom.FRAME_STRIDE
 
+    /** Число кадров из заголовка готового файла — без флага зеркала. */
+    fun framesOf(buf: ByteArray) = ((buf[4].toInt() and 0xFF) or ((buf[5].toInt() and 0xFF) shl 8)) and 0x7FFF
+
+    /** Задержка кадра (мс) из заголовка готового файла. */
+    fun delayOf(buf: ByteArray) = (buf[6].toInt() and 0xFF) or ((buf[7].toInt() and 0xFF) shl 8)
+
     /** Та же CRC32, что прошивка считает по РАСПАКОВАННЫМ байтам. */
     fun crc32(data: ByteArray): Long {
         val c = CRC32()
