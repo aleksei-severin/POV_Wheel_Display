@@ -28,7 +28,7 @@ your own text right onto bike wheel! You control it from an Android app over Blu
 
 | | |
 |---|---|
-| 🚵 **Compatible with 26″, 27.5″, 29″** | Designed from scratch to fit between the spokes of a mountain-bike wheel. Works on the **front and the rear wheel**. The wheel detects which way it spins and keeps the image the right way round on both. |
+| 🚵 **Compatible with 20″, 24″, 26″, 27.5″/650B, 29″/700C** | Designed from scratch to fit between the spokes of a bicycle wheel. Works on the **front and the rear wheel**. The wheel detects which way it spins and keeps the image the right way round on both. |
 | 💧 **Water-resistant** | Sealed housing made for real rides: rain, mud and puddles. |
 | 🔋 **Up to 6 hours of animation** | One charge covers a whole evening ride. A smart battery gauge shows the real remaining percentage. |
 | 💤 **Up to a year on standby** | It draws about 10 µA asleep and wakes when you **shake the wheel**. Transport mode ignores vibration completely, so it won't wake up in a car or on a bike rack. |
@@ -39,12 +39,12 @@ your own text right onto bike wheel! You control it from an Android app over Blu
 
 ---
 
-## 🚵 Compatible with 26″, 27.5″, 29″
+## 🚵 Compatible with 20″, 24″, 26″, 27.5″/650B, 29″/700C
 
 | | |
 |---|---|
 | **Display** | **528 RGB LEDs** on 6 arms (27 kHz PWM, 20 MHz clock), double-sided |
-| **Image size** | **~55 cm disc** (LED radius 49–273 mm), fits inside a 26″, 27.5″ or 29″ rim |
+| **Image size** | **~55 cm disc** (LED radius 49–273 mm), fits inside a 20″, 24″, 26″, 27.5″/650B or 29″/700C rim |
 | **Resolution** | 360 × 44 polar pixels per frame, **256 colours per frame** (own palette for every frame) |
 | **Refresh** | Six arms draw the full image every **1/6 of a turn**: 20 Hz at ~28 km/h |
 | **Turns on** | from **~10 km/h** (adjustable in the app) |
